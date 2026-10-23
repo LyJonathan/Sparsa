@@ -2265,3 +2265,9 @@ if(STRATA_HIP_GFX906)
   add_executable(gfx906_qsa_query_swizzle_probe bench/gfx906_qsa_query_swizzle_probe.cpp)
   target_link_libraries(gfx906_qsa_query_swizzle_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 endif()
+
+# MiniMax GGUF quantizer. Default OFF so a normal strata configure is unchanged.
+option(STRATA_BUILD_MM_QUANT "Build strata-mm-quant (tools/minimax/quant). Does not change other targets." OFF)
+if(STRATA_BUILD_MM_QUANT)
+  add_subdirectory(tools/minimax/quant)
+endif()
