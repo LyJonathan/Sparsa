@@ -538,6 +538,40 @@ class ReferenceModel:
 
     def run_layer(self, layer, hidden, position_ids, dump: DumpContext | None = None):
         DumpContext.active = dump
+        hooks = []
+        if dump is not None:
+            def pre_hook(module, args, kwargs):
+                dump.put("attn_input", kwargs.get("hidden_states", args[0] if args else None))
+                return None
+
+            def post_hook(module, args, kwargs, output):
+                dump.put("attn_out", output[0] if isinstance(output, tuple) else output)
+                return None
+
+            def router_hook(module, args, kwargs, output):
+                dump.put("router_logits", output[0])
+                dump.put("router_weights", output[1])
+                dump.put("router_topk_ids", output[2])
+                return None
+
+            def shared_hook(module, args, kwargs, output):
+                dump.put("shared_expert_out", output)
+                return None
+
+            hooks.append(layer.self_attn.register_forward_pre_hook(pre_hook, with_kwargs=True))
+            hooks.append(layer.self_attn.register_forward_hook(post_hook, with_kwargs=True))
+            if hasattr(layer.mlp, "gate"):
+                hooks.append(layer.mlp.gate.register_forward_hook(router_hook, with_kwargs=True))
+                if hasattr(layer.mlp, "shared_experts"):
+                    hooks.append(
+                        layer.mlp.shared_experts.register_forward_hook(shared_hook, with_kwargs=True)
+                    )
+                if hasattr(layer.mlp, "shared_experts"):
+                    hooks.append(
+                        layer.mlp.shared_experts.register_forward_hook(
+                            lambda m, a, o, d=dump: d.put("shared_expert_out", o)
+                        )
+                    )
         try:
             with torch.no_grad():
                 pos_emb = self.rotary(hidden, position_ids=position_ids)
@@ -551,6 +585,8 @@ class ReferenceModel:
                 )
         finally:
             DumpContext.active = None
+            for h in hooks:
+                h.remove()
 
     def embed_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():

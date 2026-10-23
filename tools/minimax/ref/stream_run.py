@@ -162,6 +162,7 @@ def run_prompts(args):
                 dump = DumpContext()
             hidden[i] = model.run_layer(layer, hidden[i], position_ids[i], dump)
             if dump is not None:
+                dump.put("layer_out", hidden[i])
                 dumps = dump.data
         t_run = time.time() - t1
         if dumps is not None:
