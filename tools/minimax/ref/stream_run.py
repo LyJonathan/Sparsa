@@ -392,7 +392,7 @@ def build_parser():
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument(
         "--tokenizer",
-        default=r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\tokenizer.json",
+        default=os.environ.get("MINIMAX_TOKENIZER", ""),
     )
     ap.add_argument("--prompts", default=str(Path(__file__).with_name("prompts.jsonl")))
     ap.add_argument("--out", default=DEFAULT_OUT)

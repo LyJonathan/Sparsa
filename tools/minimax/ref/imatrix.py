@@ -191,6 +191,33 @@ def resolve_tokenizer(args) -> str:
     raise FileNotFoundError(f"tokenizer.json not found (--tokenizer {args.tokenizer}, model dir {local})")
 
 
+def expected_names(layer_start=0, layer_end=60):
+    """Every imatrix entry a full pass must produce (spec F.2 names)."""
+    names = []
+    for L in range(layer_start, layer_end):
+        for suffix in (
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "indexer.q_proj.weight",
+            "indexer.k_proj.weight",
+        ):
+            names.append(f"blk.{L}.{suffix}")
+        if L < 3:
+            names += [f"blk.{L}.ffn_gate.weight", f"blk.{L}.ffn_up.weight", f"blk.{L}.ffn_down.weight"]
+        else:
+            names += [
+                f"blk.{L}.ffn_gate_shexp.weight",
+                f"blk.{L}.ffn_up_shexp.weight",
+                f"blk.{L}.ffn_down_shexp.weight",
+                f"blk.{L}.ffn_gate_exps.weight",
+                f"blk.{L}.ffn_up_exps.weight",
+                f"blk.{L}.ffn_down_exps.weight",
+            ]
+    return names
+
+
 def run(args):
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     torch.set_num_threads(args.threads)
@@ -281,6 +308,14 @@ def run(args):
         "entries": len(im.entries),
         "peak_rss_gb": rss.stop(),
     }
+    expected = expected_names(args.layer_start, args.layer_end)
+    missing = [n for n in expected if n not in im.entries]
+    result["expected_entries"] = len(expected)
+    result["missing_entries"] = missing
+    if missing:
+        print(f"WARNING: {len(missing)} expected entries missing, first: {missing[0]}", flush=True)
+    else:
+        print(f"all {len(expected)} expected imatrix entries present", flush=True)
     if args.estimate_only:
         print("estimate-only: no imatrix written")
     else:
@@ -300,7 +335,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     ap.add_argument("--config", default=DEFAULT_CONFIG)
-    ap.add_argument("--tokenizer", default=r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\tokenizer.json")
+    ap.add_argument("--tokenizer", default=os.environ.get("MINIMAX_TOKENIZER", ""))
     ap.add_argument("--calibration", default=str(Path(__file__).with_name("calibration.txt")))
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--report", default=None)
