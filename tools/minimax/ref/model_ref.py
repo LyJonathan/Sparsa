@@ -132,6 +132,42 @@ class ShardStore:
 # transformers patches
 
 
+class RSSMonitor:
+    """Poll this process's RSS so the report can quote a real peak."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self.peak_bytes = 0
+        self._stop = False
+        self._thread = None
+
+    def _run(self):
+        import time
+
+        try:
+            import psutil
+
+            proc = psutil.Process()
+        except Exception:
+            return
+        while not self._stop:
+            self.peak_bytes = max(self.peak_bytes, proc.memory_info().rss)
+            time.sleep(self.interval)
+
+    def start(self):
+        import threading
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        return round(self.peak_bytes / 1e9, 2)
+
+
 class DumpContext:
     """Per-forward capture buffer, filled by the patched modules."""
 

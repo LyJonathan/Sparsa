@@ -35,6 +35,7 @@ from model_ref import (
     DEFAULT_CONFIG,
     DEFAULT_MODEL_DIR,
     ReferenceModel,
+    RSSMonitor,
     make_experts_resident,
 )
 
@@ -210,6 +211,7 @@ def run(args):
     layers = list(range(args.layer_start, args.layer_end))
     timings = []
     t_all = time.time()
+    rss = RSSMonitor().start()
     for L in layers:
         t0 = time.time()
         layer = model.make_layer(L)
@@ -255,6 +257,7 @@ def run(args):
         "per_layer_s": round(per_layer, 1),
         "projected_full_pass_h": round(est_full / 3600, 2),
         "entries": len(im.entries),
+        "peak_rss_gb": rss.stop(),
     }
     if args.estimate_only:
         print("estimate-only: no imatrix written")

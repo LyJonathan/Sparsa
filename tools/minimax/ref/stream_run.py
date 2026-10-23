@@ -44,6 +44,7 @@ from model_ref import (
     DEFAULT_MODEL_DIR,
     DumpContext,
     ReferenceModel,
+    RSSMonitor,
     StreamingExperts,
 )
 
@@ -143,6 +144,7 @@ def run_prompts(args):
         gc.collect()
 
     timings = {"layers": [], "total_start": time.time()}
+    rss = RSSMonitor().start()
     dump_prompt_idx = None
     if args.dump_layer is not None:
         ids = [i["id"] for i in items]
@@ -211,12 +213,12 @@ def run_prompts(args):
         "layers": layers,
         "prompts": [i["id"] for i in items],
         "runtime_s": timings["total_s"],
-        "max_rss_gb": None,
+        "peak_rss_gb": rss.stop(),
     }
     try:
         import psutil
 
-        meta["max_rss_gb"] = round(psutil.Process().memory_info().rss / 1e9, 2)
+        meta["rss_gb_at_end"] = round(psutil.Process().memory_info().rss / 1e9, 2)
     except Exception:
         pass
     (outdir / "timings.json").write_text(json.dumps(timings, indent=1))
@@ -242,6 +244,7 @@ def run_ppl(args):
     hidden = model.embed_ids(t)
     pos = torch.arange(len(ids), dtype=torch.long).unsqueeze(0)
     t0 = time.time()
+    rss = RSSMonitor().start()
     for L in range(model.config.num_hidden_layers):
         layer = model.make_layer(L)
         hidden = model.run_layer(layer, hidden, pos)
@@ -264,6 +267,7 @@ def run_ppl(args):
         "runtime_s": time.time() - t0,
         "dtype": args.dtype,
         "file": args.ppl,
+        "peak_rss_gb": rss.stop(),
     }
     log(json.dumps(out, indent=1))
     if args.out:
@@ -304,6 +308,7 @@ def run_greedy(args):
     cache = DynamicCache(config=model.config)
     generated = []
     t_start = time.time()
+    rss = RSSMonitor().start()
     with torch.no_grad():
         for step in range(args.max_new):
             if step == 0:
@@ -338,6 +343,7 @@ def run_greedy(args):
         "generated_ids": generated,
         "generated_text": out_text,
         "runtime_s": time.time() - t_start,
+        "peak_rss_gb": rss.stop(),
     }
     log(json.dumps(res, indent=1, ensure_ascii=False))
     if args.out:
