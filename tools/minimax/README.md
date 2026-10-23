@@ -97,9 +97,10 @@ layer. None of it goes to stdout, so the serve protocol is unchanged.
 Measured on the synthetic runnable model (one MoE layer, 8 experts, top-4; F32 experts), 40 tokens:
 `vram_slots=2 ram_experts=3` gave `vram_hits=47 ram_hits=69 ssd_reads=44 ssd_bytes=8,650,752 swaps=2`, and the
 logits were max-abs `7.2e-7`, KL `3.3e-15`, top-1 `1.000` against the all-CPU path. All-VRAM was max-abs `4.8e-7`;
-all-RAM and all-SSD were byte-identical (`0.0`) to the all-CPU path. IQ2_XS on the GPU tier measured max-abs
-`1.7e-2`, KL `1.1e-5`, top-1 `1.000` against the CPU IQ2_XS path (GPU iq kernels quantize the activation with q8_1,
-the CPU path with ggml's Q8_K). Q8_0 matched to max-abs `3.6e-7`.
+all-RAM and all-SSD were byte-identical (`0.0`) to the all-CPU path. IQ2_XS on the GPU tier (hidden 512, expert
+FF 256, so neither dimension is the Qwen geometry) measured max-abs `2.1e-2`, KL `1.3e-5`, top-1 `1.000` against
+the CPU IQ2_XS path (GPU iq kernels quantize the activation with q8_1, the CPU path with ggml's Q8_K). Q8_0 matched
+to max-abs `3.6e-7`.
 
 ## Serve
 
