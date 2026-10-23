@@ -151,29 +151,91 @@ indexer block kept) and 4.5e-5 (200 tokens, sparse), KL under 3e-11, top-1 agree
 prompt with all four dense layers on the GPU measured max abs 4.7e-5. Q8_0 routed experts against a
 dequantized-weight reference (the engine also quantizes the activation) measured max abs 1.5e-2, top-1 1.0.
 
-## Real-weight parity (when the other branches have artifacts)
+## Real-weight parity (P4, gate G1 on the real checkpoint)
 
-`Strata-MiniMax/_local/ref_out/` currently has only `ppl_text.txt`, no per-layer activation dump, so the
-layer 0 / 3 / deep comparison was not run. The quant smoke file that is present is one MoE layer, not a
-3-layer or 60-layer model:
-
-```powershell
-build\strata-minimax.exe --model "..\models\quant-smoke\smoke-l3-q8.gguf" --minimax-inspect
-```
-
-That file is `minimax-m3`, 1 layer, embd 6144, vocab 200064, leading dense 0, routed experts Q8_0, output
-Q6_K. A 4-token teacher-forced run on the CPU path (`--minimax-dense-layers-gpu 0 --max-context 32`) wrote
-finite fp32 logits (shape `[1, 200064]`, max abs about 2.85). It is not a parity result.
-
-Once a truncated Q8_0 GGUF and a reference dump exist:
+The reference dumps now exist (`Strata-MiniMax/_local/ref_out/dumps/`), so the layer 0 / 3 / 40 comparison runs
+on truncated GGUFs built from the real checkpoint with near-lossless types. Build them with the converter:
 
 ```powershell
-build\strata-minimax.exe --model trunc.gguf --minimax-allow-nonstandard `
-  --minimax-eval tokens.txt --minimax-dump-logits logits.npy --minimax-last-k 4 `
-  --max-context 512 --minimax-dense-layers-gpu 1 --cpu-threads 8
+strata-mm-quant --model <checkpoint> --recipe tools\minimax\quant\recipes\MM-IQ3_S.json `
+  --override experts=Q8_0 --override output=Q8_0 --layers 0,1,2,3 --out p4-l0123-q8.gguf
+strata-mm-quant ... --layers 3  --out p4-l3-q8.gguf     # one MoE layer, remapped to blk.0
+strata-mm-quant ... --layers 40 --out p4-l40-q8.gguf    # one deep MoE layer
+strata-mm-quant ... --layers 0  --out p4-l0-q8.gguf     # one dense layer
 ```
 
-Compare `logits.npy` to the reference dump for layers 0, 3, and one deep layer. `--minimax-allow-nonstandard`
-is only for a file that fails the M3.1 fingerprint (a truncated layer count). A full M3.1 GGUF does not need it.
-Drop `--minimax-dense-layers-gpu` (or pass `-1`) to place as many leading dense layers as the 12 GB card allows
-after the KV cache; pass `0` for the strict CPU path.
+`--layers` remaps the source layer onto `blk.0`.. and writes `strata.source_layers`, which the probes use for their
+directory names, so a remapped file still calls its dump `dump-L40`.
+
+The engine can dump its own activations and can be fed a layer's input instead of the embedding:
+
+| flag | effect |
+|---|---|
+| `--minimax-dump-dir DIR` | write `DIR/dump-L<source layer>/<name>.npy` for every layer (or the list below) |
+| `--minimax-dump-layers 0,3,40` | restrict the dump to those source layers (`all` is the default) |
+| `--minimax-seed-hidden FILE.npy` | row t is token t's residual-stream input instead of the embedding |
+
+Names match the reference: `attn_input` (the post-attention-norm input), `residual_in`, `q_after_rope`,
+`k_after_rope`, `index_q_after_rope`, `index_k_after_rope`, `index_block_scores`, `index_block_indices`,
+`attn_core_out`, `attn_out`, `router_logits`, `router_weights`, `router_topk_ids`, `shared_expert_out`,
+`moe_out`, `expert_<id>_{gate_up,hidden,out,token_idx}`, `dense_*`, `layer_out`.
+
+`tools/minimax/make_seed.py` recovers a layer's input from the reference dumps (`layer_out - attn_out -
+(2*routed + shared)`), so a one-layer GGUF can be compared stage by stage. `tools/minimax/compare_parity.py`
+prints the table (max abs, relative to the reference's peak, cosine, router-id and block-id agreement).
+
+Measured on the two short/long reference prompts (114 and 4093 tokens), Q8_0 dense and experts, F32 norms and
+router, CPU placement (`--minimax-dense-layers-gpu 0`):
+
+| layer / prompt | attn_out rel | block ids | router top-4 | experts (matched routing) | layer_out rel |
+|---|---|---|---|---|---|
+| 0 / short (from the embedding) | 1.4e-3 | — (1 block) | — | — | 1.3e-3 |
+| 3 / short (seeded) | 2.2e-3 | — | 97.4% | 2.1e-3 | 7.1e-4 |
+| 40 / short (seeded) | 3.5e-3 | — | 96.5% | 4.4e-3 | 2.4e-3 |
+| 40 / long (4093 tokens, sparse) | 1.3e-2 | 99.51% sets, 0.9992 Jaccard | 98.8% | 7.7e-3 | 1.2e-3 |
+
+The handful of router and block disagreements are 4th/5th-place ties: the router logits agree to 1.4e-3 relative
+and the block scores to 3.7e-3, which is the Q8_0 noise floor, and the expert weights agree to 8.2e-4 by id. The
+aggregate numbers (`moe_out`, `attn_core_out` over every row) are dominated by those few tokens and are reported
+separately in the tool's output.
+
+## Layer split over two GPUs (P4)
+
+```powershell
+build\strata-minimax.exe --model m.gguf --serve --gpus 0,1 --layer-split auto --minimax-kv auto
+build\strata-minimax.exe --model m.gguf --serve --gpus 0,1 --layer-split 30 --minimax-kv vram
+```
+
+`--layer-split K[,K2]` gives layer K to the next GPU (upstream llama.cpp's `layer` split semantics); `auto`
+fills each card with dense + KV bytes until that card's own free VRAM (less `--vram-reserve-mib`) runs out, so
+unequal cards work (12+16, 8+12). `--gpus` picks the devices. Each layer's dense weights, its KV, and its VRAM
+expert slots live on its owner. There is no P2P between these cards: the hidden state hops through page-locked
+host memory (`--layer-split` allocates a pinned staging buffer and every device-bound operand goes through it),
+and no `cudaMemcpyPeer` is ever issued. `lm_head` goes on the last card. The startup line reports the split and
+each card's VRAM in use: `gpus=0,1 split=30 vram_used_mib=10233,10012 kv_space=vram`.
+
+## KV cache in VRAM or pinned RAM (P4)
+
+`--minimax-kv host|vram|ram|auto`. `host` is the P2 default and is unchanged: fp16 K/V in ordinary memory, CPU
+attention, bit-identical to the last release. `vram` keeps K/V (and the indexer keys) on the owning device and
+runs MSA there: the indexer block scores are a device kernel, the block choice stays on the host, and the selected
+slots are gathered on the device. `ram` keeps the full K/V in page-locked host RAM, keeps the indexer keys in
+VRAM, and per decode step copies only the selected blocks (at most `top_k` x block_size = 2048 positions per KV
+head) across the bus before the same attention kernel. `auto` (the default with `--layer-split`) tries VRAM and
+falls back to RAM, with the reason printed.
+
+The device path needs the indexer head count to equal the KV head count (4 and 4 for M3.1); a file that indexes
+only from a later layer keeps the host path and says so.
+
+Measured on the synthetic runnable model (4 layers, 200 tokens, 25 indexer blocks of 8, top-16):
+
+| case | max abs vs the baseline |
+|---|---|
+| KV in RAM vs KV in VRAM | 0.0 (bit-identical) |
+| device attention vs the host path (same weights) | 6.7e-5 (1.5e-5 relative) |
+| layers 0,1 on GPU0 and 2,3 on GPU1 vs one GPU, VRAM | 0.0 |
+| the same split with the KV in RAM | 0.0 |
+
+`python -m pytest tools/minimax/test_p4.py -q` runs those, plus an `auto` split that checks the reported
+boundary; the two-GPU cases skip on a one-card machine.
+
