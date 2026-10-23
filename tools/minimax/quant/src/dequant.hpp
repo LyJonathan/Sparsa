@@ -15,15 +15,21 @@
 // ggml GGML_TYPE_NVFP4 (type id 40) is a different packing of the same codes:
 // QK 64, block = 4 UE4M3 scales + 32 bytes. Inside each 16-wide subgroup the
 // low nibble is element j and the high nibble is element j+8 (not a consecutive
-// pair). ggml's kvalues are doubled E2M1 and ggml_ue4m3_to_fp32 returns e4m3*0.5,
-// so a raw byte copy is not the spec tensor. There is no field for G. Folding
-// e4m3(scale)/G into a new E4M3 byte is lossless only when that quotient is on
-// the E4M3 grid. Otherwise the tier is refused. No side channel is invented.
+// pair). A raw byte copy is not the spec tensor; the nibbles must be remapped.
+// ggml's dequantize_row_nvfp4 multiplies doubled E2M1 codes by e4m3(scale)*0.5,
+// so it returns e2m1 * e4m3(scale) exactly, with no G.
+//
+// This tool therefore stores G as a side tensor, one f32 per expert
+// (`blk.N.ffn_*_exps.scale`), and the scale bytes are copied verbatim. Folding
+// e4m3(scale)/G into a new E4M3 byte is NOT lossless here (layer 3 expert 0 w1:
+// G=15123.6923828125, scale byte 113 = 144, quotient 0.00952148438, nearest
+// E4M3 = 0.009765625, a +2.6% gain error), so it is not done.
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace mmq {
 
@@ -127,6 +133,7 @@ inline void dequant_bf16_row(const uint16_t * src, int64_t n, float * dst, float
 
 // One ggml NVFP4 row. n_in % 64 == 0. dst holds (n_in/64)*36 bytes.
 // Returns false when any group scale cannot be stored as E4M3 after / G.
+// Legacy folding form. MM-NVFP4 does not use it: see pack_nvfp4_row_exact.
 inline bool pack_nvfp4_row(const uint8_t * packed, const uint8_t * scales, float global_scale,
                            int64_t n_in, uint8_t * dst) {
     const int64_t nblk = n_in / 64;
@@ -152,6 +159,66 @@ inline bool pack_nvfp4_row(const uint8_t * packed, const uint8_t * scales, float
         }
     }
     return true;
+}
+
+// The lossless MM-NVFP4 form: nibble remap and a verbatim copy of each E4M3 scale
+// byte. The per-tensor global scale (a divisor) is written separately as f32.
+// n_in % 64 == 0; dst holds (n_in/64)*36 bytes. Cannot fail.
+//
+// For one 16-value subgroup the checkpoint's 8 source bytes hold the elements as
+// consecutive pairs; ggml wants out[j] = elem j | elem j+8 << 4. out[2b] and
+// out[2b+1] depend only on src[b] and src[b+4], so one 64 KiB table maps those
+// two bytes to the two output bytes (4 lookups per 16 values).
+inline const uint16_t * nvfp4_nibble_lut() {
+    static const std::vector<uint16_t> lut = [] {
+        std::vector<uint16_t> t(65536, 0);
+        for (int a = 0; a < 256; ++a) {
+            for (int b = 0; b < 256; ++b) {
+                const int x = a | (b << 8);
+                const uint8_t out0 = static_cast<uint8_t>((x & 0x0F) | (((x >> 8) & 0x0F) << 4));
+                const uint8_t out1 = static_cast<uint8_t>(((x >> 4) & 0x0F) | ((x >> 8) & 0xF0));
+                t[static_cast<size_t>(x)] = static_cast<uint16_t>(out0 | (out1 << 8));
+            }
+        }
+        return t;
+    }();
+    return lut.data();
+}
+
+inline void pack_nvfp4_row_exact(const uint8_t * packed, const uint8_t * scales, int64_t n_in, uint8_t * dst) {
+    const uint16_t * lut = nvfp4_nibble_lut();
+    const int64_t nblk = n_in / 64;
+    for (int64_t i = 0; i < nblk; ++i) {
+        uint8_t * blk = dst + i * 36;
+        for (int s = 0; s < 4; ++s) {
+            blk[s] = scales[i * 4 + s];            // E4M3 byte, unchanged
+            const uint8_t * src = packed + (i * 64 + s * 16) / 2;
+            for (int b = 0; b < 4; ++b) {
+                const uint16_t v = lut[static_cast<size_t>(src[b]) | (static_cast<size_t>(src[b + 4]) << 8)];
+                blk[4 + s * 8 + 2 * b] = static_cast<uint8_t>(v & 0xFF);
+                blk[4 + s * 8 + 2 * b + 1] = static_cast<uint8_t>(v >> 8);
+            }
+        }
+    }
+}
+
+// Dequantize one ggml NVFP4 row (the exact form above) with the side global scale.
+// `global_scale` is the divisor from blk.N.ffn_*_exps.scale[expert]. This is the
+// same expression as dequant_nvfp4_row: (e2m1 * e4m3(scale)) / G.
+inline void dequant_ggml_nvfp4_row(const uint8_t * blocks, float global_scale, int64_t n_in, float * dst) {
+    const int64_t nblk = n_in / 64;
+    for (int64_t i = 0; i < nblk; ++i) {
+        const uint8_t * blk = blocks + i * 36;
+        for (int s = 0; s < 4; ++s) {
+            const float sc = e4m3_to_f32(blk[s]);
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t b = blk[4 + s * 8 + j];
+                dst[i * 64 + s * 16 + j] = e2m1_to_f32(static_cast<uint8_t>(b & 0x0F)) * sc / global_scale;
+                dst[i * 64 + s * 16 + j + 8] =
+                    e2m1_to_f32(static_cast<uint8_t>(b >> 4)) * sc / global_scale;
+            }
+        }
+    }
 }
 
 inline bool nvfp4_row_exact(const uint8_t * scales, float global_scale, int64_t n_in) {

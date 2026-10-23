@@ -67,7 +67,10 @@ void usage() {
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
                  "  --minimax-stats [--minimax-stats-per-layer]   tier counters on stderr\n"
-                 "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n");
+                 "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n"
+                 "  --minimax-dump-dir DIR            write per-layer outputs as DIR/L<source>.npy\n"
+                 "  --minimax-dump-layers LIST|all    which source layers to dump (default all)\n"
+                 "  --minimax-seed-hidden FILE.npy    feed row t as token t's input instead of the embedding\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -424,6 +427,7 @@ int run(int argc, char** argv) {
     bool pack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
+    std::string dump_dir, dump_layers, seed_hidden;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -443,6 +447,9 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-eval") eval_path = next();
         else if (a == "--minimax-dump-logits") dump_path = next();
         else if (a == "--minimax-last-k") last_k = std::atoi(next().c_str());
+        else if (a == "--minimax-dump-dir") dump_dir = next();
+        else if (a == "--minimax-dump-layers") dump_layers = next();
+        else if (a == "--minimax-seed-hidden") seed_hidden = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
         else if (a == "--minimax-profile-save") profile_save = next();
@@ -557,6 +564,9 @@ int run(int argc, char** argv) {
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
+    opt.dump_dir = dump_dir;
+    opt.dump_layers = dump_layers;
+    opt.seed_hidden = seed_hidden;
 
     Engine* engine = nullptr;
     try {

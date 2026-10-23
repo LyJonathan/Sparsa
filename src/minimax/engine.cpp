@@ -111,6 +111,9 @@ struct Layer {
     size_t expert_gu = 0;           // one gate matrix (up is the same)
     size_t expert_down = 0;
     size_t expert_bytes = 0;
+    // MM-NVFP4: per-expert global scales (a DIVISOR) from blk.N.ffn_*_exps.scale. Empty when the
+    // layer's expert tensors carry no side scale. Applied exactly once per projection.
+    std::vector<float> egate_scale, eup_scale, edown_scale;
     struct VramSlot {
         DevPtr mem;
         int32_t expert = -1;
@@ -125,6 +128,72 @@ struct Layer {
 };
 
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
+
+// ---- MM-NVFP4 parity probes: a minimal .npy codec (little-endian fp32, C order, no pickle).
+bool read_npy_f32(const std::string& path, std::vector<float>& out, int64_t& rows, int64_t& cols) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char magic[8] = {};
+    unsigned char hlen_le[2] = {};
+    if (std::fread(magic, 1, 8, f) != 8 || std::fread(hlen_le, 1, 2, f) != 2) {
+        std::fclose(f);
+        return false;
+    }
+    const unsigned hlen = (unsigned)hlen_le[0] | ((unsigned)hlen_le[1] << 8);
+    std::string header(hlen, '\0');
+    if (hlen == 0 || std::fread(&header[0], 1, hlen, f) != hlen) {
+        std::fclose(f);
+        return false;
+    }
+    if (header.find("<f4") == std::string::npos || header.find("'fortran_order': True") != std::string::npos) {
+        std::fclose(f);
+        return false;
+    }
+    const size_t lp = header.find('(');
+    const size_t rp = header.find(')', lp);
+    int64_t a = 0, b = 1;
+    if (lp == std::string::npos || rp == std::string::npos) {
+        std::fclose(f);
+        return false;
+    }
+    const std::string shape = header.substr(lp + 1, rp - lp - 1);
+    if (std::sscanf(shape.c_str(), "%lld , %lld", &a, &b) != 2 && std::sscanf(shape.c_str(), "%lld", &a) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    if (a < 1 || b < 1) {
+        std::fclose(f);
+        return false;
+    }
+    out.resize((size_t)a * (size_t)b);
+    const size_t got = std::fread(out.data(), sizeof(float), out.size(), f);
+    std::fclose(f);
+    if (got != out.size()) return false;
+    rows = a;
+    cols = b;
+    return true;
+}
+
+void write_npy_f32(const std::string& path, const float* data, int64_t rows, int64_t cols) {
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + std::to_string(rows) + ", " +
+                         std::to_string(cols) + "), }";
+    const int pad = (int)((64 - ((10 + header.size() + 1) % 64)) % 64);
+    header.append((size_t)pad, ' ');
+    header.push_back('\n');
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) fail("cannot create " + path);
+    const unsigned char magic[8] = {0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00};
+    std::fwrite(magic, 1, 8, f);
+    const uint16_t hlen = (uint16_t)header.size();
+    std::fwrite(&hlen, 2, 1, f);
+    std::fwrite(header.data(), 1, header.size(), f);
+    const size_t n = (size_t)rows * (size_t)cols;
+    if (std::fwrite(data, sizeof(float), n, f) != n) {
+        std::fclose(f);
+        fail("short npy write " + path);
+    }
+    std::fclose(f);
+}
 
 int64_t bigger(int64_t a, int64_t b) { return a > b ? a : b; }
 
@@ -507,6 +576,16 @@ struct Engine::Impl {
     // device scratch for the grouped routed-expert pass
     DevPtr d_ex_ptr;                // top * 3 pointers
     DevPtr d_ex_xq, d_ex_hq, d_ex_h, d_ex_out;
+    DevPtr d_ex_sg, d_ex_su, d_ex_sd;   // MM-NVFP4: per-selected-expert global scales (f32), device
+
+    // ---- MM-NVFP4 parity probes. Off unless --minimax-dump-dir / --minimax-seed-hidden is given.
+    bool dump_on = false;
+    std::string dump_dir;
+    std::vector<char> dump_sel;     // [n_layers]
+    std::vector<int> dump_src;      // [n_layers] source layer id (strata.source_layers) for the file name
+    std::unordered_map<int, std::vector<float>> dump_rows;   // layer -> rows so far, n_embd each
+    std::vector<float> seed_h;
+    int64_t seed_rows = 0, seed_cols = 0;
 
     std::vector<float> usage;       // decayed routing counts, [n_layers * n_expert]
     std::vector<double> route_counts;   // undecayed counts for --minimax-profile-save
@@ -544,6 +623,7 @@ struct Engine::Impl {
         decide_norm();
         build_layers();
         read_eos();
+        init_probes();
 
         threads = opt.cpu_threads;
         if (threads <= 0) threads = (int)std::thread::hardware_concurrency();
@@ -589,16 +669,16 @@ struct Engine::Impl {
 
     ~Impl() {
         write_own_profile();
+        flush_dumps();
         if (side_stream) cu::stream_destroy(side_stream);
         if (ssd_stage) strata::platform::DirectFile::free_aligned(ssd_stage);
         if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
     }
 
-    Tensor must(const std::string& name) {
+    bool try_must(const std::string& name, Tensor& t) {
         size_t shard = 0;
         const TensorInfo* info = model.find(name, &shard);
-        if (!info) fail("missing tensor " + name);
-        Tensor t;
+        if (!info) return false;
         t.name = name;
         t.type = (int)info->type;
         t.ne0 = (int64_t)info->shape[0];
@@ -619,7 +699,31 @@ struct Engine::Impl {
             fail(name + ": no ggml to_float for type " + std::to_string(t.type));
         ggml_quantize_init((ggml_type)t.type);
         if (t.cpu && t.cpu->vec_dot_type != (ggml_type)t.type) ggml_quantize_init(t.cpu->vec_dot_type);
+        return true;
+    }
+
+    Tensor must(const std::string& name) {
+        Tensor t;
+        if (!try_must(name, t)) fail("missing tensor " + name);
         return t;
+    }
+
+    // blk.N.ffn_*_exps.scale: f32 [n_expert], the MM-NVFP4 per-expert global scale (a divisor).
+    bool load_scale_vec(const std::string& name, std::vector<float>& out, int64_t n) {
+        Tensor t;
+        if (!try_must(name, t)) return false;
+        if (t.type != kF32 || t.ne0 != n || t.ne1 != 1 || t.ne2 != 1)
+            fail(name + ": expected f32 [" + std::to_string(n) + "] (got type " + std::to_string(t.type) + ", " +
+                 std::to_string(t.ne0) + "x" + std::to_string(t.ne1) + "x" + std::to_string(t.ne2) + ")");
+        out.resize((size_t)n);
+        decode_f32(t, t.host, out.data(), n);
+        for (float v : out)
+            if (!(v > 0.f) || !std::isfinite(v))
+                fail(name + ": a global scale is not a positive finite float");
+        // The tensor stores the DIVISOR (spec A.3). The kernels multiply, so keep the reciprocal here:
+        // one division per expert at load, never per token, and the scale is applied exactly once.
+        for (float& v : out) v = 1.0f / v;
+        return true;
     }
 
     std::vector<float> norm_vec(const Tensor& t) {
@@ -720,6 +824,22 @@ struct Engine::Impl {
                     fail(L.edown.name + ": unexpected shape");
                 if (L.egate.type != L.eup.type)
                     fail(b + "gate and up experts have different ggml types");
+                // MM-NVFP4: per-expert global scale side tensors. Present only for the exact NVFP4 layout.
+                const bool sg = load_scale_vec(b + "ffn_gate_exps.scale", L.egate_scale, cfg.n_expert);
+                const bool su = load_scale_vec(b + "ffn_up_exps.scale", L.eup_scale, cfg.n_expert);
+                const bool sd = load_scale_vec(b + "ffn_down_exps.scale", L.edown_scale, cfg.n_expert);
+                if (sg != su) fail(b + " has only one of ffn_gate_exps.scale / ffn_up_exps.scale");
+                if ((L.egate.type == 40 || L.eup.type == 40) && !sg)
+                    fail(b + " stores gate/up experts as NVFP4 but has no blk.N.ffn_{gate,up}_exps.scale "
+                            "(a per-expert global scale is a divisor, not foldable into the E4M3 byte)");
+                if (L.edown.type == 40 && !sd)
+                    fail(b + " stores down experts as NVFP4 but has no blk.N.ffn_down_exps.scale");
+                if (sg && L.egate.type != 40)
+                    fail(b + " has ffn_gate_exps.scale but the expert type is " + std::to_string(L.egate.type) +
+                                ", not NVFP4 (40)");
+                if (sd && L.edown.type != 40)
+                    fail(b + " has ffn_down_exps.scale but the expert type is " + std::to_string(L.edown.type) +
+                                ", not NVFP4 (40)");
                 if (L.egate.ne2 > 0) L.expert_gu = L.egate.bytes / (size_t)L.egate.ne2;
                 if (L.eup.ne2 > 0 && L.eup.bytes / (size_t)L.eup.ne2 != L.expert_gu)
                     fail(b + "gate and up experts have different byte sizes");
@@ -750,8 +870,69 @@ struct Engine::Impl {
         out_norm = norm_vec(must("output_norm.weight"));
     }
 
-    void read_eos() {
-        if (const MetaValue* e = model.meta().get("tokenizer.ggml.eos_token_id"))
+    // ---- MM-NVFP4 parity probes. Both are opt-in and change nothing in a normal run.
+    void init_probes() {
+        if (!opt.seed_hidden.empty()) {
+            if (!read_npy_f32(opt.seed_hidden, seed_h, seed_rows, seed_cols))
+                fail("--minimax-seed-hidden: cannot read " + opt.seed_hidden + " as an .npy fp32 C-order array");
+            if (seed_cols != cfg.n_embd)
+                fail("--minimax-seed-hidden: last dimension is " + std::to_string(seed_cols) +
+                     ", the model needs " + std::to_string(cfg.n_embd));
+            if (seed_rows < 1) fail("--minimax-seed-hidden: the array is empty");
+        }
+        if (opt.dump_dir.empty()) return;
+        dump_on = true;
+        dump_dir = opt.dump_dir;
+        std::error_code ec;
+        std::filesystem::create_directories(dump_dir, ec);
+        std::vector<int> src_of((size_t)cfg.n_layers);
+        for (int64_t i = 0; i < cfg.n_layers; ++i) src_of[(size_t)i] = (int)i;
+        if (const MetaValue* sl = model.meta().get("strata.source_layers")) {
+            if (sl->type == MetaType::ARRAY && (int64_t)sl->items.size() == cfg.n_layers) {
+                for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                    if (sl->items[(size_t)i].is_num()) src_of[(size_t)i] = (int)sl->items[(size_t)i].u;
+                }
+            }
+        }
+        dump_src = src_of;
+        dump_sel.assign((size_t)cfg.n_layers, 0);
+        const std::string want = opt.dump_layers.empty() ? "all" : opt.dump_layers;
+        if (want == "all") {
+            std::fill(dump_sel.begin(), dump_sel.end(), 1);
+        } else {
+            std::stringstream ss(want);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (item.empty()) continue;
+                const int id = std::atoi(item.c_str());
+                bool hit = false;
+                for (int64_t i = 0; i < cfg.n_layers; ++i)
+                    if (src_of[(size_t)i] == id) {
+                        dump_sel[(size_t)i] = 1;
+                        hit = true;
+                    }
+                if (!hit) std::fprintf(stderr, "strata-minimax: --minimax-dump-layers %d is not in this file\n", id);
+            }
+        }
+        for (int64_t i = 0; i < cfg.n_layers; ++i)
+            if (dump_sel[(size_t)i]) dump_rows[(int)i] = {};
+    }
+
+    void flush_dumps() {
+        if (!dump_on || dump_rows.empty()) return;
+        for (auto& kv : dump_rows) {
+            if (kv.second.empty()) continue;
+            const int src = kv.first < (int)dump_src.size() ? dump_src[(size_t)kv.first] : kv.first;
+            const std::string path = dump_dir + "/L" + std::to_string(src) + ".npy";
+            write_npy_f32(path, kv.second.data(), (int64_t)(kv.second.size() / (size_t)cfg.n_embd), cfg.n_embd);
+            std::fprintf(stderr, "INFO minimax-dump %s rows=%lld cols=%lld\n", path.c_str(),
+                         (long long)(kv.second.size() / (size_t)cfg.n_embd), (long long)cfg.n_embd);
+        }
+        dump_rows.clear();
+        dump_on = false;
+    }
+
+    void read_eos() {        if (const MetaValue* e = model.meta().get("tokenizer.ggml.eos_token_id"))
             if (e->is_num()) eos.insert((int32_t)e->u);
         if (const MetaValue* a = model.meta().get("tokenizer.ggml.eos_token_ids"))
             if (a->type == MetaType::ARRAY)
@@ -1191,6 +1372,31 @@ struct Engine::Impl {
         const int gt = L.egate.type, dt = L.edown.type;
         const bool iq = iq_expert_type(gt) && iq_expert_type(dt);
         const bool raw = raw_expert_type(gt) && raw_expert_type(dt);
+        // MM-NVFP4: per-selected-expert divisors, applied once inside the kernel (gate/up before swigluoai).
+        const bool nv = !L.egate_scale.empty() || !L.edown_scale.empty();
+        const float* sg = nullptr;
+        const float* su = nullptr;
+        const float* sd = nullptr;
+        if (nv) {
+            if ((int)L.egate_scale.size() != (int)cfg.n_expert) fail("internal: expert scale vector is short");
+            std::vector<float> a((size_t)k), b((size_t)k), c((size_t)k);
+            for (int i = 0; i < k; ++i) {
+                const int e = exps[(size_t)i];
+                a[(size_t)i] = L.egate_scale[(size_t)e];
+                b[(size_t)i] = L.eup_scale[(size_t)e];
+                c[(size_t)i] = L.edown_scale[(size_t)e];
+            }
+            const size_t bytes = (size_t)cfg.n_expert_used * sizeof(float);
+            if (!d_ex_sg.p) d_ex_sg = DevPtr(cu::alloc(bytes));
+            if (!d_ex_su.p) d_ex_su = DevPtr(cu::alloc(bytes));
+            if (!d_ex_sd.p) d_ex_sd = DevPtr(cu::alloc(bytes));
+            cu::copy_h2d(d_ex_sg.p, a.data(), (size_t)k * sizeof(float));
+            cu::copy_h2d(d_ex_su.p, b.data(), (size_t)k * sizeof(float));
+            cu::copy_h2d(d_ex_sd.p, c.data(), (size_t)k * sizeof(float));
+            sg = (const float*)d_ex_sg.p;
+            su = (const float*)d_ex_su.p;
+            sd = (const float*)d_ex_sd.p;
+        }
         if (iq) {
             if (cfg.n_embd % 32 != 0 || cfg.n_ff_exp % 32 != 0)
                 fail("the GPU IQ expert path needs rounded 32-wide activations");
@@ -1198,10 +1404,10 @@ struct Engine::Impl {
             strata::kernels::quantize_q8_1_rows((const float*)d_x.p, 1, n_embd, d_ex_xq.p, nullptr);
             strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k,
                                             n_embd, n_ff, L.egate.row_bytes, d_ex_xq.p, (float*)d_ex_h.p, alpha, limit,
-                                            nullptr);
+                                            nullptr, sg, su);
             strata::kernels::quantize_q8_1_rows((const float*)d_ex_h.p, k, n_ff, d_ex_hq.p, nullptr);
             strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
-                                              L.edown.row_bytes, d_ex_hq.p, (float*)d_ex_out.p, nullptr);
+                                              L.edown.row_bytes, d_ex_hq.p, (float*)d_ex_out.p, nullptr, sd);
             cu::sync();
         } else if (raw) {
             if (gt != dt)
@@ -1325,7 +1531,10 @@ struct Engine::Impl {
             } else {
                 const CpuExpert* c = cpu_of[(size_t)e];
                 if (!c) fail("internal: routed expert has no source");
-                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp);
+                const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
+                const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
+                const float* sd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp, sg, su, sd);
             }
             const float WJ = w[(size_t)j];
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
@@ -1505,22 +1714,35 @@ struct Engine::Impl {
     }
 
     void mlp(const Tensor& gate, const Tensor& up, const Tensor& down, int64_t expert, const float* in, float* yout,
-             int ff) {
+             int ff, const float* sg = nullptr, const float* su = nullptr, const float* sd = nullptr) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         apply(gate, expert, in, ff_g.data(), ff, (int)gate.ne0);
+        if (sg)
+            for (int i = 0; i < ff; ++i) ff_g[(size_t)i] *= *sg;
         apply(up, expert, in, ff_u.data(), ff, (int)up.ne0);
+        if (su)
+            for (int i = 0; i < ff; ++i) ff_u[(size_t)i] *= *su;
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
         apply(down, expert, ff_h.data(), yout, (int)down.ne1, ff);
+        if (sd)
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= *sd;
     }
 
     // The same MLP from three explicit byte slices (a RAM arena slot or an SSD staging buffer).
     void mlp_ptr(const Tensor& gate, const uint8_t* gb, const Tensor& up, const uint8_t* ub, const Tensor& down,
-                 const uint8_t* db, const float* in, float* yout, int ff) {
+                 const uint8_t* db, const float* in, float* yout, int ff, const float* sg = nullptr,
+                 const float* su = nullptr, const float* sd = nullptr) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         dot_rows_base(gate, gb, in, ff_g.data(), ff, (int)gate.ne0);
+        if (sg)
+            for (int i = 0; i < ff; ++i) ff_g[(size_t)i] *= *sg;
         dot_rows_base(up, ub, in, ff_u.data(), ff, (int)up.ne0);
+        if (su)
+            for (int i = 0; i < ff; ++i) ff_u[(size_t)i] *= *su;
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
         dot_rows_base(down, db, ff_h.data(), yout, (int)down.ne1, ff);
+        if (sd)
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= *sd;
     }
 
     void moe(const Layer& L, const float* in, float* yout) {
@@ -1558,7 +1780,11 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
         for (int j = 0; j < top; ++j) {
-            mlp(L.egate, L.eup, L.edown, order[(size_t)j], in, ye.data(), ff);
+            const int e = order[(size_t)j];
+            const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
+            const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
+            const float* sd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
+            mlp(L.egate, L.eup, L.edown, e, in, ye.data(), ff, sg, su, sd);
             const float WJ = w[(size_t)j];
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
         }
@@ -1708,7 +1934,14 @@ struct Engine::Impl {
         const int64_t pos = n_past;
         tok_stats = TokenStats{};
         decay_usage();
-        decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
+        if (!seed_h.empty()) {
+            if (pos >= seed_rows)
+                fail("--minimax-seed-hidden has only " + std::to_string(seed_rows) + " rows");
+            std::memcpy(x.data(), seed_h.data() + (size_t)pos * (size_t)cfg.n_embd,
+                        (size_t)cfg.n_embd * sizeof(float));
+        } else {
+            decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
+        }
 
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
@@ -1742,6 +1975,10 @@ struct Engine::Impl {
             if (!L.moe) mlp(L.gate, L.up, L.down, 0, h.data(), proj.data(), (int)cfg.n_ff_dense);
             else moe(L, h.data(), proj.data());
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
+            if (dump_on && dump_sel[(size_t)li]) {
+                auto& rows = dump_rows[(int)li];
+                rows.insert(rows.end(), x.begin(), x.begin() + (size_t)cfg.n_embd);
+            }
         }
         rms(x.data(), out_norm.data(), h.data(), (int)cfg.n_embd, eps);
         gemv(output, h.data(), logit_out);
@@ -1914,6 +2151,7 @@ void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std:
     const int start = n - keep;
     logits.assign(all.begin() + (size_t)start * vocab, all.end());
     rows = keep;
+    impl_->flush_dumps();
 }
 
 GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new, const SampleParams& sp,

@@ -44,6 +44,11 @@ struct EngineOptions {
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
+
+    // ---- parity probes (MM-NVFP4 tests). Off by default; a normal run allocates nothing.
+    std::string dump_dir;           ///< write each selected layer's output as `DIR/L<source>.npy` (empty: off)
+    std::string dump_layers;        ///< "all" (default when dump_dir is set) or source layer ids "0,3,40"
+    std::string seed_hidden;        ///< npy fp32 [seq, n_embd]: row t replaces token t's embedding
 };
 
 struct SampleParams {

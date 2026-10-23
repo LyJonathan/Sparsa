@@ -1,7 +1,5 @@
 {
   "name": "MM-NVFP4",
-  "disabled": true,
-  "disabled_reason": "block_nvfp4 has no global-scale field. Folding weight_scale/weight_global_scale is not E4M3-exact (layer 3 expert 0 w1: G=15123.6923828125, scale byte 113 decodes to 144, quotient 0.00952148438, nearest E4M3 byte 5 = 0.009765625). The preflight refuses this recipe rather than writing a lossy file under a lossless name.",
   "file_type": 39,
   "require_imatrix": false,
   "dynamic_down": false,
