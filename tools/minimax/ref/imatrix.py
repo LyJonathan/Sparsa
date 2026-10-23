@@ -82,7 +82,7 @@ class IMatrix:
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
         e = self._entry(name, x.shape[-1], 1)
-        x2 = x.detach().to(torch.float32).pow(2).sum(0).numpy()
+        x2 = x.detach().to(torch.float32).pow(2).sum(0).cpu().numpy()
         e["sum2"][0] += x2
         e["count"][0] += x.shape[0]
 
@@ -92,7 +92,7 @@ class IMatrix:
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
         e = self._entry(name, x.shape[-1], 128)
-        x2 = x.detach().to(torch.float32).pow(2).sum(0).numpy()
+        x2 = x.detach().to(torch.float32).pow(2).sum(0).cpu().numpy()
         e["sum2"][expert] += x2
         e["count"][expert] += x.shape[0]
 
@@ -221,8 +221,14 @@ def expected_names(layer_start=0, layer_end=60):
 
 def run(args):
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("cuda requested but torch.cuda.is_available() is false")
     torch.set_num_threads(args.threads)
     model = ReferenceModel(args.model_dir, dtype, args.config)
+    if device.type == "cuda":
+        model.rotary.to(device)
+        model.embed.to(device)
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(resolve_tokenizer(args))
@@ -243,14 +249,16 @@ def run(args):
     n_tokens = sum(len(c) for c in chunks)
     print(
         f"calibration: {n_tokens} tokens in {len(chunks)} chunks of <= {chunk} "
-        f"(shard {args.shard_index}/{args.shard_count}, from {all_chunks} chunks)",
+        f"(shard {args.shard_index}/{args.shard_count}, from {all_chunks} chunks) "
+        f"device {device} dtype {args.dtype}",
         flush=True,
     )
 
     hidden = []
     for c in chunks:
-        hidden.append(model.embed_ids(torch.tensor([c], dtype=torch.long)))
-    positions = [torch.arange(len(c), dtype=torch.long).unsqueeze(0) for c in chunks]
+        ids = torch.tensor([c], dtype=torch.long, device=device)
+        hidden.append(model.embed_ids(ids))
+    positions = [torch.arange(len(c), dtype=torch.long, device=device).unsqueeze(0) for c in chunks]
     model._embed = None
     gc.collect()
 
@@ -264,7 +272,9 @@ def run(args):
         layer = model.make_layer(L)
         t_load = time.time() - t0
         if L >= 3 and not args.no_resident_experts:
-            make_experts_resident(layer, L, model.store, dtype)
+            make_experts_resident(layer, L, model.store, dtype, device=device)
+        if device.type != "cpu":
+            layer.to(device)
         hooks = wire_layer(layer, L, im)
         t1 = time.time()
         for i in range(len(chunks)):
@@ -274,6 +284,8 @@ def run(args):
             h.remove()
         del layer
         gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         dt = time.time() - t0
         timings.append({"layer": L, "load_s": round(t_load, 2), "run_s": round(t_run, 2), "total_s": round(dt, 2)})
         print(
@@ -301,6 +313,7 @@ def run(args):
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "dtype": args.dtype,
+        "device": str(device),
         "layers_measured": layers,
         "timings": timings,
         "measured_total_s": round(total, 1),
@@ -341,6 +354,7 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--report", default=None)
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--chunk-size", type=int, default=2048)
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--max-chunks", type=int, default=None)

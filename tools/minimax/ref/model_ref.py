@@ -122,14 +122,17 @@ class ShardStore:
         s = self.get(name[: -len("weight")] + "weight_scale_inv")
         return dequant_mxfp8(w, s, dtype)
 
-    def nvfp4(self, base: str, dtype=torch.float32) -> torch.Tensor:
+    def nvfp4(self, base: str, dtype=torch.float32, device=None) -> torch.Tensor:
         """``base`` is the projection prefix, e.g. ``...experts.3.w1.``."""
-        return dequant_nvfp4(
-            self.get(base + "weight_packed"),
-            self.get(base + "weight_scale"),
-            self.get(base + "weight_global_scale"),
-            dtype,
-        )
+        packed = self.get(base + "weight_packed")
+        scale = self.get(base + "weight_scale")
+        global_scale = self.get(base + "weight_global_scale")
+        if device is not None and torch.device(device).type != "cpu":
+            dev = torch.device(device)
+            packed = packed.to(dev, non_blocking=True)
+            scale = scale.to(dev, non_blocking=True)
+            global_scale = global_scale.to(dev, non_blocking=True)
+        return dequant_nvfp4(packed, scale, global_scale, dtype)
 
     def close(self):
         self._handles.clear()
@@ -395,7 +398,7 @@ def _get_submodule(root, path):
     return obj
 
 
-def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32, config=None):
+def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32, config=None, device=None):
     cfg = config if config is not None else layer.config
     is_moe = cfg.mlp_layer_types[layer_idx] == "sparse"
     prefix = f"{LAYER_PREFIX}{layer_idx}."
@@ -462,9 +465,9 @@ def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32,
         def provider(expert_idx, _base=base):
             p = f"{_base}{expert_idx}."
             return (
-                store.nvfp4(p + "w1.", dtype),
-                store.nvfp4(p + "w3.", dtype),
-                store.nvfp4(p + "w2.", dtype),
+                store.nvfp4(p + "w1.", dtype, device=device),
+                store.nvfp4(p + "w3.", dtype, device=device),
+                store.nvfp4(p + "w2.", dtype, device=device),
             )
 
         experts.provider = provider
@@ -482,20 +485,21 @@ def build_layer(config, layer_idx):
     return MiniMaxM3VLDecoderLayer(config, layer_idx)
 
 
-def make_experts_resident(layer, layer_idx, store, dtype=torch.float32, verbose=True):
-    """Dequantize all 128 routed experts of one layer into RAM (~29 GB fp32).
+def make_experts_resident(layer, layer_idx, store, dtype=torch.float32, verbose=True, device=None):
+    """Dequantize all 128 routed experts of one layer (~29 GB fp32, ~15 GB bf16).
 
     Only for modes that reuse the layer across many chunks (imatrix).  The
     layer's ``StreamingExperts`` provider is swapped for a dict lookup.
+    ``device`` dequantizes straight onto that device (the A100 path).
     """
     base = f"{LAYER_PREFIX}{layer_idx}.block_sparse_moe.experts."
     bank = {}
     for e in range(layer.mlp.experts.num_experts):
         p = f"{base}{e}."
         bank[e] = (
-            store.nvfp4(p + "w1.", dtype),
-            store.nvfp4(p + "w3.", dtype),
-            store.nvfp4(p + "w2.", dtype),
+            store.nvfp4(p + "w1.", dtype, device=device),
+            store.nvfp4(p + "w3.", dtype, device=device),
+            store.nvfp4(p + "w2.", dtype, device=device),
         )
         if verbose and (e + 1) % 32 == 0:
             print(f"  resident experts {layer_idx}: {e + 1}/128", flush=True)
@@ -510,9 +514,23 @@ def make_experts_resident(layer, layer_idx, store, dtype=torch.float32, verbose=
 class ReferenceModel:
     """Streaming, layer-at-a-time text reference."""
 
-    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, dtype=torch.float32, config_path: str | None = None):
+    def __init__(
+        self,
+        model_dir: str = DEFAULT_MODEL_DIR,
+        dtype=torch.float32,
+        config_path: str | None = None,
+        device: str = "cpu",
+    ):
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("dtype must be float32 or bfloat16")
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise SystemExit("cuda requested but torch.cuda.is_available() is false")
+        if self.device.type == "cuda":
+            # the reference is fp32: do not let cuBLAS silently use TF32
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision("highest")
         if not config_path:
             local = Path(model_dir) / "config.json"
             config_path = os.environ.get("MINIMAX_CONFIG") or (str(local) if local.exists() else DEFAULT_CONFIG)
@@ -531,6 +549,8 @@ class ReferenceModel:
         from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLRotaryEmbedding
 
         self.rotary = MiniMaxM3VLRotaryEmbedding(config=self.config)
+        if self.device.type != "cpu":
+            self.rotary.to(self.device)
         self._embed = None
         self._lm_head = None
         self._final_norm = None
@@ -549,6 +569,9 @@ class ReferenceModel:
                 self._final_norm.weight.copy_(
                     self.store.get("language_model.model.norm.weight").to(torch.float32)
                 )
+            if self.device.type != "cpu":
+                self._embed.to(self.device)
+                self._final_norm.to(self.device)
         return self._embed
 
     @property
@@ -563,7 +586,9 @@ class ReferenceModel:
             w = self.store.get("language_model.lm_head.weight").to(self.dtype)
             self._lm_head = torch.nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
             with torch.no_grad():
-                self._lm_head.weight.copy_(w)
+                self._lm_head.weight.data = w
+            if self.device.type != "cpu":
+                self._lm_head.to(self.device)
         return self._lm_head
 
     # -- forward --------------------------------------------------------------
@@ -578,7 +603,9 @@ class ReferenceModel:
                 layer.mlp.gate.e_score_correction_bias.data = (
                     layer.mlp.gate.e_score_correction_bias.data.float()
                 )
-        load_layer_weights(layer, layer_idx, self.store, self.dtype, self.config)
+        load_layer_weights(layer, layer_idx, self.store, self.dtype, self.config, device=self.device)
+        if self.device.type != "cpu":
+            layer.to(self.device)
         layer.eval()
         return layer
 
@@ -612,12 +639,6 @@ class ReferenceModel:
                     hooks.append(
                         layer.mlp.shared_experts.register_forward_hook(shared_hook, with_kwargs=True)
                     )
-                if hasattr(layer.mlp, "shared_experts"):
-                    hooks.append(
-                        layer.mlp.shared_experts.register_forward_hook(
-                            lambda m, a, o, d=dump: d.put("shared_expert_out", o)
-                        )
-                    )
         try:
             with torch.no_grad():
                 pos_emb = self.rotary(hidden, position_ids=position_ids)
@@ -636,7 +657,7 @@ class ReferenceModel:
 
     def embed_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return self.embed(input_ids)
+            return self.embed(input_ids.to(self.device))
 
     def final_hidden(self, hidden):
         with torch.no_grad():

@@ -65,7 +65,7 @@ def unpack_fp4_nibbles(packed: torch.Tensor) -> torch.Tensor:
 def nvfp4_to_float(packed: torch.Tensor) -> torch.Tensor:
     """Unpack the E2M1 values only (no block/global scale), as fp32."""
     nib = unpack_fp4_nibbles(packed)
-    table = _e2m1_table(torch.float32)
+    table = _e2m1_table(torch.float32).to(device=nib.device)
     val = table[(nib & 0x7).long()]
     # Multiply by -1 for the sign bit: keeps -0.0 for nibble 0x8, like the spec.
     return torch.where((nib & 0x8) != 0, val * -1.0, val)

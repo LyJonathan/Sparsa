@@ -131,7 +131,7 @@ def run_prompts(args):
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
-    model = ReferenceModel(args.model_dir, dtype, args.config)
+    model = ReferenceModel(args.model_dir, dtype, args.config, device=args.device)
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(resolve_tokenizer(args))
@@ -154,7 +154,7 @@ def run_prompts(args):
         ids = encode_prompt(tok, item)
         t = torch.tensor([ids], dtype=torch.long)
         encoded.append(ids)
-        position_ids.append(torch.arange(len(ids), dtype=torch.long).unsqueeze(0))
+        position_ids.append(torch.arange(len(ids), dtype=torch.long, device=model.device).unsqueeze(0))
         hidden.append(model.embed_ids(t))
         log(f"prompt {item['id']}: {len(ids)} tokens")
         # free the embedding table; reloaded only if a later prompt needs it
@@ -165,7 +165,12 @@ def run_prompts(args):
     timings = {"layers": [], "total_start": time.time()}
     rss = RSSMonitor().start()
     dump_prompt_idx = None
-    if args.dump_layer is not None:
+    dump_layers = set()
+    if args.dump_layers:
+        dump_layers = {int(x) for x in args.dump_layers.split(",") if x.strip()}
+    elif args.dump_layer is not None:
+        dump_layers = {args.dump_layer}
+    if dump_layers:
         ids = [i["id"] for i in items]
         if args.dump_prompt not in ids:
             raise SystemExit(f"--dump-prompt must be one of {ids}")
@@ -179,7 +184,7 @@ def run_prompts(args):
         dumps = None
         for i in range(len(items)):
             dump = None
-            if dump_prompt_idx is not None and i == dump_prompt_idx and L == args.dump_layer:
+            if dump_prompt_idx is not None and i == dump_prompt_idx and L in dump_layers:
                 dump = DumpContext()
             hidden[i] = model.run_layer(layer, hidden[i], position_ids[i], dump)
             if dump is not None:
@@ -208,16 +213,16 @@ def run_prompts(args):
             d.mkdir(parents=True, exist_ok=True)
             np.save(d / "token_ids.npy", np.asarray(ids, dtype=np.int32))
             fh = model.final_hidden(h)[0]
-            np.save(d / "final_hidden.npy", fh.to(torch.float32).numpy())
+            np.save(d / "final_hidden.npy", fh.to(torch.float32).cpu().numpy())
             n_last = min(128, fh.shape[0])
             last_logits = model.logits(fh[-n_last:], chunk=args.logit_chunk)
-            np.save(d / "logits_last128.npy", last_logits.numpy())
+            np.save(d / "logits_last128.npy", last_logits.cpu().numpy())
             # top-1 over all positions without materialising [T, vocab]
             top1 = []
             for i in range(0, fh.shape[0], args.logit_chunk):
                 lg = model.logits(fh[i : i + args.logit_chunk], chunk=args.logit_chunk)
                 top1.append(lg.argmax(-1))
-            np.save(d / "top1.npy", torch.cat(top1).to(torch.int32).numpy())
+            np.save(d / "top1.npy", torch.cat(top1).to(torch.int32).cpu().numpy())
             results[item["id"]] = {
                 "n_tokens": len(ids),
                 "top1_last": int(torch.cat(top1)[-1]),
@@ -252,7 +257,7 @@ def run_prompts(args):
 
 def run_ppl(args):
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
-    model = ReferenceModel(args.model_dir, dtype, args.config)
+    model = ReferenceModel(args.model_dir, dtype, args.config, device=args.device)
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(resolve_tokenizer(args))
@@ -261,7 +266,7 @@ def run_ppl(args):
     log(f"ppl text: {len(ids)} tokens")
     t = torch.tensor([ids], dtype=torch.long)
     hidden = model.embed_ids(t)
-    pos = torch.arange(len(ids), dtype=torch.long).unsqueeze(0)
+    pos = torch.arange(len(ids), dtype=torch.long, device=model.device).unsqueeze(0)
     t0 = time.time()
     rss = RSSMonitor().start()
     for L in range(model.config.num_hidden_layers):
@@ -276,8 +281,8 @@ def run_ppl(args):
     for i in range(0, fh.shape[0] - 1, args.logit_chunk):
         rows = fh[i : min(i + args.logit_chunk, fh.shape[0] - 1)]
         lg = model.logits(rows, chunk=args.logit_chunk).to(torch.float64)
-        tgt = torch.tensor(ids[i + 1 : i + 1 + rows.shape[0]], dtype=torch.long)
-        nll[i : i + rows.shape[0]] = torch.nn.functional.cross_entropy(lg, tgt, reduction="none")
+        tgt = torch.tensor(ids[i + 1 : i + 1 + rows.shape[0]], dtype=torch.long, device=model.device)
+        nll[i : i + rows.shape[0]] = torch.nn.functional.cross_entropy(lg, tgt, reduction="none").cpu()
     ppl = float(torch.exp(nll.mean()))
     out = {
         "tokens": len(ids),
@@ -327,7 +332,7 @@ def run_greedy(args):
     (``--expert-cache`` x 113 MB per layer, default 4 -> ~27 GB).
     """
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    model = ReferenceModel(args.model_dir, dtype, args.config)
+    model = ReferenceModel(args.model_dir, dtype, args.config, device=args.device)
     layers = []
     for L in range(model.config.num_hidden_layers):
         layer = model.make_layer(L)
@@ -338,6 +343,10 @@ def run_greedy(args):
             log(f"resident layer {L} loaded")
 
     text = apply_chat_template([{"role": "user", "content": args.greedy}])
+    if not args.think:
+        # the template lets the model decide; close the think block so the
+        # first decoded token is the visible answer
+        text = text + "</mm:think>"
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(resolve_tokenizer(args))
@@ -354,10 +363,10 @@ def run_greedy(args):
         for step in range(args.max_new):
             if step == 0:
                 inp = torch.tensor([ids], dtype=torch.long)
-                pos = torch.arange(len(ids), dtype=torch.long).unsqueeze(0)
+                pos = torch.arange(len(ids), dtype=torch.long, device=model.device).unsqueeze(0)
             else:
                 inp = torch.tensor([[generated[-1]]], dtype=torch.long)
-                pos = torch.tensor([[len(ids) + step - 1]], dtype=torch.long)
+                pos = torch.tensor([[len(ids) + step - 1]], dtype=torch.long, device=model.device)
             t0 = time.time()
             h = model.embed_ids(inp)
             pos_emb = model.rotary(h, position_ids=pos)
@@ -404,12 +413,14 @@ def build_parser():
     ap.add_argument("--prompts", default=str(Path(__file__).with_name("prompts.jsonl")))
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--layers", default=None)
     ap.add_argument("--max-layers", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--only", default=None, help="comma-separated prompt ids to run")
     ap.add_argument("--logit-chunk", type=int, default=64)
     ap.add_argument("--dump-layer", type=int, default=None)
+    ap.add_argument("--dump-layers", default=None, help="comma separated layer ids, one pass")
     ap.add_argument("--dump-prompt", default="code_lru")
     ap.add_argument("--keep-embed", action="store_true")
     ap.add_argument("--ppl", default=None)
@@ -417,6 +428,7 @@ def build_parser():
     ap.add_argument("--greedy", default=None)
     ap.add_argument("--max-new", type=int, default=32)
     ap.add_argument("--expert-cache", type=int, default=4, help="LRU experts per layer in greedy mode; 0 disables")
+    ap.add_argument("--think", action="store_true", help="let the model emit a think block (default: answer directly)")
     return ap
 
 
