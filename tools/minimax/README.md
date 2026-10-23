@@ -187,12 +187,19 @@ prints the table (max abs, relative to the reference's peak, cosine, router-id a
 Measured on the two short/long reference prompts (114 and 4093 tokens), Q8_0 dense and experts, F32 norms and
 router, CPU placement (`--minimax-dense-layers-gpu 0`):
 
-| layer / prompt | attn_out rel | block ids | router top-4 | experts (matched routing) | layer_out rel |
+| layer / prompt | attn_out rel | MSA block ids | router top-4 | experts (matched routing) | layer_out rel |
 |---|---|---|---|---|---|
 | 0 / short (from the embedding) | 1.4e-3 | — (1 block) | — | — | 1.3e-3 |
-| 3 / short (seeded) | 2.2e-3 | — | 97.4% | 2.1e-3 | 7.1e-4 |
-| 40 / short (seeded) | 3.5e-3 | — | 96.5% | 4.4e-3 | 2.4e-3 |
+| 0 / long (4093 tokens) | 1.9e-3 | 98.41% sets, 0.9974 Jaccard | — | — | 2.0e-3 |
+| 3 / short (seeded) | 2.2e-3 | — (1 block) | 97.4% | 2.1e-3 | 7.1e-4 |
+| 3 / long (seeded) | 2.6e-3 | 99.55% sets, 0.9993 Jaccard | 99.1% | 1.8e-3 | 9.6e-4 |
+| 40 / short (seeded) | 3.5e-3 | — (1 block) | 96.5% | 4.4e-3 | 2.4e-3 |
 | 40 / long (4093 tokens, sparse) | 1.3e-2 | 99.51% sets, 0.9992 Jaccard | 98.8% | 7.7e-3 | 1.2e-3 |
+
+One more run starts at the embedding and goes through layers 0-3 (`--layers 0,1,2,3` in one file): layer 0 matches
+as above and layer 3 lands at attn_out 8.6e-2, moe_out 7.5e-3 (rows with the same routing) and layer_out 2.1e-2.
+That is accumulation, not a per-layer discrepancy: the Q8_0 embedding alone is 9.8e-3 relative, and three flips
+of the router's 4th expert turn into large per-token deviations. The seeded runs above isolate the layer math.
 
 The handful of router and block disagreements are 4th/5th-place ties: the router logits agree to 1.4e-3 relative
 and the block scores to 3.7e-3, which is the Q8_0 noise floor, and the expert weights agree to 8.2e-4 by id. The

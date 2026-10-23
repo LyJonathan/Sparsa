@@ -189,6 +189,8 @@ def main():
                 wa = load(rp_w).reshape(-1, a.shape[1]).astype(np.float64)
                 wb = load(op_w).astype(np.float64)
                 for i in range(n):
+                    if set(a[i].tolist()) != set(b[i].tolist()):
+                        continue   # a different expert set renormalizes the weights; compare only equal sets
                     ma = {int(k): wa[i, j] for j, k in enumerate(a[i])}
                     mb = {int(k): wb[i, j] for j, k in enumerate(b[i])}
                     for k in set(ma) & set(mb):
