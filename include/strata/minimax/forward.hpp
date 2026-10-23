@@ -3,8 +3,8 @@
 // One GPU plus the CPU. Dense tensors for the first `--minimax-dense-layers-gpu` layers live on the device in
 // their GGUF bytes (F32/F16/BF16 expanded to fp32, quantized types dequantized per tile). Every other dense
 // matrix, and every routed expert, runs on the CPU. Routed experts use ggml-cpu's `from_float` + `vec_dot` and
-// the swigluoai activation from the reference spec. KV (K, V, indexer K) is fp16, mirrored on the host for the
-// attention math and copied to the GPU so the cache the later kernels will read is actually resident.
+// the swigluoai activation from the reference spec. KV (K, V, indexer K) is fp16 on the host. A device copy is
+// not allocated until a GPU attention kernel reads it. `--minimax-dense-layers-gpu 0` makes no CUDA calls.
 //
 // Prefill walks the same per-token path as decode. Norm weights follow the llama.cpp GGUF convention: `+1` is
 // baked into the tensor unless `minimax-m3.norm.add1` is true, and a file whose norms sit near 0 is refused

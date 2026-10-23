@@ -2,10 +2,21 @@
 //
 // Token-by-token, prefill and decode share one path (P2b; a batched prefill can replace it later without changing
 // the math). Dense GEMVs are fp32. Quantized routed experts are ggml-cpu vec_dot (activation quantized with the
-// type's vec_dot_type) plus swigluoai. KV is fp16. See include/strata/minimax/forward.hpp.
+// type's vec_dot_type) plus swigluoai. KV is fp16 on the host only; nothing is mirrored to the device until a GPU
+// attention kernel exists. See include/strata/minimax/forward.hpp.
 #include "strata/minimax/forward.hpp"
 
 #include "cuda_ops.hpp"
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -15,9 +26,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -91,25 +104,95 @@ struct Layer {
 
 int64_t bigger(int64_t a, int64_t b) { return a > b ? a : b; }
 
-void parallel_for(int threads, int rows, const std::function<void(int, int)>& fn) {
-    if (rows <= 0) return;
-    if (threads <= 1 || rows < threads * 4) {
-        fn(0, rows);
-        return;
+// One pool for the whole engine. parallel_for used to spawn and join on every GEMV row-split.
+struct Pool {
+    int nthreads = 1;
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    std::function<void(int, int)> fn;
+    int rows = 0;
+    int parts = 1;
+    int epoch = 0;
+    int pending = 0;
+    bool stop = false;
+
+    Pool() = default;
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
+
+    void start(int threads) {
+        if (!workers.empty()) return;
+        if (threads < 1) threads = 1;
+        nthreads = threads;
+        for (int p = 1; p < nthreads; ++p) workers.emplace_back([this, p] { worker(p); });
     }
-    const int parts = threads;
-    std::vector<std::thread> th;
-    th.reserve((size_t)parts - 1);
-    for (int p = 1; p < parts; ++p) {
-        const int a = (int)((int64_t)rows * p / parts);
-        const int b = (int)((int64_t)rows * (p + 1) / parts);
-        th.emplace_back([&, a, b] {
-            if (a < b) fn(a, b);
-        });
+
+    ~Pool() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+            ++epoch;
+        }
+        cv_work.notify_all();
+        for (auto& t : workers)
+            if (t.joinable()) t.join();
     }
-    const int b0 = (int)((int64_t)rows / parts);
-    if (b0 > 0) fn(0, b0);
-    for (auto& t : th) t.join();
+
+    void worker(int p) {
+        int seen = 0;
+        for (;;) {
+            std::function<void(int, int)> job;
+            int a = 0, b = 0;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv_work.wait(lk, [&] { return stop || epoch != seen; });
+                if (stop) return;
+                seen = epoch;
+                job = fn;
+                a = (int)((int64_t)rows * p / parts);
+                b = (int)((int64_t)rows * (p + 1) / parts);
+            }
+            if (a < b && job) job(a, b);
+            std::lock_guard<std::mutex> lk(mu);
+            if (--pending == 0) cv_done.notify_one();
+        }
+    }
+
+    void run(int nrows, const std::function<void(int, int)>& job) {
+        if (nrows <= 0) return;
+        if (nthreads <= 1 || nrows < nthreads * 4) {
+            job(0, nrows);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            fn = job;
+            rows = nrows;
+            parts = nthreads;
+            pending = nthreads - 1;
+            ++epoch;
+        }
+        cv_work.notify_all();
+        const int b0 = (int)((int64_t)nrows / nthreads);
+        if (b0 > 0) job(0, b0);
+        std::unique_lock<std::mutex> lk(mu);
+        cv_done.wait(lk, [&] { return pending == 0; });
+        fn = nullptr;
+    }
+};
+
+bool mul_size(size_t a, size_t b, size_t& o) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) return false;
+    o = a * b;
+    return true;
+}
+
+bool add_size(size_t a, size_t b, size_t& o) {
+    if (a > std::numeric_limits<size_t>::max() - b) return false;
+    o = a + b;
+    return true;
 }
 
 float sigmoid(float x) {
@@ -253,7 +336,6 @@ struct Engine::Impl {
     std::unordered_set<int32_t> eos;
 
     std::vector<uint16_t> k_host, v_host, ik_host;
-    DevPtr k_dev, v_dev, ik_dev;
     DevPtr d_x, d_y, d_scratch;
     int64_t max_cols = 1, max_rows = 1;
 
@@ -262,6 +344,7 @@ struct Engine::Impl {
     int64_t n_past = 0;
     bool have_logits = false;
     std::mt19937_64 rng{0};
+    Pool pool;
 
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
@@ -290,10 +373,16 @@ struct Engine::Impl {
         if (threads <= 0) threads = (int)std::thread::hardware_concurrency();
         if (threads <= 0) threads = 4;
         if (threads > 24) threads = 24;
+        pool.start(threads);
 
-        cu::init();
+        // N=0 is the all-CPU path: no device, no CUDA runtime calls. Automatic placement (-1) and any
+        // positive layer count still need a device to size VRAM.
+        const bool cpu_only = opt.dense_layers_gpu == 0;
+        if (!cpu_only) cu::init();
         alloc_cache();
-        alloc_workspace();
+        // The row/col limits are also the CPU gemv guard. Device buffers exist only when a layer can be uploaded.
+        size_workspace();
+        if (!cpu_only) alloc_workspace();
         place_weights();
 
         const int64_t qlen = cfg.n_head * cfg.head_dim;
@@ -474,23 +563,41 @@ struct Engine::Impl {
     }
 
     void alloc_cache() {
-        const size_t kp = (size_t)cfg.n_layers * (size_t)ctx * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
-        const size_t ip = (size_t)cfg.n_layers * (size_t)ctx * (size_t)cfg.idx_dim;
+        // Host fp16 only. K and V are one buffer each; the indexer K is the third. A failed alloc names the
+        // exact byte count so a 1M-context GGUF does not die as a bare bad_alloc.
+        size_t layers_ctx = 0, kp = 0, ip = 0, elems = 0, bytes = 0;
+        const bool fits = mul_size((size_t)cfg.n_layers, (size_t)ctx, layers_ctx) &&
+                          mul_size(layers_ctx, (size_t)cfg.n_head_kv, kp) &&
+                          mul_size(kp, (size_t)cfg.head_dim, kp) &&
+                          mul_size(layers_ctx, (size_t)cfg.idx_dim, ip) &&
+                          add_size(kp, kp, elems) && add_size(elems, ip, elems) &&
+                          mul_size(elems, sizeof(uint16_t), bytes);
+        if (!fits) {
+            fail("failed to allocate the host fp16 KV cache for context " + std::to_string(ctx) +
+                 ": the K, V, and indexer cache does not fit in the address space. Lower --max-context.");
+        }
+#if defined(_WIN32)
+        // Refuse before touching pages. A commit larger than the process can back would otherwise zero
+        // tens of gigabytes and grow the pagefile before bad_alloc.
+        MEMORYSTATUSEX mem{};
+        mem.dwLength = sizeof(mem);
+        if (GlobalMemoryStatusEx(&mem) && mem.ullAvailPageFile < (DWORDLONG)bytes) {
+            fail("failed to allocate the host fp16 KV cache for context " + std::to_string(ctx) + ": " +
+                 std::to_string(bytes) + " bytes are required. Lower --max-context. available commit is " +
+                 std::to_string((unsigned long long)mem.ullAvailPageFile) + " bytes.");
+        }
+#endif
         try {
             k_host.assign(kp, 0);
             v_host.assign(kp, 0);
             ik_host.assign(ip, 0);
-            k_dev = DevPtr(cu::alloc(kp * sizeof(uint16_t)));
-            v_dev = DevPtr(cu::alloc(kp * sizeof(uint16_t)));
-            ik_dev = DevPtr(cu::alloc(ip * sizeof(uint16_t)));
         } catch (const std::exception& e) {
-            const double mib = (double)((kp + kp + ip) * sizeof(uint16_t)) / (1024.0 * 1024.0);
-            fail(std::string(e.what()) + " (fp16 KV for context " + std::to_string(ctx) + " needs about " +
-                 std::to_string((int)mib) + " MiB on the GPU and the same on the host; lower --max-context)");
+            fail("failed to allocate the host fp16 KV cache for context " + std::to_string(ctx) + ": " +
+                 std::to_string(bytes) + " bytes are required. Lower --max-context. " + e.what());
         }
     }
 
-    void alloc_workspace() {
+    void size_workspace() {
         max_cols = cfg.n_embd;
         max_cols = bigger(max_cols, cfg.n_ff_dense);
         max_cols = bigger(max_cols, cfg.n_ff_exp * (cfg.n_shared_experts > 0 ? cfg.n_shared_experts : 1));
@@ -503,6 +610,9 @@ struct Engine::Impl {
         max_rows = bigger(max_rows, cfg.n_ff_exp * (cfg.n_shared_experts > 0 ? cfg.n_shared_experts : 1));
         max_rows = bigger(max_rows, cfg.n_expert);
         max_rows = bigger(max_rows, cfg.idx_heads * cfg.idx_dim);
+    }
+
+    void alloc_workspace() {
         d_x = DevPtr(cu::alloc((size_t)max_cols * sizeof(float)));
         d_y = DevPtr(cu::alloc((size_t)max_rows * sizeof(float)));
         d_scratch = DevPtr(cu::alloc((size_t)kTile * (size_t)max_cols * sizeof(float)));
@@ -549,6 +659,11 @@ struct Engine::Impl {
     }
 
     void place_weights() {
+        if (opt.dense_layers_gpu == 0) {
+            dense_gpu = 0;
+            output_gpu = false;
+            return;
+        }
         std::vector<size_t> cost((size_t)cfg.n_layers);
         for (int64_t i = 0; i < cfg.n_layers; ++i) cost[(size_t)i] = layer_cost(layers[(size_t)i]);
         const size_t out_b = gpu_bytes(output);
@@ -622,7 +737,7 @@ struct Engine::Impl {
             return;
         }
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
-            parallel_for(threads, rows, [&](int a, int b) {
+            pool.run(rows, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {
                     const uint8_t* row = t.host + (size_t)r * t.row_bytes;
                     if (t.type == kF32) yout[r] = dot_f32((const float*)row, xin, cols);
@@ -639,7 +754,7 @@ struct Engine::Impl {
         std::vector<uint8_t> aq(act_bytes);
         act->from_float(xin, aq.data(), cols);
         const ggml_vec_dot_t dot = t.cpu->vec_dot;
-        parallel_for(threads, rows, [&](int a, int b) {
+        pool.run(rows, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 float s = 0.f;
                 dot(cols, &s, 0, t.host + (size_t)r * t.row_bytes, 0, aq.data(), 0, 1);
@@ -651,7 +766,7 @@ struct Engine::Impl {
     void dot_rows(const Tensor& t, int64_t expert, const float* xin, float* yout, int rows_n, int cols) {
         // One expert (or a plain matrix when expert == 0 and ne2 == 1): yout[r] = row(expert, r) · xin.
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
-            parallel_for(threads, rows_n, [&](int a, int b) {
+            pool.run(rows_n, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {
                     const uint8_t* row = row_ptr(t, expert, r);
                     if (t.type == kF32) yout[r] = dot_f32((const float*)row, xin, cols);
@@ -667,7 +782,7 @@ struct Engine::Impl {
         std::vector<uint8_t> aq(ggml_row_size(t.cpu->vec_dot_type, cols));
         act->from_float(xin, aq.data(), cols);
         const ggml_vec_dot_t dot = t.cpu->vec_dot;
-        parallel_for(threads, rows_n, [&](int a, int b) {
+        pool.run(rows_n, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 float s = 0.f;
                 dot(cols, &s, 0, row_ptr(t, expert, r), 0, aq.data(), 0, 1);
@@ -746,12 +861,11 @@ struct Engine::Impl {
         return ik_host.data() + ((size_t)layer * (size_t)ctx + (size_t)pos) * (size_t)cfg.idx_dim;
     }
 
-    void store_f16(std::vector<uint16_t>& host, uint16_t* dev, size_t off, const float* src, int n) {
+    void store_f16(std::vector<uint16_t>& host, size_t off, const float* src, int n) {
         for (int i = 0; i < n; ++i) host[off + (size_t)i] = ggml_fp32_to_fp16(src[i]);
-        cu::copy_h2d(dev + off, host.data() + off, (size_t)n * sizeof(uint16_t));
     }
 
-    void attend(int layer, const Layer& L, int64_t pos, const float* qq, float* att) {
+    void attend(int layer, const Layer& L, int64_t pos, float* att) {
         const int H = (int)cfg.n_head;
         const int HKV = (int)cfg.n_head_kv;
         const int D = (int)cfg.head_dim;
@@ -804,28 +918,67 @@ struct Engine::Impl {
             }
         }
         const int q_per_idx = L.indexer ? H / (int)cfg.idx_heads : H;
-        std::vector<float> prob((size_t)Tk);
+        // One slot list per indexer head: the selected blocks, cut at `pos` inside the current block.
+        // Heads that share an indexer head reuse that list. 16 blocks of 128 is 2048 slots; the vector
+        // grows if a file selects more, so the mask is not truncated.
+        const int HI = L.indexer ? (int)cfg.idx_heads : 1;
+        const int BLK = (int)cfg.idx_block;
+        std::vector<int32_t> slots;
+        std::vector<int> slot_off((size_t)HI + 1, 0);
+        if (L.indexer) {
+            const int64_t cap = (int64_t)cfg.idx_top_k * BLK;
+            slots.reserve((size_t)HI * (size_t)(cap < 2048 ? cap : 2048));
+            for (int ih = 0; ih < HI; ++ih) {
+                slot_off[(size_t)ih] = (int)slots.size();
+                for (int b = 0; b < nb; ++b) {
+                    if (!sel[(size_t)ih * nb + b]) continue;
+                    const int64_t begin = (int64_t)b * BLK;
+                    int64_t end = begin + BLK;
+                    if (end > Tk) end = Tk;
+                    for (int64_t t = begin; t < end; ++t) {
+                        if (t > pos) break;
+                        slots.push_back((int32_t)t);
+                    }
+                }
+            }
+            slot_off[(size_t)HI] = (int)slots.size();
+        }
         for (int qh = 0; qh < H; ++qh) {
             const int kv = qh / q_per_kv;
-            const int ih = L.indexer ? qh / q_per_idx : 0;
-            const float* qq = q.data() + (size_t)qh * D;
-            for (int64_t t = 0; t < Tk; ++t) {
-                bool keep = t <= pos;
-                if (keep && L.indexer) keep = sel[(size_t)ih * nb + (size_t)(t / cfg.idx_block)] != 0;
-                if (!keep) prob[(size_t)t] = -std::numeric_limits<float>::infinity();
-                else prob[(size_t)t] = dot_f16_cache(k_at(layer, t, kv), qq, D) * scale;
-            }
-            softmax_inplace(prob.data(), (int)Tk);
+            const float* qrow = q.data() + (size_t)qh * D;
             float* out = att + (size_t)qh * D;
             for (int d = 0; d < D; ++d) out[d] = 0.f;
-            for (int64_t t = 0; t < Tk; ++t) {
-                const float p = prob[(size_t)t];
+            if (!L.indexer) {
+                std::vector<float> prob((size_t)Tk);
+                for (int64_t t = 0; t < Tk; ++t) {
+                    if (t > pos) prob[(size_t)t] = -std::numeric_limits<float>::infinity();
+                    else prob[(size_t)t] = dot_f16_cache(k_at(layer, t, kv), qrow, D) * scale;
+                }
+                softmax_inplace(prob.data(), (int)Tk);
+                for (int64_t t = 0; t < Tk; ++t) {
+                    const float p = prob[(size_t)t];
+                    if (p == 0.f) continue;
+                    const uint16_t* vv = v_at(layer, t, kv);
+                    for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
+                }
+                continue;
+            }
+            const int ih = qh / q_per_idx;
+            const int a = slot_off[(size_t)ih];
+            const int b = slot_off[(size_t)ih + 1];
+            const int nslot = b - a;
+            if (nslot <= 0) continue;
+            std::vector<float> prob((size_t)nslot);
+            for (int i = 0; i < nslot; ++i)
+                prob[(size_t)i] = dot_f16_cache(k_at(layer, slots[(size_t)(a + i)], kv), qrow, D) * scale;
+            softmax_inplace(prob.data(), nslot);
+            for (int i = 0; i < nslot; ++i) {
+                const float p = prob[(size_t)i];
                 if (p == 0.f) continue;
-                const uint16_t* vv = v_at(layer, t, kv);
+                const uint16_t* vv = v_at(layer, slots[(size_t)(a + i)], kv);
                 for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
             }
         }
-        (void)qq;
     }
 
     void forward_token(int32_t token, float* logit_out) {
@@ -845,8 +998,8 @@ struct Engine::Impl {
             rope(q.data(), (int)cfg.n_head, (int)cfg.head_dim, (int)cfg.n_rot, (int)pos, cfg.rope_theta);
             rope(k.data(), (int)cfg.n_head_kv, (int)cfg.head_dim, (int)cfg.n_rot, (int)pos, cfg.rope_theta);
             const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
-            store_f16(k_host, (uint16_t*)k_dev.p, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
-            store_f16(v_host, (uint16_t*)v_dev.p, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+            store_f16(k_host, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+            store_f16(v_host, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
             if (L.indexer) {
                 gemv(L.iq, h.data(), iq.data());
                 gemv(L.ik, h.data(), ik.data());
@@ -855,10 +1008,10 @@ struct Engine::Impl {
                 rope(iq.data(), (int)cfg.idx_heads, (int)cfg.idx_dim, (int)cfg.n_rot, (int)pos, cfg.rope_theta);
                 rope(ik.data(), 1, (int)cfg.idx_dim, (int)cfg.n_rot, (int)pos, cfg.rope_theta);
                 const size_t ioff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.idx_dim;
-                store_f16(ik_host, (uint16_t*)ik_dev.p, ioff, ik.data(), (int)cfg.idx_dim);
+                store_f16(ik_host, ioff, ik.data(), (int)cfg.idx_dim);
             }
             std::vector<float> att((size_t)cfg.n_head * (size_t)cfg.head_dim);
-            attend((int)li, L, pos, q.data(), att.data());
+            attend((int)li, L, pos, att.data());
             gemv(L.wo, att.data(), proj.data());
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
 
@@ -908,15 +1061,8 @@ struct Engine::Impl {
                 if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
                 return a < b;
             });
-            float cut = -std::numeric_limits<float>::infinity();
-            for (int i = 0; i < sp.top_k; ++i) {
-                const float v = row[(size_t)order[(size_t)i]];
-                if (v < cut || cut == -std::numeric_limits<float>::infinity()) cut = v;
-            }
-            // nth_element leaves the k-th at order[k] in the "not less" partition; the cutoff is the
-            // worst of the kept side, which nth_element places at index top_k (the first of the rest) ... 
-            // Use the minimum among the first top_k of the nth partition: they are the top_k.
-            cut = row[(size_t)order[0]];
+            // nth_element's first top_k entries are the kept ids, unsorted. The cutoff is their minimum.
+            float cut = row[(size_t)order[0]];
             for (int i = 1; i < sp.top_k; ++i)
                 if (row[(size_t)order[(size_t)i]] < cut) cut = row[(size_t)order[(size_t)i]];
             for (int i = 0; i < n; ++i)
@@ -1026,15 +1172,28 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
         impl_->rng.seed(((uint64_t)rd() << 32) ^ rd());
     }
 
-    const bool extend = prompt.size() >= impl_->held.size() &&
-                        std::equal(impl_->held.begin(), impl_->held.end(), prompt.begin());
+    // n_past is the cache. The last sampled token sits in `held` but is not forwarded until the next
+    // request needs its logits, so held.size() is one past the cache after a normal stop. Reuse only the
+    // forwarded prefix. Logits always come from the last prompt token: an exact cache hit re-forwards it.
+    int64_t cached = impl_->n_past;
+    bool extend = cached > 0 && (int64_t)prompt.size() >= cached && (int64_t)impl_->held.size() >= cached;
+    if (extend) {
+        for (int64_t i = 0; i < cached; ++i) {
+            if (impl_->held[(size_t)i] != prompt[(size_t)i]) {
+                extend = false;
+                break;
+            }
+        }
+    }
     if (!extend) {
         impl_->reset();
-        gr.reused = 0;
-    } else {
-        gr.reused = (int)impl_->held.size();
+        cached = 0;
     }
+    gr.reused = (int)cached;
     gr.prompt = (int)prompt.size();
+    const bool reforward = extend && (int64_t)prompt.size() == cached;
+    const int64_t begin = reforward ? cached - 1 : cached;
+    impl_->held.assign(prompt.begin(), prompt.begin() + (size_t)begin);
 
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -1042,12 +1201,13 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
         return std::chrono::duration<double, std::milli>(clock::now() - a).count();
     };
     const int chunk = impl_->opt.chunk > 0 ? impl_->opt.chunk : 16;
-    for (int i = gr.reused; i < (int)prompt.size(); ++i) {
+    for (int i = (int)begin; i < (int)prompt.size(); ++i) {
         if (stop.load(std::memory_order_relaxed)) {
             gr.finish = "cancel";
             gr.prompt_ms = ms_since(t0);
             return gr;
         }
+        if (reforward && i == (int)begin) impl_->n_past = begin;
         impl_->forward_token(prompt[(size_t)i], impl_->last_logits.data());
         impl_->have_logits = true;
         impl_->held.push_back(prompt[(size_t)i]);

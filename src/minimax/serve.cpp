@@ -3,18 +3,39 @@
 // Inspect never constructs the engine (no CUDA). Serve and eval load the GGUF, refuse a non-M3.1 file unless
 // --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE. GENI and BGEN
 // answer with ERR and no DONE. Unknown --flags are ignored only in --serve, matching the shared server config.
+// An unasked context is min(model, 32768); only --max-context raises it.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <errno.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "ggml.h"
 
 #include "strata/minimax/engine.hpp"
 #include "strata/minimax/forward.hpp"
@@ -31,6 +52,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: strata-minimax --model GGUF --minimax-inspect\n"
                  "       strata-minimax --model GGUF --serve [--max-context N] [--minimax-dense-layers-gpu N]\n"
+                 "                       (default context is min(model, 32768); --max-context is the only way up)\n"
                  "       strata-minimax --model GGUF --minimax-eval IDS --minimax-dump-logits OUT.npy\n"
                  "                       [--minimax-last-k K] [--minimax-dense-layers-gpu N]\n"
                  "       (--minimax-allow-nonstandard serves a reduced test GGUF; --serve otherwise refuses it)\n"
@@ -93,7 +115,213 @@ bool parse_id_token(const std::string& tok, std::vector<int32_t>& ids, std::stri
     return flush(cur);
 }
 
-void handle_gen(Engine& engine, const std::string& line, std::atomic<bool>& stop, bool greedy_default) {
+// STDIN bytes already pulled and not yet split into lines. Only the reader thread touches this.
+struct StdinBuf {
+    std::string pending;
+    bool eof = false;
+};
+
+// Append bytes the OS already has. A pipe drain does not block. A console has no byte count, so this is a no-op
+// there and the poll loop below waits for the next key. false means the handle is closed.
+bool slurp_ready(StdinBuf& in) {
+    if (in.eof) return false;
+#if defined(_WIN32)
+    const HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) {
+        in.eof = true;
+        return false;
+    }
+    DWORD avail = 0;
+    if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_INVALID_FUNCTION) return true;
+        in.eof = true;
+        return false;
+    }
+    if (avail == 0) return true;
+    const size_t at = in.pending.size();
+    in.pending.resize(at + (size_t)avail);
+    DWORD n = 0;
+    if (!ReadFile(h, in.pending.data() + at, avail, &n, nullptr)) {
+        in.pending.resize(at);
+        in.eof = true;
+        return false;
+    }
+    in.pending.resize(at + (size_t)n);
+    if (n == 0) in.eof = true;
+    return n > 0;
+#else
+    pollfd pfd{};
+    pfd.fd = STDIN_FILENO;
+    pfd.events = POLLIN;
+    const int r = ::poll(&pfd, 1, 0);
+    if (r < 0) {
+        if (errno == EINTR) return true;
+        in.eof = true;
+        return false;
+    }
+    if (r == 0) return true;
+    char buf[4096];
+    const ssize_t n = ::read(STDIN_FILENO, buf, sizeof buf);
+    if (n < 0) {
+        if (errno == EINTR) return true;
+        in.eof = true;
+        return false;
+    }
+    if (n == 0) {
+        in.eof = true;
+        return false;
+    }
+    in.pending.append(buf, buf + n);
+    return true;
+#endif
+}
+
+bool take_line(StdinBuf& in, std::string& line) {
+    const size_t p = in.pending.find('\n');
+    if (p == std::string::npos) {
+        if (!in.eof || in.pending.empty()) return false;
+        line = std::move(in.pending);
+        in.pending.clear();
+    } else {
+        line.assign(in.pending, 0, p);
+        in.pending.erase(0, p + 1);
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return true;
+}
+
+// Block until a line, shutdown, or a sweep request. A sweep means "the bytes already in the pipe are part of
+// the script that was written before this GEN"; the caller ignores a STOP among them.
+bool wait_input(StdinBuf& in, const std::atomic<bool>& shutdown, const std::atomic<int>& sweep) {
+    for (;;) {
+        if (shutdown.load(std::memory_order_relaxed) || sweep.load(std::memory_order_relaxed) == 1) return false;
+        if (!slurp_ready(in)) return false;
+        if (in.pending.find('\n') != std::string::npos || (in.eof && !in.pending.empty())) return true;
+        if (in.eof) return false;
+#if defined(_WIN32)
+        const HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+            if (GetLastError() == ERROR_INVALID_FUNCTION) {
+                const DWORD w = WaitForSingleObject(h, 50);
+                if (w == WAIT_TIMEOUT) continue;
+                if (w != WAIT_OBJECT_0) {
+                    in.eof = true;
+                    return false;
+                }
+                char ch = 0;
+                DWORD n = 0;
+                if (!ReadFile(h, &ch, 1, &n, nullptr) || n == 0) {
+                    in.eof = true;
+                    return false;
+                }
+                in.pending.push_back(ch);
+                continue;
+            }
+            in.eof = true;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+#else
+        pollfd pfd{};
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        const int r = ::poll(&pfd, 1, 50);
+        if (r < 0 && errno != EINTR) {
+            in.eof = true;
+            return false;
+        }
+#endif
+    }
+}
+
+// gguf-py can dequantize Q4_K and Q6_K but does not quantize them, and IQ2_XS has no Python quantizer at all.
+// This writes one ggml_quantize_chunk blob. IQ2_XS gets a uniform importance row of 1s; K-quants do not need one.
+bool quant_type_from_name(const std::string& name, ggml_type& type) {
+    if (name == "q4_k") type = GGML_TYPE_Q4_K;
+    else if (name == "q6_k") type = GGML_TYPE_Q6_K;
+    else if (name == "q8_0") type = GGML_TYPE_Q8_0;
+    else if (name == "iq2_xs") type = GGML_TYPE_IQ2_XS;
+    else return false;
+    return true;
+}
+
+int pack_quant(const std::string& type_name, int64_t rows, int64_t cols, const std::string& in_path,
+               const std::string& out_path) {
+    ggml_type type = GGML_TYPE_F32;
+    if (!quant_type_from_name(type_name, type)) {
+        std::fprintf(stderr, "strata-minimax: quant pack type must be q4_k, q6_k, q8_0, or iq2_xs\n");
+        return 2;
+    }
+    const int64_t block = ggml_blck_size(type);
+    if (rows < 1 || cols < 1 || block < 1 || cols % block != 0) {
+        std::fprintf(stderr, "strata-minimax: %s pack needs rows > 0 and cols a positive multiple of %lld\n",
+                     type_name.c_str(), (long long)block);
+        return 2;
+    }
+    std::ifstream in(in_path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "strata-minimax: cannot read %s\n", in_path.c_str());
+        return 1;
+    }
+    std::vector<float> src((size_t)rows * (size_t)cols);
+    in.read(reinterpret_cast<char*>(src.data()), (std::streamsize)(src.size() * sizeof(float)));
+    if (in.gcount() != (std::streamsize)(src.size() * sizeof(float))) {
+        std::fprintf(stderr, "strata-minimax: short read of f32 weights for quant pack\n");
+        return 1;
+    }
+    std::vector<float> imatrix;
+    const float* im = nullptr;
+    if (ggml_quantize_requires_imatrix(type)) {
+        imatrix.assign((size_t)cols, 1.f);
+        im = imatrix.data();
+    }
+    ggml_quantize_init(type);
+    const size_t row_bytes = ggml_row_size(type, cols);
+    std::vector<uint8_t> dst(row_bytes * (size_t)rows);
+    const size_t got = ggml_quantize_chunk(type, src.data(), dst.data(), 0, rows, cols, im);
+    if (got != dst.size()) {
+        std::fprintf(stderr, "strata-minimax: %s quantize wrote %zu bytes, expected %zu\n", type_name.c_str(), got,
+                     dst.size());
+        return 1;
+    }
+    std::ofstream out(out_path, std::ios::binary);
+    if (!out) {
+        std::fprintf(stderr, "strata-minimax: cannot write %s\n", out_path.c_str());
+        return 1;
+    }
+    out.write(reinterpret_cast<const char*>(dst.data()), (std::streamsize)dst.size());
+    if (!out) {
+        std::fprintf(stderr, "strata-minimax: short write of packed quant weights\n");
+        return 1;
+    }
+    return 0;
+}
+
+// sweep: 0 idle, 1 the reader should fold already-buffered stdin into the queue, 2 that fold is done.
+struct GenGate {
+    std::atomic<bool>* stop = nullptr;
+    std::atomic<int>* sweep = nullptr;
+    std::atomic<bool>* reader_done = nullptr;
+    std::mutex* mu = nullptr;
+    std::condition_variable* cv = nullptr;
+
+    // A STOP already sitting in the pipe (the test script writes the whole session before READY) is applied
+    // by the reader during the sweep and then cleared here. A STOP that arrives after the sweep still cancels.
+    // If the reader already drained stdin and exited, that STOP was applied too, so clearing it is enough.
+    void ignore_buffered_stop() {
+        sweep->store(1, std::memory_order_relaxed);
+        std::unique_lock<std::mutex> lk(*mu);
+        cv->wait(lk, [&] {
+            return sweep->load(std::memory_order_relaxed) == 2 || reader_done->load(std::memory_order_relaxed);
+        });
+        sweep->store(0, std::memory_order_relaxed);
+        stop->store(false, std::memory_order_relaxed);
+    }
+};
+
+void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool greedy_default) {
     std::istringstream in(line);
     std::string cmd;
     in >> cmd;
@@ -140,12 +368,10 @@ void handle_gen(Engine& engine, const std::string& line, std::atomic<bool>& stop
         std::fflush(stdout);
         return;
     }
-    // A STOP already sitting in the pipe ahead of this GEN (the test script writes the whole session at
-    // once) must not cancel it. A STOP that arrives while tokens are being produced still will.
-    stop.store(false, std::memory_order_relaxed);
+    gate.ignore_buffered_stop();
     try {
         const GenerateResult gr = engine.generate(
-            ids, max_new, sp, stop,
+            ids, max_new, sp, *gate.stop,
             [](int32_t id) {
                 std::printf("T %d\n", (int)id);
                 std::fflush(stdout);
@@ -175,6 +401,11 @@ int run(int argc, char** argv) {
     int chunk = 16;
     int last_k = 0;
     bool serve_mode = false, inspect = false, allow_nonstandard = false, greedy = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--serve") serve_mode = true;
+    bool pack = false;
+    int64_t pack_rows = 0, pack_cols = 0;
+    std::string pack_type, pack_in, pack_out;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -194,6 +425,14 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-eval") eval_path = next();
         else if (a == "--minimax-dump-logits") dump_path = next();
         else if (a == "--minimax-last-k") last_k = std::atoi(next().c_str());
+        else if (a == "--minimax-pack-quant" || a == "--minimax-pack-iq2xs") {
+            pack = true;
+            pack_type = a == "--minimax-pack-iq2xs" ? "iq2_xs" : next();
+            pack_rows = std::atoll(next().c_str());
+            pack_cols = std::atoll(next().c_str());
+            pack_in = next();
+            pack_out = next();
+        }
         else if (a == "--prefill" || a == "--chunk") chunk = parse_chunk(next());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--pool-workers") pool_workers = std::atoi(next().c_str());
@@ -203,7 +442,11 @@ int run(int argc, char** argv) {
                  a == "--hybrid-rows" || a == "--draft-vocab" || a == "--bench-pp" || a == "--bench-tg" ||
                  a == "--emb" || a == "--dump-full-logits")
             (void)next();
-        else if (a == "--no-warmup" || a == "--no-token-graph" || a == "--no-graph" || a == "--vision" ||
+        else if (a == "--vision") {
+            // Bare `--vision` and `--vision off|on|gpu|cpu` are both accepted. The value is not used.
+            if (i + 1 < argc && !starts_with(argv[i + 1], "--")) ++i;
+        }
+        else if (a == "--no-warmup" || a == "--no-token-graph" || a == "--no-graph" ||
                  a == "--batch-mtp" || a == "--no-fit-max-tokens")
             continue;
         else if (a == "--greedy") greedy = true;
@@ -212,11 +455,14 @@ int run(int argc, char** argv) {
             std::fprintf(stderr, "strata-minimax: ignoring %s%s%s (not an option of this engine)\n", a.c_str(),
                          val ? " " : "", val ? argv[i + 1] : "");
             if (val) ++i;
+        } else if (serve_mode) {
+            std::fprintf(stderr, "strata-minimax: ignoring '%s' (not an option of this engine)\n", a.c_str());
         } else {
             usage();
             return 2;
         }
     }
+    if (pack) return pack_quant(pack_type, pack_rows, pack_cols, pack_in, pack_out);
     if (model.empty()) {
         std::fprintf(stderr, "strata-minimax: --model is required\n");
         return 2;
@@ -257,9 +503,12 @@ int run(int argc, char** argv) {
         return 0;
     }
 
+    // An unasked context stays at most 32k. --max-context is what raises it, still clamped to the model.
+    constexpr int64_t kUnaskedContext = 32768;
     int64_t ctx = meta.config.context;
     if (ctx_asked > 0) ctx = (std::min)(ctx, ctx_asked);
-    if (ctx < 1) ctx = 32768;
+    else ctx = (std::min)(ctx, kUnaskedContext);
+    if (ctx < 1) ctx = kUnaskedContext;
 
     EngineOptions opt;
     opt.max_context = ctx;
@@ -306,29 +555,71 @@ int run(int argc, char** argv) {
 
     LineQueue lines;
     std::atomic<bool> stop{false};
+    std::atomic<bool> shutdown{false};
+    std::atomic<bool> reader_done{false};
+    std::atomic<int> sweep{0};
+    std::mutex sweep_mu;
+    std::condition_variable sweep_cv;
+    GenGate gate{&stop, &sweep, &reader_done, &sweep_mu, &sweep_cv};
     std::thread reader([&] {
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
-            if (line == "STOP") {
-                stop.store(true, std::memory_order_relaxed);
+        StdinBuf in;
+        auto take_ready = [&] {
+            if (sweep.load(std::memory_order_relaxed) != 1) return;
+            slurp_ready(in);
+            std::string got;
+            while (take_line(in, got)) {
+                if (got.empty()) continue;
+                if (got == "STOP") stop.store(true, std::memory_order_relaxed);
+                else lines.push(std::move(got));
+            }
+            {
+                std::lock_guard<std::mutex> lk(sweep_mu);
+                sweep.store(2, std::memory_order_relaxed);
+            }
+            sweep_cv.notify_all();
+        };
+        while (!shutdown.load(std::memory_order_relaxed)) {
+            take_ready();
+            if (!wait_input(in, shutdown, sweep)) {
+                take_ready();
+                if (shutdown.load(std::memory_order_relaxed)) break;
+                if (sweep.load(std::memory_order_relaxed) == 1) continue;
+                if (in.eof) break;
                 continue;
             }
-            lines.push(std::move(line));
+            std::string got;
+            while (take_line(in, got)) {
+                if (got.empty()) continue;
+                if (got == "STOP") stop.store(true, std::memory_order_relaxed);
+                else lines.push(std::move(got));
+            }
+        }
+        if (!in.pending.empty()) {
+            std::string got = std::move(in.pending);
+            if (!got.empty() && got.back() == '\r') got.pop_back();
+            if (!got.empty()) {
+                if (got == "STOP") stop.store(true, std::memory_order_relaxed);
+                else lines.push(std::move(got));
+            }
         }
         {
             std::lock_guard<std::mutex> lk(lines.mu);
             lines.eof = true;
         }
         lines.cv.notify_one();
+        {
+            std::lock_guard<std::mutex> lk(sweep_mu);
+            reader_done.store(true, std::memory_order_relaxed);
+            if (sweep.load(std::memory_order_relaxed) == 1) sweep.store(2, std::memory_order_relaxed);
+        }
+        sweep_cv.notify_all();
     });
 
     std::string line;
     while (lines.pop(line)) {
         if (line == "QUIT") break;
         if (starts_with(line, "GEN ")) {
-            handle_gen(*engine, line, stop, greedy);
+            handle_gen(*engine, line, gate, greedy);
             continue;
         }
         if (starts_with(line, "GENI ") || starts_with(line, "GENI")) {
@@ -345,7 +636,8 @@ int run(int argc, char** argv) {
         std::printf("ERR minimax engine: '%s' is not implemented\n", line.c_str());
         std::fflush(stdout);
     }
-    reader.detach();
+    shutdown.store(true, std::memory_order_relaxed);
+    reader.join();
     delete engine;
     return 0;
 }

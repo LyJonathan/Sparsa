@@ -796,12 +796,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # MiniMax-M3.1-Flash (GGUF architecture minimax-m3): src/minimax, a library that `strata` switches to at the top
   # of its main, and strata-minimax wraps on its own.  P2b is one GPU plus ggml-cpu for routed experts (swigluoai,
-  # not the Qwen SiLU pool).  Excluded on gfx906: the dense GEMV is a 32-lane kernel.  main() guards the switch with
-  # STRATA_HAVE_MINIMAX, so a gfx906 build links and runs the Qwen families, and `strata --families` says so.
-  if(NOT STRATA_HIP_GFX906)
-  if(NOT STRATA_NATIVE_EXPERTS)
-    message(FATAL_ERROR "MiniMax engine requires STRATA_NATIVE_EXPERTS (ggml-cpu expert dots)")
-  endif()
+  # not the Qwen SiLU pool).  Excluded on gfx906: the dense GEMV is a 32-lane kernel.  Also skipped when
+  # STRATA_NATIVE_EXPERTS is OFF, so a Qwen-only configuration still configures.  main() guards the switch with
+  # STRATA_HAVE_MINIMAX, so those builds link and run the Qwen families, and `strata --families` says so.
+  if(NOT STRATA_HIP_GFX906 AND STRATA_NATIVE_EXPERTS)
   add_library(strata_minimax STATIC
     src/minimax/config.cpp
     src/minimax/gguf.cpp

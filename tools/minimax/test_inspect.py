@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 
 sys.path.insert(0, str(HERE))
-from make_synthetic_gguf import build  # noqa: E402
+from make_synthetic_gguf import GEOMETRY, build  # noqa: E402
 
 
 def _exe():
@@ -34,9 +35,9 @@ EXE = _exe()
 pytestmark = pytest.mark.skipif(EXE is None, reason='strata-minimax is not built (run tools/minimax/build_windows.ps1)')
 
 
-def run(args, stdin=None):
+def run(args, stdin=None, timeout=120):
     return subprocess.run([EXE, *args], input=stdin, capture_output=True, text=True, encoding='utf-8',
-                          errors='replace', timeout=120)
+                          errors='replace', timeout=timeout)
 
 
 def test_inspect_synthetic(tmp_path):
@@ -105,3 +106,75 @@ def test_serve_handshake_and_refusal(tmp_path):
     assert 'forward pass not implemented' not in p.stdout
     # Unknown serve flags are skipped, not fatal.
     assert 'ignoring --vram-reserve-mib 700' in p.stderr
+
+
+def test_vision_value_and_leftover_token_are_not_fatal(tmp_path):
+    gguf = tmp_path / 'synthetic.gguf'
+    build(gguf)
+    p = run(['--model', str(gguf), '--minimax-inspect', '--vision', 'off'])
+    assert p.returncode == 0, p.stderr
+    served = run(['--model', str(gguf), '--serve', '--minimax-allow-nonstandard', '--vision', 'off',
+                  '--max-context', '128', '--minimax-dense-layers-gpu', '0', 'not-a-flag'],
+                 stdin='QUIT\n')
+    assert served.returncode == 0, served.stderr
+    assert 'READY 128 stop' in served.stdout
+    assert "ignoring 'not-a-flag'" in served.stderr
+
+
+def test_unasked_context_caps_at_32k_and_max_context_raises_it(tmp_path):
+    gguf = tmp_path / 'wide.gguf'
+    g = dict(GEOMETRY)
+    g['ctx'] = 100000
+    build(gguf, geometry=g)
+    base = ['--model', str(gguf), '--serve', '--minimax-allow-nonstandard', '--minimax-dense-layers-gpu', '0']
+    capped = run(base, stdin='QUIT\n')
+    assert capped.returncode == 0, capped.stderr
+    assert 'READY 32768 stop' in capped.stdout
+    raised = run(base + ['--max-context', '40000'], stdin='QUIT\n')
+    assert raised.returncode == 0, raised.stderr
+    assert 'READY 40000 stop' in raised.stdout
+
+
+def test_kv_alloc_failure_names_the_byte_count(tmp_path):
+    gguf = tmp_path / 'huge.gguf'
+    g = dict(GEOMETRY)
+    # GEOMETRY: 2 layers, 2 kv heads, head 32, indexer 32. Host fp16 KV is 640 bytes per token.
+    g['ctx'] = 300_000_000
+    build(gguf, geometry=g)
+    bytes_needed = 640 * g['ctx']
+    p = run(['--model', str(gguf), '--serve', '--minimax-allow-nonstandard',
+             '--minimax-dense-layers-gpu', '0', '--max-context', str(g['ctx'])],
+            stdin='QUIT\n', timeout=30)
+    assert p.returncode == 1, p.stdout
+    assert str(bytes_needed) in p.stderr
+    assert 'bytes are required' in p.stderr
+    assert 'READY' not in p.stdout
+
+
+def test_quit_joins_the_reader_while_stdin_stays_open(tmp_path):
+    gguf = tmp_path / 'synthetic.gguf'
+    build(gguf)
+    proc = subprocess.Popen(
+        [EXE, '--model', str(gguf), '--serve', '--minimax-allow-nonstandard',
+         '--max-context', '128', '--minimax-dense-layers-gpu', '0'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace')
+    out = []
+
+    def drain():
+        out.append(proc.stdout.read())
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    proc.stdin.write('QUIT\n')
+    proc.stdin.flush()
+    try:
+        rc = proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        thread.join(timeout=5)
+        raise AssertionError('QUIT did not exit while stdin was still open')
+    proc.stdin.close()
+    thread.join(timeout=5)
+    assert rc == 0
+    assert 'READY 128 stop' in ''.join(out)

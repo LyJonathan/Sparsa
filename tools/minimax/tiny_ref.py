@@ -53,8 +53,6 @@ def _f32(reader, name, tensors):
         return np.ascontiguousarray(t.data, dtype=np.float32)
     if kind == 'F16':
         return np.ascontiguousarray(t.data.astype(np.float32))
-    if kind == 'BF16':
-        raise SystemExit(name + ': BF16 is not decoded by tiny_ref')
     import gguf as gguf_mod
     return np.ascontiguousarray(gguf_mod.quants.dequantize(t.data, t.tensor_type), dtype=np.float32)
 

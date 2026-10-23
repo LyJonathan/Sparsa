@@ -1,19 +1,26 @@
 """Build a tiny synthetic `minimax-m3` GGUF.
 
 The default file is the P2a loader fixture: two layers, every real tensor name, all zeros. It is not a model
-to run. `--runnable` writes a 4-layer F32 model (dense MLP on layers 0-2, one MoE layer, indexer block 8)
-with glorot weights so the forward pass can be checked against tools/minimax/tiny_ref.py. `--quant-experts q8_0`
-quantizes the routed `*_exps.weight` tensors; the reference then dequantizes those stored values.
+to run. `--runnable` writes a 4-layer model (dense MLP on layers 0-2, one MoE layer, indexer block 8)
+with glorot weights so the forward pass can be checked against tools/minimax/tiny_ref.py.
+
+`--dense-type` stores the dense matrices (not norms or routed experts) as f16, bf16, q8_0, q6_k, or q4_k.
+A row whose length is not a multiple of the block stays f32. `--quant-experts q8_0` or `iq2_xs` quantizes
+the routed `*_exps.weight` tensors. IQ2_XS uses ggml's quantizer with a uniform importance row of ones
+(strata-minimax --minimax-pack-iq2xs); the reference then dequantizes those stored values.
 
     python tools/minimax/make_synthetic_gguf.py out.gguf [--drop NAME] [--bad-shape]
-    python tools/minimax/make_synthetic_gguf.py runnable.gguf --runnable [--quant-experts q8_0]
+    python tools/minimax/make_synthetic_gguf.py runnable.gguf --runnable [--dense-type q4_k] [--quant-experts iq2_xs]
 
 Requires gguf-py from the local llama.cpp copy (see llama_baseline()).
 """
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -104,7 +111,73 @@ def _glorot(name, shape, rng):
     return rng.normal(0.0, 1.0 / np.sqrt(fan), size=shape).astype(np.float32)
 
 
-def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None):
+# Names match GGMLQuantizationType. IQ2_XS is not implemented in gguf-py; the engine packs it.
+_QUANT = {
+    'f16': 'F16',
+    'bf16': 'BF16',
+    'q8_0': 'Q8_0',
+    'q6_k': 'Q6_K',
+    'q4_k': 'Q4_K',
+    'iq2_xs': 'IQ2_XS',
+}
+
+
+def _minimax_exe():
+    env = os.environ.get('STRATA_MINIMAX_EXE')
+    candidates = [env, str(ROOT / 'build' / 'strata-minimax.exe'), str(ROOT / 'build' / 'strata-minimax')]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return str(c)
+    return None
+
+
+def _is_dense_matrix(name):
+    if name.endswith('norm.weight') or name.endswith('.bias'):
+        return False
+    if name.endswith('_exps.weight'):
+        return False
+    return name.endswith('.weight')
+
+
+def _pack_ggml(arr, kind, gguf_mod, exe):
+    # Q4_K and Q6_K have no quantize_blocks in this gguf-py. IQ2_XS has none at all. ggml writes both.
+    if exe is None:
+        raise SystemExit(f'{kind} needs strata-minimax (tools/minimax/build_windows.ps1) for ggml quantize')
+    flat = np.ascontiguousarray(arr, dtype=np.float32).reshape(-1, arr.shape[-1])
+    rows, cols = flat.shape
+    qtype = getattr(gguf_mod.GGMLQuantizationType, _QUANT[kind])
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / 'w.f32'
+        dst = Path(td) / 'w.bin'
+        src.write_bytes(flat.tobytes())
+        proc = subprocess.run(
+            [exe, '--minimax-pack-quant', kind, str(rows), str(cols), str(src), str(dst)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if proc.returncode != 0:
+            raise SystemExit(proc.stderr.strip() or f'{kind} pack failed')
+        raw = np.fromfile(dst, dtype=np.uint8)
+    shape = gguf_mod.quants.quant_shape_to_byte_shape(arr.shape, qtype)
+    if raw.size != int(np.prod(shape)):
+        raise SystemExit(f'{kind} pack wrote {raw.size} bytes, expected {int(np.prod(shape))}')
+    return np.ascontiguousarray(raw.reshape(shape))
+
+
+def _quantize(arr, kind, gguf_mod, exe):
+    qtype = getattr(gguf_mod.GGMLQuantizationType, _QUANT[kind])
+    block = gguf_mod.GGML_QUANT_SIZES[qtype][0]
+    if int(arr.shape[-1]) % int(block) != 0:
+        return None, None
+    if kind in ('q4_k', 'q6_k', 'iq2_xs'):
+        return _pack_ggml(arr, kind, gguf_mod, exe), qtype
+    raw = gguf_mod.quants.quantize(np.ascontiguousarray(arr, dtype=np.float32), qtype)
+    raw = np.ascontiguousarray(raw)
+    if kind == 'f16':
+        return raw, None
+    return raw, qtype
+
+
+def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None,
+          dense_type=None, pack_exe=None):
     g = {**GEOMETRY, **(geometry or {})}
     gguf = llama_baseline(gguf_py)
     w = gguf.GGUFWriter(str(path), 'minimax-m3')
@@ -139,6 +212,12 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weig
         # Authoritative: the norm tensors below already contain +1. The engine must not add it again.
         w.add_bool('minimax-m3.norm.add1', False)
 
+    if dense_type not in (None, 'f32', 'f16', 'bf16', 'q8_0', 'q6_k', 'q4_k'):
+        raise SystemExit('dense_type must be f16, bf16, q8_0, q6_k, or q4_k')
+    if quant_experts not in (None, 'q8_0', 'iq2_xs'):
+        raise SystemExit('quant_experts must be q8_0 or iq2_xs')
+    exe = pack_exe or _minimax_exe()
+
     for name, shape, dtype in _tensor_list(g):
         if name == drop:
             continue
@@ -148,11 +227,20 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weig
             arr = _glorot(name, shape, rng)
         else:
             arr = np.zeros(shape, dtype=dtype)
-        if quant_experts == 'q8_0' and name.endswith('_exps.weight'):
-            raw = gguf.quants.quantize(np.ascontiguousarray(arr, dtype=np.float32), gguf.GGMLQuantizationType.Q8_0)
-            w.add_tensor(name, raw, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
-        else:
+        kind = None
+        if quant_experts and name.endswith('_exps.weight'):
+            kind = quant_experts
+        elif dense_type and dense_type != 'f32' and _is_dense_matrix(name):
+            kind = dense_type
+        raw, raw_dtype = (None, None)
+        if kind:
+            raw, raw_dtype = _quantize(np.ascontiguousarray(arr, dtype=np.float32), kind, gguf, exe)
+        if raw is None:
             w.add_tensor(name, arr)
+        elif raw_dtype is None:
+            w.add_tensor(name, raw)
+        else:
+            w.add_tensor(name, raw, raw_dtype=raw_dtype)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -165,14 +253,18 @@ def main(argv=None):
     ap.add_argument('out', type=Path)
     ap.add_argument('--drop', help='leave this tensor out (a malformed-file test)')
     ap.add_argument('--bad-shape', action='store_true', help='write blk.1.ffn_gate_exps.weight one element too wide')
-    ap.add_argument('--runnable', action='store_true', help='4-layer F32 model with glorot weights (RUNNABLE geometry)')
-    ap.add_argument('--quant-experts', choices=('q8_0',), help='quantize routed *_exps.weight (with --runnable)')
+    ap.add_argument('--runnable', action='store_true', help='4-layer model with glorot weights (RUNNABLE geometry)')
+    ap.add_argument('--dense-type', choices=('f32', 'f16', 'bf16', 'q8_0', 'q6_k', 'q4_k'),
+                    help='store dense matrices as this type (norms and routed experts stay put)')
+    ap.add_argument('--quant-experts', choices=('q8_0', 'iq2_xs'),
+                    help='quantize routed *_exps.weight (iq2_xs uses a uniform imatrix)')
     ap.add_argument('--gguf-py', type=Path, help='path to llama.cpp/gguf-py')
     a = ap.parse_args(argv)
     build(a.out, drop=a.drop, bad_shape=a.bad_shape, gguf_py=a.gguf_py,
           geometry=RUNNABLE if a.runnable else None,
           weights='glorot' if a.runnable else None,
-          quant_experts=a.quant_experts)
+          quant_experts=a.quant_experts,
+          dense_type=a.dense_type)
     print(a.out)
     return 0
 
