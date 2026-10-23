@@ -4168,7 +4168,90 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 
+// ---------------------------------------------------------------- MiniMax P3: grouped decode of the routed top-k
+// One selected expert per z block, one output row per warp, the whole activation shared.  The dot is the same
+// `row_dot` the model's own experts use, so an IQ2_XS / Q8_0 weight means exactly what it means elsewhere.
+__device__ __forceinline__ float minimax_swigluoai(float gate, float up, float alpha, float limit) {
+    if (gate > limit) gate = limit;
+    if (up > limit) up = limit;
+    if (up < -limit) up = -limit;
+    return (up + 1.f) * gate * (1.f / (1.f + __expf(-alpha * gate)));
+}
+
+template<int TY>
+__global__ void minimax_gu_kernel(const uint8_t* const* gate, const uint8_t* const* up,
+                                  const block_q8_1* __restrict__ x, float* __restrict__ h, int n_embd, int n_ff,
+                                  int nb, size_t gu_row, float alpha, float limit) {
+    const int e = (int)blockIdx.z;
+    const int row = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (row >= n_ff) return;
+    const int lane = (int)threadIdx.x;
+    const uint8_t* gr = gate[e] + (size_t)row * gu_row;
+    const uint8_t* ur = up[e] + (size_t)row * gu_row;
+    const float g = row_dot<TY>(gr, x, nb, lane);
+    const float u = row_dot<TY>(ur, x, nb, lane);
+    if (lane == 0) h[(size_t)e * n_ff + row] = minimax_swigluoai(g, u, alpha, limit);
+}
+
+template<int TY>
+__global__ void minimax_down_kernel(const uint8_t* const* down, const block_q8_1* __restrict__ hq,
+                                    float* __restrict__ out, int n_embd, int n_ff, int nb, size_t d_row) {
+    const int e = (int)blockIdx.z;
+    const int row = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (row >= n_embd) return;
+    const int lane = (int)threadIdx.x;
+    const uint8_t* dr = down[e] + (size_t)row * d_row;
+    const block_q8_1* x = hq + (size_t)e * (size_t)(n_ff / 32);
+    const float s = row_dot<TY>(dr, x, nb, lane);
+    if (lane == 0) out[(size_t)e * n_embd + row] = s;
+}
+
+#define STRATA_MINIMAX_LAUNCH_GU(TY)                                                                                 \
+    case TY:                                                                                                         \
+        minimax_gu_kernel<TY><<<grid, block>>>((const uint8_t* const*)gate, (const uint8_t* const*)up,               \
+                                               (const block_q8_1*)x_q8_1, h, n_embd, n_ff, n_embd / Fmt<TY>::qk,     \
+                                               gu_row, alpha, limit);                                                \
+        break;
+#define STRATA_MINIMAX_LAUNCH_DOWN(TY)                                                                               \
+    case TY:                                                                                                         \
+        minimax_down_kernel<TY><<<grid, block>>>((const uint8_t* const*)down, (const block_q8_1*)x_q8_1, out,        \
+                                                  n_embd, n_ff, n_ff / Fmt<TY>::qk, d_row);                          \
+        break;
+
 }  // namespace
+
+void minimax_moe_gu(int type, const void* const* gate, const void* const* up, int n_entries, int n_embd, int n_ff,
+                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream) {
+    if (n_entries <= 0) return;
+    const dim3 block(32, 4);
+    const dim3 grid(1, (unsigned)((n_ff + 3) / 4), (unsigned)n_entries);
+    cudaStream_t s = (cudaStream_t)stream;
+    const int nb = n_embd / 32;
+    switch (type) {
+        STRATA_GU_FMTS(STRATA_MINIMAX_LAUNCH_GU)
+        default: break;
+    }
+    (void)s;
+}
+
+void minimax_moe_down(int type, const void* const* down, int n_entries, int n_embd, int n_ff, size_t d_row,
+                      const void* x_q8_1, float* out, void* stream) {
+    if (n_entries <= 0) return;
+    const dim3 block(32, 4);
+    const dim3 grid(1, (unsigned)((n_embd + 3) / 4), (unsigned)n_entries);
+    const int nb = n_ff / 32;
+    switch (type) {
+        STRATA_GU_FMTS(STRATA_MINIMAX_LAUNCH_DOWN)
+        STRATA_MINIMAX_LAUNCH_DOWN(20)   // IQ4_NL
+        STRATA_MINIMAX_LAUNCH_DOWN(7)    // Q5_1
+        STRATA_MINIMAX_LAUNCH_DOWN(146)  // TQK7
+        default: break;
+    }
+    (void)stream;
+}
+
+#undef STRATA_MINIMAX_LAUNCH_GU
+#undef STRATA_MINIMAX_LAUNCH_DOWN
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }

@@ -41,11 +41,12 @@ fit after the KV cache and a 512 MiB reserve. F32 is uploaded as-is. F16 and BF1
 GPU-safe quantizations stay packed and are dequantized in tiles of 128 rows. A type or shape the dequant kernel
 cannot take stays on the CPU even inside those N layers.
 
-Routed experts always run on the CPU, one ggml type per gate/up pair: `from_float` into the vec_dot type, then
-`vec_dot`, then swigluoai (`clamp(gate, max=7)`, `clamp(up, -7, 7)`, `(up+1)*gate*sigmoid(1.702*gate)`). Expert
-order is gate = w1, up = w3, down = w2, expert-major, not interleaved. The router is fp32 sigmoid; the bias is
-added only while choosing the top experts; the unbiased weights are renormalized and the routed sum is scaled
-by `expert_weights_scale` (2 for M3.1). The shared expert is added unscaled.
+Without the P3 tiers, routed experts always run on the CPU, one ggml type per gate/up pair: `from_float` into the
+vec_dot type, then `vec_dot`, then swigluoai (`clamp(gate, max=7)`, `clamp(up, -7, 7)`,
+`(up+1)*gate*sigmoid(1.702*gate)`). Expert order is gate = w1, up = w3, down = w2, expert-major, not
+interleaved. The router is fp32 sigmoid; the bias is added only while choosing the top experts; the unbiased
+weights are renormalized and the routed sum is scaled by `expert_weights_scale` (2 for M3.1). The shared expert is
+added unscaled.
 
 Norm weights follow the llama.cpp GGUF convention. `minimax-m3.norm.add1` is authoritative when present
 (`true` adds 1 at load). When the key is absent, a mean near 1 is treated as already baked and a mean near 0
@@ -58,6 +59,47 @@ GGUF context. If the KV allocation fails, lower `--max-context`.
 MSA runs on every indexer layer, including the dense prefix: partial RoPE on the first `n_rot` dimensions,
 unscaled fp32 indexer dots, a causal max-pool per block, top-k with the query's own block forced inside the
 k, then fp32 softmax over the selected tokens at `1/sqrt(head_dim)`.
+
+## Expert tiers (P3)
+
+The tiers are opt-in; with none of these flags a run is the P2 path above. `--minimax-tiers` turns them on with
+automatic sizes. `--minimax-profile PATH` also turns them on and fills the static slots from a profile.
+
+| Tier | Holds | Compute |
+|---|---|---|
+| VRAM | per-layer slots from the STRP profile (or compulsory first use) | grouped GPU kernel over the selected experts; IQ2_XS and Q8_0 use `iq_kernels.cu`'s dot products, F32/F16/BF16 have a direct kernel; swigluoai fused into gate/up |
+| pinned RAM | next-hottest experts per layer in one `PinnedArena` | the existing CPU `vec_dot` path |
+| SSD | everything else, read from the GGUF shard | unbuffered `DirectFile` reads (Windows OVERLAPPED + `NO_BUFFERING`, Linux `O_DIRECT`) into 4 KiB-aligned staging, then the CPU path |
+
+Sizing: `--vram-reserve-mib` (default 700) is kept free after dense weights, KV and workspace. VRAM slots per layer
+are then `free / (MoE layers x expert bytes)`. The RAM tier uses available RAM minus a 2 GiB reserve, or
+`--memory-limit-mib`; `--minimax-vram-slots-per-layer` and `--minimax-ram-experts-per-layer` override either count
+(`0` disables that tier).
+
+The profile is the same STRP file as `include/strata/core/expert_cache.hpp`: `STRP`, `1, n_layers, n_expert,
+slots, n_ranked`, the ranked `(layer, expert)` uint16 pairs, then the rank table. MiniMax has one row per **MoE**
+layer (57 x 128 for M3.1), not per model layer.
+
+```powershell
+# record the routing a prompt exercises, then fill from it
+build\strata-minimax.exe --model m.gguf --minimax-eval ids.txt --minimax-dump-logits l.npy `
+  --minimax-profile-save profile.bin --minimax-routing-counts counts.txt
+python tools/minimax/make_profile.py --n-moe-layers 57 --n-expert 128 --out profile.bin counts.txt
+build\strata-minimax.exe --model m.gguf --serve --minimax-profile profile.bin --minimax-stats
+```
+
+`--no-minimax-adaptive` keeps the static fill and turns off both the decayed-count VRAM swaps (every 16 tokens,
+the most-routed missing expert replaces the least-used resident one, copied on a side stream) and the SSD-miss LRU
+in the RAM tier. `--minimax-stats` prints `INFO minimax-stats token=... vram=... ram=... ssd=... ssd_bytes=...` on
+stderr for every token and a `total` line after each `GEN` or eval; `--minimax-stats-per-layer` adds one line per
+layer. None of it goes to stdout, so the serve protocol is unchanged.
+
+Measured on the synthetic runnable model (one MoE layer, 8 experts, top-4; F32 experts), 40 tokens:
+`vram_slots=2 ram_experts=3` gave `vram_hits=47 ram_hits=69 ssd_reads=44 ssd_bytes=8,650,752 swaps=2`, and the
+logits were max-abs `7.2e-7`, KL `3.3e-15`, top-1 `1.000` against the all-CPU path. All-VRAM was max-abs `4.8e-7`;
+all-RAM and all-SSD were byte-identical (`0.0`) to the all-CPU path. IQ2_XS on the GPU tier measured max-abs
+`1.7e-2`, KL `1.1e-5`, top-1 `1.000` against the CPU IQ2_XS path (GPU iq kernels quantize the activation with q8_1,
+the CPU path with ggml's Q8_K). Q8_0 matched to max-abs `3.6e-7`.
 
 ## Serve
 
@@ -95,6 +137,7 @@ python tools/minimax/make_synthetic_gguf.py synthetic.gguf
 python tools/minimax/make_synthetic_gguf.py runnable.gguf --runnable
 python tools/minimax/make_synthetic_gguf.py runnable-q8.gguf --runnable --quant-experts q8_0
 python -m pytest tools/minimax/test_inspect.py tools/minimax/test_forward.py -q
+python -m pytest tools/minimax/test_tiers.py -q
 python -m pytest serve/test_minimax.py -q
 ```
 

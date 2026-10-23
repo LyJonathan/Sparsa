@@ -79,6 +79,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// MiniMax P3: the routed experts' gate/up pass (swigluoai fused) and down pass, grouped over `n_entries`
+/// selected experts.  `gate[e]`, `up[e]` and `down[e]` are raw GGUF rows; the two passes use the same dot
+/// products as `iq_mmvq` (q8_1 activations).  `x_q8_1` holds `n_embd/32` q8_1 blocks, `h` is `n_entries * n_ff`
+/// floats, and the down pass's `x_q8_1` holds `n_entries * n_ff/32` blocks (quantize `h` with
+/// `quantize_q8_1_rows`).  `gu_row`/`d_row` are the ggml row sizes.  Nothing synchronizes.
+void minimax_moe_gu(int type, const void* const* gate, const void* const* up, int n_entries, int n_embd, int n_ff,
+                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream);
+void minimax_moe_down(int type, const void* const* down, int n_entries, int n_embd, int n_ff, size_t d_row,
+                      const void* x_q8_1, float* out, void* stream);
+
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.

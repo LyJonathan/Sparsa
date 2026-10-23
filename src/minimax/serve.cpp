@@ -57,7 +57,17 @@ void usage() {
                  "                       [--minimax-last-k K] [--minimax-dense-layers-gpu N]\n"
                  "       (--minimax-allow-nonstandard serves a reduced test GGUF; --serve otherwise refuses it)\n"
                  "Prefill is token-by-token through the decode path. Dense layers 0..N-1 go to the GPU;\n"
-                 "N=0 keeps every dense matrix on the CPU. Routed experts stay on the CPU.\n");
+                 "N=0 keeps every dense matrix on the CPU. Routed experts stay on the CPU unless the P3 tiers\n"
+                 "are enabled: --minimax-tiers (auto sizes), --minimax-profile PATH, or an explicit slot budget.\n"
+                 "  --minimax-vram-slots-per-layer N  VRAM hot-expert slots per layer (-1 auto, 0 none)\n"
+                 "  --minimax-ram-experts-per-layer N pinned-RAM experts per layer (-1 auto, 0 none)\n"
+                 "  --vram-reserve-mib N              VRAM kept free (default 700)\n"
+                 "  --memory-limit-mib N              pinned-tier budget (default: available RAM - 2 GiB)\n"
+                 "  --minimax-profile PATH            STRP profile for the static fill\n"
+                 "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
+                 "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
+                 "  --minimax-stats [--minimax-stats-per-layer]   tier counters on stderr\n"
+                 "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -321,7 +331,7 @@ struct GenGate {
     }
 };
 
-void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool greedy_default) {
+void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool greedy_default, bool print_stats) {
     std::istringstream in(line);
     std::string cmd;
     in >> cmd;
@@ -384,6 +394,10 @@ void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool gre
         std::printf("DONE %d %d %.3f %.3f %s 0 0 %d\n", gr.generated, gr.prompt, gr.prompt_ms, gr.decode_ms,
                     gr.finish.c_str(), gr.reused);
         std::fflush(stdout);
+        if (print_stats) {
+            const std::string st = engine.stats();
+            if (!st.empty()) std::fprintf(stderr, "INFO minimax-stats total %s\n", st.c_str());
+        }
     } catch (const std::exception& e) {
         std::printf("ERR minimax engine: %s\n", e.what());
         std::fflush(stdout);
@@ -403,6 +417,10 @@ int run(int argc, char** argv) {
     bool serve_mode = false, inspect = false, allow_nonstandard = false, greedy = false;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve_mode = true;
+    bool tiers = false;
+    std::string profile, profile_save, routing_counts;
+    int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0;
+    bool stats = false, stats_per_layer = false, adaptive = true;
     bool pack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
@@ -425,6 +443,18 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-eval") eval_path = next();
         else if (a == "--minimax-dump-logits") dump_path = next();
         else if (a == "--minimax-last-k") last_k = std::atoi(next().c_str());
+        else if (a == "--minimax-tiers") tiers = true;
+        else if (a == "--minimax-profile") { profile = next(); tiers = true; }
+        else if (a == "--minimax-profile-save") profile_save = next();
+        else if (a == "--minimax-routing-counts") routing_counts = next();
+        else if (a == "--minimax-vram-slots-per-layer") { vram_slots = std::atoi(next().c_str()); tiers = true; }
+        else if (a == "--minimax-ram-experts-per-layer") { ram_experts = std::atoi(next().c_str()); tiers = true; }
+        else if (a == "--vram-reserve-mib" || a == "--minimax-vram-reserve-mib")
+            vram_reserve_mib = std::atoi(next().c_str());
+        else if (a == "--memory-limit-mib") memory_limit_mib = std::atoi(next().c_str());
+        else if (a == "--minimax-stats") stats = true;
+        else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
+        else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
         else if (a == "--minimax-pack-quant" || a == "--minimax-pack-iq2xs") {
             pack = true;
             pack_type = a == "--minimax-pack-iq2xs" ? "iq2_xs" : next();
@@ -516,6 +546,17 @@ int run(int argc, char** argv) {
     opt.cpu_threads = pool_workers > 0 ? pool_workers : cpu_threads;
     opt.chunk = chunk;
     opt.allow_nonstandard = allow_nonstandard;
+    opt.tiers = tiers;
+    opt.profile_path = profile;
+    opt.profile_save_path = profile_save;
+    opt.routing_counts_path = routing_counts;
+    opt.vram_slots_per_layer = vram_slots;
+    opt.ram_experts_per_layer = ram_experts;
+    opt.vram_reserve_mib = vram_reserve_mib;
+    opt.memory_limit_mib = memory_limit_mib;
+    opt.adaptive = adaptive;
+    opt.stats = stats;
+    opt.stats_per_layer = stats_per_layer;
 
     Engine* engine = nullptr;
     try {
@@ -535,6 +576,11 @@ int run(int argc, char** argv) {
             write_npy_f32(dump_path, logits.data(), rows, cols);
             std::printf("LOGITS %d %d %s\n", rows, cols, dump_path.c_str());
             std::fflush(stdout);
+            engine->save_profile();
+            if (stats) {
+                const std::string st = engine->stats();
+                if (!st.empty()) std::fprintf(stderr, "INFO minimax-stats total %s\n", st.c_str());
+            }
             delete engine;
             return 0;
         } catch (const std::exception& e) {
@@ -619,7 +665,7 @@ int run(int argc, char** argv) {
     while (lines.pop(line)) {
         if (line == "QUIT") break;
         if (starts_with(line, "GEN ")) {
-            handle_gen(*engine, line, gate, greedy);
+            handle_gen(*engine, line, gate, greedy, stats);
             continue;
         }
         if (starts_with(line, "GENI ") || starts_with(line, "GENI")) {

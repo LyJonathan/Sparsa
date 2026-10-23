@@ -91,7 +91,7 @@ def test_serve_handshake_and_refusal(tmp_path):
     gguf = tmp_path / 'synthetic.gguf'
     build(gguf)
     p = run(['--model', str(gguf), '--serve', '--minimax-allow-nonstandard', '--max-context', '1024',
-             '--vram-reserve-mib', '700', '--batch', '1', '--cpu-threads', '1'],
+             '--not-an-engine-option', '700', '--batch', '1', '--cpu-threads', '1'],
             stdin='GEN 8 temperature=0.7 1,2,3\nGENI 4 embeddings.bin 1,2\nSTOP\nQUIT\n')
     assert p.returncode == 0, p.stderr
     assert 'INFO engine=minimax-m3' in p.stdout
@@ -105,7 +105,7 @@ def test_serve_handshake_and_refusal(tmp_path):
     assert 'ERR minimax engine: GENI is not implemented (no vision encoder)' in p.stdout
     assert 'forward pass not implemented' not in p.stdout
     # Unknown serve flags are skipped, not fatal.
-    assert 'ignoring --vram-reserve-mib 700' in p.stderr
+    assert 'ignoring --not-an-engine-option 700' in p.stderr
 
 
 def test_vision_value_and_leftover_token_are_not_fatal(tmp_path):

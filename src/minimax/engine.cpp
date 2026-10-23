@@ -27,9 +27,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -45,7 +47,10 @@
 #include "ggml.h"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/pinned.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/platform/direct_file.hpp"
 
 namespace strata::minimax {
 namespace {
@@ -54,6 +59,7 @@ constexpr int kF32 = 0;
 constexpr int kF16 = 1;
 constexpr int kBF16 = 30;
 constexpr int kTile = 128;
+constexpr int32_t kNotResident = -1;
 
 struct DevPtr {
     void* p = nullptr;
@@ -80,6 +86,8 @@ struct Tensor {
     const uint8_t* host = nullptr;
     size_t bytes = 0;
     size_t row_bytes = 0;
+    size_t shard = 0;
+    uint64_t file_offset = 0;   ///< byte offset in its GGUF shard, for the SSD tier's unbuffered reads
     DevPtr dev;
     bool dev_f32 = false;
     bool gpu = false;
@@ -98,6 +106,22 @@ struct Layer {
     Tensor router;
     Tensor egate, eup, edown;
     Tensor iq, ik;
+
+    // P3: bytes of one expert's three role slices, in [gate, up, down] order, and the per-layer tiers.
+    size_t expert_gu = 0;           // one gate matrix (up is the same)
+    size_t expert_down = 0;
+    size_t expert_bytes = 0;
+    struct VramSlot {
+        DevPtr mem;
+        int32_t expert = -1;
+    };
+    std::vector<VramSlot> vram;
+    std::vector<int32_t> vram_of;   // n_expert -> slot or -1
+    uint64_t ram_off = 0;           // byte offset of slot 0 in the pinned arena
+    int ram_n = 0;
+    std::vector<int32_t> ram_of;
+    std::vector<int32_t> ram_expert_of;   // slot -> expert
+    std::vector<uint64_t> ram_tick;
 };
 
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
@@ -313,6 +337,123 @@ bool finite_row(const float* x, int n) {
     return true;
 }
 
+bool raw_expert_type(int t) { return t == kF32 || t == kF16 || t == kBF16; }
+bool iq_expert_type(int t) { return t == 8 || strata::kernels::iq_supported(t); }
+
+// Available physical memory, for the automatic pinned-tier budget.
+size_t host_available_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof(m);
+    if (GlobalMemoryStatusEx(&m)) return (size_t)m.ullAvailPhys;
+    return 0;
+#else
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    size_t v = 0;
+    std::string unit;
+    while (f >> key >> v >> unit) {
+        if (key == "MemAvailable:") return v * 1024;
+    }
+    return 0;
+#endif
+}
+
+// ---- STRP, byte for byte the format tools/make_profile.py and src/core/expert_cache.cpp read.  MiniMax has one
+// profile row per MoE layer (57 x 128 for M3.1), not per model layer: dense layers have no routed experts.
+bool read_strp(const std::string& path, int64_t n_moe, int64_t n_expert,
+               std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        err = "minimax profile: cannot open " + path;
+        return false;
+    }
+    char magic[4] = {0, 0, 0, 0};
+    uint32_t hdr[5] = {0, 0, 0, 0, 0};
+    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5) {
+        std::fclose(f);
+        err = "minimax profile: " + path + " is too short";
+        return false;
+    }
+    if (std::memcmp(magic, "STRP", 4) != 0) {
+        std::fclose(f);
+        err = "minimax profile: " + path + " does not start with STRP";
+        return false;
+    }
+    if (hdr[0] != 1 || (int64_t)hdr[1] != n_moe || (int64_t)hdr[2] != n_expert) {
+        std::fclose(f);
+        err = "minimax profile: " + path + " is version " + std::to_string(hdr[0]) + ", " +
+              std::to_string(hdr[1]) + "x" + std::to_string(hdr[2]) + "; this model needs 1, " +
+              std::to_string(n_moe) + "x" + std::to_string(n_expert) + " (MoE layers only)";
+        return false;
+    }
+    const uint32_t n = hdr[4];
+    if (n > hdr[3] || n > (uint32_t)(n_moe * n_expert)) {
+        std::fclose(f);
+        err = "minimax profile: the header's ranked count is inconsistent";
+        return false;
+    }
+    std::vector<uint16_t> raw((size_t)n * 2);
+    if (n && std::fread(raw.data(), 2, raw.size(), f) != raw.size()) {
+        std::fclose(f);
+        err = "minimax profile: the ranked list is truncated";
+        return false;
+    }
+    std::fclose(f);
+    ranked.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const int32_t l = raw[(size_t)i * 2], e = raw[(size_t)i * 2 + 1];
+        if (l < 0 || l >= n_moe || e < 0 || e >= n_expert) {
+            err = "minimax profile: a ranked pair is out of range";
+            ranked.clear();
+            return false;
+        }
+        ranked[(size_t)i] = {l, e};
+    }
+    return true;
+}
+
+bool write_strp(const std::string& path, int64_t n_moe, int64_t n_expert,
+                const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    if (n_moe <= 0 || n_expert <= 0 || n_moe > 65535 || n_expert > 65535) {
+        err = "minimax profile: the model's layout does not fit STRP";
+        return false;
+    }
+    std::vector<int32_t> table((size_t)(n_moe * n_expert), -1);
+    std::vector<uint16_t> pairs;
+    pairs.reserve(ranked.size() * 2);
+    for (size_t r = 0; r < ranked.size(); ++r) {
+        const auto [l, e] = ranked[r];
+        if (l < 0 || l >= n_moe || e < 0 || e >= n_expert) {
+            err = "minimax profile: a ranked pair is out of range";
+            return false;
+        }
+        table[(size_t)(l * n_expert + e)] = (int32_t)r;
+        pairs.push_back((uint16_t)l);
+        pairs.push_back((uint16_t)e);
+    }
+    const uint32_t hdr[5] = {1u, (uint32_t)n_moe, (uint32_t)n_expert, (uint32_t)ranked.size(),
+                             (uint32_t)ranked.size()};
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        err = "minimax profile: cannot create " + tmp;
+        return false;
+    }
+    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
+              (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
+              std::fwrite(table.data(), 4, table.size(), f) == table.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        err = "minimax profile: cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -346,6 +487,41 @@ struct Engine::Impl {
     std::mt19937_64 rng{0};
     Pool pool;
 
+    // ---- P3 expert tiers
+    bool tiers_on = false;
+    bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
+    int vram_per_layer = 0;
+    int ram_per_layer = 0;
+    int moe_layers = 0;
+    size_t max_expert_bytes = 0;
+    std::vector<std::pair<int32_t, int32_t>> profile;   // (moe layer, expert), hottest first
+    std::unique_ptr<strata::core::PinnedArena> ram_arena;
+    uint64_t ram_bytes = 0;
+    std::vector<std::unique_ptr<strata::platform::DirectFile>> ssd_files;
+    uint8_t* ssd_stage = nullptr;
+    size_t ssd_stage_bytes = 0;
+    void* ssd_tmp = nullptr;
+    size_t ssd_tmp_bytes = 0;
+    void* side_stream = nullptr;
+
+    // device scratch for the grouped routed-expert pass
+    DevPtr d_ex_ptr;                // top * 3 pointers
+    DevPtr d_ex_xq, d_ex_hq, d_ex_h, d_ex_out;
+
+    std::vector<float> usage;       // decayed routing counts, [n_layers * n_expert]
+    std::vector<double> route_counts;   // undecayed counts for --minimax-profile-save
+    uint64_t rebalance_tick = 0;
+    uint64_t lru_tick = 0;
+    uint64_t swaps = 0;
+
+    struct TokenStats {
+        int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0;
+    };
+    TokenStats tok_stats;
+    TokenStats total_stats;
+    int64_t tokens_seen = 0;
+    int64_t profile_saves = 0;
+
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
         const std::string bad = check_structure(cfg);
@@ -375,15 +551,22 @@ struct Engine::Impl {
         if (threads > 24) threads = 24;
         pool.start(threads);
 
-        // N=0 is the all-CPU path: no device, no CUDA runtime calls. Automatic placement (-1) and any
-        // positive layer count still need a device to size VRAM.
-        const bool cpu_only = opt.dense_layers_gpu == 0;
+        // N=0 is the all-CPU dense path: no device, no CUDA runtime calls. Automatic placement (-1), any
+        // positive layer count, and the P3 expert tiers still need a device to size VRAM.
+        const bool cpu_only = opt.dense_layers_gpu == 0 && !opt.tiers;
         if (!cpu_only) cu::init();
         alloc_cache();
         // The row/col limits are also the CPU gemv guard. Device buffers exist only when a layer can be uploaded.
         size_workspace();
         if (!cpu_only) alloc_workspace();
         place_weights();
+        if (opt.tiers) {
+            init_tiers();
+        } else if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) {
+            for (const Layer& L : layers)
+                if (L.moe) ++moe_layers;
+            route_counts.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert, 0.0);
+        }
 
         const int64_t qlen = cfg.n_head * cfg.head_dim;
         const int64_t klen = cfg.n_head_kv * cfg.head_dim;
@@ -404,6 +587,13 @@ struct Engine::Impl {
         last_logits.assign((size_t)cfg.n_vocab, 0.f);
     }
 
+    ~Impl() {
+        write_own_profile();
+        if (side_stream) cu::stream_destroy(side_stream);
+        if (ssd_stage) strata::platform::DirectFile::free_aligned(ssd_stage);
+        if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
+    }
+
     Tensor must(const std::string& name) {
         size_t shard = 0;
         const TensorInfo* info = model.find(name, &shard);
@@ -416,6 +606,8 @@ struct Engine::Impl {
         t.ne2 = info->shape.size() > 2 ? (int64_t)info->shape[2] : 1;
         if (info->shape.size() > 3) fail(name + " has more than 3 dimensions");
         t.host = model.shard(shard).tensor_data(*info);
+        t.shard = shard;
+        t.file_offset = model.shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
         t.row_bytes = ggml_row_size((ggml_type)t.type, t.ne0);
         if (t.row_bytes == 0 || t.row_bytes * (size_t)t.ne1 * (size_t)t.ne2 != t.bytes)
@@ -528,6 +720,11 @@ struct Engine::Impl {
                     fail(L.edown.name + ": unexpected shape");
                 if (L.egate.type != L.eup.type)
                     fail(b + "gate and up experts have different ggml types");
+                if (L.egate.ne2 > 0) L.expert_gu = L.egate.bytes / (size_t)L.egate.ne2;
+                if (L.eup.ne2 > 0 && L.eup.bytes / (size_t)L.eup.ne2 != L.expert_gu)
+                    fail(b + "gate and up experts have different byte sizes");
+                if (L.edown.ne2 > 0) L.expert_down = L.edown.bytes / (size_t)L.edown.ne2;
+                L.expert_bytes = L.expert_gu * 2 + L.expert_down;
                 if (cfg.n_shared_experts > 0) {
                     L.have_shared = true;
                     L.gate = must(b + "ffn_gate_shexp.weight");
@@ -668,7 +865,7 @@ struct Engine::Impl {
         for (int64_t i = 0; i < cfg.n_layers; ++i) cost[(size_t)i] = layer_cost(layers[(size_t)i]);
         const size_t out_b = gpu_bytes(output);
         const cu::MemInfo mi = cu::mem();
-        const size_t reserve = (size_t)512 << 20;
+        const size_t reserve = (size_t)(opt.vram_reserve_mib > 0 ? opt.vram_reserve_mib : 0) << 20;
         const size_t budget = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
         const bool automatic = opt.dense_layers_gpu < 0;
         int N = automatic ? 0 : opt.dense_layers_gpu;
@@ -685,8 +882,8 @@ struct Engine::Impl {
             if (used > budget) {
                 fail("the first " + std::to_string(N) + " dense layers need " +
                      std::to_string(used / (1024 * 1024)) + " MiB of GPU weight storage but only " +
-                     std::to_string(budget / (1024 * 1024)) +
-                     " MiB is free after KV and a 512 MiB reserve. Lower --minimax-dense-layers-gpu.");
+                     std::to_string(budget / (1024 * 1024)) + " MiB is free after KV and a " +
+                     std::to_string(opt.vram_reserve_mib) + " MiB reserve. Lower --minimax-dense-layers-gpu.");
             }
         }
         dense_gpu = N;
@@ -714,6 +911,507 @@ struct Engine::Impl {
                 output_gpu = true;
             }
         }
+    }
+
+    // ===================================================================================== P3: the expert tiers
+
+    static size_t q8_1_bytes(int64_t n) { return (size_t)(n / 32) * 36; }
+
+    void init_tiers() {
+        for (const Layer& L : layers)
+            if (L.moe) {
+                ++moe_layers;
+                if (L.expert_bytes > max_expert_bytes) max_expert_bytes = L.expert_bytes;
+            }
+        if (moe_layers == 0 || max_expert_bytes == 0) {
+            tiers_on = false;
+            return;
+        }
+        tiers_on = true;
+        const int64_t n_moe = moe_layers;
+        if (!opt.profile_path.empty()) {
+            std::string err;
+            if (!read_strp(opt.profile_path, n_moe, cfg.n_expert, profile, err)) fail(err);
+        }
+
+        // ---- VRAM slots.  Auto sizing is free VRAM after dense weights, KV and workspace, less the reserve.
+        const size_t reserve = (size_t)(opt.vram_reserve_mib > 0 ? opt.vram_reserve_mib : 0) << 20;
+        size_t vram_budget = 0;
+        if (tiers_gpu_possible()) {
+            const cu::MemInfo mi = cu::mem();
+            vram_budget = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
+        }
+        int q = opt.vram_slots_per_layer;
+        if (q < 0) {
+            q = vram_budget / ((size_t)moe_layers * max_expert_bytes);
+            if (q > cfg.n_expert) q = (int)cfg.n_expert;
+        }
+        if (q < 0) q = 0;
+        if (q > cfg.n_expert) q = (int)cfg.n_expert;
+        if (q > 0) {
+            if (!tiers_gpu_possible())
+                fail("--minimax-vram-slots-per-layer needs a CUDA device (dense_layers_gpu=0 still starts CUDA "
+                     "when the expert tiers are on)");
+            size_t need = 0;
+            for (const Layer& L : layers)
+                if (L.moe) need += (size_t)q * L.expert_bytes;
+            if (need > vram_budget) {
+                fail("the VRAM expert tier asked for " + std::to_string(q) + " slots per layer (" +
+                     std::to_string(need / (1024 * 1024)) + " MiB) but only " +
+                     std::to_string(vram_budget / (1024 * 1024)) + " MiB is free after dense/KV/workspace and the " +
+                     std::to_string(opt.vram_reserve_mib) + " MiB reserve. Lower --minimax-vram-slots-per-layer "
+                     "or --vram-reserve-mib.");
+            }
+            for (Layer& L : layers) {
+                if (!L.moe) continue;
+                L.vram.reserve((size_t)q);
+                for (int s = 0; s < q; ++s) {
+                    Layer::VramSlot slot;
+                    slot.mem = DevPtr(cu::alloc(L.expert_bytes));
+                    L.vram.push_back(std::move(slot));
+                }
+            }
+            const int top = (int)cfg.n_expert_used;
+            d_ex_ptr = DevPtr(cu::alloc((size_t)top * 3 * sizeof(void*)));
+            d_ex_xq = DevPtr(cu::alloc(q8_1_bytes(cfg.n_embd)));
+            d_ex_hq = DevPtr(cu::alloc((size_t)top * q8_1_bytes(cfg.n_ff_exp)));
+            d_ex_h = DevPtr(cu::alloc((size_t)top * (size_t)cfg.n_ff_exp * sizeof(float)));
+            d_ex_out = DevPtr(cu::alloc((size_t)top * (size_t)cfg.n_embd * sizeof(float)));
+            side_stream = cu::stream_create();
+        }
+        vram_per_layer = q;
+        tiers_gpu = q > 0;
+        for (Layer& L : layers)
+            if (L.moe) L.vram_of.assign((size_t)cfg.n_expert, kNotResident);
+
+        // ---- pinned RAM tier, auto = available RAM less a 2 GiB reserve, or --memory-limit-mib.
+        size_t ram_budget = 0;
+        if (opt.memory_limit_mib > 0) {
+            ram_budget = (size_t)opt.memory_limit_mib << 20;
+        } else {
+            const size_t avail = host_available_bytes();
+            const size_t keep = (size_t)2048 << 20;
+            ram_budget = avail > keep ? avail - keep : 0;
+        }
+        int r = opt.ram_experts_per_layer;
+        if (r < 0) {
+            r = ram_budget / ((size_t)moe_layers * max_expert_bytes);
+            if (r > cfg.n_expert) r = (int)cfg.n_expert;
+        }
+        if (r < 0) r = 0;
+        if (r > cfg.n_expert) r = (int)cfg.n_expert;
+        ram_per_layer = r;
+        for (Layer& L : layers)
+            if (L.moe) L.ram_of.assign((size_t)cfg.n_expert, kNotResident);
+        if (r > 0) {
+            uint64_t off = 0;
+            for (Layer& L : layers) {
+                if (!L.moe) continue;
+                L.ram_off = off;
+                L.ram_n = r;
+                off += (uint64_t)r * L.expert_bytes;
+            }
+            ram_bytes = off;
+            ram_arena = std::make_unique<strata::core::PinnedArena>(ram_bytes);
+            if (!ram_arena->valid()) {
+                fail("the pinned RAM expert tier could not reserve " + std::to_string(ram_bytes / (1024 * 1024)) +
+                     " MiB (" + ram_arena->note + "). Lower --memory-limit-mib or "
+                     "--minimax-ram-experts-per-layer.");
+            }
+            for (Layer& L : layers) {
+                if (!L.moe) continue;
+                L.ram_of.assign((size_t)cfg.n_expert, kNotResident);
+                L.ram_expert_of.assign((size_t)r, kNotResident);
+                L.ram_tick.assign((size_t)r, 0);
+            }
+        }
+
+        // ---- static fill from the profile: each layer's hottest q go to VRAM, the next r to RAM.
+        if (!profile.empty()) {
+            std::vector<int> rank((size_t)(n_moe * cfg.n_expert), -1);
+            for (size_t i = 0; i < profile.size(); ++i) {
+                const auto [pl, pe] = profile[i];
+                rank[(size_t)(pl * cfg.n_expert + pe)] = (int)i;
+            }
+            for (int64_t li = 0; li < cfg.n_layers; ++li) {
+                Layer& L = layers[(size_t)li];
+                if (!L.moe) continue;
+                const int ml = (int)(li - cfg.leading_dense);
+                std::vector<std::pair<int, int>> order;
+                for (int e = 0; e < (int)cfg.n_expert; ++e) {
+                    const int rr = rank[(size_t)(ml * cfg.n_expert + e)];
+                    if (rr >= 0) order.push_back({rr, e});
+                }
+                std::sort(order.begin(), order.end());
+                int at = 0;
+                for (int s = 0; s < vram_per_layer && at < (int)order.size(); ++s, ++at)
+                    vram_fill(L, s, order[(size_t)at].second);
+                for (int s = 0; s < ram_per_layer && at < (int)order.size(); ++s, ++at)
+                    ram_fill(L, s, order[(size_t)at].second);
+            }
+        }
+
+        // ---- SSD: unbuffered reads straight from the GGUF shards.  DirectFile owns the aligned OVERLAPPED /
+        // O_DIRECT I/O; this keeps the offsets and the aligned superset rule.
+        ssd_files.resize(model.size());
+        for (size_t s = 0; s < model.size(); ++s) {
+            ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
+            std::string err;
+            if (!ssd_files[s]->open(model.shard(s).path(), err))
+                fail("minimax SSD tier: " + err);
+        }
+        // One staging slot per routed entry: several selected experts of one layer may be SSD misses, and their
+        // byte slices have to stay alive together until the combine.
+        ssd_stage_bytes = (size_t)cfg.n_expert_used * max_expert_bytes;
+        ssd_stage = (uint8_t*)strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes);
+        if (!ssd_stage) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned staging buffer");
+        ssd_tmp = strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes + 4096);
+        if (!ssd_tmp) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned read buffer");
+        ssd_tmp_bytes = ssd_stage_bytes + 4096;
+
+        const size_t cells = (size_t)cfg.n_layers * (size_t)cfg.n_expert;
+        if (opt.adaptive) usage.assign(cells, 0.f);
+        if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) route_counts.assign(cells, 0.0);
+    }
+
+    bool tiers_gpu_possible() const { return opt.dense_layers_gpu != 0 || opt.tiers; }
+
+    void vram_fill(Layer& L, int slot, int expert) {
+        if (slot < 0 || slot >= (int)L.vram.size()) fail("VRAM slot out of range");
+        Layer::VramSlot& s = L.vram[(size_t)slot];
+        if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
+        uint8_t* p = (uint8_t*)s.mem.p;
+        cu::copy_h2d(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
+        cu::copy_h2d(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
+        cu::copy_h2d(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        s.expert = expert;
+        L.vram_of[(size_t)expert] = slot;
+    }
+
+    void vram_swap(Layer& L, int slot, int expert) {
+        Layer::VramSlot& s = L.vram[(size_t)slot];
+        uint8_t* p = (uint8_t*)s.mem.p;
+        cu::copy_h2d_async(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu, side_stream);
+        cu::copy_h2d_async(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu, side_stream);
+        cu::copy_h2d_async(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down,
+                           side_stream);
+        if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
+        s.expert = expert;
+        L.vram_of[(size_t)expert] = slot;
+    }
+
+    uint8_t* ram_slot_ptr(Layer& L, int slot) const {
+        return ram_arena->data() + L.ram_off + (uint64_t)slot * L.expert_bytes;
+    }
+
+    void ram_fill(Layer& L, int slot, int expert) {
+        if (!ram_arena || !ram_arena->valid()) fail("RAM tier is not allocated");
+        uint8_t* p = ram_slot_ptr(L, slot);
+        std::memcpy(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
+        std::memcpy(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
+        std::memcpy(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        for (int32_t& v : L.ram_of)
+            if (v == slot) v = kNotResident;
+        L.ram_of[(size_t)expert] = slot;
+        L.ram_expert_of[(size_t)slot] = expert;
+        L.ram_tick[(size_t)slot] = ++lru_tick;
+    }
+
+    // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
+    // in `src`; a later SSD miss for this expert then costs a RAM read instead.
+    void ram_admit(Layer& L, int expert, const uint8_t* src) {
+        if (!opt.adaptive || !ram_arena || L.ram_n <= 0) return;
+        int victim = 0;
+        for (int s = 1; s < L.ram_n; ++s)
+            if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
+        uint8_t* p = ram_slot_ptr(L, victim);
+        std::memcpy(p, src, L.expert_bytes);
+        for (int32_t& v : L.ram_of)
+            if (v == victim) v = kNotResident;
+        L.ram_of[(size_t)expert] = victim;
+        L.ram_expert_of[(size_t)victim] = expert;
+        L.ram_tick[(size_t)victim] = ++lru_tick;
+    }
+
+    void ssd_read_role(const Tensor& t, int64_t expert, uint8_t* dst) {
+        const size_t len = t.bytes / (size_t)t.ne2;
+        const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
+        constexpr uint64_t kAlign = 4096;
+        const uint64_t aoff = off & ~(kAlign - 1);
+        const uint64_t aend = (off + len + kAlign - 1) & ~(kAlign - 1);
+        const size_t alen = (size_t)(aend - aoff);
+        strata::platform::DirectFile& file = *ssd_files[t.shard];
+        std::string err;
+        if (!file.submit(aoff, ssd_tmp, (uint32_t)alen, 1, err)) fail("minimax SSD read: " + err);
+        strata::platform::Completion c{};
+        while (file.wait(&c, 1, -1) == 0) {
+        }
+        if (!c.ok) fail("minimax SSD read: I/O failed at " + std::to_string(off));
+        if ((uint64_t)c.bytes < (off - aoff) + len)
+            fail("minimax SSD read: short read at " + std::to_string(off));
+        std::memcpy(dst, (const uint8_t*)ssd_tmp + (size_t)(off - aoff), len);
+        if (std::getenv("STRATA_MINIMAX_VERIFY_SSD") != nullptr) {
+            const uint8_t* want = t.host + (size_t)expert * len;
+            size_t bad = 0;
+            while (bad < len && dst[bad] == want[bad]) ++bad;
+            if (bad != len)
+                std::fprintf(stderr, "SSD MISMATCH %s expert %lld at byte %zu (file offset %llu, aligned %llu)\n",
+                             t.name.c_str(), (long long)expert, bad, (unsigned long long)off,
+                             (unsigned long long)aoff);
+        }
+    }
+
+    void ssd_read_expert(const Layer& L, int64_t expert, uint8_t* stage) {
+        ssd_read_role(L.egate, expert, stage);
+        ssd_read_role(L.eup, expert, stage + L.expert_gu);
+        ssd_read_role(L.edown, expert, stage + 2 * L.expert_gu);
+        ++tok_stats.ssd;
+        tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
+    }
+
+    void gpu_experts(const Layer& L, const std::vector<int>& exps, const float* in, std::vector<float>& out) {
+        const int k = (int)exps.size();
+        if (k == 0) return;
+        std::vector<const void*> gp((size_t)k), up((size_t)k), dp((size_t)k);
+        for (int i = 0; i < k; ++i) {
+            const int e = exps[(size_t)i];
+            const int slot = L.vram_of[(size_t)e];
+            if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
+            const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+            gp[(size_t)i] = base;
+            up[(size_t)i] = base + L.expert_gu;
+            dp[(size_t)i] = base + 2 * L.expert_gu;
+        }
+        const int top = (int)cfg.n_expert_used;
+        void** ptr = (void**)d_ex_ptr.p;
+        cu::copy_h2d(ptr, gp.data(), (size_t)k * sizeof(void*));
+        cu::copy_h2d(ptr + top, up.data(), (size_t)k * sizeof(void*));
+        cu::copy_h2d(ptr + 2 * top, dp.data(), (size_t)k * sizeof(void*));
+        const int n_embd = (int)cfg.n_embd, n_ff = (int)cfg.n_ff_exp;
+        const int gt = L.egate.type, dt = L.edown.type;
+        const bool iq = iq_expert_type(gt) && iq_expert_type(dt);
+        const bool raw = raw_expert_type(gt) && raw_expert_type(dt);
+        if (iq) {
+            if (cfg.n_embd % 32 != 0 || cfg.n_ff_exp % 32 != 0)
+                fail("the GPU IQ expert path needs rounded 32-wide activations");
+            cu::copy_h2d(d_x.p, in, (size_t)n_embd * sizeof(float));
+            strata::kernels::quantize_q8_1_rows((const float*)d_x.p, 1, n_embd, d_ex_xq.p, nullptr);
+            strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k,
+                                            n_embd, n_ff, L.egate.row_bytes, d_ex_xq.p, (float*)d_ex_h.p, alpha, limit,
+                                            nullptr);
+            strata::kernels::quantize_q8_1_rows((const float*)d_ex_h.p, k, n_ff, d_ex_hq.p, nullptr);
+            strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
+                                              L.edown.row_bytes, d_ex_hq.p, (float*)d_ex_out.p, nullptr);
+            cu::sync();
+        } else if (raw) {
+            if (gt != dt)
+                fail("the GPU F32/F16/BF16 expert path needs the same type for gate/up and down");
+            cu::copy_h2d(d_x.p, in, (size_t)n_embd * sizeof(float));
+            cu::moe_expert_f16(gt, (const void* const*)ptr, (const void* const*)(ptr + top),
+                               (const void* const*)(ptr + 2 * top), k, n_embd, n_ff, L.egate.row_bytes,
+                               L.edown.row_bytes, (const float*)d_x.p, (float*)d_ex_h.p, (float*)d_ex_out.p, alpha,
+                               limit);
+        } else {
+            fail("no GPU expert kernel for gate/up ggml type " + std::to_string(gt) + " and down type " +
+                 std::to_string(dt) + " (supported: F32/F16/BF16 and the IQ/Q8_0 types)");
+        }
+        out.resize((size_t)k * (size_t)n_embd);
+        cu::copy_d2h(out.data(), d_ex_out.p, out.size() * sizeof(float));
+    }
+
+    void moe_tiered(const Layer& L, const float* in, float* yout) {
+        // The router and the combine are the CPU path's, unchanged.  Only where each selected expert's bytes come
+        // from (VRAM / pinned RAM / SSD) and who computes it change.
+        const int nexp = (int)cfg.n_expert;
+        const int top = (int)cfg.n_expert_used;
+        std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp), score((size_t)nexp);
+        gemv(L.router, in, logits_r.data());
+        for (int i = 0; i < nexp; ++i) {
+            prob[(size_t)i] = sigmoid(logits_r[(size_t)i]);
+            score[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
+        }
+        std::vector<int> order(nexp);
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
+            if (score[(size_t)a] != score[(size_t)b]) return score[(size_t)a] > score[(size_t)b];
+            return a < b;
+        });
+        std::vector<float> w((size_t)top);
+        float sum = 0.f;
+        for (int j = 0; j < top; ++j) {
+            w[(size_t)j] = prob[(size_t)order[(size_t)j]];
+            sum += w[(size_t)j];
+        }
+        if (renorm && sum > 0.f)
+            for (float& v : w) v /= sum;
+
+        const int64_t li = (int64_t)(&L - layers.data());
+        const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
+        if (!usage.empty()) {
+            for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
+        }
+        if (!route_counts.empty()) {
+            for (int j = 0; j < top; ++j) route_counts[base_idx + (size_t)order[(size_t)j]] += 1.0;
+        }
+
+        std::vector<int> gpu_e;
+        struct CpuExpert {
+            int e;
+            const uint8_t* gate;
+            const uint8_t* up;
+            const uint8_t* down;
+        };
+        std::vector<CpuExpert> cpu;
+        std::vector<std::pair<int, const uint8_t*>> ssd_admits;
+        gpu_e.reserve((size_t)top);
+        cpu.reserve((size_t)top);
+        int ssd_n = 0;
+        for (int j = 0; j < top; ++j) {
+            const int e = order[(size_t)j];
+            // Compulsory admission when no profile filled the slots: the first distinct experts a layer routes take
+            // the free slots.  A profile-filled tier has no free slot and leaves this a pure lookup.
+            if (!profile.empty() || L.vram_of[(size_t)e] >= 0) {
+                // lookup only
+            } else {
+                for (int s = 0; s < (int)L.vram.size(); ++s) {
+                    if (L.vram[(size_t)s].expert < 0) {
+                        vram_fill(const_cast<Layer&>(L), s, e);
+                        break;
+                    }
+                }
+                if (L.vram_of[(size_t)e] < 0 && L.ram_n > 0 && L.ram_of[(size_t)e] < 0) {
+                    for (int s = 0; s < L.ram_n; ++s)
+                        if (L.ram_expert_of[(size_t)s] < 0) {
+                            ram_fill(const_cast<Layer&>(L), s, e);
+                            break;
+                        }
+                }
+            }
+            const int vs = L.vram_of[(size_t)e];
+            if (vs >= 0) {
+                gpu_e.push_back(e);
+                ++tok_stats.vram;
+                continue;
+            }
+            const int rs = L.ram_of[(size_t)e];
+            if (rs >= 0) {
+                const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
+                cpu.push_back({e, p, p + L.expert_gu, p + 2 * L.expert_gu});
+                ++tok_stats.ram;
+                continue;
+            }
+            uint8_t* stage = ssd_stage + (size_t)ssd_n++ * max_expert_bytes;
+            ssd_read_expert(L, e, stage);
+            cpu.push_back({e, stage, stage + L.expert_gu, stage + 2 * L.expert_gu});
+            // Deferred: admitting (and evicting) now could overwrite a RAM slot another entry of this same
+            // token is still going to read.
+            ssd_admits.push_back({e, stage});
+        }
+
+        std::vector<float> gpu_out;
+        if (!gpu_e.empty()) gpu_experts(L, gpu_e, in, gpu_out);
+
+        std::fill(yout, yout + cfg.n_embd, 0.f);
+        std::vector<float> ye((size_t)cfg.n_embd);
+        std::vector<const CpuExpert*> cpu_of((size_t)cfg.n_expert, nullptr);
+        for (const CpuExpert& c : cpu) cpu_of[(size_t)c.e] = &c;
+        size_t gi = 0;
+        for (int j = 0; j < top; ++j) {
+            const int e = order[(size_t)j];
+            if (L.vram_of[(size_t)e] >= 0) {
+                std::memcpy(ye.data(), gpu_out.data() + gi * (size_t)cfg.n_embd,
+                            (size_t)cfg.n_embd * sizeof(float));
+                ++gi;
+            } else {
+                const CpuExpert* c = cpu_of[(size_t)e];
+                if (!c) fail("internal: routed expert has no source");
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp);
+            }
+            const float WJ = w[(size_t)j];
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
+        }
+        const float s = scale_routed;
+        for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= s;
+        if (L.have_shared) {
+            mlp(L.gate, L.up, L.down, 0, in, ye.data(), (int)L.gate.ne1);
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += ye[(size_t)i];
+        }
+        for (const auto& a : ssd_admits) ram_admit(const_cast<Layer&>(L), a.first, a.second);
+        if (opt.stats_per_layer) {
+            std::fprintf(stderr, "INFO minimax-stats layer=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld\n",
+                         (long long)li, (long long)tok_stats.vram, (long long)tok_stats.ram,
+                         (long long)tok_stats.ssd, (long long)tok_stats.ssd_bytes);
+        }
+    }
+
+    void rebalance() {
+        if (!tiers_gpu || !opt.adaptive || usage.empty()) return;
+        bool any = false;
+        for (int64_t li = 0; li < cfg.n_layers; ++li) {
+            Layer& L = layers[(size_t)li];
+            if (!L.moe || L.vram.empty()) continue;
+            const size_t b = (size_t)li * (size_t)cfg.n_expert;
+            int best = -1, worst = -1;
+            float best_u = -1.f, worst_u = std::numeric_limits<float>::max();
+            for (int e = 0; e < (int)cfg.n_expert; ++e) {
+                if (L.vram_of[(size_t)e] < 0) {
+                    if (usage[b + (size_t)e] > best_u) {
+                        best_u = usage[b + (size_t)e];
+                        best = e;
+                    }
+                } else if (usage[b + (size_t)e] < worst_u) {
+                    worst_u = usage[b + (size_t)e];
+                    worst = e;
+                }
+            }
+            if (best < 0 || worst < 0) continue;
+            if (best_u > worst_u * 1.10f + 0.5f) {
+                vram_swap(L, L.vram_of[(size_t)worst], best);
+                ++swaps;
+                any = true;
+            }
+        }
+        if (any) cu::stream_sync(side_stream);
+    }
+
+    void decay_usage() {
+        if (!opt.adaptive || usage.empty()) return;
+        for (float& v : usage) v *= 0.98f;
+    }
+
+    void write_own_profile() {
+        if (opt.profile_save_path.empty() && opt.routing_counts_path.empty()) return;
+        if (route_counts.empty()) return;
+        const int64_t n_moe = moe_layers;
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        ranked.reserve((size_t)(n_moe * cfg.n_expert));
+        for (int64_t ml = 0; ml < n_moe; ++ml)
+            for (int64_t e = 0; e < cfg.n_expert; ++e) ranked.push_back({(int32_t)ml, (int32_t)e});
+        const int64_t model_l0 = cfg.leading_dense;
+        auto count_of = [&](int32_t ml, int32_t e) {
+            return route_counts[(size_t)((model_l0 + ml) * cfg.n_expert + e)];
+        };
+        std::stable_sort(ranked.begin(), ranked.end(), [&](const auto& a, const auto& b) {
+            const double ca = count_of(a.first, a.second), cb = count_of(b.first, b.second);
+            if (ca != cb) return ca > cb;
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        std::string err;
+        if (!opt.profile_save_path.empty() && !write_strp(opt.profile_save_path, n_moe, cfg.n_expert, ranked, err))
+            std::fprintf(stderr, "strata-minimax: %s\n", err.c_str());
+        if (!opt.routing_counts_path.empty()) {
+            std::FILE* f = std::fopen(opt.routing_counts_path.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "strata-minimax: cannot write %s\n", opt.routing_counts_path.c_str());
+            } else {
+                for (int64_t ml = 0; ml < n_moe; ++ml)
+                    for (int64_t e = 0; e < cfg.n_expert; ++e)
+                        std::fprintf(f, "%lld %lld %.0f\n", (long long)ml, (long long)e, count_of((int32_t)ml, (int32_t)e));
+                std::fclose(f);
+            }
+        }
+        ++profile_saves;
     }
 
     void gemv(const Tensor& t, const float* xin, float* yout) {
@@ -763,12 +1461,13 @@ struct Engine::Impl {
         });
     }
 
-    void dot_rows(const Tensor& t, int64_t expert, const float* xin, float* yout, int rows_n, int cols) {
-        // One expert (or a plain matrix when expert == 0 and ne2 == 1): yout[r] = row(expert, r) · xin.
+    void dot_rows_base(const Tensor& t, const uint8_t* base, const float* xin, float* yout, int rows_n, int cols) {
+        // One expert's rows start at `base`: yout[r] = row(r) . xin.  `base` may be the GGUF mapping, the pinned
+        // RAM arena, or an SSD staging buffer; only t's type, row size and row count are used.
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
             pool.run(rows_n, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {
-                    const uint8_t* row = row_ptr(t, expert, r);
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
                     if (t.type == kF32) yout[r] = dot_f32((const float*)row, xin, cols);
                     else if (t.type == kF16) yout[r] = dot_f16w((const uint16_t*)row, xin, cols);
                     else yout[r] = dot_bf16w((const uint16_t*)row, xin, cols);
@@ -785,10 +1484,14 @@ struct Engine::Impl {
         pool.run(rows_n, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 float s = 0.f;
-                dot(cols, &s, 0, row_ptr(t, expert, r), 0, aq.data(), 0, 1);
+                dot(cols, &s, 0, base + (size_t)r * t.row_bytes, 0, aq.data(), 0, 1);
                 yout[r] = s;
             }
         });
+    }
+
+    void dot_rows(const Tensor& t, int64_t expert, const float* xin, float* yout, int rows_n, int cols) {
+        dot_rows_base(t, row_ptr(t, expert, 0), xin, yout, rows_n, cols);
     }
 
     // A plain matrix that was uploaded uses the device GEMV. Stacked experts (ne2 > 1) stay on ggml-cpu,
@@ -810,7 +1513,21 @@ struct Engine::Impl {
         apply(down, expert, ff_h.data(), yout, (int)down.ne1, ff);
     }
 
+    // The same MLP from three explicit byte slices (a RAM arena slot or an SSD staging buffer).
+    void mlp_ptr(const Tensor& gate, const uint8_t* gb, const Tensor& up, const uint8_t* ub, const Tensor& down,
+                 const uint8_t* db, const float* in, float* yout, int ff) {
+        if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
+        dot_rows_base(gate, gb, in, ff_g.data(), ff, (int)gate.ne0);
+        dot_rows_base(up, ub, in, ff_u.data(), ff, (int)up.ne0);
+        for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
+        dot_rows_base(down, db, ff_h.data(), yout, (int)down.ne1, ff);
+    }
+
     void moe(const Layer& L, const float* in, float* yout) {
+        if (tiers_on) {
+            moe_tiered(L, in, yout);
+            return;
+        }
         const int nexp = (int)cfg.n_expert;
         const int top = (int)cfg.n_expert_used;
         std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp), score((size_t)nexp);
@@ -833,6 +1550,10 @@ struct Engine::Impl {
         }
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
+        if (!route_counts.empty()) {
+            const size_t b = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
+            for (int j = 0; j < top; ++j) route_counts[b + (size_t)order[(size_t)j]] += 1.0;
+        }
         std::fill(yout, yout + cfg.n_embd, 0.f);
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
@@ -985,6 +1706,8 @@ struct Engine::Impl {
         if (token < 0 || (int64_t)token >= cfg.n_vocab) fail("token id out of range");
         if (n_past >= ctx) fail("context is full (" + std::to_string(ctx) + ")");
         const int64_t pos = n_past;
+        tok_stats = TokenStats{};
+        decay_usage();
         decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
 
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
@@ -1023,6 +1746,20 @@ struct Engine::Impl {
         rms(x.data(), out_norm.data(), h.data(), (int)cfg.n_embd, eps);
         gemv(output, h.data(), logit_out);
         ++n_past;
+        if (tiers_on) {
+            total_stats.vram += tok_stats.vram;
+            total_stats.ram += tok_stats.ram;
+            total_stats.ssd += tok_stats.ssd;
+            total_stats.ssd_bytes += tok_stats.ssd_bytes;
+            ++tokens_seen;
+            if (opt.adaptive && (++rebalance_tick % 16) == 0) rebalance();
+            if (opt.stats)
+                std::fprintf(stderr,
+                             "INFO minimax-stats token=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld swaps=%llu\n",
+                             (long long)tokens_seen, (long long)tok_stats.vram, (long long)tok_stats.ram,
+                             (long long)tok_stats.ssd, (long long)tok_stats.ssd_bytes,
+                             (unsigned long long)swaps);
+        }
     }
 
     void reset() {
@@ -1136,10 +1873,30 @@ bool Engine::norm_add1() const { return impl_->norm_add1; }
 std::string Engine::describe() const {
     std::ostringstream o;
     o << "prefill=token dense_gpu_layers=" << impl_->dense_gpu << " output_gpu=" << (impl_->output_gpu ? 1 : 0)
-      << " experts=cpu kv=f16 norm_add1=" << (impl_->norm_add1 ? 1 : 0) << " threads=" << impl_->threads
+      << " experts=";
+    if (!impl_->tiers_on) {
+        o << "cpu";
+    } else {
+        o << "tiered vram_slots_per_layer=" << impl_->vram_per_layer << " ram_experts_per_layer="
+          << impl_->ram_per_layer << " profile=" << (impl_->profile.empty() ? "none" : "loaded")
+          << " adaptive=" << (impl_->opt.adaptive ? 1 : 0);
+    }
+    o << " kv=f16 norm_add1=" << (impl_->norm_add1 ? 1 : 0) << " threads=" << impl_->threads
       << " ctx=" << impl_->ctx;
     return o.str();
 }
+
+std::string Engine::stats() const {
+    if (!impl_->tiers_on) return std::string();
+    std::ostringstream o;
+    o << "tiers=on vram_slots_per_layer=" << impl_->vram_per_layer << " ram_experts_per_layer="
+      << impl_->ram_per_layer << " tokens=" << impl_->tokens_seen << " vram_hits=" << impl_->total_stats.vram
+      << " ram_hits=" << impl_->total_stats.ram << " ssd_reads=" << impl_->total_stats.ssd
+      << " ssd_bytes=" << impl_->total_stats.ssd_bytes << " swaps=" << impl_->swaps;
+    return o.str();
+}
+
+void Engine::save_profile() { impl_->write_own_profile(); }
 
 void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std::vector<float>& logits, int& rows) {
     impl_->reset();

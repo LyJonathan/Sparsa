@@ -4,7 +4,9 @@
 // their GGUF bytes (F32/F16/BF16 expanded to fp32, quantized types dequantized per tile). Every other dense
 // matrix, and every routed expert, runs on the CPU. Routed experts use ggml-cpu's `from_float` + `vec_dot` and
 // the swigluoai activation from the reference spec. KV (K, V, indexer K) is fp16 on the host. A device copy is
-// not allocated until a GPU attention kernel reads it. `--minimax-dense-layers-gpu 0` makes no CUDA calls.
+// not allocated until a GPU attention kernel reads it. `--minimax-dense-layers-gpu 0` makes no CUDA calls while
+// the expert tiers are off; `--minimax-tiers` (or an explicit tier budget) starts CUDA for the VRAM expert slots
+// even then, and keeps every dense matrix on the CPU.
 //
 // Prefill walks the same per-token path as decode. Norm weights follow the llama.cpp GGUF convention: `+1` is
 // baked into the tensor unless `minimax-m3.norm.add1` is true, and a file whose norms sit near 0 is refused
@@ -27,6 +29,21 @@ struct EngineOptions {
     int cpu_threads = 0;         ///< 0: the machine's hardware concurrency, capped
     int chunk = 16;              ///< prompt tokens between PP lines
     bool allow_nonstandard = false;
+
+    // ---- P3: the routed-expert tiers (VRAM / pinned RAM / SSD).  Off by default: every routed expert then runs on
+    // the CPU from the mapped GGUF, exactly as P2 did.  `--minimax-tiers` (or any explicit slot budget, or a
+    // profile) turns them on.
+    bool tiers = false;
+    std::string profile_path;       ///< STRP profile to fill the static tiers from (57 x 128 for M3.1)
+    std::string profile_save_path;  ///< record routing counts and write an STRP profile when the engine closes
+    std::string routing_counts_path;///< also write a text "layer expert count" table beside the profile
+    int vram_slots_per_layer = -1;  ///< -1: auto from free VRAM after dense/KV/workspace and the reserve; 0: none
+    int ram_experts_per_layer = -1; ///< -1: auto from RAM minus the reserve; 0: no pinned tier
+    int vram_reserve_mib = 700;     ///< VRAM kept free for the driver / display after dense weights and workspace
+    int memory_limit_mib = 0;       ///< 0: auto from available RAM; else the pinned tier's byte budget
+    bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
+    bool stats = false;             ///< per-token tier counters on stderr
+    bool stats_per_layer = false;   ///< one counters line per layer as a token runs
 };
 
 struct SampleParams {
@@ -62,8 +79,12 @@ public:
     int64_t context() const;
     int dense_layers_gpu() const;
     bool norm_add1() const;
-    /// One human line: placement, norm convention, prefill mode.
+    /// One human line: placement, norm convention, prefill mode, tier sizes.
     std::string describe() const;
+    /// Tier counters as one "key=value ..." line (empty when the tiers are off).
+    std::string stats() const;
+    /// Write the profile the run collected, if --minimax-profile-save was given (also called by the destructor).
+    void save_profile();
 
     /// Teacher-forced logits, fp32, row-major. `last_k <= 0` keeps every position; otherwise the last K.
     void teacher_forced(const std::vector<int32_t>& tokens, int last_k, std::vector<float>& logits, int& rows);
