@@ -147,4 +147,9 @@ Filled in from the runs on this machine (Ryzen 9 5900X, 24 threads, 128 GB):
   all 128 experts to fp32 (once), 9.0 s per forward when the expert bank is
   resident; 43 s per forward when experts are streamed from disk for one
   forward.
+- imatrix per-layer measurement (layer 32, fp32, 24 threads, 6 chunks of 2048
+  = one half of the 24K-token corpus): 0.9 s load + 33.3 s resident-expert
+  dequant + 68.5 s for 6 forwards = **102.7 s/layer**, i.e. **1.63 h projected
+  for a full 60-layer half-pass**.  Two machines therefore finish the whole
+  imatrix in about the same 1.6 h instead of ~3.3 h.
 - runtime / perplexity / imatrix: see the final report for this task.
