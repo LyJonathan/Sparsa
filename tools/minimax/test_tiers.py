@@ -127,6 +127,8 @@ def test_profile_save_load_round_trip(tmp_path):
 
 def test_iq2_xs_experts_on_the_gpu_tier(tmp_path):
     g = dict(RUNNABLE)
+    g['hidden'] = 512   # H != FF and neither is the Qwen geometry the upstream kernels were compiled for
+    g['dense_ff'] = 512
     g['exp_ff'] = 256   # IQ2_XS blocks are 256 wide
     gguf = tmp_path / 'iq2.gguf'
     build(gguf, geometry=g, weights='glorot', quant_experts='iq2_xs', pack_exe=EXE)
