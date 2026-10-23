@@ -197,13 +197,25 @@ Variants. Expert bpw are ggml nominal values. Pack size includes dense
 
 | Variant | Experts | Expert bytes | Pack approx. | Intended for |
 |---|---|---|---|---|
+| `MM-IQ1_S` | IQ1_S (1.56) | 81 GB | ~96 GB | smallest tier; 64 GB RAM machines; **needs a new IQ1_S expert kernel** (Strata has IQ1_M, not IQ1_S) |
 | `MM-IQ1_M` | IQ1_M (1.75) | 90 GB | ~105 GB | 64-96 GB RAM machines |
-| `MM-IQ2_XXS` | IQ2_XXS (2.06) | 106 GB | ~121 GB | |
+| `MM-IQ2_XXS` | IQ2_XXS (2.06) | 106 GB | ~121 GB | 96-128 GB RAM, more headroom for long context |
+| `MM-IQ2_S` | IQ2_S (2.5) | 129 GB | ~144 GB | between IQ2_XS and IQ3_XXS |
 | **`MM-IQ2_XS`** (proposed default for 128 GB) | IQ2_XS (2.31) mix, IQ3/IQ4_NL down | 119 GB | ~134 GB | 128 GB RAM, nearly all resident |
 | `MM-IQ3_XXS` | IQ3_XXS (3.06) | 158 GB | ~173 GB | 128 GB + SSD tier, or 192 GB |
 | `MM-IQ3_S` | IQ3_S (3.44) | 178 GB | ~192 GB | 192 GB+ |
 | `MM-IQ4_XS` | IQ4_XS (4.25) | 220 GB | ~234 GB | 256 GB |
 | `MM-NVFP4` (lossless) | released NVFP4 | 232 GB | ~247 GB | 256 GB; quality reference |
+
+The low tiers (IQ1_S, IQ1_M, IQ2_XXS) use a **dynamic mix**, like Unsloth's
+UD quants: `ffn_down` and the most-routed experts by profile get one step more
+bits. The GGUF name keeps the tier label, and the exact recipe is stored in the
+GGUF metadata. Every tier gets a KL/top-1 row (gate G3) so its quality cost is
+measured.
+
+Build order on E:: `MM-IQ2_XS` first, then the low tiers (`IQ1_S`, `IQ1_M`,
+`IQ2_XXS`, `IQ2_S`; one at a time beside IQ2_XS, deleting or archiving after
+they are measured if space runs short), then `IQ3_XXS`+ once space is freed.
 
 Dense sub-variants, chosen automatically by GPU:
 - `fp8`: MXFP8 native, 10.9 GB, sm_89+.
@@ -324,7 +336,7 @@ G0-G2 always stay with Claude.
 | # | Phase | Owner | Done when |
 |---|---|---|---|
 | P0 | Venv (`_local/`); download source to E:; dequant module; R1 reference; reference logits + imatrix; llama.cpp copy in `_baseline/` with M3.1 support | Claude (+ Grok for llama.cpp, DeepSeek for dequant/MSA spec) | R1 sane (R2), reference logits saved |
-| P1 | `strata-mm-quant` + imatrix + `MM-NVFP4`, `MM-IQ2_XS`, `MM-IQ3_XXS` GGUFs; loads in llama.cpp | Grok | G0 passes; llama.cpp runs our GGUFs |
+| P1 | `strata-mm-quant` + imatrix; GGUFs `MM-IQ2_XS`, then low tiers `MM-IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`, then `MM-IQ3_XXS`/`IQ3_S`/`IQ4_XS`/`NVFP4` as disk allows; IQ1_S expert kernel (GPU + AVX2) | Grok | G0 passes; llama.cpp runs our GGUFs |
 | P2 | `src/minimax/` single-GPU engine: GGUF load, MSA, router, swigluoai experts, shared/dense, sampling, `--serve` protocol. Experts in RAM/CPU first, then GPU kernels | Claude (core) + DeepSeek (kernels) | **G1 + G2 pass** |
 | P3 | Tiers: STRP profile, VRAM cache + adaptive swaps, pinned RAM arena, SSD tier (Windows + Linux I/O), DS adaptive RAM tier + next-layer prefetch, auto-sizing | DeepSeek | G2 still passes; tier stats reported |
 | P4 | Layer split over 2 GPUs (no-P2P host hop); long-context KV in RAM | Claude | G2 passes on 2 GPUs; 256K runs |
