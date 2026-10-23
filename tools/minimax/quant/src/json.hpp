@@ -133,16 +133,40 @@ inline Json parse_json(const std::string & s) {
                                 else if (h >= 'A' && h <= 'F') cp += h - 'A' + 10;
                                 else throw std::runtime_error("json: bad \\u hex");
                             }
-                            if (cp < 0x80) {
-                                out.push_back(static_cast<char>(cp));
-                            } else if (cp < 0x800) {
-                                out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-                                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                            } else {
-                                out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-                                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                            if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                                i += 2;
+                                int lo = 0;
+                                for (int k = 0; k < 4; ++k) {
+                                    const char h = s[i++];
+                                    lo <<= 4;
+                                    if (h >= '0' && h <= '9') lo += h - '0';
+                                    else if (h >= 'a' && h <= 'f') lo += h - 'a' + 10;
+                                    else if (h >= 'A' && h <= 'F') lo += h - 'A' + 10;
+                                    else throw std::runtime_error("json: bad \\u hex");
+                                }
+                                if (lo < 0xDC00 || lo > 0xDFFF) {
+                                    throw std::runtime_error("json: bad utf-16 surrogate");
+                                }
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             }
+                            auto utf8 = [&](int u) {
+                                if (u < 0x80) {
+                                    out.push_back(static_cast<char>(u));
+                                } else if (u < 0x800) {
+                                    out.push_back(static_cast<char>(0xC0 | (u >> 6)));
+                                    out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+                                } else if (u < 0x10000) {
+                                    out.push_back(static_cast<char>(0xE0 | (u >> 12)));
+                                    out.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+                                    out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+                                } else {
+                                    out.push_back(static_cast<char>(0xF0 | (u >> 18)));
+                                    out.push_back(static_cast<char>(0x80 | ((u >> 12) & 0x3F)));
+                                    out.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+                                    out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+                                }
+                            };
+                            utf8(cp);
                             break;
                         }
                         default: throw std::runtime_error("json: bad escape");

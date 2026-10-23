@@ -266,6 +266,8 @@ struct Recipe {
     uint32_t file_type = 7;
     bool require_imatrix = false;
     bool dynamic_down = false;
+    bool disabled = false;
+    std::string disabled_reason;
     ggml_type experts = GGML_TYPE_Q8_0;
     ggml_type ffn_down = GGML_TYPE_Q8_0;
     ggml_type hot = GGML_TYPE_Q8_0;
@@ -325,6 +327,19 @@ Recipe load_recipe(const Options & opt) {
     const Json root = parse_json(read_bytes(find_recipe(opt)));
     Recipe r;
     r.name = root.find("name") ? root.at("name").as_s() : opt.recipe.stem().string();
+    if (const Json * dis = root.find("disabled")) {
+        r.disabled = dis->as_b();
+    }
+    if (const Json * why = root.find("disabled_reason")) {
+        r.disabled_reason = why->as_s();
+    }
+    if (r.disabled) {
+        std::string msg = "recipe " + r.name + " is disabled";
+        if (!r.disabled_reason.empty()) {
+            msg += ": " + r.disabled_reason;
+        }
+        die(msg);
+    }
     r.dynamic_down = root.find("dynamic_down") ? root.at("dynamic_down").as_b() : false;
     const Json & t = root.at("types");
     r.experts = recipe_type(t, "experts", r.experts);
@@ -511,7 +526,79 @@ void load_shard(Catalog & cat, const fs::path & path) {
     cat.files.push_back(std::move(mf));
 }
 
-Catalog load_catalog(const fs::path & model) {
+// True when this shard is complete and (if needles is non-empty) its header names
+// one of the requested tensors. A file that is still downloading is skipped.
+bool shard_selected(const fs::path & path, const std::vector<std::string> & needles, bool & incomplete) {
+    incomplete = false;
+    std::error_code ec;
+    const uint64_t sz = fs::file_size(path, ec);
+    if (ec || sz < 8) {
+        incomplete = true;
+        logf("skip incomplete shard %s\n", path.filename().string().c_str());
+        return false;
+    }
+    FILE * f = open_file(path, "rb");
+    if (!f) {
+        incomplete = true;
+        logf("skip unreadable shard %s\n", path.filename().string().c_str());
+        return false;
+    }
+    uint64_t hlen = 0;
+    const bool got = std::fread(&hlen, 1, 8, f) == 8;
+    if (!got || hlen > sz - 8 || hlen > (512ull << 20)) {
+        std::fclose(f);
+        incomplete = true;
+        logf("skip incomplete shard %s (header not finished)\n", path.filename().string().c_str());
+        return false;
+    }
+    std::string header(static_cast<size_t>(hlen), '\0');
+    const size_t nread = std::fread(header.data(), 1, header.size(), f);
+    std::fclose(f);
+    if (nread != header.size()) {
+        incomplete = true;
+        logf("skip incomplete shard %s (short header)\n", path.filename().string().c_str());
+        return false;
+    }
+    if (!needles.empty()) {
+        bool hit = false;
+        for (const std::string & n : needles) {
+            if (header.find(n) != std::string::npos) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            return false;
+        }
+    }
+    uint64_t max_end = 0;
+    try {
+        const Json root = parse_json(header);
+        for (const auto & kv : root.obj) {
+            if (kv.second.type != Json::Object) {
+                continue;
+            }
+            const Json * offs = kv.second.find("data_offsets");
+            if (!offs || offs->arr.size() < 2) {
+                continue;
+            }
+            const int64_t b = offs->arr[1].as_i();
+            if (b > 0 && static_cast<uint64_t>(b) > max_end) {
+                max_end = static_cast<uint64_t>(b);
+            }
+        }
+    } catch (const std::exception & e) {
+        die(path.filename().string() + ": " + e.what());
+    }
+    if (sz < 8 + hlen + max_end) {
+        incomplete = true;
+        logf("skip incomplete shard %s (payload short)\n", path.filename().string().c_str());
+        return false;
+    }
+    return true;
+}
+
+Catalog load_catalog(const fs::path & model, const std::vector<std::string> & needles) {
     std::vector<fs::path> shards;
     for (const fs::directory_entry & ent : fs::directory_iterator(model)) {
         if (!ent.is_regular_file()) {
@@ -528,13 +615,25 @@ Catalog load_catalog(const fs::path & model) {
     }
     std::sort(shards.begin(), shards.end());
     if (shards.empty()) {
-        die("no completed model-*-of-*.safetensors in " + model.string());
+        die("no model-*-of-*.safetensors in " + model.string());
     }
     Catalog cat;
     cat.files.reserve(shards.size());
     cat.map.reserve(static_cast<size_t>(shards.size()) * 4000);
+    int skipped = 0;
     for (const fs::path & p : shards) {
+        bool incomplete = false;
+        if (!shard_selected(p, needles, incomplete)) {
+            if (incomplete) {
+                ++skipped;
+            }
+            continue;
+        }
         load_shard(cat, p);
+    }
+    if (cat.files.empty()) {
+        die("no completed model-*-of-*.safetensors matched the selected layers in " + model.string() +
+            (skipped ? " (" + std::to_string(skipped) + " still downloading)" : ""));
     }
     return cat;
 }
@@ -772,6 +871,7 @@ struct Item {
     bool exact = false;
     Role role = Role::Embd;
     int src = -1;
+    int out_i = -1;
     ggml_type type = GGML_TYPE_F32;
     int64_t ne[4] = {1, 1, 1, 1};
     float add = 0.f;
@@ -840,8 +940,9 @@ int leading_dense(const Hyp & h, const std::vector<int> & sel) {
 }
 
 std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<int> & sel,
-                             const std::string & hot_mode, const Profile & prof) {
-    if (h.idx_first > static_cast<int>(sel.size())) {
+                             const std::string & hot_mode, const Profile & prof, bool keep_indices) {
+    const int meta_blocks = keep_indices ? h.n_layer : static_cast<int>(sel.size());
+    if (h.idx_first > meta_blocks) {
         die("attention.indexer.first_layer would exceed block_count and llama.cpp would reject the file");
     }
     std::vector<Item> items;
@@ -879,6 +980,7 @@ std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<
 
     for (int oi = 0; oi < static_cast<int>(sel.size()); ++oi) {
         const int src = sel[static_cast<size_t>(oi)];
+        const int blk = keep_indices ? src : oi;
         const std::string lb = layer_base(src);
         const bool hot = hot_mode == "promote-layer" && prof.layers.find(src) != prof.layers.end();
         auto add2 = [&](const std::string & gguf, const std::string & hf, Role role, ggml_type ty,
@@ -888,6 +990,7 @@ std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<
             it.hf = hf;
             it.role = role;
             it.src = src;
+            it.out_i = oi;
             it.type = ty;
             it.ne[0] = n_in;
             it.ne[1] = n_out;
@@ -900,59 +1003,62 @@ std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<
             it.hf = hf;
             it.role = role;
             it.src = src;
+            it.out_i = oi;
             it.type = r.norms;
             it.ne[0] = role == Role::ANorm || role == Role::FNorm ? h.n_embd : (role == Role::Qn || role == Role::Kn ? h.head_dim : h.idx_key);
             it.add = add;
             push_item(items, it);
         };
 
-        add1(blk_name(oi, "attn_norm"), lb + ".input_layernorm", Role::ANorm, gadd);
-        add2(blk_name(oi, "attn_q"), lb + ".self_attn.q_proj", Role::Q, r.attention, h.n_embd, static_cast<int64_t>(h.n_head) * h.head_dim);
-        add2(blk_name(oi, "attn_k"), lb + ".self_attn.k_proj", Role::K, r.attention, h.n_embd, static_cast<int64_t>(h.n_head_kv) * h.head_dim);
-        add2(blk_name(oi, "attn_v"), lb + ".self_attn.v_proj", Role::V, r.attention, h.n_embd, static_cast<int64_t>(h.n_head_kv) * h.head_dim);
-        add2(blk_name(oi, "attn_output"), lb + ".self_attn.o_proj", Role::O, r.attention, static_cast<int64_t>(h.n_head) * h.head_dim, h.n_embd);
-        add1(blk_name(oi, "attn_q_norm"), lb + ".self_attn.q_norm", Role::Qn, gadd);
-        add1(blk_name(oi, "attn_k_norm"), lb + ".self_attn.k_norm", Role::Kn, gadd);
-        add1(blk_name(oi, "ffn_norm"), lb + ".post_attention_layernorm", Role::FNorm, gadd);
+        add1(blk_name(blk, "attn_norm"), lb + ".input_layernorm", Role::ANorm, gadd);
+        add2(blk_name(blk, "attn_q"), lb + ".self_attn.q_proj", Role::Q, r.attention, h.n_embd, static_cast<int64_t>(h.n_head) * h.head_dim);
+        add2(blk_name(blk, "attn_k"), lb + ".self_attn.k_proj", Role::K, r.attention, h.n_embd, static_cast<int64_t>(h.n_head_kv) * h.head_dim);
+        add2(blk_name(blk, "attn_v"), lb + ".self_attn.v_proj", Role::V, r.attention, h.n_embd, static_cast<int64_t>(h.n_head_kv) * h.head_dim);
+        add2(blk_name(blk, "attn_output"), lb + ".self_attn.o_proj", Role::O, r.attention, static_cast<int64_t>(h.n_head) * h.head_dim, h.n_embd);
+        add1(blk_name(blk, "attn_q_norm"), lb + ".self_attn.q_norm", Role::Qn, gadd);
+        add1(blk_name(blk, "attn_k_norm"), lb + ".self_attn.k_norm", Role::Kn, gadd);
+        add1(blk_name(blk, "ffn_norm"), lb + ".post_attention_layernorm", Role::FNorm, gadd);
 
-        if (oi >= h.idx_first) {
-            add2(blk_name(oi, "indexer.q_proj"), lb + ".self_attn.index_q_proj", Role::Iq, r.indexer, h.n_embd,
+        if ((keep_indices ? src : oi) >= h.idx_first) {
+            add2(blk_name(blk, "indexer.q_proj"), lb + ".self_attn.index_q_proj", Role::Iq, r.indexer, h.n_embd,
                  static_cast<int64_t>(h.idx_heads) * h.idx_key);
-            add2(blk_name(oi, "indexer.k_proj"), lb + ".self_attn.index_k_proj", Role::Ik, r.indexer, h.n_embd, h.idx_key);
-            add1(blk_name(oi, "indexer.q_norm"), lb + ".self_attn.index_q_norm", Role::Iqn, gadd);
-            add1(blk_name(oi, "indexer.k_norm"), lb + ".self_attn.index_k_norm", Role::Ikn, gadd);
+            add2(blk_name(blk, "indexer.k_proj"), lb + ".self_attn.index_k_proj", Role::Ik, r.indexer, h.n_embd, h.idx_key);
+            add1(blk_name(blk, "indexer.q_norm"), lb + ".self_attn.index_q_norm", Role::Iqn, gadd);
+            add1(blk_name(blk, "indexer.k_norm"), lb + ".self_attn.index_k_norm", Role::Ikn, gadd);
         }
 
         if (!h.is_moe(src)) {
-            add2(blk_name(oi, "ffn_gate"), lb + ".mlp.gate_proj", Role::Dg, r.dense, h.n_embd, h.n_ff);
-            add2(blk_name(oi, "ffn_up"), lb + ".mlp.up_proj", Role::Du, r.dense, h.n_embd, h.n_ff);
-            add2(blk_name(oi, "ffn_down"), lb + ".mlp.down_proj", Role::Dd, r.dense, h.n_ff, h.n_embd);
+            add2(blk_name(blk, "ffn_gate"), lb + ".mlp.gate_proj", Role::Dg, r.dense, h.n_embd, h.n_ff);
+            add2(blk_name(blk, "ffn_up"), lb + ".mlp.up_proj", Role::Du, r.dense, h.n_embd, h.n_ff);
+            add2(blk_name(blk, "ffn_down"), lb + ".mlp.down_proj", Role::Dd, r.dense, h.n_ff, h.n_embd);
         } else {
-            add2(blk_name(oi, "ffn_gate_inp"), lb + ".block_sparse_moe.gate", Role::Router, r.router, h.n_embd, h.n_expert);
+            add2(blk_name(blk, "ffn_gate_inp"), lb + ".block_sparse_moe.gate", Role::Router, r.router, h.n_embd, h.n_expert);
             Item bias;
-            bias.gguf = blk_name(oi, "exp_probs_b", "bias");
+            bias.gguf = blk_name(blk, "exp_probs_b", "bias");
             bias.hf = lb + ".block_sparse_moe.e_score_correction_bias";
             bias.exact = true;
             bias.role = Role::Bias;
             bias.src = src;
+            bias.out_i = oi;
             bias.type = r.router;
             bias.ne[0] = h.n_expert;
             push_item(items, bias);
 
             const int64_t shexp = static_cast<int64_t>(h.n_ff_exp) * h.n_shared;
             const std::string sh = lb + ".block_sparse_moe.shared_experts.";
-            add2(blk_name(oi, "ffn_gate_shexp"), sh + "gate_proj", Role::Sg, r.shared, h.n_embd, shexp);
-            add2(blk_name(oi, "ffn_up_shexp"), sh + "up_proj", Role::Su, r.shared, h.n_embd, shexp);
-            add2(blk_name(oi, "ffn_down_shexp"), sh + "down_proj", Role::Sd, r.shared, shexp, h.n_embd);
+            add2(blk_name(blk, "ffn_gate_shexp"), sh + "gate_proj", Role::Sg, r.shared, h.n_embd, shexp);
+            add2(blk_name(blk, "ffn_up_shexp"), sh + "up_proj", Role::Su, r.shared, h.n_embd, shexp);
+            add2(blk_name(blk, "ffn_down_shexp"), sh + "down_proj", Role::Sd, r.shared, shexp, h.n_embd);
 
             const ggml_type gate_ty = hot ? r.hot : r.experts;
             auto add_ex = [&](const char * leaf, const char * wkey, Role role, ggml_type ty, int64_t n_in, int64_t n_out) {
                 Item it;
-                it.gguf = blk_name(oi, leaf);
+                it.gguf = blk_name(blk, leaf);
                 it.hf = lb + ".block_sparse_moe.experts";
                 it.wkey = wkey;
                 it.role = role;
                 it.src = src;
+                it.out_i = oi;
                 it.type = ty;
                 it.ne[0] = n_in;
                 it.ne[1] = n_out;
@@ -1560,10 +1666,107 @@ uint64_t disk_free(const fs::path & path) {
 struct Vocab {
     std::vector<std::string> tokens;
     std::vector<int32_t> types;
+    std::vector<std::string> merges;
     uint32_t bos = 200019;
     uint32_t eos = 200020;
     std::string chat;
 };
+
+std::string encode_merge_piece(const std::string & part) {
+    std::string o;
+    o.reserve(part.size());
+    for (unsigned char c : part) {
+        if (c == ' ') {
+            // llama.cpp stores a space inside a merge piece as U+0120.
+            o.push_back(static_cast<char>(0xC4));
+            o.push_back(static_cast<char>(0xA0));
+        } else {
+            o.push_back(static_cast<char>(c));
+        }
+    }
+    return o;
+}
+
+bool token_looks_special(const std::string & token) {
+    if (token == "<pad>" || token == "<mask>" || token == "<2mass>" || token == "[@BOS@]") {
+        return true;
+    }
+    if (token.size() >= 4 && token.compare(0, 2, "<|") == 0 && token.compare(token.size() - 2, 2, "|>") == 0) {
+        return true;
+    }
+    if (token.size() >= 8 && token.compare(0, 7, "<unused") == 0 && token.back() == '>') {
+        return true;
+    }
+    return false;
+}
+
+bool load_tokenizer_json(const fs::path & path, Vocab & v, int n_vocab) {
+    logf("parsing %s\n", path.string().c_str());
+    const Json root = parse_json(read_bytes(path));
+    const Json * model = root.find("model");
+    if (!model) {
+        die("tokenizer.json has no model object");
+    }
+    const Json * vocab = model->find("vocab");
+    if (!vocab || vocab->type != Json::Object) {
+        die("tokenizer.json has no model.vocab");
+    }
+    v.tokens.assign(static_cast<size_t>(n_vocab), "");
+    v.types.assign(static_cast<size_t>(n_vocab), 5);
+    for (int i = 0; i < n_vocab; ++i) {
+        v.tokens[static_cast<size_t>(i)] = "[PAD" + std::to_string(i) + "]";
+    }
+    for (const auto & kv : vocab->obj) {
+        const int64_t id = kv.second.as_i();
+        if (id < 0 || id >= n_vocab) {
+            die("tokenizer vocab id out of range: " + kv.first);
+        }
+        v.tokens[static_cast<size_t>(id)] = kv.first;
+        v.types[static_cast<size_t>(id)] = 1;
+    }
+    if (const Json * added = root.find("added_tokens")) {
+        if (added->type == Json::Array) {
+            for (const Json & a : added->arr) {
+                const Json * idj = a.find("id");
+                const Json * content = a.find("content");
+                if (!idj || !content) {
+                    continue;
+                }
+                const int64_t id = idj->as_i();
+                if (id < 0 || id >= n_vocab) {
+                    die("tokenizer added token id out of range");
+                }
+                const std::string & text = content->as_s();
+                v.tokens[static_cast<size_t>(id)] = text;
+                const Json * special = a.find("special");
+                const bool is_special =
+                    (special && special->type == Json::Bool && special->as_b()) || token_looks_special(text);
+                v.types[static_cast<size_t>(id)] = is_special ? 3 : 4;
+            }
+        }
+    }
+    v.merges.clear();
+    if (const Json * merges = model->find("merges")) {
+        if (merges->type == Json::Array && !merges->arr.empty()) {
+            if (merges->arr[0].type == Json::String) {
+                for (const Json & m : merges->arr) {
+                    v.merges.push_back(m.as_s());
+                }
+            } else if (merges->arr[0].type == Json::Array) {
+                for (const Json & pair : merges->arr) {
+                    if (pair.arr.size() != 2) {
+                        die("tokenizer merge pair is not length 2");
+                    }
+                    v.merges.push_back(encode_merge_piece(pair.arr[0].as_s()) + " " +
+                                       encode_merge_piece(pair.arr[1].as_s()));
+                }
+            } else {
+                die("tokenizer merges have an unknown shape");
+            }
+        }
+    }
+    return true;
+}
 
 Vocab load_vocab(const fs::path & model, int n_vocab) {
     Vocab v;
@@ -1573,6 +1776,11 @@ Vocab load_vocab(const fs::path & model, int n_vocab) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "t%06d", i);
         v.tokens[static_cast<size_t>(i)] = buf;
+    }
+    bool real_vocab = false;
+    const fs::path tokj = model / "tokenizer.json";
+    if (fs::is_regular_file(tokj)) {
+        real_vocab = load_tokenizer_json(tokj, v, n_vocab);
     }
     const fs::path gen = model / "generation_config.json";
     if (fs::is_regular_file(gen)) {
@@ -1615,9 +1823,65 @@ Vocab load_vocab(const fs::path & model, int n_vocab) {
     if (fs::is_regular_file(chat)) {
         v.chat = read_bytes(chat);
     }
-    logf("vocab %d tokens, bos %u (%s), eos %u (%s), merges empty (tokenizer.json not in the checkpoint yet)\n",
-         n_vocab, v.bos, v.tokens[v.bos].c_str(), v.eos, v.tokens[v.eos].c_str());
+    if (real_vocab) {
+        logf("vocab %d tokens from tokenizer.json, merges %zu, bos %u (%s), eos %u (%s)\n",
+             n_vocab, v.merges.size(), v.bos, v.tokens[v.bos].c_str(), v.eos, v.tokens[v.eos].c_str());
+    } else {
+        logf("vocab %d tokens, bos %u (%s), eos %u (%s), merges empty (tokenizer.json not in the checkpoint yet)\n",
+             n_vocab, v.bos, v.tokens[v.bos].c_str(), v.eos, v.tokens[v.eos].c_str());
+    }
     return v;
+}
+
+bool want_globals(const Options & opt) {
+    if (opt.no_globals) {
+        return false;
+    }
+    if (opt.include_globals_set) {
+        return opt.include_globals;
+    }
+    if (opt.split_count >= 2) {
+        return opt.split_part == 0;
+    }
+    return true;
+}
+
+std::vector<Item> filter_items(const std::vector<Item> & items, const Options & opt) {
+    const bool glob = want_globals(opt);
+    std::vector<Item> out;
+    out.reserve(items.size());
+    for (const Item & it : items) {
+        if (it.src < 0) {
+            if (glob) {
+                out.push_back(it);
+            }
+            continue;
+        }
+        if (opt.emit_lo >= 0 && (it.out_i < opt.emit_lo || it.out_i > opt.emit_hi)) {
+            continue;
+        }
+        out.push_back(it);
+    }
+    return out;
+}
+
+fs::path split_output_path(const Options & opt) {
+    if (opt.split_count < 2) {
+        return opt.out;
+    }
+    char suf[64];
+    std::snprintf(suf, sizeof(suf), "-%05d-of-%05d.gguf", opt.split_part + 1, opt.split_count);
+    const std::string s = opt.out.string();
+    const size_t n = std::strlen(suf);
+    if (s.size() >= n && s.compare(s.size() - n, n, suf) == 0) {
+        return opt.out;
+    }
+    std::string prefix = s;
+    if (prefix.size() >= 5 && (prefix.compare(prefix.size() - 5, 5, ".gguf") == 0 ||
+                               prefix.compare(prefix.size() - 5, 5, ".GGUF") == 0)) {
+        prefix.resize(prefix.size() - 5);
+    }
+    return fs::path(prefix + suf);
 }
 
 std::string hot_list(const Profile & p) {
@@ -1640,7 +1904,17 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
                  const Catalog & cat, const Imp * imp, int threads) {
     std::vector<Item> items = items_in;
     preflight(cat, items, h, opt.placeholder);
-    const int lead = leading_dense(h, sel);
+    const bool splitting = opt.split_count >= 2;
+    const bool write_kv = !splitting || opt.split_part == 0;
+    const int meta_blocks = opt.keep_indices ? h.n_layer : static_cast<int>(sel.size());
+    const int lead = opt.keep_indices ? h.n_dense : leading_dense(h, sel);
+    const fs::path out_path = split_output_path(opt);
+    if (splitting && opt.split_tensors < 0) {
+        die("internal: split.tensors.count was not set");
+    }
+    if (splitting && static_cast<int>(items.size()) > opt.split_tensors) {
+        die("this split part has more tensors than split.tensors.count");
+    }
     uint64_t total = 0;
     bool ph_emb = false, ph_out = false, ph_norm = false;
     for (const Item & it : items) {
@@ -1649,10 +1923,10 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
         if (it.used_placeholder && it.role == Role::Out) ph_out = true;
         if (it.used_placeholder && it.role == Role::OutNorm) ph_norm = true;
     }
-    if (!opt.out.parent_path().empty()) {
-        fs::create_directories(opt.out.parent_path());
+    if (!out_path.parent_path().empty()) {
+        fs::create_directories(out_path.parent_path());
     }
-    const uint64_t freeb = disk_free(opt.out);
+    const uint64_t freeb = disk_free(out_path);
     const uint64_t reserve = 8ull << 30;
     logf("output tensor bytes %s, free %s\n", human(total).c_str(), human(freeb).c_str());
     if (freeb < total + reserve) {
@@ -1662,7 +1936,10 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
         die("this recipe needs --imatrix (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS)");
     }
 
-    Vocab vocab = load_vocab(opt.model, h.n_vocab);
+    Vocab vocab;
+    if (write_kv) {
+        vocab = load_vocab(opt.model, h.n_vocab);
+    }
     struct PartialOut {
         fs::path path;
         bool armed = false;
@@ -1673,11 +1950,12 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
             }
         }
     } partial;
-    partial.path = opt.out;
+    partial.path = out_path;
     GgufWriter w;
     w.alignment = 32;
-    w.open(opt.out);
+    w.open(out_path);
     partial.armed = true;
+    if (write_kv) {
     const std::string arch = "minimax-m3";
     w.add_str("general.architecture", arch);
     w.add_str("general.name", h.name);
@@ -1686,7 +1964,7 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
     w.add_u32("general.alignment", 32);
     w.add_str("general.source.huggingface.repository", "MiniMaxAI/MiniMax-M3.1-Flash");
     auto key = [&](const std::string & k) { return arch + "." + k; };
-    w.add_u32(key("block_count"), static_cast<uint32_t>(sel.size()));
+    w.add_u32(key("block_count"), static_cast<uint32_t>(meta_blocks));
     w.add_u32(key("context_length"), h.n_ctx);
     w.add_u32(key("embedding_length"), static_cast<uint32_t>(h.n_embd));
     w.add_u32(key("feed_forward_length"), static_cast<uint32_t>(h.n_ff));
@@ -1744,12 +2022,21 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
     w.add_str("tokenizer.ggml.pre", "minimax-m2");
     w.add_str_array("tokenizer.ggml.tokens", vocab.tokens);
     w.add_i32_array("tokenizer.ggml.token_type", vocab.types);
-    w.add_str_array("tokenizer.ggml.merges", {});
+    w.add_str_array("tokenizer.ggml.merges", vocab.merges);
     w.add_u32("tokenizer.ggml.bos_token_id", vocab.bos);
     w.add_u32("tokenizer.ggml.eos_token_id", vocab.eos);
     w.add_bool("tokenizer.ggml.add_bos_token", false);
     if (!vocab.chat.empty()) {
         w.add_str("tokenizer.chat_template", vocab.chat);
+    }
+    }
+    if (splitting) {
+        if (opt.split_part < 0 || opt.split_part > 65535 || opt.split_count < 2 || opt.split_count > 65535) {
+            die("--split-part and --split-count must fit in uint16");
+        }
+        w.add_u16("split.no", static_cast<uint16_t>(opt.split_part));
+        w.add_u16("split.count", static_cast<uint16_t>(opt.split_count));
+        w.add_i32("split.tensors.count", opt.split_tensors);
     }
     for (const Item & it : items) {
         TensorDesc td;
@@ -1801,10 +2088,14 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
     w.close();
     partial.armed = false;
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_all).count();
-    logf("wrote %s  %s in %.1fs  (%.2f GB/s of output)\n", opt.out.string().c_str(), human(written).c_str(), sec,
+    logf("wrote %s  %s in %.1fs  (%.2f GB/s of output)\n", out_path.string().c_str(), human(written).c_str(), sec,
          sec > 0 ? (static_cast<double>(written) / 1e9) / sec : 0.0);
     logf("block_count %d, leading_dense %d, indexer.first_layer %d, file_type %u\n",
-         static_cast<int>(sel.size()), lead, h.idx_first, r.file_type);
+         meta_blocks, lead, h.idx_first, r.file_type);
+    if (splitting) {
+        logf("split.no %d  split.count %d  split.tensors.count %d  tensors in this file %zu\n",
+             opt.split_part, opt.split_count, opt.split_tensors, items.size());
+    }
     if (ph_emb || ph_out || ph_norm) {
         logf("placeholders: embed=%d output=%d output_norm=%d (embed/output value %.4f, output_norm is 1)\n",
              ph_emb ? 1 : 0, ph_out ? 1 : 0, ph_norm ? 1 : 0, opt.placeholder_value);
@@ -2041,6 +2332,7 @@ int run(const Options & opt) {
         std::string hot_mode = opt.hot_mode.empty() ? "record" : opt.hot_mode;
         std::vector<int> sel;
         std::vector<Item> items;
+        int split_tensors = opt.split_tensors;
         if (need_recipe(opt)) {
             recipe = load_recipe(opt);
             prof = load_profile(opt);
@@ -2050,11 +2342,51 @@ int run(const Options & opt) {
             if (hot_mode != "record" && hot_mode != "promote-layer") {
                 die("--hot-expert-mode must be record or promote-layer");
             }
+            if (opt.emit_lo >= 0 && opt.keep_indices) {
+                die("--emit filters a remapped plan; do not combine it with --layers A-B");
+            }
+            if (opt.emit_lo >= 0 && opt.emit_hi < opt.emit_lo) {
+                die("--emit range is empty");
+            }
+            if (opt.no_globals && opt.include_globals) {
+                die("--include-globals and --no-globals conflict");
+            }
+            if (opt.split_part >= 0 || opt.split_count > 0 || opt.split_tensors >= 0) {
+                if (opt.split_count < 2) {
+                    die("--split-count must be at least 2");
+                }
+                if (opt.split_part < 0 || opt.split_part >= opt.split_count) {
+                    die("--split-part must be in 0 .. split-count-1");
+                }
+            }
             sel = select_layers(opt, h);
-            items = build_plan(h, recipe, sel, hot_mode, prof);
-            logf("recipe %s  experts %s  down %s  file_type %u  imatrix %s  layers %zu\n",
+            if (opt.emit_lo >= 0 && opt.emit_hi >= static_cast<int>(sel.size())) {
+                die("--emit is outside the selected layers");
+            }
+            const std::vector<Item> planned = build_plan(h, recipe, sel, hot_mode, prof, opt.keep_indices);
+            if (opt.split_count >= 2 && split_tensors < 0) {
+                if (opt.keep_indices) {
+                    std::vector<int> all;
+                    all.reserve(static_cast<size_t>(h.n_layer));
+                    for (int i = 0; i < h.n_layer; ++i) {
+                        all.push_back(i);
+                    }
+                    split_tensors = static_cast<int>(build_plan(h, recipe, all, hot_mode, prof, true).size());
+                } else {
+                    split_tensors = static_cast<int>(planned.size());
+                }
+            }
+            items = filter_items(planned, opt);
+            if (!opt.out.empty() && items.empty()) {
+                die("this part has no tensors");
+            }
+            logf("recipe %s  experts %s  down %s  file_type %u  imatrix %s  layers %zu  tensors %zu\n",
                  recipe.name.c_str(), ggml_type_name(recipe.experts), ggml_type_name(recipe.ffn_down),
-                 recipe.file_type, recipe.require_imatrix ? "required" : "optional", sel.size());
+                 recipe.file_type, recipe.require_imatrix ? "required" : "optional", sel.size(), items.size());
+            if (opt.split_count >= 2) {
+                logf("split part %d/%d  globals %s  split.tensors.count %d\n", opt.split_part, opt.split_count,
+                     want_globals(opt) ? "yes" : "no", split_tensors);
+            }
         }
         if (opt.dry_run) {
             print_sizes("full model from config (promote-layer not applied)", project_full(h, recipe));
@@ -2072,7 +2404,25 @@ int run(const Options & opt) {
         const bool need_weights = opt.nvfp4_check || !opt.dump_name.empty() || opt.bench || !opt.out.empty();
         Catalog cat;
         if (need_weights) {
-            cat = load_catalog(opt.model);
+            std::vector<std::string> needles;
+            const bool subset = !opt.layers.empty() || opt.max_layers >= 0;
+            if (subset) {
+                std::unordered_set<int> layers;
+                for (const Item & it : items) {
+                    if (it.src >= 0) {
+                        layers.insert(it.src);
+                    }
+                }
+                for (int s : layers) {
+                    needles.push_back("language_model.model.layers." + std::to_string(s) + ".");
+                }
+                if (want_globals(opt) && !(opt.bench && opt.out.empty())) {
+                    needles.push_back("language_model.model.embed_tokens");
+                    needles.push_back("language_model.lm_head");
+                    needles.push_back("language_model.model.norm.weight");
+                }
+            }
+            cat = load_catalog(opt.model, needles);
         }
         Imp loaded;
         const Imp * imp = nullptr;
@@ -2093,7 +2443,9 @@ int run(const Options & opt) {
             bench(cat, h, recipe, sel, imp, opt, threads);
         }
         if (!opt.out.empty()) {
-            write_model(opt, h, recipe, prof, hot_mode, sel, items, cat, imp, threads);
+            Options wopt = opt;
+            wopt.split_tensors = split_tensors;
+            write_model(wopt, h, recipe, prof, hot_mode, sel, items, cat, imp, threads);
         }
         int rc = 0;
         if (!opt.mmproj_out.empty()) {

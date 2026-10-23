@@ -49,7 +49,15 @@ IQ1_S, IQ1_M, IQ2_XXS, and IQ2_XS stop if `--imatrix` is missing. ggml asserts f
 
 `--max-layers N` sets `block_count` to N and keeps source layers 0 through N-1. Every one of those layers must already be on disk.
 
-`--layers 3` remaps source layer 3 onto `blk.0` and sets `leading_dense_block_count` to 0. It cannot be combined with `--max-layers`.
+`--layers 3,4` remaps those source layers onto `blk.0..` and sets `block_count` to the length of the list. It cannot be combined with `--max-layers`.
+
+`--layers A-B` keeps the source names `blk.A` .. `blk.B`. Metadata `block_count` and `leading_dense_block_count` stay the full model (60 and 3), so the file is one piece of the real model rather than a renumbered smoke model.
+
+`--emit A-B` keeps a remapped plan and writes only those output layers. It is for the split-identity test. Do not combine it with `--layers A-B`.
+
+`--split-part K --split-count N` writes a final llama.cpp split file. The name is `<prefix>-%05d-of-%05d.gguf` with the part number one-based (`K+1`) and `split.no` zero-based. Part 0 carries the KV metadata, including the vocabulary. Later parts carry only `split.no`, `split.count`, and `split.tensors.count`. `--split-tensors` overrides the total; the default counts a full plan so every machine computes the same total from the config. Globals are written on part 0 unless `--include-globals` or `--no-globals` says otherwise.
+
+`--threads N` defaults to every logical processor. IQ2_XS row quant is already split across those threads.
 
 `--placeholder-missing` stands in only for a missing `token_embd`, `output`, and `output_norm`. The embedding value is the constant 0.02. An all-zero Q8 row makes RMSNorm produce NaN. The output-norm stand-in is 1, the baked identity of a missing zero norm. The tool never invents layer weights.
 
@@ -81,7 +89,7 @@ The process refuses to start a GGUF when free space on the output drive is below
 | MM-IQ3_XXS | IQ3_XXS | IQ3_XXS | IQ3_XXS | no |
 | MM-IQ3_S | IQ3_S | IQ3_S | IQ3_S | no |
 | MM-IQ4_XS | IQ4_XS | IQ4_XS | IQ4_XS | no |
-| MM-NVFP4 | NVFP4 | NVFP4 | NVFP4 | no |
+| MM-NVFP4 | disabled | disabled | disabled | n/a |
 
 Router gate and `exp_probs_b` stay F32. Norms stay F32. `token_embd` is Q8_0. `output.weight` is Q6_K.
 
@@ -105,7 +113,7 @@ Full 60-layer tensor bytes from `ggml_row_size`, decimal GB, with the default Q8
 | MM-IQ4_XS | 233.188 | 217.173 |
 | MM-NVFP4 | 246.098 | 229.197 |
 
-MM-NVFP4 is listed so the size is known. This checkpoint cannot be written as that type. See below.
+MM-NVFP4 is disabled. `load_recipe` rejects it, including `--dry-run`. The row above is the size a lossless file would have had. See below. The only tier scheduled for the machines is MM-IQ2_XS. The other recipe files stay in the tree.
 
 ## NVFP4
 
@@ -125,7 +133,7 @@ Norm weights get +1 baked in when `use_gemma_norm` is true, which it is for this
 
 `minimax-m3.swiglu_alpha` is 1.702 and `minimax-m3.swiglu_limit` is 7.0. The patched graph hardcodes swiglu-oai and does not read those keys.
 
-The tokenizer is gpt2 with pre-type `minimax-m2`. `tokenizer.ggml.merges` is an empty string array, which the loader requires. `tokenizer.json` was not in the checkpoint during this work, so token ids below the added-token range are the placeholder spelling `t` plus six digits. Real added-token spellings come from `added_tokens.json`. bos `]~b]` is id 200019 and eos `[e~[` is id 200020. Both are token type CONTROL. Other added tokens are USER_DEFINED. `add_bos_token` is false. `tokenizer.chat_template` is copied from `chat_template.jinja` when that file is present. Vocab size is 200064, matching the embedding rows.
+The tokenizer is gpt2 with pre-type `minimax-m2`. When `tokenizer.json` is in the checkpoint, tokens, token types, and merges are taken from it. Merge pairs that are two strings encode a space as U+0120, matching llama.cpp. Holes are type UNUSED and are spelled `[PAD<id>]`. Without `tokenizer.json`, ids below the added-token range stay the placeholder spelling `t` plus six digits, and `tokenizer.ggml.merges` is an empty array. Added-token spellings come from `added_tokens.json` either way. bos `]~b]` is id 200019 and eos `[e~[` is id 200020. Both are token type CONTROL. Other added tokens are USER_DEFINED. `add_bos_token` is false. `tokenizer.chat_template` is copied from `chat_template.jinja` when that file is present. Vocab size is 200064, matching the embedding rows. A split part other than part 0 does not repeat the vocabulary.
 
 Indexer projections are quantized with the recipe indexer type, default Q8_0. llama.cpp's converter forces `.indexer.` to F32. The difference is recorded in `strata.indexer_quant`.
 
@@ -135,7 +143,20 @@ Ryzen 9 5900X, 24 threads. Shards on disk at the time started at `model-00002` a
 
 `strata-mm-quant-dequant-test` passed under both gcc and MSVC. It checks signed E4M3, MXFP8, BF16, the Gemma +1 bake, the nibble remap against `dequantize_row_nvfp4` at G=1, `ggml_validate_row_data` on that block, and the refusal for G=3 and for the real scale pair above.
 
-IQ2_XS bench, 8 experts of layer-3 `w1`, uniform test imatrix: 0.604 GB of logical f32 in 10.52 s, 0.057 GB/s. Routed experts are 413122166784 params, 1.652 TB logical f32. At that rate the expert matrices alone take about 480 minutes. One attention `q_proj`, MXFP8 to Q8_0, ran at 2.994 GB/s logical f32. Applying the IQ2_XS rate to every tensor overestimates the full file. The non-expert tensors are about a minute.
+IQ2_XS bench on layer-3 `w1`, uniform test imatrix, logical f32:
+
+| threads | sample | time | rate |
+| --- | --- | --- | --- |
+| 1 | 2 experts, 0.151 GB | 28.68 s | 0.005 GB/s |
+| 12 | 2 experts, 0.151 GB | 5.61 s | 0.027 GB/s |
+| 12 | 8 experts, 0.604 GB | 14.22 s | 0.042 GB/s |
+| 24 | 8 experts, 0.604 GB | 11.43 s | 0.053 GB/s |
+
+One thread to twelve is 5.1× on the short sample, and twelve to twenty-four is 1.26× on the 8-expert sample. Rows are split across threads. The 24-thread rate is the one used for the PC and for rig-2. rig-3 measured 0.050 GB/s at 16 threads (8 experts, 12.13 s). `run_tier.py --plan` has the per-machine numbers. Routed experts are 413122166784 params, 1.652 TB logical f32. At 0.053 GB/s the expert matrices alone take about 521 minutes on one 5900X. One attention `q_proj`, MXFP8 to Q8_0, was about 3-4 GB/s at 24 threads. The non-expert tensors are about a minute for the whole model.
+
+## MM-IQ2_XS across machines
+
+`run_tier.py --plan` prints the 13-part assignment. `run_tier.sh` and `run_tier.ps1` call it. Each machine writes its own final `llama-gguf-split` parts. `fetch_shards.py` pulls the safetensors for a layer range from `MiniMaxAI/MiniMax-M3.1-Flash` with urllib. Rigs delete a shard after the parts that need it are written. The PC keeps its local checkpoint. No full-model run starts without an imatrix and an explicit part.
 
 The Q8_0 smoke GGUF is 10.196 GB and was written in 19.5 s. It is not in git. `llama-cli -m smoke-l3-q8.gguf -p "]~b]" -n 8 -c 128 -fa on -ngl 0 --ignore-eos -st` loaded the file, generated 8 tokens, and exited 0. The printed pieces are the placeholder spellings `t######` because the real BPE merges are not available yet. Token quality on a 1-layer model is not a quality check.
 

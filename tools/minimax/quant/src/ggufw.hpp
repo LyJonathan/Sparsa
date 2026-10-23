@@ -58,7 +58,16 @@ public:
         }
     }
 
+    void add_u16(const std::string & k, uint16_t v) {
+        Kv kv;
+        kv.key = k;
+        kv.type = GGUF_U16;
+        const auto * p = reinterpret_cast<const uint8_t *>(&v);
+        kv.val.insert(kv.val.end(), p, p + sizeof(v));
+        kvs.push_back(std::move(kv));
+    }
     void add_u32(const std::string & k, uint32_t v) { add_pod(k, GGUF_U32, v); }
+    void add_i32(const std::string & k, int32_t v) { add_pod(k, GGUF_I32, v); }
     void add_u64(const std::string & k, uint64_t v) { add_pod(k, GGUF_U64, v); }
     void add_f32(const std::string & k, float v) { add_pod(k, GGUF_F32, v); }
     void add_bool(const std::string & k, bool v) {

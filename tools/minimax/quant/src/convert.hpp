@@ -21,6 +21,20 @@ struct Options {
     std::filesystem::path exe_dir;
     int max_layers = -1;
     std::vector<int> layers;
+    // Range form --layers A-B keeps blk.{source} names and writes only that
+    // range. Comma form remaps onto blk.0.. for a loadable smoke model.
+    bool keep_indices = false;
+    // Output-index filter on a remapped plan (comma/--max-layers). -1 = all.
+    int emit_lo = -1;
+    int emit_hi = -1;
+    // llama-gguf-split part. part is 0-based; count >= 2 enables split output.
+    // tensors < 0 means "count a full plan". Part 0 carries KV metadata.
+    int split_part = -1;
+    int split_count = 0;
+    int split_tensors = -1;
+    bool include_globals = false;
+    bool include_globals_set = false;
+    bool no_globals = false;
     int threads = 0;
     std::string dense_type;
     std::string hot_mode = "record";
