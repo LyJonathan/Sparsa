@@ -357,6 +357,23 @@ G0-G2 always stay with Claude.
 Text-only chat through the API is usable after P2+P5. P3/P4 are what make it
 fast, and P6/P7 are additive.
 
+### P4 measured (2026-10-24)
+
+- **G1 on real weights** (Q8_0 dense and experts, F32 norms/router, truncated GGUFs from the real checkpoint,
+  CPU placement): layer 0 from the embedding, layer 3 through layers 0-3, and layers 3 and 40 seeded with the
+  reference's own input, on the 114-token and 4093-token prompts. Layer-out relative error 7.1e-4 to 2.4e-3,
+  attention out 1.4e-3 to 1.3e-2, router top-4 agreement 96.5-99.1%, MSA block sets 98.4-99.6% (Jaccard 0.9974-
+  0.9993) on the long prompt, expert weights by id 7.3e-4 to 3.0e-3. Every disagreement seen was a 4th/5th-place
+  tie inside the Q8_0 noise floor.
+- **Layer split**: `--gpus 0,1 --layer-split auto|K` with per-layer ownership of dense weights, KV and VRAM
+  expert slots; the hidden state crosses through pinned host memory (no P2P). On the synthetic model the split is
+  bit-identical to one GPU in both KV placements.
+- **KV in VRAM / pinned RAM**: `--minimax-kv vram|ram|auto`; `ram` keeps K/V page-locked and copies only the
+  selected blocks per step (<= 2048 positions per KV head) to the owning device, with the indexer keys in VRAM.
+  RAM vs VRAM is bit-identical; the device attention path is 6.7e-5 max-abs from the host path.
+- **Not run**: full-model benchmarks (the PC was busy with a quantization job) and an unequal-VRAM split (both
+  cards here are 12 GB).
+
 ---
 
 ## 7. Benchmark protocol

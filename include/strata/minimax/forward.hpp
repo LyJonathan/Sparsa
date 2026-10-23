@@ -44,6 +44,16 @@ struct EngineOptions {
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
+
+    // ---- parity probes (P4).  Both are opt-in and add nothing to a normal run.
+    std::string dump_dir;           ///< write per-layer activations as npy files here (empty: off)
+    std::string dump_layers;        ///< "all" (default when dump_dir is set) or source layer ids "0,3,40"
+    std::string seed_hidden;        ///< npy fp32 [seq, n_embd]: use row t as token t's input instead of the embedding
+
+    // ---- P4: more than one GPU, and where the KV cache lives.
+    std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
+    std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
+    std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
 };
 
 struct SampleParams {
