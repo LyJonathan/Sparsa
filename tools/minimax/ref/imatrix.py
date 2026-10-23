@@ -81,7 +81,7 @@ class IMatrix:
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
         e = self._entry(name, x.shape[-1], 1)
-        x2 = x.to(torch.float32).pow(2).sum(0).numpy()
+        x2 = x.detach().to(torch.float32).pow(2).sum(0).numpy()
         e["sum2"][0] += x2
         e["count"][0] += x.shape[0]
 
@@ -91,7 +91,7 @@ class IMatrix:
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
         e = self._entry(name, x.shape[-1], 128)
-        x2 = x.to(torch.float32).pow(2).sum(0).numpy()
+        x2 = x.detach().to(torch.float32).pow(2).sum(0).numpy()
         e["sum2"][expert] += x2
         e["count"][expert] += x.shape[0]
 
@@ -334,7 +334,7 @@ def run(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--config", default=os.environ.get("MINIMAX_CONFIG", ""))
     ap.add_argument("--tokenizer", default=os.environ.get("MINIMAX_TOKENIZER", ""))
     ap.add_argument("--calibration", default=str(Path(__file__).with_name("calibration.txt")))
     ap.add_argument("--out", default=DEFAULT_OUT)

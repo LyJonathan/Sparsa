@@ -513,7 +513,7 @@ class ReferenceModel:
     def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, dtype=torch.float32, config_path: str | None = None):
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("dtype must be float32 or bfloat16")
-        if config_path is None:
+        if not config_path:
             local = Path(model_dir) / "config.json"
             config_path = os.environ.get("MINIMAX_CONFIG") or (str(local) if local.exists() else DEFAULT_CONFIG)
         torch.set_num_threads(int(os.environ.get("MINIMAX_THREADS", os.cpu_count() or 1)))

@@ -389,7 +389,7 @@ def run_greedy(args):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--config", default=os.environ.get("MINIMAX_CONFIG", ""))
     ap.add_argument(
         "--tokenizer",
         default=os.environ.get("MINIMAX_TOKENIZER", ""),
