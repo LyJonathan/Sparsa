@@ -198,6 +198,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 98;
         return true;
+    case 19:   // IQ1_S: fp16 scale + QK_K/8 qs + QK_K/16 qh (ggml block_iq1_s)
+        elems = 256;
+        bytes = 50;
+        return true;
     case 20:
         elems = 32;
         bytes = 18;

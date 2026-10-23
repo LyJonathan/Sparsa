@@ -1,10 +1,12 @@
-"""Build a tiny synthetic `minimax-m3` GGUF for the P2a loader/inspect test.
+"""Build a tiny synthetic `minimax-m3` GGUF.
 
-The shapes and names are the real ones from spec F.2, with every dimension reduced; the model is deliberately NOT
-MiniMax-M3.1-Flash's fingerprint (2 layers, 256-wide), which exercises the inspect-only path.  There is no such
-model: this is a directory test, not weights to run.
+The default file is the P2a loader fixture: two layers, every real tensor name, all zeros. It is not a model
+to run. `--runnable` writes a 4-layer F32 model (dense MLP on layers 0-2, one MoE layer, indexer block 8)
+with glorot weights so the forward pass can be checked against tools/minimax/tiny_ref.py. `--quant-experts q8_0`
+quantizes the routed `*_exps.weight` tensors; the reference then dequantizes those stored values.
 
     python tools/minimax/make_synthetic_gguf.py out.gguf [--drop NAME] [--bad-shape]
+    python tools/minimax/make_synthetic_gguf.py runnable.gguf --runnable [--quant-experts q8_0]
 
 Requires gguf-py from the local llama.cpp copy (see llama_baseline()).
 """
@@ -38,6 +40,14 @@ def llama_baseline(gguf_py=None):
 GEOMETRY = dict(layers=2, hidden=256, vocab=320, heads=8, heads_kv=2, head_dim=32, rot=16, dense_ff=512,
                 exp_ff=192, experts=8, used=4, shared=1, leading_dense=1, idx_heads=2, idx_dim=32, idx_top_k=2,
                 idx_block=8, idx_local=1, idx_first=0, ctx=4096)
+
+# Small enough to run token-by-token, wide enough that 200 tokens span more indexer blocks than top-k.
+# leading_dense=3 puts swigluoai dense MLP on layers 0-2 and a routed+shared expert layer on layer 3.
+RUNNABLE = dict(layers=4, hidden=256, vocab=128, heads=8, heads_kv=2, head_dim=32, rot=16, dense_ff=64,
+                exp_ff=64, experts=8, used=4, shared=1, leading_dense=3, idx_heads=2, idx_dim=32, idx_top_k=16,
+                idx_block=8, idx_local=1, idx_first=0, ctx=512)
+
+WEIGHT_SEED = 0xC0FFEE
 
 
 def _tensor_list(g):
@@ -83,7 +93,18 @@ def _tensor_list(g):
             yield b + 'indexer.k_norm.weight', (g['idx_dim'],), np.float32
 
 
-def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None):
+def _glorot(name, shape, rng):
+    shape = tuple(int(x) for x in shape)
+    if name.endswith('norm.weight'):
+        # Already includes the +1 the llama.cpp converter bakes in (spec F.2). Metadata says not to add it again.
+        return (1.0 + rng.normal(0.0, 0.02, size=shape)).astype(np.float32)
+    if name.endswith('exp_probs_b.bias'):
+        return rng.normal(0.0, 0.05, size=shape).astype(np.float32)
+    fan = max(int(shape[-1]), 1)
+    return rng.normal(0.0, 1.0 / np.sqrt(fan), size=shape).astype(np.float32)
+
+
+def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None):
     g = {**GEOMETRY, **(geometry or {})}
     gguf = llama_baseline(gguf_py)
     w = gguf.GGUFWriter(str(path), 'minimax-m3')
@@ -113,13 +134,25 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None):
     w.add_indexer_block_size(g['idx_block'])
     w.add_indexer_local_blocks(g['idx_local'])
     w.add_indexer_first_layer(g['idx_first'])
+    rng = np.random.default_rng(WEIGHT_SEED)
+    if weights == 'glorot':
+        # Authoritative: the norm tensors below already contain +1. The engine must not add it again.
+        w.add_bool('minimax-m3.norm.add1', False)
 
     for name, shape, dtype in _tensor_list(g):
         if name == drop:
             continue
         if bad_shape and name == 'blk.1.ffn_gate_exps.weight':
             shape = (shape[0], shape[1], shape[2] + 1)
-        w.add_tensor(name, np.zeros(shape, dtype=dtype))
+        if weights == 'glorot':
+            arr = _glorot(name, shape, rng)
+        else:
+            arr = np.zeros(shape, dtype=dtype)
+        if quant_experts == 'q8_0' and name.endswith('_exps.weight'):
+            raw = gguf.quants.quantize(np.ascontiguousarray(arr, dtype=np.float32), gguf.GGMLQuantizationType.Q8_0)
+            w.add_tensor(name, raw, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+        else:
+            w.add_tensor(name, arr)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -132,9 +165,14 @@ def main(argv=None):
     ap.add_argument('out', type=Path)
     ap.add_argument('--drop', help='leave this tensor out (a malformed-file test)')
     ap.add_argument('--bad-shape', action='store_true', help='write blk.1.ffn_gate_exps.weight one element too wide')
+    ap.add_argument('--runnable', action='store_true', help='4-layer F32 model with glorot weights (RUNNABLE geometry)')
+    ap.add_argument('--quant-experts', choices=('q8_0',), help='quantize routed *_exps.weight (with --runnable)')
     ap.add_argument('--gguf-py', type=Path, help='path to llama.cpp/gguf-py')
     a = ap.parse_args(argv)
-    build(a.out, drop=a.drop, bad_shape=a.bad_shape, gguf_py=a.gguf_py)
+    build(a.out, drop=a.drop, bad_shape=a.bad_shape, gguf_py=a.gguf_py,
+          geometry=RUNNABLE if a.runnable else None,
+          weights='glorot' if a.runnable else None,
+          quant_experts=a.quant_experts)
     print(a.out)
     return 0
 

@@ -795,20 +795,26 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # MiniMax-M3.1-Flash (GGUF architecture minimax-m3): src/minimax, a library that `strata` switches to at the top
-  # of its main, and strata-minimax wraps on its own.  P2a is metadata-only (no CUDA yet), but it is registered beside
-  # q36 and excluded on gfx906 for the same reason: the forward pass that follows uses cuBLAS entry points the wave64
-  # compat layer does not map.  main() guards the switch with STRATA_HAVE_MINIMAX, so a gfx906 build links and runs
-  # the Qwen families, and `strata --families` says so.
+  # of its main, and strata-minimax wraps on its own.  P2b is one GPU plus ggml-cpu for routed experts (swigluoai,
+  # not the Qwen SiLU pool).  Excluded on gfx906: the dense GEMV is a 32-lane kernel.  main() guards the switch with
+  # STRATA_HAVE_MINIMAX, so a gfx906 build links and runs the Qwen families, and `strata --families` says so.
   if(NOT STRATA_HIP_GFX906)
+  if(NOT STRATA_NATIVE_EXPERTS)
+    message(FATAL_ERROR "MiniMax engine requires STRATA_NATIVE_EXPERTS (ggml-cpu expert dots)")
+  endif()
   add_library(strata_minimax STATIC
     src/minimax/config.cpp
     src/minimax/gguf.cpp
-    src/minimax/serve.cpp)
-  target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_minimax PRIVATE strata_warnings)
+    src/minimax/serve.cpp
+    src/minimax/engine.cpp
+    src/minimax/cuda_ops.cu)
+  target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                             PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_minimax PUBLIC strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+                        PRIVATE strata_warnings)
   add_executable(strata-minimax src/minimax/minimax_main.cpp)
   strata_utf8_manifest(strata-minimax)
-  target_link_libraries(strata-minimax PRIVATE strata_minimax)
+  target_link_libraries(strata-minimax PRIVATE strata_minimax ${_strata_gpu_runtime_target})
   target_link_libraries(strata PRIVATE strata_minimax)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAX=1)
   endif()
