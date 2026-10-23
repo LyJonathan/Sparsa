@@ -645,6 +645,30 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// MiniMax-M3.1-Flash's guard: every key its geometry and tensor layout are read from must be present.  The exact
+/// M3.1 fingerprint is checked by src/minimax/config.cpp (from_gguf / check_m3_1), which owns the engine's config;
+/// this shared header only makes sure a `minimax-m3` file reaches that engine rather than `read_geometry` (which
+/// requires qwen4exp).  Values are validated there with the key that differs named.
+inline std::string check_architecture_minimax(const GgufFile& g) {
+    static const char* const keys[] = {
+        "minimax-m3.block_count", "minimax-m3.embedding_length", "minimax-m3.attention.head_count",
+        "minimax-m3.attention.head_count_kv", "minimax-m3.attention.key_length",
+        "minimax-m3.attention.layer_norm_rms_epsilon", "minimax-m3.feed_forward_length",
+        "minimax-m3.expert_count", "minimax-m3.expert_used_count", "minimax-m3.expert_feed_forward_length",
+        "minimax-m3.expert_shared_count", "minimax-m3.expert_gating_func", "minimax-m3.attention.indexer.head_count",
+        "minimax-m3.attention.indexer.key_length", "minimax-m3.attention.indexer.top_k",
+        "minimax-m3.attention.indexer.block_size", "minimax-m3.attention.indexer.local_blocks",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        // llama.cpp writes expert_feed_forward_length as a number or one number per layer.
+        if (!v->is_num() && !(v->type == MetaType::ARRAY && std::strcmp(k, "minimax-m3.expert_feed_forward_length") == 0))
+            return std::string(k) + " is not a number";
+    }
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -832,6 +856,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::MinimaxM3) return check_architecture_minimax(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

@@ -794,6 +794,25 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # MiniMax-M3.1-Flash (GGUF architecture minimax-m3): src/minimax, a library that `strata` switches to at the top
+  # of its main, and strata-minimax wraps on its own.  P2a is metadata-only (no CUDA yet), but it is registered beside
+  # q36 and excluded on gfx906 for the same reason: the forward pass that follows uses cuBLAS entry points the wave64
+  # compat layer does not map.  main() guards the switch with STRATA_HAVE_MINIMAX, so a gfx906 build links and runs
+  # the Qwen families, and `strata --families` says so.
+  if(NOT STRATA_HIP_GFX906)
+  add_library(strata_minimax STATIC
+    src/minimax/config.cpp
+    src/minimax/gguf.cpp
+    src/minimax/serve.cpp)
+  target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_minimax PRIVATE strata_warnings)
+  add_executable(strata-minimax src/minimax/minimax_main.cpp)
+  strata_utf8_manifest(strata-minimax)
+  target_link_libraries(strata-minimax PRIVATE strata_minimax)
+  target_link_libraries(strata PRIVATE strata_minimax)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAX=1)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
