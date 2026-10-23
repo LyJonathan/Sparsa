@@ -1,0 +1,182 @@
+#include "convert.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace {
+
+void usage() {
+    std::fputs(
+        "strata-mm-quant --model DIR --recipe NAME|FILE [options]\n"
+        "\n"
+        "Stream MiniMax-M3.1 safetensors into a minimax-m3 GGUF.\n"
+        "Dequantizes NVFP4 / MXFP8 / BF16 in memory and quantizes with ggml.\n"
+        "Does not write a full-model BF16 or F32 intermediate.\n"
+        "\n"
+        "  --model DIR                 checkpoint directory (config.json + shards)\n"
+        "  --recipe NAME|FILE          recipes/MM-IQ2_XS.json or a path\n"
+        "  --out FILE                  GGUF to write\n"
+        "  --imatrix FILE              llama.cpp GGUF imatrix\n"
+        "  --write-test-imatrix FILE   uniform TEST-ONLY imatrix for the selected layers\n"
+        "  --max-layers N              block_count=N, source layers 0..N-1 (all must exist)\n"
+        "  --layers 3,4                source layers, renumbered to blk.0.. (not with --max-layers)\n"
+        "  --threads N                 default: all logical cores\n"
+        "  --dense-type Q8_0|Q6_K|Q4_K dense, attention, indexer, shared-expert type\n"
+        "  --override KEY=TYPE         KEY is experts, ffn_down_exps, hot_experts, attention,\n"
+        "                              indexer, dense_ffn, shared_experts, router, norms,\n"
+        "                              token_embd, output. experts= also sets down and hot.\n"
+        "  --expert-profile FILE       {\"mode\":\"record\"|\"promote-layer\",\"layers\":{\"3\":[12]}}\n"
+        "  --hot-expert-mode MODE      record (default) or promote-layer; overrides the file\n"
+        "  --placeholder-missing       stand in for a missing token_embd, output, output_norm\n"
+        "  --dump-dequant NAME OUT.npy dequant one tensor (HF name or layers.N.experts.E.w1)\n"
+        "  --dry-run                   print output sizes, do not write a model\n"
+        "  --bench                     time expert dequant+quant (no GGUF)\n"
+        "  --bench-experts N           default 8\n"
+        "  --nvfp4-check               report whether expert scales fold into GGML_TYPE_NVFP4\n"
+        "  --mmproj OUT.gguf           F16 vision projector via llama.cpp (skips if shards are absent)\n"
+        "  --llama-cpp DIR             llama.cpp tree for --mmproj\n",
+        stderr);
+}
+
+std::filesystem::path exe_dir() {
+#ifdef _WIN32
+    std::wstring buf(32768, L'\0');
+    DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) {
+        return {};
+    }
+    buf.resize(n);
+    return std::filesystem::path(buf).parent_path();
+#else
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        return std::filesystem::path(buf).parent_path();
+    }
+    return {};
+#endif
+}
+
+bool take(int & i, int argc, char ** argv, const char * key, std::string & out) {
+    const std::string a = argv[i];
+    const std::string pref = std::string(key) + "=";
+    if (a == key) {
+        if (i + 1 >= argc) {
+            throw std::runtime_error(std::string("missing value for ") + key);
+        }
+        out = argv[++i];
+        return true;
+    }
+    if (a.compare(0, pref.size(), pref) == 0) {
+        out = a.substr(pref.size());
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    try {
+        mmq::Options opt;
+        opt.exe_dir = exe_dir();
+        if (argc < 2) {
+            usage();
+            return 2;
+        }
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "-h" || a == "--help") {
+                usage();
+                return 0;
+            }
+            std::string val;
+            if (take(i, argc, argv, "--model", val)) {
+                opt.model = val;
+            } else if (take(i, argc, argv, "--recipe", val)) {
+                opt.recipe = val;
+            } else if (take(i, argc, argv, "--out", val)) {
+                opt.out = val;
+            } else if (take(i, argc, argv, "--imatrix", val)) {
+                opt.imatrix = val;
+            } else if (take(i, argc, argv, "--write-test-imatrix", val)) {
+                opt.write_imatrix = val;
+            } else if (take(i, argc, argv, "--max-layers", val)) {
+                opt.max_layers = std::stoi(val);
+            } else if (take(i, argc, argv, "--layers", val)) {
+                std::string cur;
+                for (size_t k = 0; k <= val.size(); ++k) {
+                    if (k == val.size() || val[k] == ',') {
+                        if (!cur.empty()) {
+                            opt.layers.push_back(std::stoi(cur));
+                            cur.clear();
+                        }
+                    } else {
+                        cur.push_back(val[k]);
+                    }
+                }
+            } else if (take(i, argc, argv, "--threads", val)) {
+                opt.threads = std::stoi(val);
+            } else if (take(i, argc, argv, "--dense-type", val)) {
+                opt.dense_type = val;
+            } else if (take(i, argc, argv, "--override", val)) {
+                const auto eq = val.find('=');
+                if (eq == std::string::npos) {
+                    throw std::runtime_error("--override expects KEY=TYPE");
+                }
+                opt.overrides.emplace_back(val.substr(0, eq), val.substr(eq + 1));
+            } else if (take(i, argc, argv, "--expert-profile", val)) {
+                opt.expert_profile = val;
+            } else if (take(i, argc, argv, "--hot-expert-mode", val)) {
+                opt.hot_mode = val;
+                opt.hot_mode_set = true;
+            } else if (a == "--placeholder-missing") {
+                opt.placeholder = true;
+            } else if (take(i, argc, argv, "--dump-dequant", val)) {
+                opt.dump_name = val;
+                if (i + 1 >= argc) {
+                    throw std::runtime_error("--dump-dequant needs an output .npy path");
+                }
+                opt.dump_out = argv[++i];
+            } else if (a == "--dry-run") {
+                opt.dry_run = true;
+            } else if (a == "--bench") {
+                opt.bench = true;
+            } else if (take(i, argc, argv, "--bench-experts", val)) {
+                opt.bench_experts = std::stoi(val);
+            } else if (a == "--nvfp4-check") {
+                opt.nvfp4_check = true;
+            } else if (take(i, argc, argv, "--mmproj", val)) {
+                opt.mmproj_out = val;
+            } else if (take(i, argc, argv, "--llama-cpp", val)) {
+                opt.llama_cpp = val;
+            } else {
+                throw std::runtime_error("unknown argument " + a);
+            }
+        }
+        if (opt.model.empty()) {
+            throw std::runtime_error("--model is required");
+        }
+        return mmq::run(opt);
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+}

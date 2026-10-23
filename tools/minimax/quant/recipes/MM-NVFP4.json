@@ -1,0 +1,19 @@
+{
+  "name": "MM-NVFP4",
+  "file_type": 39,
+  "require_imatrix": false,
+  "dynamic_down": false,
+  "types": {
+    "experts": "NVFP4",
+    "ffn_down_exps": "NVFP4",
+    "hot_experts": "NVFP4",
+    "attention": "Q8_0",
+    "indexer": "Q8_0",
+    "dense_ffn": "Q8_0",
+    "shared_experts": "Q8_0",
+    "router": "F32",
+    "norms": "F32",
+    "token_embd": "Q8_0",
+    "output": "Q6_K"
+  }
+}
