@@ -145,20 +145,30 @@ def wire_layer(layer, L, im: IMatrix):
             mod = getattr(mod, part)
         hooks.append(mod.register_forward_pre_hook(mk(gname)))
 
+    def mk_two(name_a, name_b):
+        def hook(module, args):
+            if args:
+                im.add(name_a, args[0])
+                im.add(name_b, args[0])
+            return None
+
+        return hook
+
     if L < 3:
         dense = layer.mlp
-        hooks.append(dense.gate_up_proj.register_forward_pre_hook(
-            lambda m, a: (im.add(f"blk.{L}.ffn_gate.weight", a[0]), im.add(f"blk.{L}.ffn_up.weight", a[0]))
-        ))
+        hooks.append(
+            dense.gate_up_proj.register_forward_pre_hook(
+                mk_two(f"blk.{L}.ffn_gate.weight", f"blk.{L}.ffn_up.weight")
+            )
+        )
         hooks.append(dense.down_proj.register_forward_pre_hook(mk(f"blk.{L}.ffn_down.weight")))
     else:
         shared = layer.mlp.shared_experts
-        hooks.append(shared.gate_up_proj.register_forward_pre_hook(
-            lambda m, a: (
-                im.add(f"blk.{L}.ffn_gate_shexp.weight", a[0]),
-                im.add(f"blk.{L}.ffn_up_shexp.weight", a[0]),
+        hooks.append(
+            shared.gate_up_proj.register_forward_pre_hook(
+                mk_two(f"blk.{L}.ffn_gate_shexp.weight", f"blk.{L}.ffn_up_shexp.weight")
             )
-        ))
+        )
         hooks.append(shared.down_proj.register_forward_pre_hook(mk(f"blk.{L}.ffn_down_shexp.weight")))
         experts = layer.mlp.experts
         experts.imatrix = im

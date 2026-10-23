@@ -352,8 +352,8 @@ def _get_submodule(root, path):
     return obj
 
 
-def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32):
-    cfg = layer.config
+def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32, config=None):
+    cfg = config if config is not None else layer.config
     is_moe = cfg.mlp_layer_types[layer_idx] == "sparse"
     prefix = f"{LAYER_PREFIX}{layer_idx}."
     missing = []
@@ -366,7 +366,7 @@ def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32)
 
     def set_param(param, value):
         with torch.no_grad():
-            param.copy_(value)
+            param.data = value
 
     inter = cfg.dense_intermediate_size
     for ckpt_suffix, module_path, kind in _module_suffixes(layer_idx, is_moe):
@@ -377,9 +377,33 @@ def load_layer_weights(layer, layer_idx, store: ShardStore, dtype=torch.float32)
         value = deq(kind, key)
         if module_path.endswith("]"):
             path, rng = module_path.split("[")
-            lo, hi = rng[:-1].split(":")
-            lo = 0 if lo == "" else (inter if lo == "inter" else int(lo))
-            hi = 2 * inter if hi == "2*inter" else int(hi)
+            lo_s, hi_s = rng[:-1].split(":")
+
+            def bound(s, default):
+                if s == "":
+                    return default
+                if s == "inter":
+                    return inter
+                if s == "2*inter":
+                    return 2 * inter
+                return int(s)
+
+            lo, hi = bound(lo_s, 0), bound(hi_s, 2 * inter)
+            path = path[: -len(".weight")] if path.endswith(".weight") else path
+            inter_size = (
+                cfg.shared_intermediate_size if "shared_experts" in path else cfg.dense_intermediate_size
+            )
+
+            def bound(s, default):
+                if s == "":
+                    return default
+                if s == "inter":
+                    return inter_size
+                if s == "2*inter":
+                    return 2 * inter_size
+                return int(s)
+
+            lo, hi = bound(lo_s, 0), bound(hi_s, 2 * inter_size)
             target = _get_submodule(layer, path)
             with torch.no_grad():
                 target.weight[lo:hi].copy_(value)
@@ -447,6 +471,10 @@ class ReferenceModel:
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("dtype must be float32 or bfloat16")
         torch.set_num_threads(int(os.environ.get("MINIMAX_THREADS", os.cpu_count() or 1)))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
         self.dtype = dtype
         self.config_path = config_path
         self.config = build_text_config(config_path)
@@ -496,7 +524,15 @@ class ReferenceModel:
 
     def make_layer(self, layer_idx):
         layer = build_layer(self.config, layer_idx)
-        load_layer_weights(layer, layer_idx, self.store, self.dtype)
+        if self.dtype != torch.float32:
+            layer.to(self.dtype)
+            if self.config.mlp_layer_types[layer_idx] == "sparse":
+                # spec D.7: the router gate and bias stay fp32 (checkpoint F32)
+                layer.mlp.gate.weight.data = layer.mlp.gate.weight.data.float()
+                layer.mlp.gate.e_score_correction_bias.data = (
+                    layer.mlp.gate.e_score_correction_bias.data.float()
+                )
+        load_layer_weights(layer, layer_idx, self.store, self.dtype, self.config)
         layer.eval()
         return layer
 
