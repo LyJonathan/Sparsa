@@ -36,6 +36,13 @@ void usage() {
         "  --write-test-imatrix FILE   uniform TEST-ONLY imatrix for the selected layers\n"
         "  --max-layers N              block_count=N, source layers 0..N-1 (all must exist)\n"
         "  --layers 3,4                source layers, renumbered to blk.0.. (not with --max-layers)\n"
+        "  --layers A-B                keep blk.{source} names; metadata block_count stays the full model\n"
+        "  --emit A-B                  on a remapped plan, write only those output layers\n"
+        "  --split-part K              0-based llama-gguf-split part (with --split-count)\n"
+        "  --split-count N             number of final parts; N>=2 writes name-0000k-of-0000N.gguf\n"
+        "  --split-tensors N           total tensors across every part (default: count a full plan)\n"
+        "  --include-globals           write token_embd, output_norm, output in this part\n"
+        "  --no-globals                skip those three tensors\n"
         "  --threads N                 default: all logical cores\n"
         "  --dense-type Q8_0|Q6_K|Q4_K dense, attention, indexer, shared-expert type\n"
         "  --override KEY=TYPE         KEY is experts, ffn_down_exps, hot_experts, attention,\n"
@@ -121,17 +128,53 @@ int main(int argc, char ** argv) {
             } else if (take(i, argc, argv, "--max-layers", val)) {
                 opt.max_layers = std::stoi(val);
             } else if (take(i, argc, argv, "--layers", val)) {
-                std::string cur;
-                for (size_t k = 0; k <= val.size(); ++k) {
-                    if (k == val.size() || val[k] == ',') {
-                        if (!cur.empty()) {
-                            opt.layers.push_back(std::stoi(cur));
-                            cur.clear();
+                opt.layers.clear();
+                opt.keep_indices = false;
+                if (val.find(',') == std::string::npos && val.find('-') != std::string::npos) {
+                    const auto dash = val.find('-');
+                    if (dash == 0 || dash + 1 >= val.size()) {
+                        throw std::runtime_error("--layers range expects A-B");
+                    }
+                    const int lo = std::stoi(val.substr(0, dash));
+                    const int hi = std::stoi(val.substr(dash + 1));
+                    if (hi < lo) {
+                        throw std::runtime_error("--layers range is empty");
+                    }
+                    opt.keep_indices = true;
+                    for (int layer = lo; layer <= hi; ++layer) {
+                        opt.layers.push_back(layer);
+                    }
+                } else {
+                    std::string cur;
+                    for (size_t k = 0; k <= val.size(); ++k) {
+                        if (k == val.size() || val[k] == ',') {
+                            if (!cur.empty()) {
+                                opt.layers.push_back(std::stoi(cur));
+                                cur.clear();
+                            }
+                        } else {
+                            cur.push_back(val[k]);
                         }
-                    } else {
-                        cur.push_back(val[k]);
                     }
                 }
+            } else if (take(i, argc, argv, "--emit", val)) {
+                const auto dash = val.find('-');
+                if (dash == std::string::npos || dash == 0 || dash + 1 >= val.size()) {
+                    throw std::runtime_error("--emit expects A-B");
+                }
+                opt.emit_lo = std::stoi(val.substr(0, dash));
+                opt.emit_hi = std::stoi(val.substr(dash + 1));
+            } else if (take(i, argc, argv, "--split-part", val)) {
+                opt.split_part = std::stoi(val);
+            } else if (take(i, argc, argv, "--split-count", val)) {
+                opt.split_count = std::stoi(val);
+            } else if (take(i, argc, argv, "--split-tensors", val)) {
+                opt.split_tensors = std::stoi(val);
+            } else if (a == "--include-globals") {
+                opt.include_globals = true;
+                opt.include_globals_set = true;
+            } else if (a == "--no-globals") {
+                opt.no_globals = true;
             } else if (take(i, argc, argv, "--threads", val)) {
                 opt.threads = std::stoi(val);
             } else if (take(i, argc, argv, "--dense-type", val)) {

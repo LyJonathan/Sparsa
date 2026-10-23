@@ -187,8 +187,11 @@ expert slots for the SSD tier (DS layout). This is what makes the requested
   free disk.
 - The imatrix is collected by the R1 reference (per-column activation
   statistics on calibration text) and written in llama.cpp's imatrix format.
-- An **NVFP4 lossless** tier copies the released expert bytes through
-  unchanged.
+- An **NVFP4** recipe exists and is **disabled**. `block_nvfp4` has no
+  global-scale field, and this checkpoint's `weight_scale / weight_global_scale`
+  is not an exact E4M3 fold (layer 3 expert 0 `w1`, G=15123.69, scale byte 113).
+  `strata-mm-quant` rejects `MM-NVFP4` instead of writing a lossy file under a
+  lossless name.
 - Q2_0 (ISTA GSQ format) is **not** in v1: Strata has no quantizer for it, only
   kernels.
 
@@ -205,7 +208,7 @@ Variants. Expert bpw are ggml nominal values. Pack size includes dense
 | `MM-IQ3_XXS` | IQ3_XXS (3.06) | 158 GB | ~173 GB | 128 GB + SSD tier, or 192 GB |
 | `MM-IQ3_S` | IQ3_S (3.44) | 178 GB | ~192 GB | 192 GB+ |
 | `MM-IQ4_XS` | IQ4_XS (4.25) | 220 GB | ~234 GB | 256 GB |
-| `MM-NVFP4` (lossless) | released NVFP4 | 232 GB | ~247 GB | 256 GB; quality reference |
+| `MM-NVFP4` | disabled | 232 GB measured if it were legal | ~247 GB | not shipped; the fold into `GGML_TYPE_NVFP4` is not exact |
 
 The low tiers (IQ1_S, IQ1_M, IQ2_XXS) use a **dynamic mix**, like Unsloth's
 UD quants: `ffn_down` and the most-routed experts by profile get one step more
@@ -213,9 +216,14 @@ bits. The GGUF name keeps the tier label, and the exact recipe is stored in the
 GGUF metadata. Every tier gets a KL/top-1 row (gate G3) so its quality cost is
 measured.
 
-Build order on E:: `MM-IQ2_XS` first, then the low tiers (`IQ1_S`, `IQ1_M`,
-`IQ2_XXS`, `IQ2_S`; one at a time beside IQ2_XS, deleting or archiving after
-they are measured if space runs short), then `IQ3_XXS`+ once space is freed.
+The only tier being built now is `MM-IQ2_XS`. The other recipe files stay in
+the tree and are not scheduled. `MM-IQ2_XS` is written as 13 final
+`llama-gguf-split` parts (`split.no` / `split.count` / `split.tensors.count`,
+KV metadata only in part 0). rig-2, the PC, and rig-3 each write the parts in
+`tools/minimax/quant/run_tier.py`. Rigs download their safetensors from
+Hugging Face. Nothing is copied over the 1 MB/s LAN except the quantizer
+bundle and, later, the imatrix. `run_tier.py --plan` is the layer table and
+the projected wall-clock. The low tiers and `MM-NVFP4` wait.
 
 Dense sub-variants, chosen automatically by GPU:
 - `fp8`: MXFP8 native, 10.9 GB, sm_89+.
