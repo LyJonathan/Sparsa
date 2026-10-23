@@ -151,6 +151,7 @@ def main():
     ap.add_argument("--tokenizer", default=r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\tokenizer.json")
     ap.add_argument("--out", default=str(Path(__file__).with_name("calibration.txt")))
     ap.add_argument("--max-tokens", type=int, default=52000)
+    ap.add_argument("--scale", type=float, default=1.0, help="per-section cap = n*scale (before the global budget)")
     ap.add_argument("--truncate-to-tokens", type=int, default=None)
     args = ap.parse_args()
 
@@ -163,7 +164,7 @@ def main():
     n_total = 0
     for name, text in parts:
         n = len(tok.encode(text, add_special_tokens=False).ids)
-        take = min(n, max(0, budget - n_total))
+        take = min(n, max(0, budget - n_total), max(1, int(n * args.scale)))
         if take <= 0:
             continue
         if take < n:

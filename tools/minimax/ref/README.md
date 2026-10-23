@@ -17,9 +17,10 @@ and an imatrix for parity work (gates G0–G3).
 | `model_ref.py` | builds `MiniMaxM3VLTextConfig` from `config.json`, per-layer weight loading, forward, dumps |
 | `stream_run.py` | layer-streaming runner: prompt set logits, perplexity, greedy decode, dump mode |
 | `imatrix.py` | calibration pass and GGUF imatrix writer (llama.cpp format, spec F) |
+| `merge_imatrix.py` | sums partial imatrix GGUFs (chunks are independent) and writes the final file |
 | `chat.py`, `make_prompts.py`, `make_calibration.py` | prompt/calibration corpus generation |
 | `prompts.jsonl` | the 8-prompt set (two > 2,500 tokens) |
-| `calibration.txt` | ~41K-token calibration corpus for the imatrix |
+| `calibration.txt` | ~23.7K-token calibration corpus for the imatrix (12 chunks of 2048) |
 | `test_dequant.py` | hand-built unit tests for both formats |
 
 ## Environment
@@ -89,10 +90,12 @@ $PY stream_run.py --ppl ppl_text.txt --out .../ppl
 # greedy continuation
 $PY stream_run.py --greedy "The capital of France is" --max-new 32 --dtype bf16 --out .../greedy
 
-# imatrix: estimate first, then the real pass
-$PY imatrix.py --estimate-only --layers 30-32 --max-chunks 2 --report .../imatrix_estimate.json
-$PY imatrix.py --out "E:/.../Strata-MiniMax/_local/ref_out/imatrix-minimax-m3.1.gguf" \
-    --report .../imatrix_report.json
+# imatrix: modest 12-chunk corpus, split across two machines
+$PY imatrix.py --estimate-only --layers 32-33 --max-chunks 2 --report .../imatrix_estimate.json
+$PY imatrix.py --shard-index 0 --shard-count 2 --out .../imatrix-part0.gguf --report .../imatrix_part0.json
+# (on the other machine) --shard-index 1 --shard-count 2 -> imatrix-part1.gguf
+$PY merge_imatrix.py --out "E:/.../Strata-MiniMax/_local/ref_out/imatrix-minimax-m3.1.gguf" \
+    .../imatrix-part0.gguf .../imatrix-part1.gguf
 
 # per-op activations for layer L (chosen prompt)
 $PY stream_run.py --dump-layer 32 --dump-prompt code_lru --out .../dump

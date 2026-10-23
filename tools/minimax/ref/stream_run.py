@@ -115,6 +115,18 @@ def save_dump(dump_dir: Path, data: dict, meta: dict):
 # main streaming pass
 
 
+def resolve_tokenizer(args) -> str:
+    p = Path(args.tokenizer) if args.tokenizer else None
+    if p is not None and p.exists():
+        return str(p)
+    local = Path(args.model_dir) / "tokenizer.json"
+    if local.exists():
+        return str(local)
+    raise FileNotFoundError(
+        f"tokenizer.json not found (--tokenizer {args.tokenizer}, model dir {local})"
+    )
+
+
 def run_prompts(args):
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -122,7 +134,7 @@ def run_prompts(args):
     model = ReferenceModel(args.model_dir, dtype, args.config)
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(resolve_tokenizer(args))
     items = load_prompts(args.prompts)[: args.limit]
     layers = parse_layers(args.layers, model.config.num_hidden_layers)
     if args.max_layers:
@@ -236,7 +248,7 @@ def run_ppl(args):
     model = ReferenceModel(args.model_dir, dtype, args.config)
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(resolve_tokenizer(args))
     text = Path(args.ppl).read_text(encoding="utf-8")
     ids = tok.encode(text, add_special_tokens=False).ids[: args.max_tokens]
     log(f"ppl text: {len(ids)} tokens")
@@ -321,7 +333,7 @@ def run_greedy(args):
     text = apply_chat_template([{"role": "user", "content": args.greedy}])
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(resolve_tokenizer(args))
     ids = tok.encode(text, add_special_tokens=False).ids
     log(f"greedy prompt: {len(ids)} tokens")
 

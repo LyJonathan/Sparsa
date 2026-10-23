@@ -42,9 +42,16 @@ import torch.nn.functional as F
 
 from dequant import dequant_mxfp8, dequant_nvfp4
 
-DEFAULT_MODEL_DIR = r"E:\Jon's Projects\AI\Strata Fork Minimax\models\MiniMax-M3.1-Flash"
-DEFAULT_INDEX = r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\model.safetensors.index.json"
-DEFAULT_CONFIG = r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\config.json"
+DEFAULT_MODEL_DIR = os.environ.get(
+    "MINIMAX_MODEL_DIR", r"E:\Jon's Projects\AI\Strata Fork Minimax\models\MiniMax-M3.1-Flash"
+)
+DEFAULT_INDEX = os.environ.get(
+    "MINIMAX_INDEX",
+    r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\model.safetensors.index.json",
+)
+DEFAULT_CONFIG = os.environ.get(
+    "MINIMAX_CONFIG", r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\config.json"
+)
 
 LAYER_PREFIX = "language_model.model.layers."
 
@@ -503,9 +510,12 @@ def make_experts_resident(layer, layer_idx, store, dtype=torch.float32, verbose=
 class ReferenceModel:
     """Streaming, layer-at-a-time text reference."""
 
-    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, dtype=torch.float32, config_path: str = DEFAULT_CONFIG):
+    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, dtype=torch.float32, config_path: str | None = None):
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("dtype must be float32 or bfloat16")
+        if config_path is None:
+            local = Path(model_dir) / "config.json"
+            config_path = os.environ.get("MINIMAX_CONFIG") or (str(local) if local.exists() else DEFAULT_CONFIG)
         torch.set_num_threads(int(os.environ.get("MINIMAX_THREADS", os.cpu_count() or 1)))
         try:
             torch.set_num_interop_threads(1)

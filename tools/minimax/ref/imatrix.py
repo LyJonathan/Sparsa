@@ -181,13 +181,23 @@ def wire_layer(layer, L, im: IMatrix):
     return hooks
 
 
+def resolve_tokenizer(args) -> str:
+    p = Path(args.tokenizer) if args.tokenizer else None
+    if p is not None and p.exists():
+        return str(p)
+    local = Path(args.model_dir) / "tokenizer.json"
+    if local.exists():
+        return str(local)
+    raise FileNotFoundError(f"tokenizer.json not found (--tokenizer {args.tokenizer}, model dir {local})")
+
+
 def run(args):
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     torch.set_num_threads(args.threads)
     model = ReferenceModel(args.model_dir, dtype, args.config)
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(resolve_tokenizer(args))
     text = Path(args.calibration).read_text(encoding="utf-8")
     ids_all = tok.encode(text, add_special_tokens=False).ids
     if args.max_tokens:
@@ -197,8 +207,17 @@ def run(args):
     chunks = [c for c in chunks if len(c) >= 32]
     if args.max_chunks:
         chunks = chunks[: args.max_chunks]
+    all_chunks = len(chunks)
+    if args.shard_count > 1:
+        if not (0 <= args.shard_index < args.shard_count):
+            raise SystemExit("--shard-index must be in [0, shard-count)")
+        chunks = [c for i, c in enumerate(chunks) if i % args.shard_count == args.shard_index]
     n_tokens = sum(len(c) for c in chunks)
-    print(f"calibration: {n_tokens} tokens in {len(chunks)} chunks of <= {chunk}", flush=True)
+    print(
+        f"calibration: {n_tokens} tokens in {len(chunks)} chunks of <= {chunk} "
+        f"(shard {args.shard_index}/{args.shard_count}, from {all_chunks} chunks)",
+        flush=True,
+    )
 
     hidden = []
     for c in chunks:
@@ -250,6 +269,9 @@ def run(args):
         "tokens": n_tokens,
         "chunks": len(chunks),
         "chunk_size": chunk,
+        "all_chunks": all_chunks,
+        "shard_index": args.shard_index,
+        "shard_count": args.shard_count,
         "dtype": args.dtype,
         "layers_measured": layers,
         "timings": timings,
@@ -264,7 +286,8 @@ def run(args):
     else:
         path = args.out
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        n = im.write(path, [Path(args.calibration).name], len(chunks), chunk)
+        label = f"{Path(args.calibration).name}:shard{args.shard_index}of{args.shard_count}"
+        n = im.write(path, [label], len(chunks), chunk)
         result["imatrix"] = str(path)
         result["entries_written"] = n
         print(f"wrote {path} ({n} entries)")
@@ -287,6 +310,8 @@ def main():
     ap.add_argument("--max-chunks", type=int, default=None)
     ap.add_argument("--layer-start", type=int, default=0)
     ap.add_argument("--layer-end", type=int, default=60)
+    ap.add_argument("--shard-index", type=int, default=0, help="select chunks i %% shard-count == shard-index")
+    ap.add_argument("--shard-count", type=int, default=1)
     ap.add_argument("--threads", type=int, default=24)
     ap.add_argument("--estimate-only", action="store_true")
     ap.add_argument("--no-resident-experts", action="store_true")

@@ -7,9 +7,15 @@ The checkpoint ships ``chat_template.jinja``; it needs only ``messages``,
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-DEFAULT_TEMPLATE = Path(r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\chat_template.jinja")
+DEFAULT_TEMPLATE = Path(
+    os.environ.get(
+        "MINIMAX_CHAT_TEMPLATE",
+        r"E:\Jon's Projects\AI\Strata Fork Minimax\_ref\minimax\chat_template.jinja",
+    )
+)
 
 
 def load_template(path: str | Path | None = None) -> str:
