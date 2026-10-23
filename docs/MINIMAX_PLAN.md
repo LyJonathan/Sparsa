@@ -396,6 +396,32 @@ fast, and P6/P7 are additive.
 9. **License:** MiniMax community license, not yet analyzed. It matters only if
    quants are ever published. The repo stays private.
 
+## 8b. Publishing (decided 2026-10-23)
+
+- **Quants go on Hugging Face, public,** under `LyJonathan`. The CLI is
+  already logged in; the token is read from the HF cache and is never printed
+  or committed.
+- **Repo:** `LyJonathan/MiniMax-M3.1-Flash-GGUF`, one folder per tier,
+  split with `llama-gguf-split` so no file is over 50 GB.
+- **A tier is uploaded only after its quality gate (G3) runs.** Its model-card
+  row gives measured KL / top-1 vs the reference, the exact recipe, file sizes
+  and the llama.cpp commit and patch needed.
+- **License compliance:** the MiniMax M3.1-Flash license allows publishing and
+  distributing derivatives, provided the copyright and permission notice is
+  included. Its `LICENSE` file ships in the HF repo (`license: other`,
+  `license_name: minimax-community`, with a link to the original). The card
+  restates the Commercial-Use conditions ("Built with MiniMax M3.1-Flash"
+  attribution; notice or authorization to MiniMax) and the prohibited-use
+  appendix.
+- **Disk:** once a tier is uploaded and its upload is checked (file hashes),
+  the local copy can be deleted. This is how E: makes room for the IQ3/IQ4
+  tiers.
+- **GitHub repo goes public at the end,** after:
+  - a secrets scan of the full history (gitleaks or trufflehog)
+  - a check that `_baseline/`, `_local/` and model files are untracked
+  - a README section on MiniMax
+  - your final OK on the checklist
+
 ## 9. Decisions (approved 2026-10-23)
 
 1. Default quant for 128 GB is **`MM-IQ2_XS`**. **`MM-IQ3_XXS`** is the
