@@ -136,6 +136,13 @@ def run_prompts(args):
 
     tok = Tokenizer.from_file(resolve_tokenizer(args))
     items = load_prompts(args.prompts)[: args.limit]
+    if args.only:
+        wanted = [x.strip() for x in args.only.split(",") if x.strip()]
+        by_id = {i["id"]: i for i in items}
+        missing = [w for w in wanted if w not in by_id]
+        if missing:
+            raise SystemExit(f"--only ids not found: {missing}")
+        items = [by_id[w] for w in wanted]
     layers = parse_layers(args.layers, model.config.num_hidden_layers)
     if args.max_layers:
         layers = layers[: args.max_layers]
@@ -400,6 +407,7 @@ def build_parser():
     ap.add_argument("--layers", default=None)
     ap.add_argument("--max-layers", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--only", default=None, help="comma-separated prompt ids to run")
     ap.add_argument("--logit-chunk", type=int, default=64)
     ap.add_argument("--dump-layer", type=int, default=None)
     ap.add_argument("--dump-prompt", default="code_lru")
