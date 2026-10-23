@@ -280,19 +280,41 @@ def run_ppl(args):
 # greedy continuation (resident model + KV cache)
 
 
+def _lru_provider(provider, capacity):
+    from collections import OrderedDict
+
+    cache = OrderedDict()
+
+    def get(expert):
+        if expert in cache:
+            cache.move_to_end(expert)
+            return cache[expert]
+        value = provider(expert)
+        cache[expert] = value
+        if len(cache) > capacity:
+            cache.popitem(last=False)
+        return value
+
+    return get
+
+
 def run_greedy(args):
     """Greedy decode with all layers resident.
 
     Decoding one token at a time with layer streaming would re-dequantize every
     attention weight per token, so this mode keeps the 60 decoder layers in RAM
     (bf16 by default) and only streams routed experts, with a bounded LRU
-    expert cache.  Memory: ~21 GB (bf16 dense) + one expert per resident slot.
+    expert cache per layer.  Memory: ~21 GB (bf16 dense) + cache entries
+    (``--expert-cache`` x 113 MB per layer, default 4 -> ~27 GB).
     """
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     model = ReferenceModel(args.model_dir, dtype, args.config)
     layers = []
     for L in range(model.config.num_hidden_layers):
-        layers.append(model.make_layer(L))
+        layer = model.make_layer(L)
+        if L >= 3 and args.expert_cache > 0:
+            layer.mlp.experts.provider = _lru_provider(layer.mlp.experts.provider, args.expert_cache)
+        layers.append(layer)
         if (L + 1) % 10 == 0:
             log(f"resident layer {L} loaded")
 
@@ -374,6 +396,7 @@ def build_parser():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--greedy", default=None)
     ap.add_argument("--max-new", type=int, default=32)
+    ap.add_argument("--expert-cache", type=int, default=4, help="LRU experts per layer in greedy mode; 0 disables")
     return ap
 
 
