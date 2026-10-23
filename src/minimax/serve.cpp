@@ -67,7 +67,13 @@ void usage() {
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
                  "  --minimax-stats [--minimax-stats-per-layer]   tier counters on stderr\n"
-                 "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n");
+                 "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n"
+                 "  --minimax-dump-dir DIR            write per-layer activations as npy (parity probes)\n"
+                 "  --minimax-dump-layers LIST|all    which source layers to dump (default all)\n"
+                 "  --minimax-seed-hidden FILE.npy    feed row t as token t's input instead of the embedding\n"
+                 "  --gpus 0,1                       CUDA devices to use (default: 0)\n"
+                 "  --layer-split auto|K[,K2]         layer K is the first one on the next GPU (auto: by free VRAM)\n"
+                 "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -424,6 +430,8 @@ int run(int argc, char** argv) {
     bool pack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
+    std::string dump_dir, dump_layers, seed_hidden;
+    std::string layer_split, gpus, kv_space;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -443,6 +451,12 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-eval") eval_path = next();
         else if (a == "--minimax-dump-logits") dump_path = next();
         else if (a == "--minimax-last-k") last_k = std::atoi(next().c_str());
+        else if (a == "--minimax-dump-dir") dump_dir = next();
+        else if (a == "--minimax-dump-layers") dump_layers = next();
+        else if (a == "--minimax-seed-hidden") seed_hidden = next();
+        else if (a == "--layer-split") layer_split = next();
+        else if (a == "--gpus" || a == "--gpu") gpus = next();
+        else if (a == "--minimax-kv" || a == "--kv-space") kv_space = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
         else if (a == "--minimax-profile-save") profile_save = next();
@@ -557,6 +571,12 @@ int run(int argc, char** argv) {
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
+    opt.dump_dir = dump_dir;
+    opt.dump_layers = dump_layers;
+    opt.seed_hidden = seed_hidden;
+    opt.layer_split = layer_split;
+    opt.gpus = gpus;
+    opt.kv_space = kv_space;
 
     Engine* engine = nullptr;
     try {
@@ -573,6 +593,7 @@ int run(int argc, char** argv) {
             int rows = 0;
             engine->teacher_forced(ids, last_k, logits, rows);
             const int cols = (int)engine->config().n_vocab;
+            std::fprintf(stderr, "INFO %s\n", engine->describe().c_str());
             write_npy_f32(dump_path, logits.data(), rows, cols);
             std::printf("LOGITS %d %d %s\n", rows, cols, dump_path.c_str());
             std::fflush(stdout);
