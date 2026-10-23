@@ -17,7 +17,7 @@
 source fields. The two long prompts are 4,093 and 5,536 tokens, so they exceed
 17 blocks of 128 and actually exercise MSA block selection.
 
-## `calibration.txt` (~41.5K tokens; used by `imatrix.py`)
+## `calibration.txt` (~41.7K tokens; used by `imatrix.py`)
 
 | section | tokens | source / license |
 |---|---|---|
@@ -25,7 +25,7 @@ source fields. The two long prompts are 4,093 and 5,536 tokens, so they exceed
 | Python stdlib code | 13,236 | CPython 3.11 `asyncio/base_events.py`, `json/decoder.py`, `dataclasses.py`, `typing.py`, **PSF-2.0** |
 | transformers code | 5,438 | HuggingFace `transformers` 5.20.2 `generation/utils.py`, `tokenization_utils_base.py`, **Apache-2.0** |
 | Spanish | 5,841 | Miguel de Cervantes, *Don Quijote de la Mancha* (1605/1615), public domain, Project Gutenberg ebook **2000** |
-| Chinese | 305 | self-written + a public-domain quote from the *Analects* |
+| Chinese | 547 | self-written + a public-domain quote from the *Analects* |
 | chat-formatted | 1,567 | self-written dialogues rendered through the checkpoint's `chat_template.jinja` |
 
 No calibration text overlaps `prompts.jsonl`: the prose books, code files and

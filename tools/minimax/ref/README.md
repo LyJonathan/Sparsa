@@ -131,4 +131,17 @@ Filled in from the runs on this machine (Ryzen 9 5900X, 24 threads, 128 GB):
   - `w2` NVFP4 [6144,3072]: std 0.0283, absmax 0.165, zeros 7.18%
   - `w3` NVFP4: std 0.0272, absmax 0.165, zeros 7.10%
   - shared `gate_proj` MXFP8: std 0.0261, absmax 0.406, zeros 6.6e-06
+- **NVFP4 divisor cross-check** (layer 53, expert 0): `2688 / weight_global_scale`
+  reproduces the decoded tensor's absmax for `w2` exactly
+  (`2688/6062.80 = 0.4433594`, decoded absmax `0.4433594`) and for `w3`
+  (`2688/15123.69 = 0.1777344` vs `0.1777344`). If the global scale were a
+  multiplier these would be off by `G²`. `w1`'s computed max is
+  `2496/15123.69 = 0.16504` because its largest E4M3 block scale is 416, not
+  448 — also consistent.
+- MXFP8 `weight_scale_inv` bytes on layer 53 are 112…120 (E8M0), i.e.
+  2^-15…2^-7; NVFP4 E4M3 block scales are 98…125.
+- layer 53 (MoE), 2048 tokens, 24 threads: 0.8 s load, 38.3 s to dequantize
+  all 128 experts to fp32 (once), 9.0 s per forward when the expert bank is
+  resident; 43 s per forward when experts are streamed from disk for one
+  forward.
 - runtime / perplexity / imatrix: see the final report for this task.
