@@ -150,7 +150,8 @@ BF16 is about 854 GB, so neither can run here. Plan:
 - **R2. Validate the dequant formula.** The NVFP4 global-scale convention and
   the MXFP8 `weight_scale_inv` encoding are not stated in the repo. Cross-check
   against the vLLM/SGLang loader source, then sanity-check: perplexity on plain
-  text, and top-1 agreement with the Sakura Q2_K on llama.cpp.
+  text, and top-1 agreement with llama.cpp running our `MM-IQ2_XS` once P1
+  produces it.
 - **Prompt set:** 8 prompts (code, English, Chinese, tool-call, chat
   template). Two prompts must be **longer than 2,176 tokens** (17 blocks x
   128); below that, MSA selects every block and the sparse path never runs.
@@ -184,8 +185,8 @@ expert slots for the SSD tier (DS layout). This is what makes the requested
 - Quantizes straight to the target ggml type with an imatrix and writes GGUF.
   **No BF16 intermediate:** one would be about 854 GB, more than this machine's
   free disk.
-- The imatrix is collected with llama.cpp `llama-imatrix` on the Sakura Q2_K
-  (bootstrap), and later with our own engine.
+- The imatrix is collected by the R1 reference (per-column activation
+  statistics on calibration text) and written in llama.cpp's imatrix format.
 - An **NVFP4 lossless** tier copies the released expert bytes through
   unchanged.
 - Q2_0 (ISTA GSQ format) is **not** in v1: Strata has no quantizer for it, only
@@ -203,15 +204,25 @@ Variants. Expert bpw are ggml nominal values. Pack size includes dense
 | `MM-IQ3_S` | IQ3_S (3.44) | 178 GB | ~192 GB | 192 GB+ |
 | `MM-IQ4_XS` | IQ4_XS (4.25) | 220 GB | ~234 GB | 256 GB |
 | `MM-NVFP4` (lossless) | released NVFP4 | 232 GB | ~247 GB | 256 GB; quality reference |
-| *third-party* `Sakura Q2_K` | Q2_K | — | 156 GB | llama.cpp baseline from day 1 |
 
 Dense sub-variants, chosen automatically by GPU:
 - `fp8`: MXFP8 native, 10.9 GB, sm_89+.
 - `q8`: Q8_0, 11.3 GB, sm_75/86 and HIP.
 - `q4`: Q4_K, 6.0 GB, for GPUs with 16 GB or less.
 
-**Disk:** E: has 513 GB free and D: has 547 GB. The source safetensors
-(250 GB) go to D:. Output variants go to E:, about two or three at a time.
+**Disk (decided: everything on E:, 513 GB free):**
+
+- Source safetensors (250 GB) go to `E:\...\Strata Fork Minimax\models\`,
+  outside the repo.
+- That leaves about 263 GB: room for `MM-IQ2_XS` (~134 GB) plus working
+  space, but not `MM-IQ3_XXS` (~173 GB) as well.
+- To fit, the Sakura Q2_K baseline download (156 GB) is **dropped**. The
+  imatrix is collected by the R1 reference instead: per-column activation
+  statistics from the source-precision weights, which is better than
+  bootstrapping it from a Q2_K.
+- Before `MM-IQ3_XXS` or `MM-NVFP4` are built, space has to be freed. Options:
+  delete the source after its reference logits and imatrix are saved (it can be
+  re-downloaded), or free space on E:. Decide when P1 reaches that point.
 
 ---
 
@@ -312,7 +323,7 @@ G0-G2 always stay with Claude.
 
 | # | Phase | Owner | Done when |
 |---|---|---|---|
-| P0 | Venv; download source to D:; dequant module; R1 reference; dump reference logits; llama.cpp copy with M3.1 alias; Sakura Q2_K baseline running | Claude | R1 sane (R2), reference logits saved |
+| P0 | Venv (`_local/`); download source to E:; dequant module; R1 reference; reference logits + imatrix; llama.cpp copy in `_baseline/` with M3.1 support | Claude (+ Grok for llama.cpp, DeepSeek for dequant/MSA spec) | R1 sane (R2), reference logits saved |
 | P1 | `strata-mm-quant` + imatrix + `MM-NVFP4`, `MM-IQ2_XS`, `MM-IQ3_XXS` GGUFs; loads in llama.cpp | Grok | G0 passes; llama.cpp runs our GGUFs |
 | P2 | `src/minimax/` single-GPU engine: GGUF load, MSA, router, swigluoai experts, shared/dense, sampling, `--serve` protocol. Experts in RAM/CPU first, then GPU kernels | Claude (core) + DeepSeek (kernels) | **G1 + G2 pass** |
 | P3 | Tiers: STRP profile, VRAM cache + adaptive swaps, pinned RAM arena, SSD tier (Windows + Linux I/O), DS adaptive RAM tier + next-layer prefetch, auto-sizing | DeepSeek | G2 still passes; tier stats reported |
@@ -373,14 +384,13 @@ fast, and P6/P7 are additive.
 9. **License:** MiniMax community license, not yet analyzed. It matters only if
    quants are ever published. The repo stays private.
 
-## 9. Decisions needed from you
+## 9. Decisions (approved 2026-10-23)
 
-1. **Default quant for 128 GB:** `MM-IQ2_XS` (fits almost entirely in memory),
-   with `MM-IQ3_XXS` (about 27% on SSD at 32K) as the quality tier? Real IQ3
-   or IQ4 quality on this rig means SSD streaming.
-2. **Disk:** OK to put the 250 GB source download on **D:** and quants on
-   **E:**?
-3. **Scope of v1:** text first (P0-P5), then vision (P6) and DSpark (P7)? Is
-   CPU-only (P9) a v1 requirement?
-4. **llama.cpp baseline:** OK to build a patched copy (M3.1 alias only) next to
-   your existing builds in `E:\llm`?
+1. Default quant for 128 GB is **`MM-IQ2_XS`**. **`MM-IQ3_XXS`** is the
+   quality tier (with the SSD tier).
+2. All data goes on **E:** (see the disk plan in section 4).
+3. Order: text first (P0-P5), then vision (P6), then DSpark (P7). CPU-only
+   comes later, in P9.
+4. The llama.cpp baseline is a minimally patched copy in
+   **`_baseline/llama.cpp/`** inside this repo, which is git-ignored (as is
+   `_local/` for the venv and dumps).
