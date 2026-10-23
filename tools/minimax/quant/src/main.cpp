@@ -33,6 +33,8 @@ void usage() {
         "  --recipe NAME|FILE          recipes/MM-IQ2_XS.json or a path\n"
         "  --out FILE                  GGUF to write\n"
         "  --imatrix FILE              llama.cpp GGUF imatrix\n"
+        "  --imatrix-min-count N       blend experts with count < N (0 = every expert)\n"
+        "  --imatrix-blend K           blend weight K for --imatrix-min-count (0 = off)\n"
         "  --write-test-imatrix FILE   uniform TEST-ONLY imatrix for the selected layers\n"
         "  --max-layers N              block_count=N, source layers 0..N-1 (all must exist)\n"
         "  --layers 3,4                source layers, renumbered to blk.0.. (not with --max-layers)\n"
@@ -55,6 +57,12 @@ void usage() {
         "  --dry-run                   print output sizes, do not write a model\n"
         "  --bench                     time expert dequant+quant (no GGUF)\n"
         "  --bench-experts N           default 8\n"
+        "  --exp-layer N               experiment: quantize every expert of MoE layer N\n"
+        "  --exp-type TYPE             experiment expert type (default: recipe experts)\n"
+        "  --exp-out FILE              experiment JSON report\n"
+        "  --exp-x FILE.npy            experiment: routed-expert input [tokens, n_embd]\n"
+        "  --exp-dumps DIR             experiment: dump dir with expert_XXX_hidden/token_idx.npy\n"
+        "  --exp-experts N             experiment: limit to the first N experts (default all)\n"
         "  --nvfp4-check               report whether expert scales fold into GGML_TYPE_NVFP4\n"
         "  --mmproj OUT.gguf           F16 vision projector via llama.cpp (skips if shards are absent)\n"
         "  --llama-cpp DIR             llama.cpp tree for --mmproj\n",
@@ -123,6 +131,22 @@ int main(int argc, char ** argv) {
                 opt.out = val;
             } else if (take(i, argc, argv, "--imatrix", val)) {
                 opt.imatrix = val;
+            } else if (take(i, argc, argv, "--imatrix-min-count", val)) {
+                opt.imatrix_min_count = std::stoi(val);
+            } else if (take(i, argc, argv, "--imatrix-blend", val)) {
+                opt.imatrix_blend = std::stof(val);
+            } else if (take(i, argc, argv, "--exp-layer", val)) {
+                opt.exp_layer = std::stoi(val);
+            } else if (take(i, argc, argv, "--exp-type", val)) {
+                opt.exp_type = val;
+            } else if (take(i, argc, argv, "--exp-out", val)) {
+                opt.exp_out = val;
+            } else if (take(i, argc, argv, "--exp-x", val)) {
+                opt.exp_x = val;
+            } else if (take(i, argc, argv, "--exp-dumps", val)) {
+                opt.exp_dumps = val;
+            } else if (take(i, argc, argv, "--exp-experts", val)) {
+                opt.exp_experts = std::stoi(val);
             } else if (take(i, argc, argv, "--write-test-imatrix", val)) {
                 opt.write_imatrix = val;
             } else if (take(i, argc, argv, "--max-layers", val)) {
