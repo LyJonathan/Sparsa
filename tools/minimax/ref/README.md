@@ -81,6 +81,9 @@ $PY dequant.py --stats --tensors language_model.model.layers.32.self_attn.q_proj
 # full prompt set (fp32), outputs to _local/ref_out/prompts-fp32
 $PY stream_run.py --out "E:/.../Strata-MiniMax/_local/ref_out/prompts-fp32"
 
+# on a CUDA box: add --device cuda (public-domain reference output used this)
+$PY stream_run.py --device cuda --dtype fp32 --out .../logits
+
 # 3-layer smoke test
 $PY stream_run.py --layers 30-32 --limit 2 --out .../smoke
 
@@ -124,7 +127,8 @@ recorded through module hooks when dumping (see `model_ref.install_patches`).
 
 ## Measured results
 
-Filled in from the runs on this machine (Ryzen 9 5900X, 24 threads, 128 GB):
+Filled in from the runs on an A100-SXM4-80GB (Thunder Compute, 16 vCPU, 128 GB,
+torch 2.12.1+cu130) and the PC (Ryzen 9 5900X, 24 threads, 128 GB):
 
 - dequant sanity on real layer-3 tensors:
   - `q_proj` MXFP8: mean 1.1e-06, std 0.0322, absmax 0.234, zeros 6.5e-06,
@@ -143,13 +147,34 @@ Filled in from the runs on this machine (Ryzen 9 5900X, 24 threads, 128 GB):
   448 — also consistent.
 - MXFP8 `weight_scale_inv` bytes on layer 53 are 112…120 (E8M0), i.e.
   2^-15…2^-7; NVFP4 E4M3 block scales are 98…125.
-- layer 53 (MoE), 2048 tokens, 24 threads: 0.8 s load, 38.3 s to dequantize
-  all 128 experts to fp32 (once), 9.0 s per forward when the expert bank is
-  resident; 43 s per forward when experts are streamed from disk for one
-  forward.
-- imatrix per-layer measurement (layer 32, fp32, 24 threads, 6 chunks of 2048
-  = one half of the 24K-token corpus): 0.9 s load + 33.3 s resident-expert
-  dequant + 68.5 s for 6 forwards = **102.7 s/layer**, i.e. **1.63 h projected
-  for a full 60-layer half-pass**.  Two machines therefore finish the whole
-  imatrix in about the same 1.6 h instead of ~3.3 h.
-- runtime / perplexity / imatrix: see the final report for this task.
+- layer 53 (MoE), 2048 tokens, 24 threads on the PC: 0.8 s load, 38.3 s to
+  dequantize all 128 experts to fp32 (once), 9.0 s per forward with the expert
+  bank resident; 43 s per forward when experts are streamed from disk.
+- imatrix, A100 bf16, 23,738 tokens, 12 chunks, all 60 layers:
+  **603.5 s total, 10.1 s/layer** (1.2 s load + 2.0 s for 12 chunks + expert
+  dequant). 711/711 expected entries, 12 chunks, counts sum to
+  23,738 × 4 = 94,952 routed-token rows per expert tensor.
+- A100 fp32 full prompt set (8 prompts, 10,910 tokens, last-128 fp32 logits +
+  all-position top-1 + final hidden): **2,116 s (35.3 min)**, 33–36 s/layer.
+- A100 perplexity, 2,048 tokens of *Alice in Wonderland* (raw text, no chat
+  template): **ppl 39.69 fp32** (mean NLL 3.681), **ppl 34.50 bf16**
+  (mean NLL 3.541) — the bf16-vs-fp32 noise floor is ~13% in PPL.
+- A100 greedy, chat-templated "The capital of France is": **"Paris."** (EOS
+  after two tokens).
+- Top-1 agreement with the true next token over the prompt text: 27.2% for the
+  4,093-token prose prompt, 30.2% for the 5,536-token code prompt, 36.7% for
+  the math prompt.  (Next-token exact match is a strict measure; this is
+  consistent with a working forward pass.)
+
+**Caveat on raw-text perplexity.** 39.7 is higher than a base LM would score
+on this text. The checkpoint is a chat/reasoning model: untemplated prose and
+code are off-distribution (the chat-templated greedy answer is correct), and
+per-position NLL on untemplated text is dominated by a few very confident
+mistakes. Treat 39.69/34.50 as the measured reference numbers and use the
+teacher-forced logits (not PPL) for engine parity. A llama.cpp cross-check on
+the same GGUF (gate G3) is the right follow-up once `MM-IQ2_XS` exists.
+
+Run artefacts are in `Strata-MiniMax/_local/ref_out/`:
+`logits/` (8 prompts), `dumps/short` and `dumps/long` (layers 0, 3, 40),
+`ppl_a100_fp32.json`, `ppl_a100_bf16.json`, `greedy_a100_bf16.json`,
+`imatrix-minimax-m3.1.gguf`, `imatrix.json`.
