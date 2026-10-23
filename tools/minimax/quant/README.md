@@ -147,9 +147,14 @@ Output is 246.098 GB of tensor bytes, input ~232 GB of packed NVFP4 plus the MXF
 figure quoted for the experts elsewhere is their f32 logical size; the checkpoint is already 4.5 bpw, so the
 relayout reads about as many bytes as it writes. Measured here (Ryzen 9 5900X, 24 threads, `--threads 12`,
 all 48 shards on the local 4 TB NVMe, 2026-10-24): a 4-layer test file (7.648 GB, one MoE layer) took 54.0 s and
-a 1-layer file (6.572 GB, 2.3 GB of which is `token_embd`/`output`) took 51.8 s. The expert tensors alone run at
-0.25-0.30 GB/s of output (1.359 GB in 4.5-5.5 s), so the full run is about 15-20 minutes of one machine, bounded
-by the single-threaded nibble remap and the write, not by the disk (a raw read of the shards measured 2 GB/s).
+a 1-layer file (6.572 GB, 2.3 GB of which is `token_embd`/`output`) took 51.8 s on an idle machine. One 1.359 GB
+expert tensor takes 4.1-6.8 s (0.20-0.33 GB/s of output) depending on what else is running; the same layer-40
+conversion took 51.8 s, then 119 s and 100 s later in the day while another job held the CPU and the disk.
+Projection for the full run: 232.4 GB of experts at 0.25-0.33 GB/s is 12-16 min, plus the ~13.7 GB dense side at
+~0.1-0.15 GB/s, so **15-20 min** on an idle machine (up to ~35 min when the box is busy). The output is
+byte-identical across runs (SHA-256 of two layer-40 conversions matched). A raw read of the shards measured
+2 GB/s, so the disk is not the limit; the single-threaded per-row write plus the dequant/requantize of the
+non-expert side set the pace.
 
 Attention, indexer, dense MLP and the shared expert are MXFP8 in the checkpoint. The engine has no MXFP8 ggml type, so they are written as **Q8_0**. `q8_dense_error.py` measures the extra error of that choice on real tensors: relative L2 5.49e-3 to 5.74e-3 (median 5.56e-3) over six tensors (layer 0 q/o/dense gate, layer 3 shared gate/down, layer 40 index q). `output.weight` is Q6_K and `token_embd` Q8_0, as in every recipe.
 
@@ -158,6 +163,20 @@ Attention, indexer, dense MLP and the shared expert are MXFP8 in the checkpoint.
 CPU: `ggml-cpu`'s `ggml_vec_dot_nvfp4_q8_0` (Q8_0 activations), then the side scale is applied to the gate/up output before swigluoai and to the down output. GPU (P3 tiers): `minimax_moe_gu` / `minimax_moe_down` take optional device `f32` scale arrays and apply them in the kernel, once.
 
 `tools/minimax/compare_nvfp4_parity.py` compares the engine's per-layer output with the reference dumps; `strata-minimax --minimax-dump-dir DIR --minimax-dump-layers 0,3,40` writes `DIR/L<layer>.npy`, and `--minimax-seed-hidden FILE.npy` replays one layer from a reference input (so a 1-layer file can be compared against layer 40 of a 60-layer run).
+
+Measured 2026-10-24, CPU expert path (`--minimax-dense-layers-gpu 0`, 12 threads), reference = the FP32 dumps in `_local/ref_out/dumps/{short,long}`. `rel_l2` is over the whole layer output; the per-token column is `median / p90 / count above 1e-2`.
+
+| layer / file | tokens | layer_out rel_l2 | max abs diff | cos | per token |
+|---|---:|---:|---:|---:|---|
+| L0, 4-layer chain | 114 | 2.39e-3 | 0.21 (ref max 166) | 0.9999976 | 2.37e-3 / 2.49e-3 / 0 |
+| L0, 4-layer chain | 4093 | 2.37e-3 | 0.33 (ref max 170) | 0.9999977 | 2.36e-3 / 2.49e-3 / 0 |
+| L3, 4-layer chain | 114 | 3.53e-2 | 18.6 (ref max 860) | 0.999379 | 2.00e-3 / 2.6e-3 / 2 |
+| L3, 1-layer, reference input | 114 | 3.35e-3 | 0.62 | 0.9999944 | 1.03e-3 / 1.37e-3 / 3 |
+| L3, 4-layer chain | 4093 | 3.06e-3 | 1.00 (ref max 608) | 0.9999956 | 2.01e-3 / 2.52e-3 / 72 |
+| L40, 1-layer, reference input | 114 | 7.74e-3 | 5.54 (ref max 2273) | 0.9999700 | 3.08e-3 / 3.46e-3 / 4 |
+| L40, 1-layer, reference input | 4093 | 4.76e-3 | 16.2 (ref max 13193) | 0.9999887 | 2.55e-3 / 2.99e-3 / 53 |
+
+The 114-token layer-3 aggregate is dominated by one token (0) whose 4-way expert pick differs by 1e-3 of activation noise; replaying that same layer from the chain's own input reproduces the chain output bit for bit. Repeated runs: CPU and SSD-staged expert paths are bit-identical; the GPU path (all 128 experts in VRAM, sm_120) is 2.65e-5 relative L2 from the CPU path and matches the reference to the same 7.74e-3.
 
 ## Metadata
 
