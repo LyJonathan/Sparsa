@@ -1257,3 +1257,7 @@ slice's 35 % were near-tied swaps.
 degenerate inputs. It passes with the host compiler. The 2 x 5070 auto plan is unchanged when prefill is off
 (this engine's default); when `--minimax-prefill-batch` is on, the workspace is taken out first, which is what PR
 #19 already did for its per-token part and this branch extends to the rows scratch, ring and staged K/V.
+
+**Tests.** `python -m pytest tools/minimax`: **68 passed**. The two setup errors in `test_g3_sparsa.py`
+(`ref_dir`, `name`, `logits`, `ids` are used as fixtures but are not defined) reproduce on the merged base
+`1390bdb8` in 0.19 s and are unrelated to this branch.
