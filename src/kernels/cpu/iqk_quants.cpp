@@ -1035,6 +1035,18 @@ float dot_row(int type, const void* src, const void* q8k, int n) {
 
 size_t quantize_rows(int type, const float* src, void* dst, int64_t nrows, int64_t n_per_row,
                      const float* imatrix, int nthreads) {
+#if !defined(__AVX2__)
+    // ik_llama.cpp aborts here too (`iqk_kt_can_quantize`): the search it replaced with the AVX2 scan has no
+    // scalar fallback, so a build without AVX2 would produce a plausible-looking but wrong row.
+    (void) type;
+    (void) src;
+    (void) dst;
+    (void) nrows;
+    (void) n_per_row;
+    (void) imatrix;
+    (void) nthreads;
+    throw std::runtime_error("ikq: the trellis quantizer needs an AVX2 build");
+#else
     if (type != kIQ2KT && type != kIQ3KT) throw std::runtime_error("ikq: quantize type");
     const size_t row_size = row_bytes(type, n_per_row);
     if (!row_size) throw std::runtime_error("ikq: quantize width");
@@ -1119,6 +1131,7 @@ size_t quantize_rows(int type, const float* src, void* dst, int64_t nrows, int64
     for (auto& e : errors)
         if (e) std::rethrow_exception(e);
     return (size_t) nrows * row_size;
+#endif
 }
 
 }  // namespace strata::kernels::ikq
