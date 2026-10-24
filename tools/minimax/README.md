@@ -707,3 +707,105 @@ choice now follows the KV's home (`dev_attn = kv_mode == 1`) and the layer's att
 CPU when its weights are not on the device; `attend_host()` also refuses a missing host K/V by name.
 `tools/minimax/test_p7_kv_prefill.py` holds the combination to `prefill=batch` + `kv_space=vram` and compares it
 with the token path (max abs < 1e-2 on the synthetic fixture), plus the `--minimax-kv host` decode comparison.
+
+## P8: long context (32 K, 128 K, 256 K)
+
+Everything before this phase was measured at 512-4096 tokens. Two costs grow with the context and neither was
+addressable by a flag: the KV cache's size, and the MSA *indexer*'s score loop, which is linear in the context and
+ran as scalar dots on one thread. The analysis (bytes per token, placement, decode traffic, the prefill ceiling) is
+in `_ref/research/LONG_CONTEXT.md`; this is what the engine does about it.
+
+### What the KV cache costs
+
+| context | f16 | q8_0 K/V + f16 indexer | q8_0 everything |
+|---|---|---|---|
+| 32 K | 4.22 GiB | 2.46 GiB | 2.24 GiB |
+| 128 K | 16.88 GiB | 9.84 GiB | 8.96 GiB |
+| 256 K | 33.75 GiB | 19.69 GiB | 17.92 GiB |
+| 1 M | 135.0 GiB | 78.75 GiB | 71.75 GiB |
+
+2304 bytes/token/layer at f16 (K 1024 + V 1024 + indexer K 256), 60 layers. The indexer keys stay fp16 in every
+mode: they only *rank* blocks, and a flipped rank is a discrete change in what a query sees, not a small error.
+
+### `--minimax-kv-quant f16|q8_0|auto` (default f16, byte-identical)
+
+q8_0 blocks: 32 values share one fp16 scale, 34 bytes per block, laid out along `head_dim` so one 128-dim head is
+four whole blocks and a head row is self-contained. K and V independently. The host and pinned-RAM tiers hold the
+blocks; the device attention kernels read fp16 rows, so `--minimax-kv vram` with `q8_0` is refused by name rather
+than silently ignored.
+
+Measured on the synthetic runnable fixture (4 layers, head_dim 32 -> one block per head, the worst case for q8_0):
+mean KL 6.0e-4 nats over 96 rows, top-1 agreement 94-97%, max abs logit difference 0.093 on a logit standard
+deviation of 1.0. That is inside the project's accepted quantized-path KL (the fp16 prefill activation was
+accepted at 1.7e-3). `tools/minimax/test_p8_longctx.py` gates on that KL.
+
+`auto` is a capacity decision, not a default: fp16 unless the process cannot commit it, and the plan line says which
+way it went and why.
+
+### The plan line
+
+One parseable line at startup, on every path:
+
+```
+INFO minimax-kv plan: ctx=131072 quant=f16 kv=16.875GiB placement=ram source=auto indexer=f16 rows=294912B/layer host_attn=fast
+```
+
+`placement` is `host` (fp16 in std::vector, CPU attention), `vram` (per-layer device tensors) or `ram` (pinned host
+memory, indexer keys on the card). `source` says whether `--minimax-kv` decided it or the engine did. In the `vram`
+tier the line also carries `per_card=[...]` so an unequal split is visible before the run.
+
+**A placement bug, fixed.** The pinned-RAM tier used to charge the host KV against the *VRAM* budget, so
+`--minimax-kv ram` refused any context whose KV was larger than the cards' free memory -- exactly the case that
+tier exists for (17 GiB of f16 KV at 128 K against ~7 GiB of free VRAM). The host KV is now what decides, and the
+run refuses with the byte count and the available commit when it cannot fit.
+
+### `--minimax-host-attn fast|legacy` (default fast, byte-identical)
+
+`attend_host` allocated 65 vectors per token per layer (five in `select_slots`, one `prob` per query head) and ran
+the indexer's block scores -- `idx_heads x every key x 128` dots -- on the calling thread. It is now:
+
+* allocation-free: the block scores, the selection scratch and one `prob` slice per pool band are sized once;
+* parallel over (indexer head, block) for the scores and over query heads for the attention, using the same pool
+  the GEMV rowwise splits use. Every output is independent of every other, and each row's dots and softmax run in
+  the original order, so the arithmetic is unchanged.
+
+Measured on a 6-layer synthetic fixture with the real attention geometry (hidden 1024, 16 q / 4 kv heads,
+head_dim 128, 4 indexer heads, ctx 32768), 2048-token prompt, `--cpu-threads 12`, CPU-only:
+
+| attention | wall | rate |
+|---|---|---|
+| `legacy` | 251.3 s | 8.15 tok/s |
+| `fast` | 73.6 s | **27.82 tok/s** |
+
+3.4x on that workload, and the speedup grows with context because the indexer's share of the time grows with it.
+The logits are bit-identical (`test_p8_longctx.py::test_host_attn_fast_is_bit_identical` requires
+`np.array_equal`, not a tolerance).
+
+### `--minimax-prefill-kv auto|off` (default auto): the prompt pass on the card, whatever holds the KV
+
+With the KV in pinned RAM, batched prefill had no device path (`dev_attn = kv_mode == 1`), so it fell back to
+`attend_host` per token -- the ~1 s/token at 32 K above. It now **stages one layer's whole K/V prefix on the card**
+(a single large copy per layer, `[pos0+T][n_head_kv][head_dim]` fp16, the same layout the device tier uses, so the
+selected block ids are absolute positions in both) and runs the existing `msa_attn_batch`. The staging buffer costs
+one layer's KV -- 256 MiB of K plus 256 MiB of V at 256 K -- not the whole cache.
+
+That move is `60 x KV_size` bytes for a prompt, i.e. **the whole cache once**, against the per-token gather the
+decode path uses, which re-reads the same block for every query that selects it (32x more at 32 K):
+
+| context | staged bytes for the prompt | at 22 GB/s (Gen4 x16) |
+|---|---|---|
+| 32 K | 4.2 GB | 0.19 s |
+| 128 K | 16.9 GB | 0.77 s |
+| 256 K | 33.8 GB | 1.54 s |
+
+`off` keeps the P7 behaviour. In the pinned-RAM tier the indexer keys are device-only, so `off` now refuses by name
+instead of dereferencing a null host pointer (it used to take an access violation), and it says what to do.
+
+### What is not done
+
+* q8_0 is not wired to `--minimax-kv vram`; that needs a dequantizing MSA kernel.
+* `--minimax-kv ram` + `q8_0` keeps the host attention in prefill (the staged path wants fp16 rows), so a q8
+  long-context prompt is still slow. The RAM tier at long context wants fp16 for prefill and q8 for capacity: those
+  two do not yet coexist.
+* Prefill is still CPU-expert-bound on the full model; the expert bytes per chunk, not the attention, are the
+  ceiling. See §3.3 of the analysis.
