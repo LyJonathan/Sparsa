@@ -56,6 +56,13 @@ void sync();
 void* stream_create();
 /// A blocking stream: ordered against the legacy default stream without events (the decode norm+rope chain).
 void* stream_create_blocking();
+/// CUDA graph capture for the per-token GPU block.  Begin/end on a dedicated stream; `end` returns an
+/// instantiated graph executable (or null when capture is unsupported here).  Capture does NOT execute the work:
+/// the caller launches once after ending, then replays per token.
+void* graph_capture_begin(void* stream);
+void* graph_capture_end(void* stream);
+void graph_launch(void* graph, void* stream);
+void graph_destroy(void* graph);
 void stream_destroy(void* stream);
 void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void stream_sync(void* stream);

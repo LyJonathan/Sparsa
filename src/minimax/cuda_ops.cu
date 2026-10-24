@@ -859,6 +859,39 @@ void* stream_create_blocking() {
     return (void*)s;
 }
 
+// P5c: CUDA graphs.  Capture is ThreadLocal so a launch from another thread (the pool) cannot be folded in by
+// accident, and the stream must be the dedicated blocking one: the legacy default stream cannot be captured.
+void* graph_capture_begin(void* stream) {
+    if (!stream) throw std::runtime_error("cuda: graph capture needs an explicit stream");
+    check(cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeThreadLocal), "graph begin");
+    return stream;
+}
+
+void* graph_capture_end(void* stream) {
+    cudaGraph_t g = nullptr;
+    const cudaError_t e = cudaStreamEndCapture((cudaStream_t)stream, &g);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    cudaGraphExec_t ex = nullptr;
+    if (cudaGraphInstantiate(&ex, g, nullptr, nullptr, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaGraphDestroy(g);
+        return nullptr;
+    }
+    cudaGraphDestroy(g);
+    return (void*)ex;
+}
+
+void graph_launch(void* graph, void* stream) {
+    if (graph) check(cudaGraphLaunch((cudaGraphExec_t)graph, (cudaStream_t)stream), "graph launch");
+}
+
+void graph_destroy(void* graph) {
+    if (graph) cudaGraphExecDestroy((cudaGraphExec_t)graph);
+}
+
 void stream_destroy(void* stream) {
     if (stream) cudaStreamDestroy((cudaStream_t)stream);
 }

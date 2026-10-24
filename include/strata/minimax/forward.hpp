@@ -72,6 +72,8 @@ struct EngineOptions {
                                     ///< "off": the host rms_heads/rope/ggml_fp32_to_fp16 loop (the P5b path)
     float expert_skip = 0.f;        ///< --minimax-expert-skip: drop a routed expert whose renormalized weight is
                                     ///< below this; the survivors are renormalized. 0 (default) keeps every route.
+    std::string graphs;             ///< "" / "on": CUDA-graph the token path's per-layer GPU prefix; "off": launch
+                                    ///< the same kernels one at a time
     std::string expert_resident;    ///< "" / "auto": pin the RAM tier at startup when it fits; "all": also pin the
                                     ///< mmap-only experts (everything the RAM budget can hold); "off": on demand
 };

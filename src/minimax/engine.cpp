@@ -615,6 +615,7 @@ struct Engine::Impl {
         // P5c: the fused norm+rope step's device operands.  `qn`/`kn`/`vn` are the projection outputs of the
         // token path (normed/rotated in place), `iqn`/`ikn` the indexer's; `pos1` is the one-token position array.
         DevPtr qn, kn, vn, iqn, ikn, pos1;
+        DevPtr kn16, vn16, ik16;    // fp16 staging the graph writes; the cache copy is one D2D outside it
         DevPtr rope_cos, rope_sin;   // [rope_pos_cap][n_rot/2] fp32
         int64_t rope_pos_cap = 0;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
@@ -728,6 +729,11 @@ struct Engine::Impl {
     int prefetch_slots = 0;   // --minimax-expert-prefetch (0 = off)
     int prefetch_pending = -1;
 
+    // ---- P5c: CUDA graphs for the token path's per-layer GPU prefix (q8_1 -> dense MMVQ q/k/v + indexer ->
+    // norm+rope -> fp16).  One graph per layer, captured on the first token that reaches it.
+    bool graphs_on = true;
+    std::vector<void*> tok_graph;      // [n_layers], null when not captured (or capture failed)
+
     // ---- P3 expert tiers
     bool tiers_on = false;
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
@@ -795,12 +801,14 @@ struct Engine::Impl {
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
+        graphs_on = opt.graphs != "off";
         if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
         if (expert_skip > 0.f)
             std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
+        tok_graph.assign((size_t)cfg.n_layers, nullptr);
 
         ggml_cpu_init();
         load_tensors();
@@ -862,6 +870,9 @@ struct Engine::Impl {
     ~Impl() {
         write_own_profile();
         flush_dumps();
+        for (void* g : tok_graph)
+            if (g) cu::graph_destroy(g);
+        tok_graph.clear();
         for (Work& w : work) {
             if (w.side) cu::stream_destroy(w.side);
             w.side = nullptr;
@@ -1262,6 +1273,9 @@ struct Engine::Impl {
                 w.iqn = DevPtr(cu::alloc((size_t)cfg.idx_heads * cfg.idx_dim * sizeof(float)));
                 w.ikn = DevPtr(cu::alloc((size_t)cfg.idx_dim * sizeof(float)));
                 w.pos1 = DevPtr(cu::alloc(sizeof(int32_t)));
+                w.kn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
+                w.vn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
+                w.ik16 = DevPtr(cu::alloc((size_t)cfg.idx_dim * 2 + 64));
                 // The cos/sin table the kernel indexes.  It is built once per device up to a cap: at 256 KiB of
                 // table per 1 K positions an uncapped 1 M context would cost 256 MiB on every card, so the table
                 // stops at 128 K and a longer context keeps the host rope (correct, just not this fast path).
@@ -3206,15 +3220,89 @@ struct Engine::Impl {
             // into the cache, so the host sees one position update and no 16 K-float round trip per layer.
             const bool dev_tok = kv_mode != 0 && L.want_gpu && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
                                  pos < p_rope_cap();
+            bool graphed = false;
             const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
             const size_t koff_dev = (size_t)pos * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
             if (dev_tok) {
                 Work& w = W();
                 const int H = (int)cfg.n_head, HKV = (int)cfg.n_head_kv, D = (int)cfg.head_dim;
+                const int32_t ppos = (int32_t)pos;
+                // P5c: one captured graph per layer holds the whole GPU prefix of the attention block - q8_1
+                // quantize, the dense MMVQs, the fused norm+rope and the fp16 conversions - so a token costs one
+                // graph launch per layer instead of ~9 kernel launches.  Capture does not execute the work, so
+                // the layer runs its graph (replay or first launch) right after building it.
+                if (graphs_on && kv_mode == 1 && !dbg) {
+                    const bool fits = dense_mmvq && mmvq_dense_fits(L.wq.type, (int)cfg.n_embd) &&
+                                      mmvq_dense_fits(L.wk.type, (int)cfg.n_embd) &&
+                                      mmvq_dense_fits(L.wv.type, (int)cfg.n_embd) &&
+                                      (!L.indexer || (mmvq_dense_fits(L.iq.type, (int)cfg.n_embd) &&
+                                                      mmvq_dense_fits(L.ik.type, (int)cfg.n_embd)));
+                    if (fits) {
+                        if (!w.dsb) w.dsb = cu::stream_create_blocking();
+                        auto emit = [&] {
+                            strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, (int)cfg.n_embd, w.xq.p,
+                                                                w.dsb);
+                            strata::kernels::native_mmvq(L.wq.type, L.wq.dev.p, w.xq.p, (float*)w.qn.p,
+                                                         (int)cfg.n_embd, H * D, 1, w.dsb);
+                            strata::kernels::native_mmvq(L.wk.type, L.wk.dev.p, w.xq.p, (float*)w.kn.p,
+                                                         (int)cfg.n_embd, HKV * D, 1, w.dsb);
+                            strata::kernels::native_mmvq(L.wv.type, L.wv.dev.p, w.xq.p, (float*)w.vn.p,
+                                                         (int)cfg.n_embd, HKV * D, 1, w.dsb);
+                            cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p,
+                                               nullptr, H, H, D, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                               (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, w.dsb);
+                            cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p,
+                                               (uint16_t*)w.kn16.p, HKV, HKV, D, (int)cfg.n_rot,
+                                               (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                               (const int32_t*)w.pos1.p, eps, w.dsb);
+                            cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.vn16.p, (int64_t)HKV * D, w.dsb);
+                            if (L.indexer) {
+                                const int HI = (int)cfg.idx_heads, ID = (int)cfg.idx_dim;
+                                strata::kernels::native_mmvq(L.iq.type, L.iq.dev.p, w.xq.p, (float*)w.iqn.p,
+                                                             (int)cfg.n_embd, HI * ID, 1, w.dsb);
+                                strata::kernels::native_mmvq(L.ik.type, L.ik.dev.p, w.xq.p, (float*)w.ikn.p,
+                                                             (int)cfg.n_embd, ID, 1, w.dsb);
+                                cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p,
+                                                   (float*)w.iqn.p, nullptr, (int64_t)HI, HI, ID, (int)cfg.n_rot,
+                                                   (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                                   (const int32_t*)w.pos1.p, eps, w.dsb);
+                                cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p,
+                                                   (float*)w.ikn.p, (uint16_t*)w.ik16.p, (int64_t)1, 1, ID,
+                                                   (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                                   (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps,
+                                                   w.dsb);
+                            }
+                        };
+                        if (!tok_graph[(size_t)li]) {
+                            h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
+                            cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                            cu::graph_capture_begin(w.dsb);
+                            emit();
+                            tok_graph[(size_t)li] = cu::graph_capture_end(w.dsb);
+                            if (!tok_graph[(size_t)li])
+                                std::fprintf(stderr, "INFO minimax-graphs layer=%lld capture failed; launching "
+                                                     "kernels directly\n",
+                                             (long long)li);
+                        }
+                        if (tok_graph[(size_t)li]) {
+                            // The activation and the position are host-side inputs: copied every token, outside
+                            // the graph, which only bakes in their device addresses.
+                            h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
+                            cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                            cu::graph_launch(tok_graph[(size_t)li], w.dsb);
+                            cu::copy_d2d((uint16_t*)L.d_k.p + koff_dev, w.kn16.p, (size_t)HKV * D * 2);
+                            cu::copy_d2d((uint16_t*)L.d_v.p + koff_dev, w.vn16.p, (size_t)HKV * D * 2);
+                            if (L.indexer)
+                                cu::copy_d2d((uint16_t*)L.d_ik.p + (size_t)pos * (size_t)cfg.idx_dim, w.ik16.p,
+                                             (size_t)cfg.idx_dim * 2);
+                            graphed = true;
+                        }
+                    }
+                }
+                if (!graphed) {
                 gemv(L.wq, h.data(), nullptr, w.qn.p);
                 gemv(L.wk, h.data(), nullptr, w.kn.p);
                 gemv(L.wv, h.data(), nullptr, w.vn.p);
-                const int32_t ppos = (int32_t)pos;
                 cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
                 cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p, nullptr, H, H, D,
                                    (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
@@ -3246,6 +3334,7 @@ struct Engine::Impl {
                     cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.att.p, n, nullptr);
                     cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
                     std::memcpy(v_host + koff, kv_tmp.data(), (size_t)n * 2);
+                }
                 }
             } else {
             gemv(L.wq, h.data(), q.data());
@@ -3280,15 +3369,17 @@ struct Engine::Impl {
                 if (dev_tok) {
                     Work& w = W();
                     const int HI = (int)cfg.idx_heads, ID = (int)cfg.idx_dim;
-                    gemv(L.iq, h.data(), nullptr, w.iqn.p);
-                    gemv(L.ik, h.data(), nullptr, w.ikn.p);
-                    cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p, (float*)w.iqn.p, nullptr,
-                                       (int64_t)HI, HI, ID, (int)cfg.n_rot, (const float*)w.rope_cos.p,
-                                       (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
-                    cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p, (float*)w.ikn.p,
-                                       (uint16_t*)L.d_ik.p + (size_t)pos * (size_t)ID, (int64_t)1, 1, ID,
-                                       (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
-                                       (const int32_t*)w.pos1.p, eps, nullptr);
+                    if (!graphed) {
+                        gemv(L.iq, h.data(), nullptr, w.iqn.p);
+                        gemv(L.ik, h.data(), nullptr, w.ikn.p);
+                        cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p, (float*)w.iqn.p, nullptr,
+                                           (int64_t)HI, HI, ID, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                           (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
+                        cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p, (float*)w.ikn.p,
+                                           (uint16_t*)L.d_ik.p + (size_t)pos * (size_t)ID, (int64_t)1, 1, ID,
+                                           (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                           (const int32_t*)w.pos1.p, eps, nullptr);
+                    }
                     if (dbg) {
                         cu::sync();
                         cu::copy_d2h(iq.data(), w.iqn.p, (size_t)HI * ID * sizeof(float));

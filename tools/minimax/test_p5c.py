@@ -102,3 +102,14 @@ def test_batched_normrope_is_bit_identical(gguf, tmp_path):
     assert 'prefill=batch' in err
     dev, _, _ = _run(gguf, ids, tmp_path / 'bon.npy', common)
     assert np.array_equal(base, dev), float(np.abs(base - dev).max())
+
+
+def test_cuda_graphs_are_bit_identical(gguf, tmp_path):
+    """The captured token-path prefix replays the same kernels with the same arguments: exact output."""
+    if NDEV < 1:
+        pytest.skip('needs a CUDA device')
+    ids = _ids(200)
+    common = ['--gpus', '0', '--minimax-kv', 'vram', '--minimax-dense-layers-gpu', '-1']
+    base, _, _ = _run(gguf, ids, tmp_path / 'goff.npy', common + ['--minimax-graphs', 'off'])
+    got, _, _ = _run(gguf, ids, tmp_path / 'gon.npy', common)
+    assert np.array_equal(base, got), float(np.abs(base - got).max())

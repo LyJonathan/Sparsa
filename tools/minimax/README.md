@@ -550,6 +550,28 @@ placement (`tools/minimax/skip_quality.py`):
 checkpoint (0.012), for +3 % decode; 0.15 is at the floor with a visible top-1 cost. The default stays **off**: a
 3 % win does not justify changing answers, and the slice's 15 layers understate what a deep-layer skip costs.
 
+### CUDA graphs: `--minimax-graphs off` (default on)
+
+The token path's attention prefix is nine small launches per layer per token: the q8_1 quantize of the activation,
+five dense MMVQs (q, k, v, indexer q, indexer k), two fused norm+rope calls and one fp16 cast. The first token of
+each layer now captures that prefix into a CUDA graph (`cudaStreamBeginCapture` on the dedicated blocking stream,
+instantiated once per layer) and every later token replays it with one launch; the host-side inputs (the activation
+h2d and the 4-byte position) stay outside the graph as addresses baked in at capture. The K/V rows land in a fixed
+fp16 staging buffer inside the graph, and two 2 KB D2D copies place them in the cache at the token's offset - the
+one pointer that changes per token.
+
+The graphs are **bit-identical** to the direct launches (`test_p5c.py`, 200 tokens) - same kernels, same
+arguments. 512-token prompt, 96 new tokens, 3 interleaved rounds, same box:
+
+| arm | ms/token | decode tok/s |
+| --- | ---: | ---: |
+| `--minimax-graphs off` | 57.71 (57.16, 57.71, 57.77) | 17.33 |
+| graphs on (default) | **54.56** (54.33, 54.56, 56.64) | **18.33** |
+
++5.8 %. It buys launch and stream-ordering overhead only: the expert reads, which dominate the token, are on the
+CPU and untouched.
+
+
 
 
 
