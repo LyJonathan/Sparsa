@@ -455,8 +455,14 @@ rows) and 3.7x faster: MSA 16.4 → 4.4 s over a 4096-token prompt (73 % → 21 
   `vec_dot`; llama.cpp is at ~23 GB/s because its weights are committed RAM rather than our mmap, which pays a soft
   page fault per 4 KiB. `--minimax-tiers --minimax-ram-experts-per-layer 128` does not help by itself (the arena is
   filled on demand, i.e. re-reads the same bytes once more).
-- `--minimax-prefill-dense f16` is 7 % faster (209.7 tok/s at 4096) but still produces non-finite logits above 512
-  prompt tokens. It is not the default; the fp32 path is now correct after the dequantizer fix.
+- `--minimax-prefill-dense f16` **is fixed** (P5c). It used to produce non-finite logits for any prompt that needed
+  more than one prefill chunk. The fault was not the HGEMM: `p.gh`, the fp16 swiglu buffer the f16 path feeds to the
+  down GEMM, was sized `rows_cap x n_ff_exp` (1024 x 3072) while the *dense* MLP's hidden is `n_ff_dense` = 12288
+  wide - a 4x write past the end of the buffer that landed in whatever was allocated after it. The f32 path never
+  touches `p.gh` in the dense MLP (it swiglu's into `p.sh`), which is why only f16 broke. It is now sized by
+  `max_dense_n`. On the real slice, 4096-token prefill: f32 270.6 tok/s, f16 294.8/296.4 tok/s (+9 %), and the
+  f16 logits against f32 over 768 tokens (two chunks) are finite at KL 1.7e-3, top-1 0.977, median |d| 0.068. It
+  stays opt-in: the coarser activation is measurable, and the default is the parity-first f32 path.
 
 ## P5c: the norm+rope round trip is gone
 
