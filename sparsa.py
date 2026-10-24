@@ -146,6 +146,17 @@ def prefill_batch_value(text: str) -> int:
     return n
 
 
+def find_mmproj(model: Path, explicit: str | None) -> Path | None:
+    """The vision file: --mmproj, else the one mmproj-*.gguf beside the model.  None keeps the engine text-only."""
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"sparsa: --mmproj {p} is not a file")
+        return p
+    found = sorted(model.parent.glob("mmproj-*.gguf"))
+    return found[0] if found else None
+
+
 def build_config(args) -> dict:
     if not args.model:
         raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
@@ -193,6 +204,9 @@ def build_config(args) -> dict:
         cfg_args += ["--cpu-threads", str(args.threads)]
     if args.allow_nonstandard:
         cfg_args += ["--minimax-allow-nonstandard"]
+    mmproj = None if getattr(args, "no_vision", False) else find_mmproj(first, args.mmproj)
+    if mmproj is not None:
+        cfg_args += ["--mmproj", str(mmproj)]
     cfg_args += list(args.engine_arg or [])
 
     log = Path(args.log).expanduser() if args.log else Path(args.config).with_suffix(".log")
@@ -214,6 +228,9 @@ def build_config(args) -> dict:
         cfg["gpu"] = gpus if len(gpus) > 1 else gpus[0]
         if len(gpus) > 1:
             cfg["layer_split"] = "auto"
+    if mmproj is not None:
+        # The engine owns the ViT: the server writes the picture and counts its tokens, the engine projects it.
+        cfg["vision"] = {"engine": True, "mmproj": str(mmproj), "max_tokens": 576}
     return cfg
 
 
@@ -348,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--allow-nonstandard", action="store_true",
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
+        p.add_argument("--mmproj", help="vision mmproj GGUF (default: the mmproj-*.gguf beside the model)")
+        p.add_argument("--no-vision", action="store_true", help="ignore the mmproj and serve text only")
         p.add_argument("--port", type=int, default=8080)
         p.add_argument("--host", help="the address to listen on (default: 127.0.0.1, or 0.0.0.0 for --access lan)")
         p.add_argument("--access", choices=("local", "lan"), default="local",
