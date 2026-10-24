@@ -735,11 +735,12 @@ fires and costs one query when it does not.
 
 **`--minimax-ssd-prefetch on|off` (default off): the next layer's reads, issued a layer early.** `prefetch_for`
 already applies layer *l+1*'s router to the residual to fill VRAM slots; it now also queues *l+1*'s SSD misses, so
-they are in flight across that layer's attention, router and shared expert. The residual at that point is only a
-*prediction* of the router's input (the next layer's attention moves it before the router runs), so the routes can
-differ. The staging ring is doubled, each route's slot is recorded, and `ssd_pf_hit` / `ssd_pf_waste` in the totals
-line say how good the prediction was -- which is the number that decides whether it is worth turning on, and it is
-why the default is off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
+they are in flight across that layer's attention, router and shared expert. It is scored from the layer that is
+running now: its post-attention FFN input fed to the future layer's router. `--minimax-ssd-prefetch-depth N`
+(1-8) chooses how many layers ahead. The staging pool has a region per layer slot, each route's slot is recorded,
+and `ssd_pf_hit` / `ssd_pf_waste` in the totals line say how good the prediction was -- which is the number that
+decides whether it is worth turning on. See the P11 section at the end for the three bugs that were fixed and why
+the default is still off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
 19.64 -> 20.22 tok/s, both with a much larger resident tier.)
 
 **CPU threads: the default is the physical core count, not the logical one.** Decode is bandwidth-bound -- the CPU
@@ -1310,3 +1311,49 @@ degenerate inputs. It passes with the host compiler. The 2 x 5070 auto plan is u
 **Tests.** `python -m pytest tools/minimax`: **68 passed**. The two setup errors in `test_g3_sparsa.py`
 (`ref_dir`, `name`, `logits`, `ids` are used as fixtures but are not defined) reproduce on the merged base
 `1390bdb8` in 0.19 s and are unrelated to this branch.
+
+## P11: the drive's slow windows, measured with `io_probe`
+
+The decode wait on the SSD tier swings between runs (20-76 ms/token, and a single token can spend seconds in
+`ssd_wait`), so this branch adds a drive-side probe instead of guessing: `tools/minimax/io_probe.cpp` issues the
+same 4 KiB-aligned unbuffered requests the tier issues, at a chosen queue depth, and reports GB/s. Build it with
+`tools/minimax/build_io_probe.bat`.
+
+Measured on the full D3 pack's shards, 5.2 MiB per request, 32-200 requests per configuration:
+
+| configuration | first ~1 GB after an idle box | immediately after, same offsets |
+| --- | ---: | ---: |
+| plain `NO_BUFFERING | OVERLAPPED` | 0.13-0.15 GB/s | 4.9-7.2 GB/s |
+| `+ FILE_FLAG_RANDOM_ACCESS` (what the engine sets) | 0.13-0.14 GB/s | 5.1-7.1 GB/s |
+| queue depth 1 / 2 / 8 / 32 | 0.13 / 0.13 / 0.13 / 0.15 | 4.9 / 7.0 / 7.2 / 7.2 |
+
+Three things follow. **The flag is not the cause** (the two arms are indistinguishable inside a window, and the
+mature `FileExpertSource` path in `src/core/expert_source.cpp` opens plain `NO_BUFFERING | OVERLAPPED` for the
+same reason); **queue depth is not the lever inside a slow window** (0.13 GB/s at depth 1 and at depth 32 means
+the device is not serving requests, not that it has too few); and **the drive has multi-second degraded windows**
+after sustained reads, which the token inherits as `ssd_wait`. The engine can only (a) have fewer bytes to read and
+(b) have them in flight before the layer needs them.
+
+### The one-layer-early prefetch, and the three bugs that made it wrong
+
+`--minimax-ssd-prefetch` was reported as producing no completed generation. Three separate faults were found:
+
+1. **It matched a prediction rank-for-rank.** A prediction that named the right experts in a different order was
+   counted as a miss and the bytes were read twice. It now matches the predicted *set* (`ssd_pf_exp` is searched).
+2. **It reused a staging region while a read into it was still in flight.** Regions are now per
+   `layer % (depth + 1)` and the region is drained before reuse.
+3. **It scored the predicted layer's router on the wrong CUDA device.** With `--gpus 0,1 --layer-split auto`,
+   layer `j`'s MoE predicted layer `j+2` and ran `j+2`'s router GEMV while device `j` was current; the first
+   token died with `cuda: gemv sync: an illegal memory access`. `use_layer_device(target)` fixes it. This was the
+   "no completed generation": the engine reports the error on **stdout** (`ERR minimax engine: ...`) and exits 0,
+   which a harness that only looks for `DONE` sees as silence.
+
+With those fixed, `gate_logits.py` on the 15-layer real-weight slice is **max abs 0.0 / KL 0.0 / top-1 1.000**
+(prefetch off against on), and the prediction is scored from the current layer's post-attention FFN input, which
+is what Project Maya's device uses.
+
+**It is still not a win on the full model.** The depth is a whole-layer drain (`ssd_wait_all` before reusing a
+region), because a per-region completion tag deadlocked after the full model's prefill when a prediction's
+completion was not reaped on its shard. On the slice, prefetch on reads 48 % more bytes and spends more time in
+`ssd_wait` (60 -> 124 ms); the default stays **off**, and the flag remains opt-in while a per-region drain that
+does not leak is written.

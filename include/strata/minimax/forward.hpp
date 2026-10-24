@@ -108,8 +108,9 @@ struct EngineOptions {
     std::string ssd_zerocopy;       ///< "" / "on": an expert whose pages are already resident is computed from the
                                     ///< mapping with no read; "off": always issue the read (P6 behaviour)
     int page_probe = 32;            ///< P9: pages probed per expert for a page-cache hit (0 = walk every page)
-    std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
-                                    ///< MoE, so they are in flight across that layer's attention
+    std::string ssd_prefetch;       ///< "" / off: "on" queues a future layer's SSD misses while this layer computes,
+                                    ///< so they are in flight across whole layers instead of one attention block
+    int ssd_prefetch_depth = 1;     ///< --minimax-ssd-prefetch-depth: layers between the issue and the use (1-8)
     // ---- P7b: the route nudge (Xolotl's selection bias toward resident experts).
     std::string route_bias;         ///< "" / off: "on" ranks the router's top-k on the expert's score plus a
                                     ///< residency bonus / file penalty; the weights stay unbiased

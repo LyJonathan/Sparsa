@@ -917,10 +917,12 @@ struct Engine::Impl {
     // is queued at once so the drive and the CPU experts work at the same time.
     uint8_t* ssd_slots = nullptr;
     size_t ssd_slot_bytes = 0;
-    size_t ssd_slot_cap = 0;       // routes that can be in flight at once (P7: doubled when prefetching)
+    size_t ssd_slot_cap = 0;       // slots: one route per slot, 2 x top per prefetch region
     size_t ssd_gu_cap = 0;
     size_t ssd_dn_cap = 0;
-    std::vector<int> ssd_pending;   // queued, not yet completed, per shard
+    std::vector<int> ssd_pending;   // queued, not yet completed, per shard (the layer's own misses, tag 0)
+    std::vector<int> ssd_pf_out;    // queued, not yet completed, per prefetched layer (tag = layer + 1)
+    std::vector<int> ssd_pf_out_shard;   // the same split per shard, so a layer wait blocks only where it reads
     double ssd_wait_ms = 0.0;       // the last token's total time spent waiting for the SSD
 
     std::vector<float> usage;       // decayed routing counts, [n_layers * n_expert]
@@ -1140,6 +1142,10 @@ struct Engine::Impl {
         ssd_zero_copy = opt.ssd_zerocopy != "off";
         page_probe = opt.page_probe;
         ssd_prefetch = opt.ssd_prefetch != "off" && !opt.ssd_prefetch.empty();
+        ssd_prefetch_depth = std::clamp(opt.ssd_prefetch_depth, 1, 8);
+        if (ssd_prefetch)
+            std::fprintf(stderr, "INFO minimax-ssd-prefetch depth=%d slots=%zu\n", ssd_prefetch_depth,
+                         (size_t)cfg.n_expert_used * 2 * (size_t)(ssd_prefetch_depth + 1));
         route_bias = opt.route_bias == "on";
         ram_inplace = opt.ram_mode == "inplace";
         if (ram_inplace && opt.memory_limit_mib > 0)
@@ -2557,12 +2563,17 @@ struct Engine::Impl {
             ssd_slot_bytes = up(2 * ssd_gu_cap + ssd_dn_cap);
             // P7 --minimax-ssd-prefetch guesses the next layer's routes from the residual, which is only a
             // prediction (the next layer's attention moves the residual before its router runs), so a layer can
-            // need a slot for a route nobody predicted.  Doubling the slots keeps both sets alive; the wasted
-            // reads are counted as ssd_pf_waste.
-            ssd_slot_cap = (size_t)cfg.n_expert_used * (ssd_prefetch ? 2 : 1);
+            // need slots for routes nobody predicted.  Each of the `depth` prefetch regions holds 2 x top slots:
+            // the predicted routes first, then room for the layer's own unpredicted misses.  A region is reused
+            // only after `ssd_wait_layer` has drained the reads that were in it, so an in-flight read can never
+            // be overwritten by the next prediction.
+            const size_t per_region = (size_t)cfg.n_expert_used * 2;
+            ssd_slot_cap = per_region * (size_t)(ssd_prefetch ? ssd_prefetch_depth + 1 : 1);
             ssd_slots = (uint8_t*)strata::platform::DirectFile::alloc_aligned(ssd_slot_cap * ssd_slot_bytes);
             if (!ssd_slots) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned expert staging slots");
             ssd_pending.assign(ssd_files.size(), 0);
+            ssd_pf_out.assign((size_t)cfg.n_layers, 0);
+            ssd_pf_out_shard.assign((size_t)cfg.n_layers * ssd_files.size(), 0);
             ssd_pf_exp.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert_used, -1);
             ssd_pf_slot.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert_used, -1);
             ssd_pf_n.assign((size_t)cfg.n_layers, 0);
@@ -3093,8 +3104,20 @@ struct Engine::Impl {
         return b + (role == 0 ? 0 : role == 1 ? ssd_gu_cap : 2 * ssd_gu_cap);
     }
 
+    // A layer's staging region: `2 * top` slots, the first `top` for the routes prefetched for it and the rest for
+    // misses the prediction did not name.  With depth 1 the region is the whole pool, as before.
+    size_t ssd_region_slots() const { return (size_t)cfg.n_expert_used * 2; }
+    // depth + 1 regions: while layer `li` computes in region `li % (depth+1)`, the prediction for `li + depth`
+    // lands in the region vacated by `li - 1`, which is finished.  Neither can touch the other's slots.
+    size_t ssd_region_base(int64_t li) const {
+        if (!ssd_prefetch || ssd_prefetch_depth < 1) return 0;
+        return (size_t)(li % (int64_t)(ssd_prefetch_depth + 1)) * ssd_region_slots();
+    }
+
     // Queue one role's bytes so they land in their final place; returns the pointer the dot kernels read.
-    uint8_t* ssd_submit_role(const Tensor& t, int64_t expert, uint8_t* base) {
+    // `tag` is 0 for the layer's own miss and `layer + 1` for a read queued a layer (or more) early; the tag is
+    // what lets a prefetch region be drained without waiting for the current layer's reads.
+    uint8_t* ssd_submit_role(const Tensor& t, int64_t expert, uint8_t* base, uint64_t tag = 0) {
         const size_t len = t.bytes / (size_t)t.ne2;
         const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
         constexpr uint64_t A = strata::platform::DirectFile::alignment();
@@ -3113,35 +3136,72 @@ struct Engine::Impl {
             const uint32_t o = (uint32_t)c * step;
             if (o >= alen) break;
             const uint32_t l = alen - o < step ? alen - o : step;
-            if (!file.submit(aoff + o, base + o, l, 0, err)) fail("minimax SSD read: " + err);
-            ++ssd_pending[t.shard];
+            if (!file.submit(aoff + o, base + o, l, tag, err)) fail("minimax SSD read: " + err);
+            if (tag == 0) {
+                ++ssd_pending[t.shard];
+            } else {
+                ++ssd_pf_out[(size_t)(tag - 1)];
+                ++ssd_pf_out_shard[(size_t)(tag - 1) * ssd_files.size() + t.shard];
+            }
         }
         return base + (size_t)(off - aoff);
+    }
+
+    // Collect up to 64 completions from one shard and account them by tag.  Returns the number the port
+    // delivered (0 when `timeout_ms` is 0 and nothing was ready).  A completion is the only place a prefetch
+    // read stops being outstanding, whichever layer's wait happens to reap it.
+    int ssd_pump(int f, int max, int timeout_ms) {
+        strata::platform::Completion buf[64];
+        const int want = max < 64 ? max : 64;
+        const int n = ssd_files[(size_t)f]->wait(buf, want, timeout_ms);
+        if (n <= 0) return 0;
+        for (int i = 0; i < n; ++i) {
+            if (buf[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+            if (!buf[i].ok) fail("minimax SSD read: I/O failed");
+            if (buf[i].tag == 0) {
+                --ssd_pending[(size_t)f];
+            } else {
+                const size_t li = (size_t)(buf[i].tag - 1);
+                if (li >= ssd_pf_out.size() || ssd_pf_out[li] <= 0)
+                    fail("minimax SSD read: completion for a prefetch layer that is not in flight");
+                --ssd_pf_out[li];
+                int& by_shard = ssd_pf_out_shard[li * ssd_files.size() + (size_t)f];
+                if (by_shard > 0) --by_shard;
+            }
+        }
+        return n;
     }
 
     void ssd_wait_all() {
         if (ssd_pending.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
-        strata::platform::Completion buf[64];
         for (size_t f = 0; f < ssd_pending.size(); ++f) {
-            int left = ssd_pending[f];
-            if (left <= 0) continue;
-            strata::platform::DirectFile& file = *ssd_files[f];
-            while (left > 0) {
-                // Drain a batch, not one completion at a time: a layer of a 57-layer model queues a few hundred
-                // reads, and one completion-port call each was measurable host time of its own.
-                const int want = left < 64 ? left : 64;
-                const int n = file.wait(buf, want, -1);
-                if (n <= 0) continue;
-                for (int i = 0; i < n; ++i) {
-                    if (buf[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
-                    if (!buf[i].ok) fail("minimax SSD read: I/O failed");
-                    --left;
-                }
+            // Drain a batch, not one completion at a time: a layer of a 57-layer model queues a few hundred
+            // reads, and one completion-port call each was measurable host time of its own.  Prefetch
+            // completions that arrive here are simply accounted and dropped; the data is already in its slot.
+            while (ssd_pending[f] > 0) {
+                if (ssd_pump((int)f, 64, -1) == 0) continue;
             }
-            ssd_pending[f] = 0;
         }
         ssd_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Wait until every read queued for layer `li` a few layers ago has completed, so its staging region can be
+    // reused.  This is deliberately per layer: the current layer's own misses are `ssd_wait_all`, and blocking on
+    // the deeper predictions there would throw away the lookahead.
+    void ssd_wait_layer(int li) {
+        if (ssd_pf_out.empty() || li < 0 || li >= (int)ssd_pf_out.size()) return;
+        while (ssd_pf_out[(size_t)li] > 0) {
+            int progressed = 0;
+            int block_on = -1;
+            for (size_t f = 0; f < ssd_files.size() && ssd_pf_out[(size_t)li] > 0; ++f) {
+                if (ssd_pf_out_shard[(size_t)li * ssd_files.size() + f] <= 0) continue;
+                if (block_on < 0) block_on = (int)f;
+                progressed += ssd_pump((int)f, 64, 0);
+            }
+            // Nothing was ready: sleep on a shard this layer actually reads from, never on shard 0 by assumption.
+            if (progressed == 0 && block_on >= 0 && ssd_pf_out[(size_t)li] > 0) ssd_pump(block_on, 64, -1);
+        }
     }
 
     // P7: is every page covering [p, p + len) in this process's working set?  If so, reading the expert's bytes
@@ -3203,10 +3263,10 @@ struct Engine::Impl {
 
     // Queue one expert's three roles into `slot`; fills the three data pointers.
     void ssd_submit_expert(const Layer& L, int64_t expert, int slot, const uint8_t*& g, const uint8_t*& u,
-                           const uint8_t*& d) {
-        g = ssd_submit_role(L.egate, expert, ssd_slot_role(slot, 0));
-        u = ssd_submit_role(L.eup, expert, ssd_slot_role(slot, 1));
-        d = ssd_submit_role(L.edown, expert, ssd_slot_role(slot, 2));
+                           const uint8_t*& d, uint64_t tag = 0) {
+        g = ssd_submit_role(L.egate, expert, ssd_slot_role(slot, 0), tag);
+        u = ssd_submit_role(L.eup, expert, ssd_slot_role(slot, 1), tag);
+        d = ssd_submit_role(L.edown, expert, ssd_slot_role(slot, 2), tag);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
     }
@@ -3433,6 +3493,9 @@ struct Engine::Impl {
             t_ph = std::chrono::steady_clock::now();
         }
         const int64_t li = (int64_t)(&L - layers.data());
+        // Start the prediction for a later layer now, while this layer's experts compute.  `in` is this layer's
+        // post-attention FFN input, the predictor Maya's device uses; the target layer's own router scores it.
+        if (ssd_prefetch && li + ssd_prefetch_depth < cfg.n_layers) ssd_prefetch_for(li + ssd_prefetch_depth, in);
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
         if (!usage.empty()) {
             for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
@@ -3456,7 +3519,9 @@ struct Engine::Impl {
         cpu.reserve((size_t)top);
         int ssd_n = 0;
         int pf_hits = 0;
-        ssd_slot_next = (int)li < (int)ssd_pf_n.size() ? ssd_pf_n[(size_t)li] : 0;
+        const size_t slot_base = ssd_region_base(li);
+        const int slot_end = (int)(slot_base + ssd_region_slots());
+        ssd_slot_next = (int)(slot_base + ((int)li < (int)ssd_pf_n.size() ? ssd_pf_n[(size_t)li] : 0));
         for (int j = 0; j < top; ++j) {
             if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
@@ -3525,10 +3590,15 @@ struct Engine::Impl {
                     continue;
                 }
             }
-            // P7 --minimax-ssd-prefetch: the read for this route was queued right after the previous layer, so it
-            // has had that layer's attention and router to complete.  Take its slot; do not issue it twice.
-            const size_t pfat = (size_t)li * (size_t)top + (size_t)j;
-            if (!ssd_pf_exp.empty() && ssd_pf_exp[pfat] == e) {
+            // P7 --minimax-ssd-prefetch: the read for this route was queued a few layers ago.  Match the route
+            // against the predicted *set*, not rank-for-rank: a prediction that names the right experts in a
+            // slightly different order is still a hit and its slot is still the one holding its bytes.
+            int pf_at = -1;
+            const size_t pfat_base = (size_t)li * (size_t)top;
+            for (int j2 = 0; j2 < top && !ssd_pf_exp.empty(); ++j2)
+                if (ssd_pf_exp[pfat_base + (size_t)j2] == e) { pf_at = j2; break; }
+            if (pf_at >= 0) {
+                const size_t pfat = pfat_base + (size_t)pf_at;
                 const int slot = ssd_pf_slot[pfat];
                 ssd_pf_exp[pfat] = -1;
                 g = ssd_role_ptr(L.egate, e, ssd_slot_role(slot, 0));
@@ -3537,7 +3607,7 @@ struct Engine::Impl {
                 ++ssd_n;
                 ++pf_hits;
             } else {
-                if (ssd_slot_next >= (int)ssd_slot_cap)
+                if (ssd_slot_next >= slot_end)
                     fail("internal: the SSD staging slots are exhausted (more misses than slots in one layer)");
                 ssd_submit_expert(L, e, ssd_slot_next++, g, u, d);
                 ++ssd_n;
@@ -3602,7 +3672,9 @@ struct Engine::Impl {
             t_ph = std::chrono::steady_clock::now();
         }
         if (ssd_n > 0) {
-            // The drive has had the GPU stream and this pass's RAM experts to hide behind.
+            // The drive has had the GPU stream and this pass's RAM experts to hide behind.  A prefetched read
+            // carries the same tag as a miss, so this drains it too: a route that used a predicted slot is never
+            // read before its bytes are there.
             ssd_wait_all();
             if (pt) {
                 prof.ssd_wait += pms(t_ph);
@@ -3685,24 +3757,24 @@ struct Engine::Impl {
     // route that the layer then skips (`--minimax-expert-skip`) never mis-maps another route's bytes.
     int prefetch_wait = -1;
     bool ssd_prefetch = false;
+    int ssd_prefetch_depth = 1;     // layers between the issue and the use of a predicted read
     std::vector<int> ssd_pf_exp;    // [n_layers * top]: expert whose read is already in flight, or -1
     std::vector<int> ssd_pf_slot;   // [n_layers * top]: the staging slot it landed in
     std::vector<int> ssd_pf_n;      // [n_layers]: slots this layer's prefetch took
     int ssd_slot_next = 0;          // staging slot cursor inside one layer
-    int64_t ssd_prefetched = 0;     // reads issued a layer early (counters, not bytes: bytes count once)
+    int64_t ssd_prefetched = 0;     // reads issued early (counters, not bytes: bytes count once)
     int64_t ssd_pf_hit = 0;         // predicted routes that the layer then really used
     int64_t ssd_pf_waste = 0;       // predicted routes the layer did not use (bytes read for nothing)
 
+    // The VRAM half of the lookahead: one layer ahead, exact router, fill the card's empty slots.
     void prefetch_for(int64_t li) {
         const bool want_vram = prefetch_slots > 0 && tiers_gpu && li >= 0 && li < cfg.n_layers;
-        if (!want_vram && !ssd_prefetch) return;
+        if (!want_vram) return;
         if (li < 0 || li >= cfg.n_layers) return;
         Layer& L = layers[(size_t)li];
         if (!L.moe || !L.router.host) return;
         const bool vram_part = want_vram && !L.vram.empty();
-        const bool ssd_part = ssd_prefetch && ssd_slots &&
-                              (int)ssd_pf_exp.size() >= (int)cfg.n_layers * (int)cfg.n_expert_used;
-        if (!vram_part && !ssd_part) return;
+        if (!vram_part) return;
         Work* wv = nullptr;
         if (vram_part) {
             use_layer_device(li);
@@ -3738,8 +3810,38 @@ struct Engine::Impl {
             ++started;
         }
         if (started) prefetch_wait = (int)li;
-        if (!ssd_part) return;
-        // The SSD part: queue this layer's misses now, so the drive works through the next layer's attention.
+    }
+
+    // The SSD half: apply layer `li`'s router to the *post-attention, post-norm input* of the layer that is about
+    // to run (`hnorm`), which is what Project Maya's device does ("the device guesses the next layer's picks from
+    // the current layer's FFN input", ds4_model.cu:1173-1190).  It is called from inside layer `j`'s MoE for
+    // `li = j + depth`, so the bytes are in flight across `depth` layers of expert compute and attention instead of
+    // one attention block.  The router input is a prediction: the real layer `li` sees a different attention
+    // output.  It only ever decides *which bytes to read early*; a route the prediction missed is read
+    // synchronously exactly as it was with prefetch off, so the result cannot change.
+    void ssd_prefetch_for(int64_t li, const float* hnorm) {
+        if (!ssd_prefetch || !ssd_slots || !hnorm) return;
+        if (li < 0 || li >= cfg.n_layers) return;
+        if ((int)ssd_pf_exp.size() < (int)cfg.n_layers * (int)cfg.n_expert_used) return;
+        Layer& L = layers[(size_t)li];
+        if (!L.moe || !L.router.host) return;
+        // This layer's router may be on the other card (--layer-split): the prediction is scored on the target
+        // layer's device, not on the device of the layer whose MoE is running.  Without this, a 2-GPU split faults
+        // with "gemv sync: an illegal memory access" on the first token.
+        use_layer_device(li);
+        // Drain every read before writing into the region.  A region can hold a read that no route ever consumed,
+        // and reusing those bytes while the old read is in flight is a data race.  Draining here is a whole-layer
+        // barrier, so the effective lookahead is one layer, but it is unconditional, cannot deadlock on a tag
+        // that a shard never reports, and keeps the prediction safe.  (A per-region drain was tried: it deadlocked
+        // after the full model's prefill when a prediction's completion was never reaped on its shard.)
+        ssd_wait_all();
+        const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
+        std::vector<float> logits((size_t)nexp), prob((size_t)nexp);
+        gemv(L.router, hnorm, logits.data());
+        for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(logits[(size_t)i]);
+        std::vector<int> order;
+        select_routes(L, prob, order, top, false);
+        const size_t region = ssd_region_base(li);
         const size_t at = (size_t)li * (size_t)top;
         for (int j = 0; j < top; ++j) ssd_pf_exp[at + (size_t)j] = -1;
         int k = 0;
@@ -3750,13 +3852,14 @@ struct Engine::Impl {
             if (rs >= 0) continue;
             if (ssd_skip_rank > 0 && j >= ssd_skip_rank) continue;
             if (k >= top) break;
-            const int slot = k++;
+            const int slot = (int)region + k;
             const uint8_t* g = nullptr;
             const uint8_t* u = nullptr;
             const uint8_t* d = nullptr;
             ssd_submit_expert(L, e, slot, g, u, d);
             ssd_pf_exp[at + (size_t)j] = e;
             ssd_pf_slot[at + (size_t)j] = slot;
+            ++k;
             ++ssd_prefetched;
         }
         ssd_pf_n[(size_t)li] = k;
@@ -5403,7 +5506,9 @@ struct Engine::Impl {
                 moe(L, h.data(), proj.data());
             }
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
-            if ((prefetch_slots > 0 || ssd_prefetch) && li + 1 < cfg.n_layers) {
+            if (prefetch_slots > 0 && li + 1 < cfg.n_layers) {
+                // The SSD lookahead is issued from inside moe() (it needs this layer's FFN input); only the VRAM
+                // fill is left here, and it keeps its one-layer distance and its exact router input.
                 const auto t_pf = std::chrono::steady_clock::now();
                 prefetch_for(li + 1);
                 if (pt) prof.prefetch += pms(t_pf);
