@@ -974,3 +974,154 @@ genuinely drops 48 blocks per query.
 
 q8_0 K/V on the same slice, 2048 tokens: 0.1318 -> 0.0769 GiB (0.583x), **mean KL 3.8e-5 nats, top-1 2/2**, and
 faster (136 s against 269 s) because that path is bandwidth-bound.
+
+## P8: what a decode token is made of, and the three phases it pointed at
+
+After P7 the drive was ~4 % of a token (7.8 SSD experts, 13.5 ms of wait) and the rest was unattributed. The first
+job here was to attribute it, because "the GPUs are idle and the expert dots are slow" is an inference and not a
+measurement. `--minimax-profile-time` is that measurement; the three changes below are the phases it named.
+
+### `--minimax-profile-time`
+
+One line per decode token on stderr, and the mean of the run in the `--minimax-stats` totals line:
+
+```
+INFO minimax-profile token=527 total=232.1 embed=0.46 attn=36.4 idx_sync=12.9 msa_sync=3.9 router=5.3 pick=0.1
+gpu_begin=4.58 cpu_ram=142.8 ssd_wait=3.5 cpu_ssd=1.9 gpu_finish=1.9 gpu_stream=4.8 combine=1.3 shared=26.7
+admit=2.0 prefetch=0.0 lm_head=1.8 other=3.1 cpu_exp=178 cpu_gbs=22.3 ssd_exp=2
+```
+
+Every key is one wall-clock pair around work that already existed, so the flag changes no arithmetic. Off by
+default; with it off the token path tests one `bool` per phase.
+
+| key | what it times |
+| --- | --- |
+| `embed` | the token's embedding row |
+| `attn` | the attention blocks of every layer: the norms, the per-layer graph launch (q8_1, q/k/v MMVQ, norm+rope, fp16), the MSA attention kernel, the output projection and the residual add. The indexer readback and the MSA sync are inside this window and reported separately below, so they are a breakdown of `attn`, not extra time |
+| `idx_sync` | the MSA indexer's block scores: kernel, device sync, and the readback of the scores to the host that decides the slots |
+| `msa_sync` | the MSA attention kernel's device sync and the readback of its output |
+| `router` | the router GEMV, the sigmoids, the top-k selection (including the P7b nudge) and the skip renormalisation |
+| `pick` | classifying each route into VRAM / pinned RAM / SSD, including the page-cache probes |
+| `gpu_begin` | uploading the expert pointers and launching the GPU experts on the side stream |
+| `cpu_ram` | the CPU lane's pass over the pinned-RAM experts |
+| `ssd_wait` | the wait for the layer's queued SSD reads |
+| `cpu_ssd` | the CPU lane's pass over the experts that had to be read |
+| `gpu_finish` | the side stream's join and the copy-back of the GPU experts |
+| `gpu_stream` | the **device-busy** time of that side stream, measured with timing events: the pair `gpu_stream` / `gpu_finish` separates "the card was slow" from "the card was idle" |
+| `combine` | the weighted sum of the routes |
+| `shared` | the shared expert's MLP |
+| `admit` | copying this layer's SSD experts into the RAM tier |
+| `prefetch` | the next layer's lookahead (off by default) |
+| `lm_head` | the final norm and the output projection |
+| `other` | everything the clocks did not name (the residual adds, the counters). A large value is a missing timer, not work |
+| `cpu_exp`, `ssd_exp`, `cpu_gbs` | experts on the CPU lane, how many of them came off the drive, and the lane's achieved GB/s (the lane's bytes over its two passes) |
+
+`bench_p6_ssd.py` parses these lines and prints the phase table under the decode table when an arm runs with the
+flag.
+
+### The full model, measured
+
+MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4-3200, Ryzen 9 5900X. A 512-token prefix of
+`ppl_text.bin` (real G3 text), 16 greedy tokens, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin
+--memory-limit-mib 90000 --minimax-prefill-batch 512 --minimax-prefill-read direct`, box to itself. **The prompt ran
+token by token in this path** (the run's profile covers 527 tokens = 512 prompt + 16 decode-1, so `prefill_batch`
+did not engage; each arm therefore costs ~5 min, most of it the prompt). The RAM tier came out at 65..106 experts a
+layer (mean 91.3, 5203 slots); the token's routes were **66 VRAM / 136 pinned RAM / 9.3 SSD** (161 MB from the
+drive). One round, arms in this order, so the later arms found a warmer drive:
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token |
+| --- | ---: | ---: | ---: | ---: |
+| pre-P8 build | 4.17 | 239.8 | not counted (no `--minimax-stats`) | — |
+| **this branch** (12 threads, the default) | **4.37** | **229.0** | 9.3 | 161 |
+| this branch, `--cpu-threads 24` | 4.31 | 232.1 | 9.4 | 162 |
+| this branch, `--minimax-route-bias on` | **4.70** | **212.9** | **4.3** | **75** |
+
+**+4.8 %** for this branch at the default thread count. The phase table below is the deliverable; everything else
+in this section is measured against it.
+
+| phase | ms/token | share | what it says |
+| --- | ---: | ---: | --- |
+| `cpu_ram` | **108.4** | 44 % | the CPU lane's pinned-RAM pass: 146 experts a token, ~2.5 GB, **~22 GB/s** (see the lane section) |
+| `attn` | 41.6 | 17 % | the attention blocks of 60 layers; `idx_sync` (~14) and `msa_sync` (~6) inside it are device syncs + host readbacks |
+| `shared` | 27.5 | 11 % | the shared expert's MLP: three `gemv` calls a layer, each with its own stream sync |
+| `ssd_wait` | 19.6 | 8 % | the drive, for 161 MB a token |
+| `pick` | 13.5 | 5.5 % | classifying 212 routes, including the page-cache probes |
+| `admit` | 9.5 | 4 % | copying the 9.3 SSD experts into the RAM tier (162 MB, 17 GB/s over the pool) |
+| `cpu_ssd` | 6.6 | 2.7 % | the same lane, for the experts that had to be read |
+| `router` | 5.4 | 2.2 % | the router GEMV, sigmoid and top-k per layer |
+| `gpu_begin` | 4.3 | 1.8 % | the expert pointer uploads and launches |
+| `gpu_stream` / `gpu_finish` | 4.7 / 1.9 | 2.7 % | the card was **busy 4.7 ms** of the token and the host waited 1.9 ms for it |
+| `other` | 3.4 | 1.4 % | residual adds and counters |
+| `lm_head` | 1.7 | 0.7 % | the final norm and the 200 K output projection |
+| `combine` | 1.1 | 0.5 % | the weighted sum of four routes |
+| **total** | **244.4** | | |
+
+`attn` splits, in the run's own mean over its 527 tokens, into `idx_sync` 13.8 ms (57 device syncs and readbacks of
+the block scores, one per layer) and `msa_sync` 6.1 ms of device sync, with the rest - the norms, the per-layer
+graph, the output projection, the residual add - about 22 ms. Both syncs are host round trips that a device-side
+slot selection and a device-side combine would remove; that is the "de-synchronise" item, and it is worth ~20 ms
+(8 %) before any graph work.
+
+Two things fall out. **The CPU lane is the token** (108 + 6.6 ms, 47 %), and **the idle GPUs are idle by
+construction**: the GPU expert stream is busy 4.7 ms, the attention kernels sit inside their own syncs, and the
+cards never have more than one layer's work queued. The drive is 8 %, and `pick` + `admit` together are 9.5 % -
+more than the drive.
+
+### The CPU lane: two parallel regions instead of twelve
+
+`mlp_ptr` ran `dot_rows_base` for gate, up and down as three separate `pool.run` calls per expert: twelve barriers
+a layer for four routed experts, and with the pool's spin window at its default 0 every barrier after the first
+wakes eleven sleeping threads. `mlp_ptr_multi` dispatches the whole pass instead - gate and up rows of all four
+experts in one region (they share one activation image), the down rows in a second - so a layer pays two barriers
+and quantizes its activation once instead of twice.
+
+Measured on the 15-layer real-weight IQ2_XS slice with every expert in the pinned tier (`--minimax-tiers
+--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`, 48 routes a token all on the CPU, one RTX
+5070, 512-token prompt then 16 greedy tokens, one round):
+
+| arm | decode tok/s | ms/token | lane ms/token | lane GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| pre-P8 build, 12 threads | 17.52 | 57.1 | — | — |
+| **this branch, 12 threads** | **19.38** | **51.6** | 36.0 | 20.8 |
+| **this branch, 24 threads (SMT)** | **24.64** | **40.6** | **26.1** | **28.7** |
+
+**+10.6 %** from the fused regions alone, and **+27 %** more from using the second thread of each core. On this
+placement the lane is compute-bound (the 24-thread lane moves 28.7 GB/s against 20.8 GB/s, and a raw stream of the
+same bytes is 39.5 GB/s), so the second SMT thread is not contention - it is the difference between 17.5 and
+24.6 tok/s.
+
+**That does not transfer to the full model**, and the full-model table says why: there the same arm at 24 threads
+was 4.31 against 4.37 tok/s (**-1.4 %**). The lane in the full model runs beside the SSD reader threads and the
+admissions that copy 162 MB a token, and 22-23 GB/s is what the memory system gives this access pattern once the
+drive and the copies are in it; the extra SMT threads only add contention. So the default stays the physical core
+count, and the slice's SMT result is recorded as placement-specific rather than as a default change.
+
+A software-prefetch probe (`STRATA_LANE_PF=N`, rows ahead) is in the lane's row loops for the same reason the
+default is 0: the hardware prefetcher already sees the sequential row stride, and an unmeasured prefetch hint is
+the kind of change `SPEED_RESEARCH.md` §4 measured *slower* (15-18 tok/s against 24). It is an environment probe,
+not a flag, and off unless set.
+
+### The RAM-tier admission
+
+Admitting a routed expert into the pinned tier is a 17.4 MB copy that used to run on the calling thread, between
+two layers, once per SSD miss. `ram_admit_many` picks the victims serially (still LRU) and then copies the whole
+layer's admissions in ~1 MiB pieces over the pool. On the full model the phase now costs **9.5 ms for 162 MB
+(17 GB/s across 12 threads)**, measured with `--minimax-profile-time` above. The before number is from the
+SSD-heavy slice placement earlier in this round (`--minimax-ram-experts-per-layer 11`, 27-30 of 48 routes read
+from the drive), where the serial per-expert copy showed up as **16-60 ms a token** in the same profile; that is a
+different file and placement, so it is a scale, not a delta. **A clean slice A/B of this change was cut for box
+time and is not in the table.**
+
+### The route nudge: measured speed, unmeasured quality
+
+With the whole box, the same placement and the same prompt, `--minimax-route-bias on` (the P7b defaults: in 0.25,
+out 0.15, protect 2, pool 12) is **4.70 against 4.37 tok/s (+7.5 %)** and halves the drive's share of the token
+(9.3 -> 4.3 SSD experts, 161 -> 75 MB). The engine's own meter says **9.1 % of expert picks are swapped and 99.5 %
+of the router weight is kept** - against 35.3 % swapped on the slice placement that has only 11 of 128 experts
+resident, because the full model's tier holds 91 of 128.
+
+What is *not* measured: KL and top-1 for the nudge on the full model. The plan was
+`tools/minimax/gate_logits.py` over the six short G3 prompts concatenated into one 320-position teacher-forced
+pass (one model load an arm); the PC window ran out after the speed arms. The extrapolation from the meter -
+Xolotl's own table has 26.1 % swapped at 85.2 % API top-1 against 86.2 % exact, so 9.1 % should cost well under a
+point - is an extrapolation, not a measurement. **The default stays off** until that run exists.

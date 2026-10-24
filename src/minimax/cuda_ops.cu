@@ -920,6 +920,21 @@ bool event_ready(void* event) {
     return !event || cudaEventQuery((cudaEvent_t)event) == cudaSuccess;
 }
 
+// P8: timing events for --minimax-profile-time.  Two of these bracket a phase on a stream and `event_elapsed_ms`
+// reports how long the DEVICE was busy with it, which is the number that tells an idle card from a slow one.
+void* event_create_timed() {
+    cudaEvent_t e = nullptr;
+    check(cudaEventCreate(&e), "event create (timed)");
+    return (void*)e;
+}
+
+double event_elapsed_ms(void* a, void* b) {
+    if (!a || !b) return 0.0;
+    float ms = 0.f;
+    if (cudaEventElapsedTime(&ms, (cudaEvent_t)a, (cudaEvent_t)b) != cudaSuccess) return 0.0;
+    return (double)ms;
+}
+
 void idx_block_scores(const void* ik, int64_t ntok, const float* q, int heads, int dim, int blk, int nb, float* bs,
                       void* stream) {
     if (nb <= 0 || heads <= 0) return;

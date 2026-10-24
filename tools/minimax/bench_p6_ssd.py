@@ -6,6 +6,11 @@ both the VRAM and the RAM tier and are read from the file, which is what a model
 token.  Two binaries are compared by running them one after the other, interleaved, in the same process-free
 state.
 
+When an arm runs with `--minimax-profile-time`, the per-token phase lines (`INFO minimax-profile ...`) are
+collected too and printed as a phase table after the decode table: that is the P8 breakdown (attention, router,
+the CPU lane's passes and their achieved GB/s, the drive wait, the combine, the shared expert, the RAM-tier
+admission, lm_head, and `other`).
+
     python tools/minimax/bench_p6_ssd.py --exe A/build/strata-minimax.exe --exe B/build/strata-minimax.exe \
         --model slice.gguf --prompt 512 --decode 32 --reps 3 -- --gpus 1 --minimax-tiers \
         --minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 4
@@ -72,6 +77,27 @@ def parse_line(line: str) -> dict | None:
     return d if len(d) > 1 else None
 
 
+def parse_profile(line: str) -> dict | None:
+    """A `--minimax-profile-time` line: phase=ms pairs, token=N.  The `--minimax-stats` totals line repeats the mean
+    of those tokens with the same key names, so it is excluded here (it is parsed as a stats row)."""
+    if 'minimax-profile' not in line or 'minimax-stats' in line:
+        return None
+    d = {}
+    for tok in line.split():
+        if '=' not in tok:
+            continue
+        k, v = tok.split('=', 1)
+        try:
+            d[k] = float(v)
+        except ValueError:
+            pass
+    return d if 'total' in d else None
+
+
+PHASES = ('total', 'embed', 'attn', 'idx_sync', 'msa_sync', 'router', 'pick', 'gpu_begin', 'cpu_ram', 'ssd_wait',
+          'cpu_ssd', 'gpu_finish', 'gpu_stream', 'combine', 'shared', 'admit', 'prefetch', 'lm_head', 'other')
+
+
 def run_arm(exe: str, model: str, ctx: int, prompt: int, decode: int, reps: int, source: list[int],
             extra: list[str], timeout: int) -> dict:
     cmd = [exe, '--model', model, '--serve', '--max-context', str(ctx), *extra]
@@ -81,11 +107,16 @@ def run_arm(exe: str, model: str, ctx: int, prompt: int, decode: int, reps: int,
                          text=True, encoding='utf-8', errors='replace', bufsize=1)
     stats: list[dict] = []
     waits: list[float] = []
+    profiles: list[dict] = []
     err: list[str] = []
 
     def reader():
         for line in p.stderr:
             err.append(line.rstrip())
+            prof = parse_profile(line)
+            if prof is not None:
+                profiles.append(prof)
+                continue
             s = parse_line(line)
             if s is None:
                 continue
@@ -131,6 +162,15 @@ def run_arm(exe: str, model: str, ctx: int, prompt: int, decode: int, reps: int,
     if waits:
         arm['ssd_wait_ms_mean'] = round(statistics.mean(waits), 1)
         arm['ssd_wait_ms_p50'] = round(statistics.median(waits), 1)
+    if profiles:
+        # Only the decode tokens: a token-by-token prefill emits a line per prompt token too, and the last `reps x
+        # decode` lines of a process are its decode tokens (the prefill comes first in every GEN request).
+        tail = decode * reps
+        warm = profiles[-tail:] if len(profiles) >= tail else profiles
+        arm['profile_mean'] = {k: round(statistics.mean([x[k] for x in warm if k in x]), 2) for k in PHASES
+                               if any(k in x for x in warm)}
+        arm['profile_tokens'] = len(warm)
+        arm['profile_total_s'] = sum(x.get('total', 0.0) for x in warm) / 1000.0
     # the per-layer dump can be huge; keep the tail in a file
     Path('bench_p6_engine.err').write_text('\n'.join(err[-4000:]), encoding='utf-8')
     return arm
@@ -189,6 +229,20 @@ def main() -> int:
     if a.json_out:
         Path(a.json_out).write_text(json.dumps({'args': extra, 'results': results}, indent=1), encoding='utf-8')
         print(f'wrote {a.json_out}')
+    # The per-token phase breakdown, when the arms ran with --minimax-profile-time.
+    if any(arm.get('profile_mean') for label in labels for arm in results[label]):
+        print()
+        head = f'{"arm":>12} | {"tok":>4} | ' + ' | '.join(f'{k:>10}' for k in PHASES if k != 'total')
+        print(head)
+        print('-' * len(head))
+        for label in labels:
+            for arm in results[label]:
+                pm = arm.get('profile_mean')
+                if not pm:
+                    continue
+                print(f'{label:>12} | {arm["profile_tokens"]:4d} | ' +
+                      ' | '.join(f'{pm.get(k, 0):10.1f}' for k in PHASES if k != 'total'))
+                print(f'{"":>12} |      | total {pm.get("total", 0):.1f} ms/token')
     return 0
 
 

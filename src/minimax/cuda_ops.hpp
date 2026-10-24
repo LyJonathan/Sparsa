@@ -71,6 +71,10 @@ void* event_create();
 void event_record(void* event, void* stream);
 void event_sync(void* event);
 bool event_ready(void* event);
+/// P8: a timing event pair.  `event_create_timed` makes an event `cudaEventElapsedTime` accepts;
+/// `event_elapsed_ms` is the device-busy time between two records (0 when either is null).
+void* event_create_timed();
+double event_elapsed_ms(void* a, void* b);
 
 /// Grouped routed-expert MLP for F32/F16/BF16 experts, all on the device.  `n_entries` selected experts:
 /// gate[e]/up[e] are `n_ff` rows of `n_embd`, down[e] is `n_embd` rows of `n_ff`, GGUF row-major bytes.
