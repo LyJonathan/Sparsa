@@ -798,10 +798,11 @@ struct Engine::Impl {
     struct PfBuf {
         uint16_t* x16 = nullptr;     // [T][embd] fp16 hidden state
         uint16_t* h16 = nullptr;     // [T][embd] fp16 normed input to the projections
-        uint16_t* a16 = nullptr;     // [T][maxN] fp16 attention output (wider than the hidden state)
-        float* y32 = nullptr;        // [T][maxN] fp32 GEMM output (also the attention output)
-        float* p32 = nullptr;        // [T][embd] fp32 projection / routed MoE output
-        float* sh = nullptr;         // [T][embd] fp32 shared-expert output and the final MoE sum
+        uint16_t* a16 = nullptr;     // [T][max(qlen,klen)] fp16 attention output / K+V staging
+        float* y32 = nullptr;        // [max(T*wide, rows_cap*maxN)] fp32 GEMM output
+        float* p32 = nullptr;        // [max(T*wide, rows_cap*maxN)] fp32 projection / routed MoE output
+        float* sh = nullptr;         // [max(T*embd, rows_cap*maxN)] fp32 shared/MoE sum and the dense tile's up
+        size_t y32_elems = 0, p32_elems = 0, sh_elems = 0;
         uint16_t* w16 = nullptr;     // fp16 dequantization scratch for one weight tile
         float* w32 = nullptr;        // fp32 scratch (the parity-first cuBLAS SGEMM path)
         int64_t w16_elems = 0;
@@ -835,6 +836,12 @@ struct Engine::Impl {
     int64_t max_dense_n = 0;         // widest projection (rows)
     int64_t rows_cap = 0;            // rows per expert/dense chunk in the batched path
     int pf_max_blk = 0;              // top_k blocks per query (device shared-memory bound)
+    // P9: a pinned-tier budget bounds the arena, not the OS page cache.  With `--minimax-prefill-read direct` (and
+    // by default when `--memory-limit-mib` is set) every expert that is not resident in VRAM or pinned RAM is read
+    // straight from the shard file into a staging buffer, so streaming the 146 GB model cannot grow the working set.
+    bool stream_direct = false;
+    std::vector<uint8_t> pf_expert_h;   // one streamed expert for the CPU MoE path (direct reads)
+    int mem_probe_n = 0;                // experts read since the last memory probe line
 
     struct PfEntry {
         int tid;
@@ -1115,6 +1122,14 @@ struct Engine::Impl {
         if (ram_inplace && opt.memory_limit_mib > 0)
             std::fprintf(stderr, "INFO minimax-ram-mode=inplace (--memory-limit-mib still sets how much of the "
                                  "model the ranking calls resident)\n");
+        // P9: `direct` is explicit; with a pinned-tier byte budget it is implied, because the budget cannot bound
+        // the page cache the mmap path grows.  `mmap` stays available (and is the default without a budget): it is
+        // faster when the whole expert set is meant to be cached.
+        stream_direct = opt.prefill_read == "direct" ||
+                        (opt.prefill_read.empty() && opt.memory_limit_mib > 0);
+        if (stream_direct && opt.prefill_read != "direct")
+            std::fprintf(stderr, "INFO minimax-prefill-read=direct (implied by --memory-limit-mib; "
+                                 "--minimax-prefill-read mmap keeps the page cache)\n");
         rb_in = opt.route_bias_in;
         rb_out = opt.route_bias_out;
         rb_protect = std::max(0, opt.route_protect);
@@ -1194,6 +1209,11 @@ struct Engine::Impl {
             route_counts.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert, 0.0);
         }
         init_prefill();
+        // P9: drop the mapping pages the weight upload just faulted in.  With a pinned tier the budget is a hard
+        // promise; leaving 10 GiB of dense weights in the standby list next to it is what a desktop feels.
+        mem_probe("prefill-init");
+        trim_mapped_pages();
+        mem_probe("ready");
 
         const int64_t qlen = cfg.n_head * cfg.head_dim;
         const int64_t klen = cfg.n_head_kv * cfg.head_dim;
@@ -2078,6 +2098,7 @@ struct Engine::Impl {
             }
         }
         use_device_index(0);
+        mem_probe("weights");
     }
 
     // ===================================================================================== P3: the expert tiers
@@ -2113,7 +2134,27 @@ struct Engine::Impl {
             for (size_t d = 0; d < devs.size(); ++d) {
                 const cu::MemInfo mi = cu::mem_on(devs[d]);
                 dev_budget[d] = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
+                // P9: a batched prompt pass allocates its workspace on every card that owns a layer.  Sizing the
+                // VRAM expert slots first (the old order) is what clamped --minimax-prefill-batch to a few thousand
+                // tokens on this box: the automatic slot count spent all of the free VRAM on experts, so the
+                // workspace then fit only the remainder.  Reserve the workspace first, but only when the caller
+                // asked for a batch and did not name a slot count, so no existing plan changes.
+                if (opt.prefill_batch > 1 && opt.vram_slots_per_layer < 0) {
+                    const size_t ws = (size_t)prefill_bytes_per_token() *
+                                          (size_t)std::min<int64_t>(opt.prefill_batch, ctx) +
+                                      ((size_t)224 << 20);
+                    dev_budget[d] = dev_budget[d] > ws ? dev_budget[d] - ws : 0;
+                }
             }
+            if (opt.prefill_batch > 1 && opt.vram_slots_per_layer < 0)
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
+                             "workspace before sizing expert slots\n",
+                             (double)((size_t)prefill_bytes_per_token() *
+                                          (size_t)std::min<int64_t>(opt.prefill_batch, ctx) +
+                                      ((size_t)224 << 20)) /
+                                 1048576.0,
+                             (int)std::min<int64_t>(opt.prefill_batch, ctx));
         }
         int q = opt.vram_slots_per_layer;
         // `--minimax-expert-resident all` with the tiers off is a RAM-residency request, not a VRAM one: keep the
@@ -2366,9 +2407,29 @@ struct Engine::Impl {
                                  ? "--memory-limit-mib"
                                  : (opt.ram_experts_per_layer >= 0 ? "--minimax-ram-experts-per-layer" : "auto"),
                              ram_inplace ? "inplace" : "pinned");
+                mem_probe("tier-plan");
             }
             (void)bytes;
         }
+
+        // ---- SSD: unbuffered reads straight from the GGUF shards.  DirectFile owns the aligned OVERLAPPED /
+        // O_DIRECT I/O; this keeps the offsets and the aligned superset rule.
+        //
+        // P9: this comes before the profile-driven fill, because with `--minimax-prefill-read direct` (implied by a
+        // --memory-limit-mib budget) the pinned arena is filled through these files rather than through the mapping.
+        ssd_files.resize(model.size());
+        for (size_t s = 0; s < model.size(); ++s) {
+            ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
+            std::string err;
+            if (!ssd_files[s]->open(model.shard(s).path(), err))
+                fail("minimax SSD tier: " + err);
+        }
+        // One staging slot per routed entry: several selected experts of one layer may be SSD misses, and their
+        // byte slices have to stay alive together until the combine.
+        ssd_stage_bytes = (size_t)cfg.n_expert_used * max_expert_bytes;
+        ssd_tmp = strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes + 4096);
+        if (!ssd_tmp) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned read buffer");
+        ssd_tmp_bytes = ssd_stage_bytes + 4096;
 
         // ---- static fill from the profile: each layer's hottest q go to VRAM, the next r to RAM.
         if (!profile.empty()) {
@@ -2395,23 +2456,9 @@ struct Engine::Impl {
             }
         }
 
-        // ---- SSD: unbuffered reads straight from the GGUF shards.  DirectFile owns the aligned OVERLAPPED /
-        // O_DIRECT I/O; this keeps the offsets and the aligned superset rule.
-        ssd_files.resize(model.size());
-        for (size_t s = 0; s < model.size(); ++s) {
-            ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
-            std::string err;
-            if (!ssd_files[s]->open(model.shard(s).path(), err))
-                fail("minimax SSD tier: " + err);
-        }
-        // One staging slot per routed entry: several selected experts of one layer may be SSD misses, and their
-        // byte slices have to stay alive together until the combine.
-        ssd_stage_bytes = (size_t)cfg.n_expert_used * max_expert_bytes;
+        // ---- SSD staging buffers for the token path (the files and ssd_tmp were opened above, before the fill).
         ssd_stage = (uint8_t*)strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes);
         if (!ssd_stage) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned staging buffer");
-        ssd_tmp = strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes + 4096);
-        if (!ssd_tmp) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned read buffer");
-        ssd_tmp_bytes = ssd_stage_bytes + 4096;
 
         // P6: the token path reads each role straight into its own place.  A role's buffer holds the aligned
         // superset of the tensor's bytes (`off & 4095` bytes in front, up to 4095 behind), so the read lands where
@@ -2509,7 +2556,14 @@ struct Engine::Impl {
 
     // One expert's three role slices into `p`, spread over the pool.  The source is the mmap, so the cost is the
     // soft page fault per 4 KiB: many threads is the difference between 8 and 20 GB/s on a cold mapping.
+    // P9: with a byte budget the mapping is not the source -- an unbuffered read is, so filling the tier costs no
+    // page cache.  Same bytes either way.
     void ram_copy(const Layer& L, int expert, uint8_t* p) {
+        if (stream_direct) {
+            read_expert_roles(L, expert, p);
+            if ((++mem_probe_n % 512) == 0) mem_probe("fill");
+            return;
+        }
         const size_t gu = L.expert_gu, dn = L.expert_down;
         const uint8_t* src[3] = {L.egate.host + (size_t)expert * gu, L.eup.host + (size_t)expert * gu,
                                  L.edown.host + (size_t)expert * dn};
@@ -2524,6 +2578,38 @@ struct Engine::Impl {
                 if (p1 > p0) std::memcpy(p + off[m] + p0, src[m] + p0, p1 - p0);
             }
         });
+    }
+
+    // P9: one line per stage with the process's working set, its high-water mark, the machine's available RAM and
+    // the system commit charge.  A budget is only kept if it can be seen; this is what bench_longctx.py's samples
+    // are cross-checked against.
+    static void mem_probe(const char* stage) {
+#if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS pmc{};
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        GlobalMemoryStatusEx(&ms);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
+            std::fprintf(stderr,
+                         "INFO minimax-mem %-12s ws=%.1f GiB peak=%.1f GiB avail=%.1f GiB commit=%.1f GiB\n",
+                         stage, (double)pmc.WorkingSetSize / 1073741824.0,
+                         (double)pmc.PeakWorkingSetSize / 1073741824.0, (double)ms.ullAvailPhys / 1073741824.0,
+                         (double)(ms.ullTotalPageFile - ms.ullAvailPageFile) / 1073741824.0);
+        }
+#else
+        (void)stage;
+#endif
+    }
+
+    // P9: hand the process's clean mapped pages back to the standby list.  Windows only trims a working set under
+    // memory pressure, which is why the round-1 32 K run ended with 0.3 GB of available RAM while the pinned arena
+    // was inside its budget.  Locked/pinned pages are not trimmable, so the tier the budget paid for stays resident;
+    // what leaves the working set is the file mapping the reads went through.
+    void trim_mapped_pages() const {
+#if defined(_WIN32)
+        if (!stream_direct) return;
+        EmptyWorkingSet(GetCurrentProcess());
+#endif
     }
 
     // P5c: fill every static RAM slot at startup instead of on first use.  The on-demand fill re-read the same
@@ -2612,6 +2698,32 @@ struct Engine::Impl {
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        if (stream_direct) {
+            // P9: fill the arena with unbuffered reads instead of memcpy out of the mapping.  The bytes are the same,
+            // so the tier is bit-identical; what changes is that the 74 GiB that just became pinned is not also left
+            // in the page cache (which is what took the working set to 112.8 GB in the round-1 32 K run).
+            size_t bytes = 0;
+            for (const Job& j : jobs) {
+                read_expert_roles(*j.L, j.expert, ram_slot_ptr(*j.L, j.slot));
+                j.L->ram_of[(size_t)j.expert] = j.slot;
+                j.L->ram_expert_of[(size_t)j.slot] = j.expert;
+                j.L->ram_tick[(size_t)j.slot] = ++lru_tick;
+                bytes += j.L->expert_bytes;
+            }
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr,
+                         "INFO minimax-ram-tier experts=%zu gib=%.1f seconds=%.1f rate=%.1f GiB/s backing=%s "
+                         "reads_from=direct\n",
+                         jobs.size(), (double)bytes / 1073741824.0, s,
+                         s > 0 ? (double)bytes / 1073741824.0 / s : 0.0,
+                         ram_arena ? (ram_arena->backing == strata::core::PageBacking::LargePages
+                                          ? "large-pages"
+                                          : ram_arena->backing == strata::core::PageBacking::PinnedByCuda ? "cuda-pinned"
+                                                                                                          : "locked")
+                                   : "none");
+            trim_mapped_pages();
+            return;
+        }
         // ONE pool.run OVER PIECES, NOT a pool.run per expert from our own thread band: Pool::run is not
         // reentrant, and a band of threads each calling it deadlocked the tier fill (measured: 27 s of CPU and no
         // progress).  ~1 MiB pieces are small enough that every core gets several and large enough that the
@@ -2787,6 +2899,14 @@ struct Engine::Impl {
         ssd_read_role(L.edown, expert, stage + 2 * L.expert_gu);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
+    }
+
+    // P9: the same three role slices, read unbuffered, without touching the tier counters.  `dst` receives
+    // [gate|up|down] exactly as the mapping would present them, so a caller can hand it to the same kernels.
+    void read_expert_roles(const Layer& L, int64_t expert, uint8_t* dst) {
+        ssd_read_role(L.egate, expert, dst);
+        ssd_read_role(L.eup, expert, dst + L.expert_gu);
+        ssd_read_role(L.edown, expert, dst + 2 * L.expert_gu);
     }
 
     // ---- P6: the token path's SSD staging, queued rather than waited on.
@@ -4281,7 +4401,7 @@ struct Engine::Impl {
         prefetch_slots = opt.expert_prefetch;
         if (opt.prefill_batch <= 1) return;
         prefill_dense_f32 = opt.prefill_dense != "f16";
-        prefill_direct = opt.prefill_read == "direct";
+        prefill_direct = stream_direct;
         if (!prefill_dense_f32)
             std::fprintf(stderr,
                          "INFO minimax-prefill-dense=f16 (the down GEMM's activation is fp16; measured KL 1.7e-3 "
@@ -4336,9 +4456,11 @@ struct Engine::Impl {
         if (cfg.n_embd > max_dense_n) max_dense_n = cfg.n_embd;
         if (cfg.n_expert > max_dense_n) max_dense_n = cfg.n_expert;
 
-        // Per-token device bytes: two fp16 hidden-state buffers, the fp32 GEMM output and the two fp32 MoE buffers.
-        const size_t per_tok = (size_t)cfg.n_embd * 2 * 2 + (size_t)max_dense_n * 4 + (size_t)max_dense_n * 4 * 2 +
-                               (size_t)(cfg.n_head * cfg.head_dim) * 2;
+        // Per-token device bytes.  P9: this used to size three fp32 buffers at `max_dense_n` for the whole chunk
+        // (the dense MLP only ever touches one rows_cap tile of that width) plus an fp16 buffer nothing read, which
+        // cost 188 KiB/token and clamped a 32 K chunk to ~20 K tokens.  The real T-wide needs are the GEMM output
+        // (qlen = 8192 on M3.1, not 12288), the projection scratch, and the MoE sum (embd): 140 KiB/token.
+        const size_t per_tok = (size_t)prefill_bytes_per_token();
         const size_t fixed = (size_t)224 << 20;
         for (size_t d = 0; d < devs.size(); ++d) {
             const cu::MemInfo mi = cu::mem_on(devs[d]);
@@ -4352,6 +4474,10 @@ struct Engine::Impl {
                 return;
             }
             const size_t fit = (mi.free_bytes - reserve) / per_tok;
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-workspace dev=%d free=%zu MiB reserve=%zu MiB per_token=%.1f KiB "
+                         "fit=%zu tokens\n",
+                         devs[d], mi.free_bytes >> 20, reserve >> 20, (double)per_tok / 1024.0, fit);
             if ((size_t)batch_cap > fit) batch_cap = (int)fit;
         }
         if (batch_cap < 2) {
@@ -4361,7 +4487,7 @@ struct Engine::Impl {
         }
         if (rows_cap > batch_cap) rows_cap = batch_cap;
 
-        if (prefill_gpu_experts && prefill_direct && ssd_files.empty()) {
+        if (prefill_direct && ssd_files.empty()) {
             ssd_files.resize(model.size());
             for (size_t sh = 0; sh < model.size(); ++sh) {
                 ssd_files[sh] = std::make_unique<strata::platform::DirectFile>();
@@ -4378,14 +4504,22 @@ struct Engine::Impl {
             PfBuf& p = pf[d];
             const size_t T = (size_t)batch_cap;
             const size_t embd = (size_t)cfg.n_embd;
-            p.x16 = (uint16_t*)cu::alloc(T * embd * 2);
+            const size_t qlen = (size_t)(cfg.n_head * cfg.head_dim);
+            const size_t klen = (size_t)(cfg.n_head_kv * cfg.head_dim);
+            const size_t wide = std::max(qlen, embd);
+            const size_t tile_wide = (size_t)rows_cap * (size_t)max_dense_n;   // the dense MLP's rows_cap tile
+            p.x16 = nullptr;   // P9: allocated and never read; 24 KiB/token of nothing
             p.h16 = (uint16_t*)cu::alloc(T * embd * 2);
             // The attention output of a chunk is [T][n_head*head_dim], wider than the hidden state; the f16 path
             // used to write it into p.h16 and run past the end of that buffer (non-finite logits on real weights).
-            p.a16 = (uint16_t*)cu::alloc(T * (size_t)max_dense_n * 2);
-            p.y32 = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
-            p.p32 = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
-            p.sh = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
+            p.a16 = (uint16_t*)cu::alloc(T * std::max(qlen, klen) * 2);
+            // P9: qlen/embd wide, not max_dense_n; the dense MLP's 12288-wide gate/up live in a rows_cap tile.
+            p.y32_elems = std::max(T * wide, tile_wide);
+            p.p32_elems = std::max(T * wide, tile_wide);
+            p.sh_elems = std::max(T * embd, tile_wide);
+            p.y32 = (float*)cu::alloc(p.y32_elems * 4);
+            p.p32 = (float*)cu::alloc(p.p32_elems * 4);
+            p.sh = (float*)cu::alloc(p.sh_elems * 4);
             p.w16_elems = std::min<int64_t>(4096, max_dense_n) * (int64_t)cfg.n_embd;
             p.w16 = (uint16_t*)cu::alloc((size_t)p.w16_elems * 2);
             p.w32 = (float*)cu::alloc((size_t)p.w16_elems * 4);
@@ -4473,17 +4607,37 @@ struct Engine::Impl {
         pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
         pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
         pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_dense_h.assign((size_t)batch_cap * (size_t)max_dense_n, 0.f);
+        pf_dense_h.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
         pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
         pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
-        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s\n", batch_cap,
-                     prefill_gpu_experts ? "gpu" : "cpu");
+        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
+                     batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
+                     (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
         if (ikq_experts)
             std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
                                  "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
+
+    // P9: the batched prompt workspace, bytes per token per device.  Kept in one place because the tier sizing
+    // (which must leave room for it) and the allocator below both need it.
+    int64_t prefill_bytes_per_token() const {
+        const int64_t embd = cfg.n_embd;
+        const int64_t qlen = cfg.n_head * cfg.head_dim;
+        const int64_t klen = cfg.n_head_kv * cfg.head_dim;
+        const int64_t wide = bigger(qlen, embd);
+        const int64_t nbmax = (ctx + cfg.idx_block - 1) / cfg.idx_block;
+        return 2 * embd                              // h16
+             + 2 * bigger(qlen, klen)                // a16 (attention output, K/V staging)
+             + 4 * wide * 2                          // y32, p32
+             + 4 * embd                              // sh (MoE combine sum)
+             + 2 * qlen                              // d_q16
+             + 2 * cfg.idx_heads * cfg.idx_dim       // d_iq16
+             + 4 * cfg.idx_heads * nbmax             // d_bs
+             + 4 * cfg.idx_heads * cfg.idx_top_k     // d_blk
+             + 4 * cfg.idx_heads + 4;                // d_nblk, d_pos
+    }
 
     // P5c: how many positions the device cos/sin table covers (all devices share the same cap).
     int64_t p_rope_cap() const { return work.empty() ? 0 : work[0].rope_pos_cap; }
@@ -5002,16 +5156,38 @@ struct Engine::Impl {
         std::vector<float> hid((size_t)rows_cap * (size_t)ff);
         std::vector<float> yd((size_t)rows_cap * (size_t)embd);
         std::vector<float> g((size_t)rows_cap * (size_t)ff), u((size_t)rows_cap * (size_t)ff);
+        if (stream_direct && pf_expert_h.size() < (size_t)max_expert_bytes)
+            pf_expert_h.resize((size_t)max_expert_bytes);
         for (int e = 0; e < nexp; ++e) {
             const std::vector<int>& toks = tok_of[(size_t)e];
+            if (toks.empty()) continue;
+            // P9: a resident expert is read from the pinned arena (P5c's rule for the device path), and a streamed
+            // one through an unbuffered read instead of a fault through the 146 GB mapping.  Both hand the same
+            // bytes to the same kernels, so the result is unchanged; only the page cache stops growing.
+            const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)e] : -1;
+            const uint8_t* gb;
+            const uint8_t* ub;
+            const uint8_t* db;
+            if (rs >= 0) {
+                const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
+                gb = base;
+                ub = base + L.expert_gu;
+                db = base + 2 * L.expert_gu;
+            } else if (stream_direct) {
+                read_expert_roles(L, e, pf_expert_h.data());
+                gb = pf_expert_h.data();
+                ub = gb + L.expert_gu;
+                db = gb + 2 * L.expert_gu;
+            } else {
+                gb = L.egate.host + (size_t)e * L.expert_gu;
+                ub = L.eup.host + (size_t)e * L.expert_gu;
+                db = L.edown.host + (size_t)e * L.expert_down;
+            }
             for (size_t a = 0; a < toks.size(); a += (size_t)rows_cap) {
                 const int nt = (int)std::min<size_t>(toks.size() - a, (size_t)rows_cap);
                 for (int i = 0; i < nt; ++i)
                     std::memcpy(xin.data() + (size_t)i * embd, H + (size_t)toks[a + (size_t)i] * embd,
                                 (size_t)embd * sizeof(float));
-                const uint8_t* gb = L.egate.host + (size_t)e * L.expert_gu;
-                const uint8_t* ub = L.eup.host + (size_t)e * L.expert_gu;
-                const uint8_t* db = L.edown.host + (size_t)e * L.expert_down;
                 const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
                 const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
                 const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
@@ -5571,6 +5747,9 @@ struct Engine::Impl {
                              (long long)li, ms(t_layer) - f, f, L.moe ? 1 : 0, dur(ta0, ta1), dur(ta1, ta2),
                              (ms(t_layer) - f) - dur(ta0, ta2));
             }
+            // P9: the layer read through the mapping (a dense weight on the CPU, the embedding table) leaves clean
+            // pages behind; hand them back so the available figure stays where the budget put it.
+            if (stream_direct && (li % 8) == 7) trim_mapped_pages();
         }
         if (time_on) {
             std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f\n", t_idx, t_topk,
@@ -5591,7 +5770,7 @@ struct Engine::Impl {
             cu::sync();
             for (int n0 = 0; n0 < vocab; n0 += 4096) {
                 const int nt = std::min(4096, vocab - n0);
-                if ((int64_t)rows * nt > (int64_t)batch_cap * max_dense_n) fail("output tile exceeds the workspace");
+                if ((int64_t)rows * nt > (int64_t)p.y32_elems) fail("output tile exceeds the workspace");
                 gemm_gpu(output, p.h16, p.p32, p.y32, rows, nt, n0, nt);
                 cu::copy_d2h(pf_out_tile.data(), p.y32, (size_t)rows * nt * sizeof(float));
                 for (int i = 0; i < rows; ++i)
