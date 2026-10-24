@@ -7,6 +7,9 @@
 
 #include <ggml.h>
 
+#include "strata/kernels/cpu/iqk_quants.hpp"
+#include "strata/kernels/iqk_types.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -16,7 +19,21 @@
 
 namespace mmq {
 
+inline bool is_ikq(ggml_type type) { return strata::kernels::ikq::is_iqk_type((int) type); }
+
+/// Row bytes for a type, ggml's own or one of the ported ik_llama.cpp formats (ggml does not know those).
+inline size_t row_size(ggml_type type, int64_t n) {
+    if (is_ikq(type)) return strata::kernels::ikq::row_bytes((int) type, n);
+    return ggml_row_size(type, n);
+}
+
+inline const char * type_name(ggml_type type) {
+    if (is_ikq(type)) return strata::kernels::ikq::type_name((int) type);
+    return ggml_type_name(type);
+}
+
 inline bool type_needs_imatrix(ggml_type type) {
+    if (is_ikq(type)) return true;   // the trellis search is imatrix-driven (ik's own default)
     return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS;
 }
@@ -36,7 +53,7 @@ inline uint64_t tensor_nbytes(ggml_type type, const int64_t ne[4]) {
         throw std::runtime_error("non-positive tensor dimension");
     }
     const int64_t nrows = ne[1] * ne[2] * ne[3];
-    return static_cast<uint64_t>(ggml_row_size(type, ne[0])) * static_cast<uint64_t>(nrows);
+    return static_cast<uint64_t>(row_size(type, ne[0])) * static_cast<uint64_t>(nrows);
 }
 
 inline size_t quantize_rows(ggml_type type, const float * src, void * dst, int64_t nrows,
@@ -45,7 +62,16 @@ inline size_t quantize_rows(ggml_type type, const float * src, void * dst, int64
         throw std::runtime_error("quantize: empty tensor");
     }
     if (type_needs_imatrix(type) && !imatrix) {
-        throw std::runtime_error(std::string("quantize: ") + ggml_type_name(type) + " requires an imatrix");
+        throw std::runtime_error(std::string("quantize: ") + type_name(type) + " requires an imatrix");
+    }
+    if (is_ikq(type)) {
+        const size_t bytes = strata::kernels::ikq::quantize_rows((int) type, src, dst, nrows, n_per_row,
+                                                                imatrix, nthreads);
+        if (bytes == 0) {
+            throw std::runtime_error(std::string("quantize: ") + type_name(type) + " cannot hold " +
+                                     std::to_string(n_per_row) + " values in a row");
+        }
+        return bytes;
     }
     const size_t row_size = ggml_row_size(type, n_per_row);
     if (type == GGML_TYPE_F32) {

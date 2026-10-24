@@ -41,11 +41,23 @@ if(NOT TARGET ggml-base)
     add_subdirectory("${STRATA_LLAMA_CPP_DIR}/ggml" "${CMAKE_BINARY_DIR}/mm-quant-ggml" EXCLUDE_FROM_ALL)
 endif()
 
+# The formats ported from ik_llama.cpp (IQ2_KT, IQ3_KT) have their own codec, in the engine's tree: it
+# depends on nothing but the standard library, so the tool and the engine share one implementation.
+get_filename_component(STRATA_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set(STRATA_IKQ_SRC "${STRATA_REPO_ROOT}/src/kernels/cpu/iqk_quants.cpp")
+
 add_executable(strata-mm-quant
     src/main.cpp
-    src/convert.cpp)
-target_include_directories(strata-mm-quant PRIVATE src "${STRATA_LLAMA_CPP_DIR}/ggml/include")
+    src/convert.cpp
+    ${STRATA_IKQ_SRC})
+target_include_directories(strata-mm-quant PRIVATE src "${STRATA_REPO_ROOT}/include" "${STRATA_LLAMA_CPP_DIR}/ggml/include")
 target_link_libraries(strata-mm-quant PRIVATE ggml-base)
+if(MSVC)
+    # the trellis quantizer is AVX2 code, like ik's own (which refuses to run without it)
+    set_source_files_properties(${STRATA_IKQ_SRC} PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+    set_source_files_properties(${STRATA_IKQ_SRC} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 target_compile_features(strata-mm-quant PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_definitions(strata-mm-quant PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
@@ -53,6 +65,18 @@ else()
     target_compile_options(strata-mm-quant PRIVATE -Wall -Wextra -Wno-unused-function)
     find_package(Threads REQUIRED)
     target_link_libraries(strata-mm-quant PRIVATE Threads::Threads)
+endif()
+
+add_executable(strata-mm-quant-ikq-test src/test_ikq.cpp ${STRATA_IKQ_SRC})
+target_include_directories(strata-mm-quant-ikq-test PRIVATE src "${STRATA_REPO_ROOT}/include")
+target_compile_features(strata-mm-quant-ikq-test PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_definitions(strata-mm-quant-ikq-test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    set_source_files_properties(${STRATA_IKQ_SRC} PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(strata-mm-quant-ikq-test PRIVATE Threads::Threads)
+    set_source_files_properties(${STRATA_IKQ_SRC} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 
 add_executable(strata-mm-quant-dequant-test src/test_dequant.cpp)
@@ -80,4 +104,5 @@ add_custom_command(TARGET strata-mm-quant POST_BUILD
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_test(NAME dequant_test COMMAND strata-mm-quant-dequant-test)
+    add_test(NAME ikq_test COMMAND strata-mm-quant-ikq-test)
 endif()

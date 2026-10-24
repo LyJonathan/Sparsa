@@ -6,6 +6,9 @@
 // attention kernel exists. See include/strata/minimax/forward.hpp.
 #include "strata/minimax/forward.hpp"
 
+#include "strata/kernels/cpu/iqk_quants.hpp"
+#include "strata/kernels/iqk_types.hpp"
+
 #include "cuda_ops.hpp"
 
 #if defined(_WIN32)
@@ -284,6 +287,10 @@ void decode_f32(const Tensor& t, const uint8_t* src, float* dst, int64_t n) {
     // ggml leaves F32's to_float null; the bytes already are the floats.
     if (t.type == kF32) {
         std::memcpy(dst, src, (size_t)n * sizeof(float));
+        return;
+    }
+    if (strata::kernels::ikq::is_iqk_type(t.type)) {
+        strata::kernels::ikq::dequantize_row(t.type, src, dst, n);
         return;
     }
     if (!t.base || !t.base->to_float) fail(t.name + ": ggml has no to_float for type " + std::to_string(t.type));
@@ -741,9 +748,18 @@ struct Engine::Impl {
         t.shard = shard;
         t.file_offset = model.shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
-        t.row_bytes = ggml_row_size((ggml_type)t.type, t.ne0);
+        if (strata::kernels::ikq::is_iqk_type(t.type)) {
+            // An ik_llama.cpp format ported into the engine: ggml has no ids for these, so the geometry and
+            // the codec are the engine's own (src/kernels/cpu/iqk_quants.cpp).
+            if (!strata::kernels::ikq::has_codec(t.type))
+                fail(name + ": " + strata::kernels::ikq::type_name(t.type) + " is not implemented in this build");
+            t.row_bytes = strata::kernels::ikq::row_bytes(t.type, t.ne0);
+        } else {
+            t.row_bytes = ggml_row_size((ggml_type)t.type, t.ne0);
+        }
         if (t.row_bytes == 0 || t.row_bytes * (size_t)t.ne1 * (size_t)t.ne2 != t.bytes)
             fail(name + ": row size does not match the GGUF payload (type " + std::to_string(t.type) + ")");
+        if (strata::kernels::ikq::is_iqk_type(t.type)) return true;
         t.base = ggml_get_type_traits((ggml_type)t.type);
         t.cpu = ggml_get_type_traits_cpu((ggml_type)t.type);
         if (!t.base) fail(name + ": ggml has no type traits for type " + std::to_string(t.type));
@@ -1737,6 +1753,10 @@ struct Engine::Impl {
                                (const void* const*)(ptr + 2 * top), k, n_embd, n_ff, L.egate.row_bytes,
                                L.edown.row_bytes, (const float*)w.x.p, (float*)w.ex_h.p, (float*)w.ex_out.p, alpha,
                                limit);
+        } else if (strata::kernels::ikq::is_iqk_type(gt) || strata::kernels::ikq::is_iqk_type(dt)) {
+            fail(std::string("the ") + strata::kernels::ikq::type_name(strata::kernels::ikq::is_iqk_type(gt) ? gt : dt) +
+                 " expert format has no GPU kernel in this build; keep those experts on the CPU "
+                 "(RAM or SSD tier)");
         } else {
             fail("no GPU expert kernel for gate/up ggml type " + std::to_string(gt) + " and down type " +
                  std::to_string(dt) + " (supported: F32/F16/BF16 and the IQ/Q8_0 types)");
@@ -2000,6 +2020,24 @@ struct Engine::Impl {
     void dot_rows_base(const Tensor& t, const uint8_t* base, const float* xin, float* yout, int rows_n, int cols) {
         // One expert's rows start at `base`: yout[r] = row(r) . xin.  `base` may be the GGUF mapping, the pinned
         // RAM arena, or an SSD staging buffer; only t's type, row size and row count are used.
+        if (strata::kernels::ikq::is_iqk_type(t.type)) {
+            // The ported formats dot against the same q8_K activation as everything else; the weight type is
+            // unknown to ggml, but the activation type is not, so its own quantizer does the work.
+            if ((cols % 256) != 0) {
+                fail(t.name + ": " + strata::kernels::ikq::type_name(t.type) +
+                     " needs a width that is a whole number of 256-value blocks");
+            }
+            const ggml_type_traits_cpu* act = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+            if (!act || !act->from_float) fail(t.name + ": no from_float for the q8_K activation");
+            std::vector<uint8_t> aq(ggml_row_size(GGML_TYPE_Q8_K, cols));
+            act->from_float(xin, aq.data(), cols);
+            pool.run(rows_n, [&](int a, int b) {
+                for (int r = a; r < b; ++r)
+                    yout[r] = strata::kernels::ikq::dot_row(t.type, base + (size_t) r * t.row_bytes, aq.data(),
+                                                           cols);
+            });
+            return;
+        }
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
             pool.run(rows_n, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {

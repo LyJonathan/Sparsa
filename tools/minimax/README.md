@@ -151,6 +151,56 @@ indexer block kept) and 4.5e-5 (200 tokens, sparse), KL under 3e-11, top-1 agree
 prompt with all four dense layers on the GPU measured max abs 4.7e-5. Q8_0 routed experts against a
 dequantized-weight reference (the engine also quantizes the activation) measured max abs 1.5e-2, top-1 1.0.
 
+## ik_llama.cpp expert types (IQ2_KT, IQ3_KT)
+
+`tools/minimax/quant` can emit two expert formats ported from
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) by Iwan Kawrakow (MIT; see `THIRD_PARTY_NOTICES.md` at
+the repository root). They are the best quality per byte on the MiniMax-M3.1 routed experts that
+`_ref/research/IQK_EXPERIMENT.md` measured, and they beat every mainline type at the same size on layer 40:
+
+| recipe | experts | bpw | projected size | out error on layer 40 |
+|---|---|---:|---:|---:|
+| `MM-IQ2_KT` | IQ2_KT | 2.125 | 123.4 GB | 0.2625 |
+| `MM-IQ2_KT-IQ3_KT-down` | IQ2_KT gate/up, IQ3_KT down | 2.458 | 140.6 GB | 0.2215 |
+| `MM-IQ3_K` | IQ3_K | 3.4375 | 191.2 GB | 0.1156 |
+| `MM-IQ4_KS` | IQ4_KS | 4.25 | 233.1 GB | 0.0608 |
+| `MM-IQ2_KL` | IQ2_KL | 2.6875 | 152.4 GB | 0.2047 |
+
+`IQ3_K`, `IQ4_KS` and `IQ2_KL` are reserved type ids only: this build implements the codec for IQ2_KT and
+IQ3_KT, and the converter refuses the other three by name until their quantizers are ported. The sizes are
+`51.625 x bpw + 13.7` GB from `IQK_EXPERIMENT.md` (1.652e12 routed-expert values at 1 bpw plus the dense
+remainder), not a run.
+
+These recipes run in Strata only. Neither mainline llama.cpp nor ik_llama.cpp can read the files: the type ids
+are Strata's own (160..164 in `include/strata/kernels/iqk_types.hpp`, chosen because ik's 144/145/146 collide
+with the TQ trellis types) and ik_llama.cpp has no MiniMax-M3 architecture to run them in.
+
+```powershell
+strata-mm-quant --model <checkpoint> --recipe tools\minimax\quant\recipes\MM-IQ2_KT.json `
+  --imatrix <imatrix.gguf> --out mm-iq2-kt.gguf
+# "dense-lite": attention / indexer / dense / shared experts as Q6_K instead of Q8_0, which frees VRAM
+strata-mm-quant --model <checkpoint> --recipe tools\minimax\quant\recipes\MM-IQ2_KT.json `
+  --imatrix <imatrix.gguf> --dense-type Q6_K --out mm-iq2-kt-dl.gguf
+```
+
+The port is checked against ik's own quantizer, not just against itself:
+
+```powershell
+cmake -S tools/minimax/quant -B build-quant -DSTRATA_LLAMA_CPP_DIR=<_baseline/llama.cpp>
+cmake --build build-quant --target strata-mm-quant-ikq-test
+.\build-quant\strata-mm-quant-ikq-test.exe --ref <iqk-dump.exe> --bench
+```
+
+`iqk-dump` is a five-line harness that links ik_llama.cpp's own ggml (`_ref/research/iqk/dump.cpp`, built with
+`_ref/research/iqk/build.cmd`); without it the test still runs the round-trip and the dot-vs-double checks and
+says that the reference was skipped. With it, the quantization is byte-identical and the dequantization is
+bit-identical to ik's on every case, and the test prints the quantize speed: 36 MB/s for IQ2_KT and 17 MB/s for
+IQ3_KT at 8 threads on a 5900X, against 42 and 21 measured for ik at 12 threads.
+
+Runtime support today: the CPU expert path (`dot_rows_base` in `src/minimax/engine.cpp`) reads both formats, so
+a tier with these experts on the RAM or SSD tier runs. The grouped CUDA expert kernels do not have them yet, so
+placing them in VRAM fails with a message that says to keep them on the CPU.
+
 ## Real-weight parity (P4, gate G1 on the real checkpoint)
 
 The reference dumps now exist (`Strata-MiniMax/_local/ref_out/dumps/`), so the layer 0 / 3 / 40 comparison runs

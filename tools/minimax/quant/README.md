@@ -117,6 +117,34 @@ Full 60-layer tensor bytes from `ggml_row_size`, decimal GB, with the default Q8
 
 MM-NVFP4 is the exact copy of the released expert weights. The row above is `ggml_row_size`, so it includes the side tensors' 87 KB only in the last digit. See below.
 
+## ik_llama.cpp types (`IQ2_KT`, `IQ3_KT`)
+
+Two expert formats are ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) by Iwan Kawrakow
+(MIT; `THIRD_PARTY_NOTICES.md` at the repository root). They are typed by ids Strata owns, because ik's 144/145/146
+collide with the TQ trellis types:
+
+| name in a recipe | id | bpw |
+|---|---:|---:|
+| `IQ2_KT` | 160 | 2.125 |
+| `IQ3_KT` | 163 | 3.125 |
+
+`IQ3_K` (161), `IQ4_KS` (162) and `IQ2_KL` (164) are reserved ids with no quantizer in this build: `parse_type`
+knows the names and `--recipe`/`--override` will fail on them with the format's name rather than a bad byte count.
+
+Both formats need the imatrix (`type_needs_imatrix` returns true), are quantized 32 values at a time with a
+trellis search, and take an AVX2 build (this tool sets `/arch:AVX2` on the codec; ik refuses to quantize them
+without AVX2 too). `IQ3_KT` needs a row width that is a whole number of 256-value super-blocks; MiniMax's expert
+widths (3072, 1536) are.
+
+Quantize speed on this PC (5900X, 8 threads, 64 x 3072 f32 rows): 36 MB/s for IQ2_KT and 17 MB/s for IQ3_KT,
+against 42 and 21 measured for ik_llama.cpp at 12 threads in `_ref/research/IQK_EXPERIMENT.md`. A full-model
+expert pass at 36 MB/s is about 13 hours for IQ2_KT and 27 hours for IQ3_KT.
+
+`strata-mm-quant-ikq-test` (ctest name `ikq_test`) checks the port against ik's own quantizer: with
+`--ref <iqk-dump.exe>` every case has to be byte-identical after quantization and bit-identical after
+dequantization, and the dot has to match a double reference. Without the reference binary it runs the round trip
+and the dot check and says the reference was skipped.
+
 ## NVFP4
 
 MM-NVFP4 stores the routed experts as `GGML_TYPE_NVFP4` (type id 40, `block_nvfp4`, 36 bytes per 64 values, 4.5 bpw) and is **lossless**: the dequantized matrix is the source checkpoint's dequantized matrix, bit for bit in fp32.
