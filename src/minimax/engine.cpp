@@ -2684,6 +2684,22 @@ struct Engine::Impl {
         if (prefill_gpu_experts && devs.empty()) {
             prefill_gpu_experts = false;
         }
+        // The device dequant path (iq_mmvq) has no kernel for the expert formats ported from ik_llama.cpp.
+        // In `auto` (the default) a model made of them computes its experts on the CPU, the path the G3 runs
+        // use, instead of failing the first batched chunk with "iq_mmvq: type 164 is not supported".  An
+        // explicit `gpu` still asks for the device and fails with that message.
+        bool ikq_experts = false;
+        if (prefill_gpu_experts && opt.prefill_experts != "gpu") {
+            for (const Layer& L : layers) {
+                if (L.moe && (strata::kernels::ikq::is_iqk_type(L.egate.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.eup.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.edown.type))) {
+                    ikq_experts = true;
+                    prefill_gpu_experts = false;
+                    break;
+                }
+            }
+        }
         if (max_expert_bytes == 0)
             for (const Layer& L : layers)
                 if (L.moe && L.expert_bytes > max_expert_bytes) max_expert_bytes = L.expert_bytes;
@@ -2809,6 +2825,9 @@ struct Engine::Impl {
         pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
         std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s\n", batch_cap,
                      prefill_gpu_experts ? "gpu" : "cpu");
+        if (ikq_experts)
+            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
+                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
