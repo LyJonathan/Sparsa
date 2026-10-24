@@ -295,7 +295,8 @@ def main():
         # 3b. NVFP4 must be lossless against the checkpoint, every matrix
         if tier == "NVFP4":
             cmd = [UVX, "--with", "numpy", "python3",
-                   os.path.join(c["quant_dir"], "verify_nvfp4_gguf.py"), "--gguf", path, "--model", c["model"]]
+                   os.path.join(c["quant_dir"], "verify_nvfp4_gguf.py"), "--gguf", path,
+                   "--model", c["model"], "--layers", "%d-%d" % (lo, hi)]
             rc = run(cmd, log)
             if rc != 0:
                 log.write("PART_FAIL %d nvfp4-verify rc=%d\n" % (part, rc))
