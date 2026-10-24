@@ -37,6 +37,8 @@
 
 #include "ggml.h"
 
+#include "strata/kernels/cpu/iqk_quants.hpp"
+#include "strata/kernels/iqk_types.hpp"
 #include "strata/minimax/engine.hpp"
 #include "strata/minimax/forward.hpp"
 #include "strata/minimax/gguf.hpp"
@@ -258,11 +260,18 @@ bool wait_input(StdinBuf& in, const std::atomic<bool>& shutdown, const std::atom
 
 // gguf-py can dequantize Q4_K and Q6_K but does not quantize them, and IQ2_XS has no Python quantizer at all.
 // This writes one ggml_quantize_chunk blob. IQ2_XS gets a uniform importance row of 1s; K-quants do not need one.
+// The formats ported from ik_llama.cpp (IQ2_KT, IQ3_K, IQ4_KS, IQ3_KT, IQ2_KL) go through the engine's own codec
+// (src/kernels/cpu/iqk_quants.cpp) with a uniform importance row, which is also what the synthetic fixtures use.
 bool quant_type_from_name(const std::string& name, ggml_type& type) {
     if (name == "q4_k") type = GGML_TYPE_Q4_K;
     else if (name == "q6_k") type = GGML_TYPE_Q6_K;
     else if (name == "q8_0") type = GGML_TYPE_Q8_0;
     else if (name == "iq2_xs") type = GGML_TYPE_IQ2_XS;
+    else if (name == "iq2_kt") type = (ggml_type) strata::kernels::ikq::kIQ2KT;
+    else if (name == "iq3_k") type = (ggml_type) strata::kernels::ikq::kIQ3K;
+    else if (name == "iq4_ks") type = (ggml_type) strata::kernels::ikq::kIQ4KS;
+    else if (name == "iq3_kt") type = (ggml_type) strata::kernels::ikq::kIQ3KT;
+    else if (name == "iq2_kl") type = (ggml_type) strata::kernels::ikq::kIQ2KL;
     else return false;
     return true;
 }
@@ -271,10 +280,12 @@ int pack_quant(const std::string& type_name, int64_t rows, int64_t cols, const s
                const std::string& out_path) {
     ggml_type type = GGML_TYPE_F32;
     if (!quant_type_from_name(type_name, type)) {
-        std::fprintf(stderr, "strata-minimax: quant pack type must be q4_k, q6_k, q8_0, or iq2_xs\n");
+        std::fprintf(stderr, "strata-minimax: quant pack type must be q4_k, q6_k, q8_0, iq2_xs, iq2_kt, iq3_k, "
+                             "iq4_ks, iq3_kt or iq2_kl\n");
         return 2;
     }
-    const int64_t block = ggml_blck_size(type);
+    const bool ikq = strata::kernels::ikq::is_iqk_type((int) type);
+    const int64_t block = ikq ? 256 : ggml_blck_size(type);
     if (rows < 1 || cols < 1 || block < 1 || cols % block != 0) {
         std::fprintf(stderr, "strata-minimax: %s pack needs rows > 0 and cols a positive multiple of %lld\n",
                      type_name.c_str(), (long long)block);
@@ -293,18 +304,36 @@ int pack_quant(const std::string& type_name, int64_t rows, int64_t cols, const s
     }
     std::vector<float> imatrix;
     const float* im = nullptr;
-    if (ggml_quantize_requires_imatrix(type)) {
+    if (ikq || ggml_quantize_requires_imatrix(type)) {
         imatrix.assign((size_t)cols, 1.f);
         im = imatrix.data();
     }
-    ggml_quantize_init(type);
-    const size_t row_bytes = ggml_row_size(type, cols);
-    std::vector<uint8_t> dst(row_bytes * (size_t)rows);
-    const size_t got = ggml_quantize_chunk(type, src.data(), dst.data(), 0, rows, cols, im);
-    if (got != dst.size()) {
-        std::fprintf(stderr, "strata-minimax: %s quantize wrote %zu bytes, expected %zu\n", type_name.c_str(), got,
-                     dst.size());
-        return 1;
+    std::vector<uint8_t> dst;
+    size_t row_bytes = 0;
+    if (ikq) {
+        row_bytes = strata::kernels::ikq::row_bytes((int) type, cols);
+        if (row_bytes == 0) {
+            std::fprintf(stderr, "strata-minimax: %s cannot hold %lld values in a row\n", type_name.c_str(),
+                         (long long)cols);
+            return 2;
+        }
+        dst.resize(row_bytes * (size_t)rows);
+        try {
+            strata::kernels::ikq::quantize_rows((int) type, src.data(), dst.data(), rows, cols, im, 1);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-minimax: %s quantize failed: %s\n", type_name.c_str(), e.what());
+            return 1;
+        }
+    } else {
+        ggml_quantize_init(type);
+        row_bytes = ggml_row_size(type, cols);
+        dst.resize(row_bytes * (size_t)rows);
+        const size_t got = ggml_quantize_chunk(type, src.data(), dst.data(), 0, rows, cols, im);
+        if (got != dst.size()) {
+            std::fprintf(stderr, "strata-minimax: %s quantize wrote %zu bytes, expected %zu\n", type_name.c_str(),
+                         got, dst.size());
+            return 1;
+        }
     }
     std::ofstream out(out_path, std::ios::binary);
     if (!out) {
@@ -314,6 +343,53 @@ int pack_quant(const std::string& type_name, int64_t rows, int64_t cols, const s
     out.write(reinterpret_cast<const char*>(dst.data()), (std::streamsize)dst.size());
     if (!out) {
         std::fprintf(stderr, "strata-minimax: short write of packed quant weights\n");
+        return 1;
+    }
+    return 0;
+}
+
+// The reference side of the synthetic tests: packed ikq rows -> f32, one row at a time through the engine's own
+// dequantizer.  A Python reference cannot read these types (gguf-py has no codec for them).
+int unpack_dequant(const std::string& type_name, int64_t rows, int64_t cols, const std::string& in_path,
+                   const std::string& out_path) {
+    ggml_type type = GGML_TYPE_F32;
+    if (!quant_type_from_name(type_name, type) || !strata::kernels::ikq::is_iqk_type((int) type)) {
+        std::fprintf(stderr, "strata-minimax: dequant type must be one of the ik_llama.cpp formats\n");
+        return 2;
+    }
+    const size_t row_bytes = strata::kernels::ikq::row_bytes((int) type, cols);
+    if (rows < 1 || cols < 1 || row_bytes == 0) {
+        std::fprintf(stderr, "strata-minimax: bad dequant shape\n");
+        return 2;
+    }
+    std::ifstream in(in_path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "strata-minimax: cannot read %s\n", in_path.c_str());
+        return 1;
+    }
+    std::vector<uint8_t> raw(row_bytes * (size_t)rows);
+    in.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)raw.size());
+    if (in.gcount() != (std::streamsize)raw.size()) {
+        std::fprintf(stderr, "strata-minimax: short read of packed quant weights\n");
+        return 1;
+    }
+    std::vector<float> out((size_t)rows * (size_t)cols);
+    try {
+        for (int64_t r = 0; r < rows; ++r)
+            strata::kernels::ikq::dequantize_row((int) type, raw.data() + (size_t)r * row_bytes,
+                                                out.data() + (size_t)r * (size_t)cols, cols);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata-minimax: %s dequantize failed: %s\n", type_name.c_str(), e.what());
+        return 1;
+    }
+    std::ofstream f(out_path, std::ios::binary);
+    if (!f) {
+        std::fprintf(stderr, "strata-minimax: cannot write %s\n", out_path.c_str());
+        return 1;
+    }
+    f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)(out.size() * sizeof(float)));
+    if (!f) {
+        std::fprintf(stderr, "strata-minimax: short write of f32 weights\n");
         return 1;
     }
     return 0;
@@ -431,7 +507,7 @@ int run(int argc, char** argv) {
     std::string profile, profile_save, routing_counts;
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0;
     bool stats = false, stats_per_layer = false, adaptive = true;
-    bool pack = false;
+    bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
     std::string dump_dir, dump_layers, seed_hidden;
@@ -489,6 +565,14 @@ int run(int argc, char** argv) {
             pack_in = next();
             pack_out = next();
         }
+        else if (a == "--minimax-pack-dequant") {
+            unpack = true;
+            pack_type = next();
+            pack_rows = std::atoll(next().c_str());
+            pack_cols = std::atoll(next().c_str());
+            pack_in = next();
+            pack_out = next();
+        }
         else if (a == "--prefill" || a == "--chunk") chunk = parse_chunk(next());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--pool-workers") pool_workers = std::atoi(next().c_str());
@@ -519,6 +603,7 @@ int run(int argc, char** argv) {
         }
     }
     if (pack) return pack_quant(pack_type, pack_rows, pack_cols, pack_in, pack_out);
+    if (unpack) return unpack_dequant(pack_type, pack_rows, pack_cols, pack_in, pack_out);
     if (model.empty()) {
         std::fprintf(stderr, "strata-minimax: --model is required\n");
         return 2;

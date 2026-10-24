@@ -510,7 +510,12 @@ private:
         uint64_t align = 32;
         if (const MetaValue* a = get("general.alignment"))
             if (a->u) align = a->u;
+        // `general.alignment` comes from the file: a zero or absurd value would make the padded start wrap (and
+        // then every payload check would measure from the wrong place).  llama.cpp clamps nothing here; we do.
+        if (align == 0 || align > (uint64_t) 1 << 20) throw std::runtime_error("GGUF: bad general.alignment");
         alignment_ = align;
+        if (c.pos() > (std::numeric_limits<uint64_t>::max)() - (align - 1))
+            throw std::runtime_error("GGUF: data section overflows");
         data_start_ = (c.pos() + align - 1) / align * align;
         if (data_start_ > size_) {
             // A file with tensors needs its data section.  One without (a split model's metadata-only first
@@ -537,25 +542,34 @@ private:
 };
 
 // Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
-// blocks, or the count overflows.
+// blocks, or the count overflows.  A GGUF is untrusted input (models are downloaded), so every count here is
+// checked: a wrapped total is a smaller-than-real allocation or a bounds check that passes on a truncated file.
 inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
+    constexpr uint64_t kMax = (std::numeric_limits<uint64_t>::max)();
     if (t.shape.empty()) return 0;
     if (strata::kernels::ikq::is_iqk_type((int) t.type)) {
+        // The ikq row geometry takes an int64_t width; a shape dim wider than that is not a tensor we can hold.
+        if (t.shape[0] == 0 || t.shape[0] > (uint64_t) (std::numeric_limits<int64_t>::max)()) return 0;
         const size_t row = strata::kernels::ikq::row_bytes((int) t.type, (int64_t) t.shape[0]);
         if (row == 0) return 0;
         uint64_t rows = 1;
-        for (size_t i = 1; i < t.shape.size(); ++i) rows *= t.shape[i];
+        for (size_t i = 1; i < t.shape.size(); ++i) {
+            const uint64_t d = t.shape[i];
+            if (d == 0 || rows > kMax / d) return 0;
+            rows *= d;
+        }
+        if ((uint64_t) row > kMax / rows) return 0;
         return (uint64_t) row * rows;
     }
     int be = 0, bb = 0;
-    if (!block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
+    if (!block_geometry(t.type, be, bb) || be <= 0 || bb <= 0 || t.shape[0] % (uint64_t) be) return 0;
     uint64_t elements = 1;
     for (uint64_t d : t.shape) {
-        if (d == 0 || elements > (std::numeric_limits<uint64_t>::max)() / d) return 0;
+        if (d == 0 || elements > kMax / d) return 0;
         elements *= d;
     }
     const uint64_t blocks = elements / (uint64_t) be;
-    if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t) bb) return 0;
+    if (blocks > kMax / (uint64_t) bb) return 0;
     return blocks * (uint64_t) bb;
 }
 

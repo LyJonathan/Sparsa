@@ -67,7 +67,7 @@ automatic sizes. `--minimax-profile PATH` also turns them on and fills the stati
 
 | Tier | Holds | Compute |
 |---|---|---|
-| VRAM | per-layer slots from the STRP profile (or compulsory first use) | grouped GPU kernel over the selected experts; IQ2_XS and Q8_0 use `iq_kernels.cu`'s dot products, F32/F16/BF16 have a direct kernel; swigluoai fused into gate/up |
+| VRAM | per-layer slots from the STRP profile (or compulsory first use) | grouped GPU kernel over the selected experts; the IQ types, Q8_0 and the ported ik_llama.cpp formats use `iq_kernels.cu`'s dot products, F32/F16/BF16 have a direct kernel; swigluoai fused into gate/up |
 | pinned RAM | next-hottest experts per layer in one `PinnedArena` | the existing CPU `vec_dot` path |
 | SSD | everything else, read from the GGUF shard | unbuffered `DirectFile` reads (Windows OVERLAPPED + `NO_BUFFERING`, Linux `O_DIRECT`) into 4 KiB-aligned staging, then the CPU path |
 
@@ -151,25 +151,24 @@ indexer block kept) and 4.5e-5 (200 tokens, sparse), KL under 3e-11, top-1 agree
 prompt with all four dense layers on the GPU measured max abs 4.7e-5. Q8_0 routed experts against a
 dequantized-weight reference (the engine also quantizes the activation) measured max abs 1.5e-2, top-1 1.0.
 
-## ik_llama.cpp expert types (IQ2_KT, IQ3_KT)
+## ik_llama.cpp expert types (IQ2_KT, IQ3_K, IQ4_KS, IQ3_KT, IQ2_KL)
 
-`tools/minimax/quant` can emit two expert formats ported from
+`tools/minimax/quant` emits five expert formats ported from
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) by Iwan Kawrakow (MIT; see `THIRD_PARTY_NOTICES.md` at
 the repository root). They are the best quality per byte on the MiniMax-M3.1 routed experts that
 `_ref/research/IQK_EXPERIMENT.md` measured, and they beat every mainline type at the same size on layer 40:
 
-| recipe | experts | bpw | projected size | out error on layer 40 |
+| recipe | experts | bpw | projected size | out error on layer 40 (ik's harness) |
 |---|---|---:|---:|---:|
 | `MM-IQ2_KT` | IQ2_KT | 2.125 | 123.4 GB | 0.2625 |
 | `MM-IQ2_KT-IQ3_KT-down` | IQ2_KT gate/up, IQ3_KT down | 2.458 | 140.6 GB | 0.2215 |
+| `MM-IQ2_KL` | IQ2_KL | 2.6875 | 152.4 GB | 0.2047 |
 | `MM-IQ3_K` | IQ3_K | 3.4375 | 191.2 GB | 0.1156 |
 | `MM-IQ4_KS` | IQ4_KS | 4.25 | 233.1 GB | 0.0608 |
-| `MM-IQ2_KL` | IQ2_KL | 2.6875 | 152.4 GB | 0.2047 |
 
-`IQ3_K`, `IQ4_KS` and `IQ2_KL` are reserved type ids only: this build implements the codec for IQ2_KT and
-IQ3_KT, and the converter refuses the other three by name until their quantizers are ported. The sizes are
-`51.625 x bpw + 13.7` GB from `IQK_EXPERIMENT.md` (1.652e12 routed-expert values at 1 bpw plus the dense
-remainder), not a run.
+The sizes are `51.625 x bpw + 13.7` GB from `IQK_EXPERIMENT.md` (1.652e12 routed-expert values at 1 bpw plus the
+dense remainder); `--dry-run` prints the exact tensor bytes (123.811, 141.025, 152.680, 191.230 and 233.547 GB
+with the default Q8_0 dense side).
 
 These recipes run in Strata only. Neither mainline llama.cpp nor ik_llama.cpp can read the files: the type ids
 are Strata's own (160..164 in `include/strata/kernels/iqk_types.hpp`, chosen because ik's 144/145/146 collide
@@ -194,12 +193,14 @@ cmake --build build-quant --target strata-mm-quant-ikq-test
 `iqk-dump` is a five-line harness that links ik_llama.cpp's own ggml (`_ref/research/iqk/dump.cpp`, built with
 `_ref/research/iqk/build.cmd`); without it the test still runs the round-trip and the dot-vs-double checks and
 says that the reference was skipped. With it, the quantization is byte-identical and the dequantization is
-bit-identical to ik's on every case, and the test prints the quantize speed: 36 MB/s for IQ2_KT and 17 MB/s for
-IQ3_KT at 8 threads on a 5900X, against 42 and 21 measured for ik at 12 threads.
+bit-identical to ik's on every one of the 24 cases (six per format), and the test prints the quantize speed:
+47 MB/s for IQ2_KT, 17 for IQ3_KT, 482 for IQ3_K, 315 for IQ4_KS and 138 for IQ2_KL at 8 threads on a 5900X.
 
-Runtime support today: the CPU expert path (`dot_rows_base` in `src/minimax/engine.cpp`) reads both formats, so
-a tier with these experts on the RAM or SSD tier runs. The grouped CUDA expert kernels do not have them yet, so
-placing them in VRAM fails with a message that says to keep them on the CPU.
+Runtime support: the CPU expert path (`dot_rows_base` in `src/minimax/engine.cpp`) reads all five formats, and
+so does the CUDA path. `minimax_moe_gu` / `minimax_moe_down` have `Fmt<160>`..`Fmt<164>` in
+`src/kernels/cuda/iq_kernels.cu`, so these experts can sit in the VRAM tier (`--minimax-tiers`).
+`tools/minimax/test_ikq.py` runs the synthetic model per format on the CPU, against `tiny_ref` on the
+dequantized weights, and with every expert in VRAM.
 
 ## Real-weight parity (P4, gate G1 on the real checkpoint)
 

@@ -92,6 +92,11 @@ The process refuses to start a GGUF when free space on the output drive is below
 | MM-IQ3_XXS | IQ3_XXS | IQ3_XXS | IQ3_XXS | no |
 | MM-IQ3_S | IQ3_S | IQ3_S | IQ3_S | no |
 | MM-IQ4_XS | IQ4_XS | IQ4_XS | IQ4_XS | no |
+| MM-IQ2_KT | IQ2_KT | IQ2_KT | IQ2_KT | yes |
+| MM-IQ2_KT-IQ3_KT-down | IQ2_KT | IQ3_KT | IQ3_KT | yes |
+| MM-IQ2_KL | IQ2_KL | IQ2_KL | IQ2_KL | yes |
+| MM-IQ3_K | IQ3_K | IQ3_K | IQ3_K | yes |
+| MM-IQ4_KS | IQ4_KS | IQ4_KS | IQ4_KS | yes |
 | MM-NVFP4 | NVFP4 | NVFP4 | NVFP4 | no |
 
 Router gate and `exp_probs_b` stay F32. Norms stay F32. `token_embd` is Q8_0. `output.weight` is Q6_K. MM-NVFP4 additionally writes three f32 side tensors per MoE layer (see below); they are 512 bytes each.
@@ -119,33 +124,85 @@ Full 60-layer tensor bytes from `ggml_row_size`, decimal GB, with the default Q8
 
 MM-NVFP4 is the exact copy of the released expert weights. The row above is `ggml_row_size`, so it includes the side tensors' 87 KB only in the last digit. See below.
 
-## ik_llama.cpp types (`IQ2_KT`, `IQ3_KT`)
+## ik_llama.cpp types (`IQ2_KT`, `IQ3_K`, `IQ4_KS`, `IQ3_KT`, `IQ2_KL`)
 
-Two expert formats are ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) by Iwan Kawrakow
-(MIT; `THIRD_PARTY_NOTICES.md` at the repository root). They are typed by ids Strata owns, because ik's 144/145/146
-collide with the TQ trellis types:
+Five expert formats are ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) by Iwan Kawrakow
+(MIT; `THIRD_PARTY_NOTICES.md` at the repository root). They are typed by ids Strata owns, because ik's
+144/145/146 collide with the TQ trellis types:
 
-| name in a recipe | id | bpw |
+| name in a recipe | id | bpw | quantize | CPU / CUDA codec |
+|---|---:|---:|---|---|
+| `IQ2_KT` | 160 | 2.125 | trellis | both |
+| `IQ3_K` | 161 | 3.4375 | codebook | both |
+| `IQ4_KS` | 162 | 4.25 | codebook | both |
+| `IQ3_KT` | 163 | 3.125 | trellis | both |
+| `IQ2_KL` | 164 | 2.6875 | pair codebook | both |
+
+**These files are Sparsa only.** Neither ggml-org's llama.cpp nor ik_llama.cpp knows the ids, and ik_llama.cpp
+has no MiniMax-M3 architecture to run them in. Do not publish them as files another runtime opens.
+
+All five need the imatrix (`type_needs_imatrix` returns true) and an AVX2 build (this tool sets `/arch:AVX2` on
+the codec; ik refuses to quantize without AVX2 too). The codebook formats quantize whole 256-value super-blocks
+only, as in ik (`GGML_ASSERT(n_per_row % QK_K == 0)`); MiniMax's expert widths (3072, 1536) are.
+
+Quantize speed on this PC (5900X, 8 threads, 64 x 3072 f32 rows, measured by `strata-mm-quant-ikq-test --bench`;
+the machine was shared, so these are lower bounds):
+
+| type | Sparsa MB/s | ik MB/s (12 threads, `_ref/research/IQK_EXPERIMENT.md`) |
 |---|---:|---:|
-| `IQ2_KT` | 160 | 2.125 |
-| `IQ3_KT` | 163 | 3.125 |
-
-`IQ3_K` (161), `IQ4_KS` (162) and `IQ2_KL` (164) are reserved ids with no quantizer in this build: `parse_type`
-knows the names and `--recipe`/`--override` will fail on them with the format's name rather than a bad byte count.
-
-Both formats need the imatrix (`type_needs_imatrix` returns true), are quantized 32 values at a time with a
-trellis search, and take an AVX2 build (this tool sets `/arch:AVX2` on the codec; ik refuses to quantize them
-without AVX2 too). `IQ3_KT` needs a row width that is a whole number of 256-value super-blocks; MiniMax's expert
-widths (3072, 1536) are.
-
-Quantize speed on this PC (5900X, 8 threads, 64 x 3072 f32 rows): 36 MB/s for IQ2_KT and 17 MB/s for IQ3_KT,
-against 42 and 21 measured for ik_llama.cpp at 12 threads in `_ref/research/IQK_EXPERIMENT.md`. A full-model
-expert pass at 36 MB/s is about 13 hours for IQ2_KT and 27 hours for IQ3_KT.
+| `IQ2_KT` | 47 | 42 |
+| `IQ3_KT` | 17 | 21 |
+| `IQ3_K` | 482 | 717 |
+| `IQ4_KS` | 315 | 401 |
+| `IQ2_KL` | 138 | 188 |
 
 `strata-mm-quant-ikq-test` (ctest name `ikq_test`) checks the port against ik's own quantizer: with
 `--ref <iqk-dump.exe>` every case has to be byte-identical after quantization and bit-identical after
 dequantization, and the dot has to match a double reference. Without the reference binary it runs the round trip
-and the dot check and says the reference was skipped.
+and the dot check and says the reference was skipped. `tools/minimax/test_ikq.py` runs the engine's CPU path and
+the CUDA VRAM tier against `tiny_ref` on the synthetic model, per format.
+
+Dense matrices stay Q8_0 and `output.weight` Q6_K, as in every recipe. `--dense-type Q6_K` (the dense-lite
+variant) moves attention, indexer, dense MLP and the shared experts to Q6_K for all of them.
+
+Projected full 60-layer tensor bytes (`--dry-run`, decimal GB / GiB):
+
+| recipe | total GB | GiB |
+|---|---:|---:|
+| MM-IQ2_KT | 123.811 | 115.308 |
+| MM-IQ2_KT-IQ3_KT-down | 141.025 | 131.339 |
+| MM-IQ2_KL | 152.680 | 142.194 |
+| MM-IQ3_K | 191.230 | 178.097 |
+| MM-IQ4_KS | 233.547 | 217.507 |
+
+### Layer-40 real weights
+
+One-layer layer-40 GGUFs with the real imatrix (`--layers 40 --imatrix
+Strata-MiniMax/_local/ref_out/imatrix-minimax-m3.1.gguf --placeholder-missing`), replayed from the reference
+dumps' residual input (`tools/minimax/make_seed.py`, `--minimax-seed-hidden`) and compared with
+`_local/ref_out/dumps/short/dump-L40/layer_out.npy` (114 tokens, `tools/minimax/compare_nvfp4_parity.py`).
+`rel_l2` is over the whole layer output; the mainline rows are the same harness on the same dump.
+
+| recipe | experts | bpw | layer_out rel_l2 | cos | VRAM tier rel_l2 vs the CPU run |
+|---|---|---:|---:|---:|---:|
+| MM-IQ2_XS | IQ2_XS | 2.3125 | 4.604e-2 | 0.998942 | — |
+| MM-IQ2_KT | IQ2_KT | 2.125 | 4.465e-2 | 0.999004 | 1.91e-3 |
+| MM-IQ3_XXS | IQ3_XXS | 3.0625 | 2.752e-2 | 0.999622 | — |
+| MM-IQ3_KT (`--override experts=IQ3_KT`) | IQ3_KT | 3.125 | 2.476e-2 | 0.999693 | 1.82e-3 |
+| MM-IQ3_K | IQ3_K | 3.4375 | 2.045e-2 | 0.999791 | 1.82e-3 |
+| MM-IQ2_KL | IQ2_KL | 2.6875 | 3.381e-2 | 0.999428 | 1.81e-3 |
+| MM-IQ4_XS | IQ4_XS | 4.25 | 1.323e-2 | 0.999913 | — |
+| MM-IQ4_KS | IQ4_KS | 4.25 | 1.257e-2 | 0.999921 | 1.79e-3 |
+
+The order matches `IQK_EXPERIMENT.md`: IQ2_KT is slightly better than IQ2_XS while 9 GB smaller, IQ3_KT beats
+IQ3_XXS by 10%, IQ3_K and IQ4_KS beat their mainline same-bpw counterparts (IQ3_S/Q3_K and IQ4_XS) and IQ2_KL
+sits between them at 2.6875 bpw. The VRAM tier (`--minimax-tiers --minimax-vram-slots-per-layer 128`) runs all
+114 tokens × 4 experts on the grouped CUDA kernels (`vram_hits=456`) and lands within 1.9e-3 of the CPU path:
+the q8_1-versus-Q8_K activation difference, as on the synthetic model.
+
+Quantize speed for these one-layer files (5900X, 8 threads, shared machine; each expert tensor is 9.7 GB of f32
+values): IQ3_K 21 s, IQ4_KS 34 s, IQ2_KL 73 s, IQ2_KT 202 s, IQ3_KT 1094 s. For reference the mainline
+baselines on the same machine: IQ2_XS 246 s, IQ3_XXS 131 s, IQ4_XS 86 s.
 
 ## NVFP4
 
