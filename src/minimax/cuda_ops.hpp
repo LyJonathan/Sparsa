@@ -17,6 +17,8 @@ void* alloc(size_t bytes);
 void dealloc(void* p);
 void copy_h2d(void* dst, const void* src, size_t bytes);
 void copy_d2h(void* dst, const void* src, size_t bytes);
+void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
+void copy_d2d(void* dst, const void* src, size_t bytes);
 
 // ---- P4: more than one device.  Every call above acts on the thread's CURRENT device; `set_device` is the only
 // thing that changes it.  The engine owns the policy (which layer runs where); these are the primitives.
@@ -55,6 +57,11 @@ void* stream_create();
 void stream_destroy(void* stream);
 void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void stream_sync(void* stream);
+/// CUDA events for the staged expert ring (copy stream -> compute stream ordering).
+void* event_create();
+void event_record(void* event, void* stream);
+void event_sync(void* event);
+bool event_ready(void* event);
 
 /// Grouped routed-expert MLP for F32/F16/BF16 experts, all on the device.  `n_entries` selected experts:
 /// gate[e]/up[e] are `n_ff` rows of `n_embd`, down[e] is `n_embd` rows of `n_ff`, GGUF row-major bytes.
@@ -63,5 +70,53 @@ void stream_sync(void* stream);
 void moe_expert_f16(int type, const void* const* gate, const void* const* up, const void* const* down,
                     int n_entries, int n_embd, int n_ff, size_t gu_row, size_t d_row, const float* x, float* h,
                     float* out, float alpha, float limit);
+
+// ============================================================================================= P5a: batched prefill
+//
+// The prompt path.  Every kernel here is asynchronous on the stream it is given (nullptr = the default stream);
+// the engine synchronizes once per stage.  Activations are fp16 between the batched GEMMs (tensor cores) and fp32
+// for the combine; the arithmetic is the same as the per-token path, only the order of the reductions changes.
+
+/// y[i] = (half) x[i], n values.  Device pointers.
+void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// y[i] *= s, n values (the MM-NVFP4 per-expert global divisor on a batched expert result).
+void scale_rows(float* y, int64_t n, float s, void* stream);
+/// y[r][c] = (half) x[rows[r]][c], n_rows x cols, row-major.
+void gather_rows_f16(const float* x, const int32_t* rows, int64_t n_rows, int64_t cols, uint16_t* y, void* stream);
+/// y[r][c] = x[rows[r]][c] (fp32).
+void gather_rows_f32(const float* x, const int32_t* rows, int64_t n_rows, int64_t cols, float* y, void* stream);
+/// Dequantize `n` contiguous values of `ggml_type` to fp16 (F32/F16/BF16 handled here, the GGUF quants through the
+/// kernels' dequantizer).  n must be a multiple of the type's block.
+void dequant_to_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+/// The same to fp32 (the parity-first batched path: same weights as the per-token GPU GEMV, no fp16 rounding).
+void dequant_to_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
+/// Y[T, N] (fp32) = X[T, K] . W[N, K]^T with both operands fp32 (cuBLAS SGEMM).
+void gemm_f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+              void* stream);
+/// Y[T, N] (fp32, row stride ldy) = X[T, K] . W[N, K]^T with both operands fp16 row-major.  `beta` 0 replaces,
+/// 1 adds.  cuBLAS FP16 tensor cores with an fp32 accumulator.  Initializes the handle on first use (per device).
+void gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+              float beta, void* stream);
+/// h[t][r] = swigluoai(gate[t][r], up[t][r]) in fp16 (rows x n_ff), the down matrix's activation.
+void swiglu_rows_f16(const float* g, const float* u, uint16_t* h, int64_t rows, int64_t n_ff, float alpha,
+                     float limit, void* stream);
+/// The same in fp32 (the q8_1 activation of the int8 expert kernels).
+void swiglu_rows_f32(const float* g, const float* u, float* h, int64_t rows, int64_t n_ff, float alpha, float limit,
+                     void* stream);
+/// out[t][c] += ent_w[r] * Y[r][c], where token t = ent_tok[r] (n_rows entries, row back to back).  Groups are
+/// launched one after another on the stream, so the plain `+=` is ordered; `zero` clears out first.
+void moe_combine_rows(const float* Y, const int32_t* ent_tok, const float* ent_w, int64_t n_rows, int64_t n_embd,
+                      float* out, int64_t n_tok, bool zero, void* stream);
+/// Indexer block maxima for a whole prompt chunk: bs[t][h][b] = max_{p in block b, p <= pos0+t} q[t][h] . ik[p].
+/// `q` is fp16 [n_tok][heads][dim], `ik` fp16 [ctx][dim].
+void idx_block_scores_batch(const void* ik, const uint16_t* q, int heads, int dim, int blk, int64_t nb,
+                            int64_t n_tok, int64_t pos0, float* bs, void* stream);
+/// Causal MSA attention for a whole chunk, reading the fp16 KV cache directly (no gather).
+/// `q` fp16 [n_tok][heads][dim]; `blk` int32 [n_tok][idx_heads][blocks_per_q] and `nblk` [n_tok][idx_heads] are the
+/// selected block ids (ascending).  `dense_all` != 0 ignores them and attends every position <= pos (no indexer).
+/// `out` fp32 [n_tok][heads][dim].
+void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32_t* blk, const int32_t* nblk,
+                    int heads, int q_per_kv, int q_per_idx, int dim, int blk_size, int dense_all, int64_t pos0,
+                    int64_t n_tok, int64_t max_blk, float* out, void* stream);
 
 }  // namespace strata::minimax::cu

@@ -87,6 +87,7 @@ The process refuses to start a GGUF when free space on the output drive is below
 | MM-IQ1_M | IQ1_M | IQ2_XXS | IQ2_XS | yes |
 | MM-IQ2_XXS | IQ2_XXS | IQ2_XS | IQ2_S | yes |
 | MM-IQ2_XS | IQ2_XS | IQ2_XS | IQ2_S | yes |
+| MM-IQ2_XS-D3 | IQ2_XS | IQ3_XXS | IQ2_S | yes |
 | MM-IQ2_S | IQ2_S | IQ2_S | IQ2_S | no |
 | MM-IQ3_XXS | IQ3_XXS | IQ3_XXS | IQ3_XXS | no |
 | MM-IQ3_S | IQ3_S | IQ3_S | IQ3_S | no |
@@ -100,7 +101,7 @@ The process refuses to start a GGUF when free space on the output drive is below
 
 Router gate and `exp_probs_b` stay F32. Norms stay F32. `token_embd` is Q8_0. `output.weight` is Q6_K. MM-NVFP4 additionally writes three f32 side tensors per MoE layer (see below); they are 512 bytes each.
 
-IQ1_S, IQ1_M, and IQ2_XXS step the whole `ffn_down_exps` tensor up one type. A GGUF tensor has one ggml type, so mixed types inside one stacked expert tensor are not possible. MM-IQ2_XS keeps IQ2_XS on gate, up, and down.
+IQ1_S, IQ1_M, and IQ2_XXS step the whole `ffn_down_exps` tensor up one type. A GGUF tensor has one ggml type, so mixed types inside one stacked expert tensor are not possible. MM-IQ2_XS keeps IQ2_XS on gate, up, and down. MM-IQ2_XS-D3 keeps IQ2_XS on `ffn_gate_exps` and `ffn_up_exps` and sets `ffn_down_exps` to IQ3_XXS; everything else is byte-for-byte the MM-IQ2_XS recipe.
 
 An expert-usage file looks like `{"mode":"record","layers":{"3":[12,40]}}`. `record` stores the ids and does not change types. `promote-layer` sets that source layer's whole `ffn_gate_exps` and `ffn_up_exps` to `hot_experts`. `--hot-expert-mode` overrides the file.
 
@@ -114,6 +115,7 @@ Full 60-layer tensor bytes from `ggml_row_size`, decimal GB, with the default Q8
 | MM-IQ1_M | 109.467 | 101.949 |
 | MM-IQ2_XXS | 124.528 | 115.976 |
 | MM-IQ2_XS | 133.135 | 123.992 |
+| MM-IQ2_XS-D3 | 146.045 | 136.015 |
 | MM-IQ2_S | 146.045 | 136.015 |
 | MM-IQ3_XXS | 171.865 | 160.062 |
 | MM-IQ3_S | 191.230 | 178.097 |

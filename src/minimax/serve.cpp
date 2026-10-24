@@ -1,4 +1,4 @@
-// src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
+﻿// src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
 //
 // Inspect never constructs the engine (no CUDA). Serve and eval load the GGUF, refuse a non-M3.1 file unless
 // --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE. GENI and BGEN
@@ -75,7 +75,11 @@ void usage() {
                  "  --minimax-seed-hidden FILE.npy    feed row t as token t's input instead of the embedding\n"
                  "  --gpus 0,1                       CUDA devices to use (default: 0)\n"
                  "  --layer-split auto|K[,K2]         layer K is the first one on the next GPU (auto: by free VRAM)\n"
-                 "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n");
+                 "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n"
+                 "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
+                 "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
+                 "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
+                 "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -508,6 +512,8 @@ int run(int argc, char** argv) {
     std::string pack_type, pack_in, pack_out;
     std::string dump_dir, dump_layers, seed_hidden;
     std::string layer_split, gpus, kv_space;
+    int prefill_batch = 0, expert_prefetch = 0;
+    std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -533,6 +539,12 @@ int run(int argc, char** argv) {
         else if (a == "--layer-split") layer_split = next();
         else if (a == "--gpus" || a == "--gpu") gpus = next();
         else if (a == "--minimax-kv" || a == "--kv-space") kv_space = next();
+        else if (a == "--minimax-prefill-batch" || a == "--minimax-batch") prefill_batch = std::atoi(next().c_str());
+        else if (a == "--minimax-prefill-experts") prefill_experts = next();
+        else if (a == "--minimax-prefill-dense") prefill_dense = next();
+        else if (a == "--minimax-prefill-read") prefill_read = next();
+        else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
+        else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
         else if (a == "--minimax-profile-save") profile_save = next();
@@ -662,6 +674,12 @@ int run(int argc, char** argv) {
     opt.layer_split = layer_split;
     opt.gpus = gpus;
     opt.kv_space = kv_space;
+    opt.prefill_batch = prefill_batch;
+    opt.prefill_experts = prefill_experts;
+    opt.prefill_dense = prefill_dense;
+    opt.prefill_read = prefill_read;
+    opt.expert_prefetch = expert_prefetch;
+    opt.dense_mmvq = dense_mmvq;
 
     Engine* engine = nullptr;
     try {
