@@ -4553,13 +4553,13 @@ __global__ void minimax_down_kernel(const uint8_t* const* down, const block_q8_1
 
 #define STRATA_MINIMAX_LAUNCH_GU(TY)                                                                                 \
     case TY:                                                                                                         \
-        minimax_gu_kernel<TY><<<grid, block>>>((const uint8_t* const*)gate, (const uint8_t* const*)up,               \
+        minimax_gu_kernel<TY><<<grid, block, 0, s>>>((const uint8_t* const*)gate, (const uint8_t* const*)up,          \
                                                (const block_q8_1*)x_q8_1, h, n_embd, n_ff, n_embd / Fmt<TY>::qk,     \
                                                gu_row, alpha, limit, s_gate, s_up);                                  \
         break;
 #define STRATA_MINIMAX_LAUNCH_DOWN(TY)                                                                               \
     case TY:                                                                                                         \
-        minimax_down_kernel<TY><<<grid, block>>>((const uint8_t* const*)down, (const block_q8_1*)x_q8_1, out,        \
+        minimax_down_kernel<TY><<<grid, block, 0, s>>>((const uint8_t* const*)down, (const block_q8_1*)x_q8_1, out,   \
                                                   n_embd, n_ff, n_ff / Fmt<TY>::qk, d_row, s_down);                   \
         break;
 
@@ -4585,6 +4585,7 @@ void minimax_moe_down(int type, const void* const* down, int n_entries, int n_em
     if (n_entries <= 0) return;
     const dim3 block(32, 4);
     const dim3 grid(1, (unsigned)((n_embd + 3) / 4), (unsigned)n_entries);
+    cudaStream_t s = (cudaStream_t)stream;
     const int nb = n_ff / 32;
     switch (type) {
         STRATA_GU_FMTS(STRATA_MINIMAX_LAUNCH_DOWN)
@@ -4593,7 +4594,7 @@ void minimax_moe_down(int type, const void* const* down, int n_entries, int n_em
         STRATA_MINIMAX_LAUNCH_DOWN(146)  // TQK7
         default: break;
     }
-    (void)stream;
+    (void)s;
 }
 
 #undef STRATA_MINIMAX_LAUNCH_GU

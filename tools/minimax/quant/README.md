@@ -175,6 +175,35 @@ Projected full 60-layer tensor bytes (`--dry-run`, decimal GB / GiB):
 | MM-IQ3_K | 191.230 | 178.097 |
 | MM-IQ4_KS | 233.547 | 217.507 |
 
+### Layer-40 real weights
+
+One-layer layer-40 GGUFs with the real imatrix (`--layers 40 --imatrix
+Strata-MiniMax/_local/ref_out/imatrix-minimax-m3.1.gguf --placeholder-missing`), replayed from the reference
+dumps' residual input (`tools/minimax/make_seed.py`, `--minimax-seed-hidden`) and compared with
+`_local/ref_out/dumps/short/dump-L40/layer_out.npy` (114 tokens, `tools/minimax/compare_nvfp4_parity.py`).
+`rel_l2` is over the whole layer output; the mainline rows are the same harness on the same dump.
+
+| recipe | experts | bpw | layer_out rel_l2 | cos | VRAM tier rel_l2 vs the CPU run |
+|---|---|---:|---:|---:|---:|
+| MM-IQ2_XS | IQ2_XS | 2.3125 | 4.604e-2 | 0.998942 | — |
+| MM-IQ2_KT | IQ2_KT | 2.125 | 4.465e-2 | 0.999004 | 1.91e-3 |
+| MM-IQ3_XXS | IQ3_XXS | 3.0625 | 2.752e-2 | 0.999622 | — |
+| MM-IQ3_KT (`--override experts=IQ3_KT`) | IQ3_KT | 3.125 | 2.476e-2 | 0.999693 | 1.82e-3 |
+| MM-IQ3_K | IQ3_K | 3.4375 | 2.045e-2 | 0.999791 | 1.82e-3 |
+| MM-IQ2_KL | IQ2_KL | 2.6875 | 3.381e-2 | 0.999428 | 1.81e-3 |
+| MM-IQ4_XS | IQ4_XS | 4.25 | 1.323e-2 | 0.999913 | — |
+| MM-IQ4_KS | IQ4_KS | 4.25 | 1.257e-2 | 0.999921 | 1.79e-3 |
+
+The order matches `IQK_EXPERIMENT.md`: IQ2_KT is slightly better than IQ2_XS while 9 GB smaller, IQ3_KT beats
+IQ3_XXS by 10%, IQ3_K and IQ4_KS beat their mainline same-bpw counterparts (IQ3_S/Q3_K and IQ4_XS) and IQ2_KL
+sits between them at 2.6875 bpw. The VRAM tier (`--minimax-tiers --minimax-vram-slots-per-layer 128`) runs all
+114 tokens × 4 experts on the grouped CUDA kernels (`vram_hits=456`) and lands within 1.9e-3 of the CPU path:
+the q8_1-versus-Q8_K activation difference, as on the synthetic model.
+
+Quantize speed for these one-layer files (5900X, 8 threads, shared machine; each expert tensor is 9.7 GB of f32
+values): IQ3_K 21 s, IQ4_KS 34 s, IQ2_KL 73 s, IQ2_KT 202 s, IQ3_KT 1094 s. For reference the mainline
+baselines on the same machine: IQ2_XS 246 s, IQ3_XXS 131 s, IQ4_XS 86 s.
+
 ## NVFP4
 
 MM-NVFP4 stores the routed experts as `GGML_TYPE_NVFP4` (type id 40, `block_nvfp4`, 36 bytes per 64 values, 4.5 bpw) and is **lossless**: the dequantized matrix is the source checkpoint's dequantized matrix, bit for bit in fp32.

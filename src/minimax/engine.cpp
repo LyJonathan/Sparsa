@@ -1915,13 +1915,9 @@ struct Engine::Impl {
                                (const void* const*)(ptr + 2 * top), k, n_embd, n_ff, L.egate.row_bytes,
                                L.edown.row_bytes, (const float*)w.x.p, (float*)w.ex_h.p, (float*)w.ex_out.p, alpha,
                                limit);
-        } else if (strata::kernels::ikq::is_iqk_type(gt) || strata::kernels::ikq::is_iqk_type(dt)) {
-            fail(std::string("the ") + strata::kernels::ikq::type_name(strata::kernels::ikq::is_iqk_type(gt) ? gt : dt) +
-                 " expert format has no GPU kernel in this build; keep those experts on the CPU "
-                 "(RAM or SSD tier)");
         } else {
             fail("no GPU expert kernel for gate/up ggml type " + std::to_string(gt) + " and down type " +
-                 std::to_string(dt) + " (supported: F32/F16/BF16 and the IQ/Q8_0 types)");
+                 std::to_string(dt) + " (supported: F32/F16/BF16, Q8_0, the IQ types and the ik_llama.cpp formats)");
         }
         out.resize((size_t)k * (size_t)n_embd);
         cu::copy_d2h(out.data(), w.ex_out.p, out.size() * sizeof(float));
