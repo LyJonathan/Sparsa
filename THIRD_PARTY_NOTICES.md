@@ -18,12 +18,15 @@ Copyright (c) 2023-2024 The llama.cpp authors
 ## ik_llama.cpp (Iwan Kawrakow)
 
 `include/strata/kernels/iqk_types.hpp`, `include/strata/kernels/cpu/iqk_quants.hpp` and
-`src/kernels/cpu/iqk_quants.cpp` port the IQ2_KT and IQ3_KT formats of
+`src/kernels/cpu/iqk_quants.cpp` port the IQ2_KT, IQ3_KT, IQ3_K, IQ4_KS and IQ2_KL formats of
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), commit `804ee29c28a5`. What is ported is the trellis
-codebook, the cluster search the quantizer builds, the two quantization row functions and the dequantizers;
-the type ids are Strata's own (see `include/strata/kernels/iqk_types.hpp` for why) and ik's `iqk_mul_mat` tile
-kernels are not ported. `tools/minimax/quant/src/test_ikq.cpp` compares the port against ik's own output, byte
-for byte.
+codebook and the cluster search the trellis quantizers build, the five quantization row functions (with the
+AVX2 evaluation order of `find_best_scale_avx2` / `evaluate_block_iq4k`, so the bytes match ik's), the
+dequantizers, and the q8_1 dot products of `ggml-cuda/template-instances/mmvq-instance-iq*` into
+`src/kernels/cuda/iq_kernels.cu` (`vec_dot_iq2_kt_q8_1` and friends, plus the `dq_*` dequantizers from
+`ggml-cuda/convert.cu`); the type ids are Strata's own (see `include/strata/kernels/iqk_types.hpp` for why) and
+ik's `iqk_mul_mat` tile kernels are not ported. `tools/minimax/quant/src/test_ikq.cpp` compares the port against
+ik's own output, byte for byte, on 24 cases (six per format).
 
 ```
 MIT License

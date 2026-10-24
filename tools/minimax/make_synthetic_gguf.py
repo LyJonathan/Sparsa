@@ -111,7 +111,9 @@ def _glorot(name, shape, rng):
     return rng.normal(0.0, 1.0 / np.sqrt(fan), size=shape).astype(np.float32)
 
 
-# Names match GGMLQuantizationType. IQ2_XS is not implemented in gguf-py; the engine packs it.
+# Names match GGMLQuantizationType. IQ2_XS is not implemented in gguf-py; the engine packs it.  The five
+# formats ported from ik_llama.cpp have no ggml-py ids either: the engine packs them and the writer below
+# stores them under the engine's own ids (160..164, see include/strata/kernels/iqk_types.hpp).
 _QUANT = {
     'f16': 'F16',
     'bf16': 'BF16',
@@ -119,7 +121,13 @@ _QUANT = {
     'q6_k': 'Q6_K',
     'q4_k': 'Q4_K',
     'iq2_xs': 'IQ2_XS',
+    'iq2_kt': 160,
+    'iq3_k': 161,
+    'iq4_ks': 162,
+    'iq3_kt': 163,
+    'iq2_kl': 164,
 }
+IKQ_TYPES = {160, 161, 162, 163, 164}
 
 
 def _minimax_exe():
@@ -145,7 +153,9 @@ def _pack_ggml(arr, kind, gguf_mod, exe):
         raise SystemExit(f'{kind} needs strata-minimax (tools/minimax/build_windows.ps1) for ggml quantize')
     flat = np.ascontiguousarray(arr, dtype=np.float32).reshape(-1, arr.shape[-1])
     rows, cols = flat.shape
-    qtype = getattr(gguf_mod.GGMLQuantizationType, _QUANT[kind])
+    raw_id = _QUANT[kind]
+    ikq = isinstance(raw_id, int)
+    qtype = raw_id if ikq else getattr(gguf_mod.GGMLQuantizationType, raw_id)
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / 'w.f32'
         dst = Path(td) / 'w.bin'
@@ -156,19 +166,27 @@ def _pack_ggml(arr, kind, gguf_mod, exe):
         if proc.returncode != 0:
             raise SystemExit(proc.stderr.strip() or f'{kind} pack failed')
         raw = np.fromfile(dst, dtype=np.uint8)
+    if ikq:
+        # No gguf-py block table for these: one row per ne1*ne2, each of the engine's own row size.
+        return np.ascontiguousarray(raw.reshape(-1)), qtype
     shape = gguf_mod.quants.quant_shape_to_byte_shape(arr.shape, qtype)
     if raw.size != int(np.prod(shape)):
         raise SystemExit(f'{kind} pack wrote {raw.size} bytes, expected {int(np.prod(shape))}')
-    return np.ascontiguousarray(raw.reshape(shape))
+    return np.ascontiguousarray(raw.reshape(shape)), qtype
 
 
 def _quantize(arr, kind, gguf_mod, exe):
-    qtype = getattr(gguf_mod.GGMLQuantizationType, _QUANT[kind])
-    block = gguf_mod.GGML_QUANT_SIZES[qtype][0]
+    raw_id = _QUANT[kind]
+    ikq = isinstance(raw_id, int)
+    if ikq:
+        block = 256
+    else:
+        qtype = getattr(gguf_mod.GGMLQuantizationType, raw_id)
+        block = gguf_mod.GGML_QUANT_SIZES[qtype][0]
     if int(arr.shape[-1]) % int(block) != 0:
         return None, None
-    if kind in ('q4_k', 'q6_k', 'iq2_xs'):
-        return _pack_ggml(arr, kind, gguf_mod, exe), qtype
+    if ikq or kind in ('q4_k', 'q6_k', 'iq2_xs'):
+        return _pack_ggml(arr, kind, gguf_mod, exe)
     raw = gguf_mod.quants.quantize(np.ascontiguousarray(arr, dtype=np.float32), qtype)
     raw = np.ascontiguousarray(raw)
     if kind == 'f16':
@@ -176,11 +194,7 @@ def _quantize(arr, kind, gguf_mod, exe):
     return raw, qtype
 
 
-def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None,
-          dense_type=None, pack_exe=None):
-    g = {**GEOMETRY, **(geometry or {})}
-    gguf = llama_baseline(gguf_py)
-    w = gguf.GGUFWriter(str(path), 'minimax-m3')
+def _add_meta(w, g, weights, gguf):
     w.add_block_count(g['layers'])
     w.add_context_length(g['ctx'])
     w.add_embedding_length(g['hidden'])
@@ -207,16 +221,43 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weig
     w.add_indexer_block_size(g['idx_block'])
     w.add_indexer_local_blocks(g['idx_local'])
     w.add_indexer_first_layer(g['idx_first'])
-    rng = np.random.default_rng(WEIGHT_SEED)
     if weights == 'glorot':
         # Authoritative: the norm tensors below already contain +1. The engine must not add it again.
         w.add_bool('minimax-m3.norm.add1', False)
 
+
+def _unpack_ikq(raw, kind, shape, exe):
+    """The stored bytes -> f32 with the engine's dequantizer (gguf-py has no codec for these types)."""
+    rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+    cols = int(shape[-1])
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / 'w.bin'
+        dst = Path(td) / 'w.f32'
+        src.write_bytes(np.ascontiguousarray(raw, dtype=np.uint8).tobytes())
+        proc = subprocess.run(
+            [exe, '--minimax-pack-dequant', kind, str(rows), str(cols), str(src), str(dst)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if proc.returncode != 0:
+            raise SystemExit(proc.stderr.strip() or f'{kind} dequant failed')
+        out = np.fromfile(dst, dtype=np.float32)
+    return out.reshape(shape)
+
+
+def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None,
+          dense_type=None, pack_exe=None, deq_copy=None):
+    g = {**GEOMETRY, **(geometry or {})}
+    gguf = llama_baseline(gguf_py)
+    w = gguf.GGUFWriter(str(path), 'minimax-m3')
+    _add_meta(w, g, weights, gguf)
+    rng = np.random.default_rng(WEIGHT_SEED)
+
     if dense_type not in (None, 'f32', 'f16', 'bf16', 'q8_0', 'q6_k', 'q4_k'):
         raise SystemExit('dense_type must be f16, bf16, q8_0, q6_k, or q4_k')
-    if quant_experts not in (None, 'q8_0', 'iq2_xs'):
-        raise SystemExit('quant_experts must be q8_0 or iq2_xs')
+    ikq_kinds = ('iq2_kt', 'iq3_k', 'iq4_ks', 'iq3_kt', 'iq2_kl')
+    if quant_experts not in ((None, 'q8_0', 'iq2_xs') + ikq_kinds):
+        raise SystemExit('quant_experts must be q8_0, iq2_xs, ' + ', '.join(ikq_kinds))
     exe = pack_exe or _minimax_exe()
+    deq_tensors = {}
 
     for name, shape, dtype in _tensor_list(g):
         if name == drop:
@@ -233,18 +274,65 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weig
         elif dense_type and dense_type != 'f32' and _is_dense_matrix(name):
             kind = dense_type
         raw, raw_dtype = (None, None)
+        deq = None
         if kind:
             raw, raw_dtype = _quantize(np.ascontiguousarray(arr, dtype=np.float32), kind, gguf, exe)
         if raw is None:
             w.add_tensor(name, arr)
         elif raw_dtype is None:
             w.add_tensor(name, raw)
+        elif isinstance(raw_dtype, int) and raw_dtype in IKQ_TYPES:
+            # Bytes only: gguf-py has no block geometry for these, so the shape is the logical one in numpy
+            # order (the writer reverses it, as it does for every tensor) and the payload is the engine's row
+            # layout.
+            w.add_tensor(name, raw.view(np.int8), raw_shape=list(arr.shape), raw_dtype=raw_dtype)
+            if deq_copy:
+                deq = _unpack_ikq(raw, kind, arr.shape, exe)
         else:
             w.add_tensor(name, raw, raw_dtype=raw_dtype)
+        if deq is not None:
+            deq_tensors[name] = deq
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+
+    if deq_copy and deq_tensors:
+        # The reference model: the same weights, with the ported expert formats expanded to f32.  A Python
+        # forward pass can read this one (gguf-py has no codec for the ported ids).
+        w2 = gguf.GGUFWriter(str(deq_copy), 'minimax-m3')
+        _add_meta(w2, g, weights, gguf)
+        rng2 = np.random.default_rng(WEIGHT_SEED)
+        for name, shape, dtype in _tensor_list(g):
+            if name == drop:
+                continue
+            if bad_shape and name == 'blk.1.ffn_gate_exps.weight':
+                shape = (shape[0], shape[1], shape[2] + 1)
+            # Draw for every tensor, in the same order as the main loop, so the two files hold the same
+            # non-expert weights (`_glorot` pulls from the shared RNG).
+            arr = _glorot(name, shape, rng2) if weights == 'glorot' else np.zeros(shape, dtype=dtype)
+            if name in deq_tensors:
+                w2.add_tensor(name, np.ascontiguousarray(deq_tensors[name], dtype=np.float32))
+                continue
+            kind = None
+            if quant_experts and name.endswith('_exps.weight'):
+                kind = quant_experts
+            elif dense_type and dense_type != 'f32' and _is_dense_matrix(name):
+                kind = dense_type
+            if not kind:
+                w2.add_tensor(name, arr)
+                continue
+            raw, raw_dtype = _quantize(np.ascontiguousarray(arr, dtype=np.float32), kind, gguf, exe)
+            if raw is None:
+                w2.add_tensor(name, arr)
+            elif isinstance(raw_dtype, int) and raw_dtype in IKQ_TYPES:
+                w2.add_tensor(name, _unpack_ikq(raw, kind, arr.shape, exe))
+            else:
+                w2.add_tensor(name, raw, raw_dtype=raw_dtype)
+        w2.write_header_to_file()
+        w2.write_kv_data_to_file()
+        w2.write_tensors_to_file()
+        w2.close()
     return path
 
 
@@ -256,8 +344,8 @@ def main(argv=None):
     ap.add_argument('--runnable', action='store_true', help='4-layer model with glorot weights (RUNNABLE geometry)')
     ap.add_argument('--dense-type', choices=('f32', 'f16', 'bf16', 'q8_0', 'q6_k', 'q4_k'),
                     help='store dense matrices as this type (norms and routed experts stay put)')
-    ap.add_argument('--quant-experts', choices=('q8_0', 'iq2_xs'),
-                    help='quantize routed *_exps.weight (iq2_xs uses a uniform imatrix)')
+    ap.add_argument('--quant-experts', choices=('q8_0', 'iq2_xs', 'iq2_kt', 'iq3_k', 'iq4_ks', 'iq3_kt', 'iq2_kl'),
+                    help='quantize routed *_exps.weight (iq2_xs and the ik_llama.cpp formats use a uniform imatrix)')
     ap.add_argument('--gguf-py', type=Path, help='path to llama.cpp/gguf-py')
     a = ap.parse_args(argv)
     build(a.out, drop=a.drop, bad_shape=a.bad_shape, gguf_py=a.gguf_py,

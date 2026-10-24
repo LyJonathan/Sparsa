@@ -21,10 +21,10 @@ namespace strata::kernels::ikq {
 
 // Ported from ik_llama.cpp (MIT). See THIRD_PARTY_NOTICES.md.
 inline constexpr int kIQ2KT = 160;  // IQ2_KT: 2.125 bpw trellis, 16-bit group index
-inline constexpr int kIQ3K  = 161;  // IQ3_K:  3.4375 bpw (reserved, not implemented yet)
-inline constexpr int kIQ4KS = 162;  // IQ4_KS: 4.25 bpw   (reserved, not implemented yet)
+inline constexpr int kIQ3K  = 161;  // IQ3_K:  3.4375 bpw 8-value codebook plus a 2-level scale
+inline constexpr int kIQ4KS = 162;  // IQ4_KS: 4.25 bpw 16-value codebook, two halves, 8-bit scales
 inline constexpr int kIQ3KT = 163;  // IQ3_KT: 3.125 bpw trellis, abs. values + sign bits
-inline constexpr int kIQ2KL = 164;  // IQ2_KL: 2.6875 bpw (reserved, not implemented yet)
+inline constexpr int kIQ2KL = 164;  // IQ2_KL: 2.6875 bpw pair codebook (32 entries) + ±32 scales
 
 /// Block geometry of a packed format.
 ///
@@ -44,7 +44,7 @@ inline bool is_iqk_type(int type) noexcept {
 
 /// The ids that this build implements the codec for.
 inline bool has_codec(int type) noexcept {
-    return type == kIQ2KT || type == kIQ3KT;
+    return type == kIQ2KT || type == kIQ3K || type == kIQ4KS || type == kIQ3KT || type == kIQ2KL;
 }
 
 inline const char* type_name(int type) noexcept {
@@ -98,7 +98,11 @@ inline size_t row_bytes(int type, int64_t n) noexcept {
     }
     const size_t head = (size_t) g.row_meta + (size_t) g.block_bytes * (size_t) (n / g.block_elems);
     const size_t raw = head + (size_t) t;
-    return (raw + 3) & ~(size_t) 3;   // ik pads a KT row to 4 bytes
+    // Only the trellis formats pad a row to 4 bytes (ik's ggml_is_kt_tail_type branch of ggml_row_size);
+    // IQ3_K / IQ4_KS / IQ2_KL take the plain `row_meta + type_size * n / block` path there, so a row of
+    // IQ2_KL is 174 bytes at 512 values, not 176.
+    if (type == kIQ2KT || type == kIQ3KT) return (raw + 3) & ~(size_t) 3;
+    return raw;
 }
 
 }  // namespace strata::kernels::ikq

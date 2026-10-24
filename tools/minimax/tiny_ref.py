@@ -44,7 +44,11 @@ def _opt(reader, suffix, default):
     return v
 
 
-def _f32(reader, name, tensors):
+def _f32(reader, name, tensors, override=None):
+    if override is not None and name in override:
+        # Dequantized outside: the formats ported from ik_llama.cpp have no gguf-py codec, so the test
+        # dequantizes the stored bytes with the engine's own kernel and hands them in.
+        return np.ascontiguousarray(override[name], dtype=np.float32)
     t = tensors[name]
     gguf = reader  # unused; type dispatch is on the tensor
     del gguf
@@ -57,7 +61,7 @@ def _f32(reader, name, tensors):
     return np.ascontiguousarray(gguf_mod.quants.dequantize(t.data, t.tensor_type), dtype=np.float32)
 
 
-def load(path, gguf_py=None):
+def load(path, gguf_py=None, deq=None):
     gguf = llama_baseline(gguf_py)
     reader = gguf.GGUFReader(str(path))
     tensors = {t.name: t for t in reader.tensors}
@@ -89,7 +93,7 @@ def load(path, gguf_py=None):
     norm_add1 = bool(int(add1)) if add1 is not None else False
 
     def norm(name):
-        w = _f32(reader, name, tensors)
+        w = _f32(reader, name, tensors, deq)
         if norm_add1:
             w = w + np.float32(1)
         return w
@@ -102,37 +106,37 @@ def load(path, gguf_py=None):
             'ffn_norm': norm(b + 'ffn_norm.weight'),
             'q_norm': norm(b + 'attn_q_norm.weight'),
             'k_norm': norm(b + 'attn_k_norm.weight'),
-            'wq': _f32(reader, b + 'attn_q.weight', tensors),
-            'wk': _f32(reader, b + 'attn_k.weight', tensors),
-            'wv': _f32(reader, b + 'attn_v.weight', tensors),
-            'wo': _f32(reader, b + 'attn_output.weight', tensors),
+            'wq': _f32(reader, b + 'attn_q.weight', tensors, deq),
+            'wk': _f32(reader, b + 'attn_k.weight', tensors, deq),
+            'wv': _f32(reader, b + 'attn_v.weight', tensors, deq),
+            'wo': _f32(reader, b + 'attn_output.weight', tensors, deq),
             'moe': i >= leading,
             'indexer': i >= idx_first,
         }
         if not L['moe']:
-            L['gate'] = _f32(reader, b + 'ffn_gate.weight', tensors)
-            L['up'] = _f32(reader, b + 'ffn_up.weight', tensors)
-            L['down'] = _f32(reader, b + 'ffn_down.weight', tensors)
+            L['gate'] = _f32(reader, b + 'ffn_gate.weight', tensors, deq)
+            L['up'] = _f32(reader, b + 'ffn_up.weight', tensors, deq)
+            L['down'] = _f32(reader, b + 'ffn_down.weight', tensors, deq)
         else:
-            L['router'] = _f32(reader, b + 'ffn_gate_inp.weight', tensors)
-            L['bias'] = _f32(reader, b + 'exp_probs_b.bias', tensors)
-            L['egate'] = _f32(reader, b + 'ffn_gate_exps.weight', tensors)
-            L['eup'] = _f32(reader, b + 'ffn_up_exps.weight', tensors)
-            L['edown'] = _f32(reader, b + 'ffn_down_exps.weight', tensors)
+            L['router'] = _f32(reader, b + 'ffn_gate_inp.weight', tensors, deq)
+            L['bias'] = _f32(reader, b + 'exp_probs_b.bias', tensors, deq)
+            L['egate'] = _f32(reader, b + 'ffn_gate_exps.weight', tensors, deq)
+            L['eup'] = _f32(reader, b + 'ffn_up_exps.weight', tensors, deq)
+            L['edown'] = _f32(reader, b + 'ffn_down_exps.weight', tensors, deq)
             if shared:
-                L['sgate'] = _f32(reader, b + 'ffn_gate_shexp.weight', tensors)
-                L['sup'] = _f32(reader, b + 'ffn_up_shexp.weight', tensors)
-                L['sdown'] = _f32(reader, b + 'ffn_down_shexp.weight', tensors)
+                L['sgate'] = _f32(reader, b + 'ffn_gate_shexp.weight', tensors, deq)
+                L['sup'] = _f32(reader, b + 'ffn_up_shexp.weight', tensors, deq)
+                L['sdown'] = _f32(reader, b + 'ffn_down_shexp.weight', tensors, deq)
         if L['indexer']:
-            L['iq'] = _f32(reader, b + 'indexer.q_proj.weight', tensors)
-            L['ik'] = _f32(reader, b + 'indexer.k_proj.weight', tensors)
+            L['iq'] = _f32(reader, b + 'indexer.q_proj.weight', tensors, deq)
+            L['ik'] = _f32(reader, b + 'indexer.k_proj.weight', tensors, deq)
             L['iq_norm'] = norm(b + 'indexer.q_norm.weight')
             L['ik_norm'] = norm(b + 'indexer.k_norm.weight')
         layers.append(L)
 
     return {
-        'embd': _f32(reader, 'token_embd.weight', tensors),
-        'output': _f32(reader, 'output.weight', tensors),
+        'embd': _f32(reader, 'token_embd.weight', tensors, deq),
+        'output': _f32(reader, 'output.weight', tensors, deq),
         'out_norm': norm('output_norm.weight'),
         'layers': layers,
         'hidden': hidden,

@@ -1021,6 +1021,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(dequant_wide_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(dequant_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME dequant_wide_parity COMMAND dequant_wide_parity)
+    # the ported ik_llama.cpp formats: the GPU dequantizers (dq_iq2_kt and friends) bitwise against the CPU
+    # codec, and the grouped expert dot against the CPU dot (GPU, synthetic, no model)
+    add_executable(ikq_cuda_parity src/kernels/ikq_cuda_parity.cpp)
+    target_include_directories(ikq_cuda_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(ikq_cuda_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    if(MSVC)
+      target_compile_options(ikq_cuda_parity PRIVATE /EHsc)
+    endif()
+    add_test(NAME ikq_cuda_parity COMMAND ikq_cuda_parity)
   endif()
   # programmatic dependent launch (pdl.hpp) in a captured verify-shaped chain: bitwise vs ordinary launches over
   # replays with poisoned buffers, and only kernel-to-kernel programmatic edges (GPU, synthetic, no model; the edges

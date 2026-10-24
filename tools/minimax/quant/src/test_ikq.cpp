@@ -87,7 +87,16 @@ void write_file(const fs::path& p, const void* data, size_t bytes) {
     f.write((const char*) data, (std::streamsize) bytes);
 }
 
-int ik_id(int type) { return type == kIQ2KT ? 153 : 154; }
+int ik_id(int type) {
+    switch (type) {
+    case kIQ2KT: return 153;
+    case kIQ3KT: return 154;
+    case kIQ3K: return 138;
+    case kIQ4KS: return 144;
+    case kIQ2KL: return 157;
+    default: return -1;
+    }
+}
 
 std::string mbs(double bytes, double secs) {
     char buf[64];
@@ -131,7 +140,7 @@ int main(int argc, char** argv) {
     {
         const auto warm = make_tensor(1, 256, 0x5eedull);
         const auto ww = make_imatrix(256, 0x5eedull);
-        for (int t : {kIQ2KT, kIQ3KT}) {
+        for (int t : {kIQ2KT, kIQ3KT, kIQ3K, kIQ4KS, kIQ2KL}) {
             std::vector<char> out(strata::kernels::ikq::row_bytes(t, 256));
             quantize_rows(t, warm.data(), out.data(), 1, 256, ww.data(), 1);
         }
@@ -153,6 +162,25 @@ int main(int argc, char** argv) {
         // is defined for whole super-blocks only (see quantize_rows)
         {"IQ3_KT", kIQ3KT, 16, 768, true},
         {"IQ3_KT", kIQ3KT, 16, 512, false},
+        // IQ3_K, IQ4_KS and IQ2_KL have no tail layout in ik either (GGML_ASSERT(n_per_row%QK_K == 0)).
+        {"IQ3_K", kIQ3K, 32, 512, true},
+        {"IQ3_K", kIQ3K, 16, 768, true},
+        {"IQ3_K", kIQ3K, 16, 512, false},
+        {"IQ3_K", kIQ3K, 16, 1024, true},
+        {"IQ3_K", kIQ3K, 8, 256, true},
+        {"IQ3_K", kIQ3K, 12, 3072, true},
+        {"IQ4_KS", kIQ4KS, 32, 512, true},
+        {"IQ4_KS", kIQ4KS, 16, 768, true},
+        {"IQ4_KS", kIQ4KS, 16, 512, false},
+        {"IQ4_KS", kIQ4KS, 16, 1024, true},
+        {"IQ4_KS", kIQ4KS, 8, 256, true},
+        {"IQ4_KS", kIQ4KS, 12, 3072, true},
+        {"IQ2_KL", kIQ2KL, 32, 512, true},
+        {"IQ2_KL", kIQ2KL, 16, 768, true},
+        {"IQ2_KL", kIQ2KL, 16, 512, false},
+        {"IQ2_KL", kIQ2KL, 16, 1024, true},
+        {"IQ2_KL", kIQ2KL, 8, 256, true},
+        {"IQ2_KL", kIQ2KL, 12, 3072, true},
     };
 
     for (const Case& c : cases) {
@@ -255,15 +283,23 @@ int main(int argc, char** argv) {
                                          (c.imatrix ? "w" : "n") + ".bin");
         const fs::path ref_f32 = work / ("ref-" + std::to_string(c.type) + "-" + std::to_string(c.cols) +
                                          (c.imatrix ? "w" : "n") + ".f32");
-        // _spawnv: no shell, so no quoting to get wrong
+        // _spawnv: no shell, so no quoting to get wrong.  The strings outlive the call: the temporary
+        // `p.string()` results would be freed before the child runs.
         const std::string type_s = std::to_string(ik_id(c.type));
         const std::string rows_s = std::to_string(c.rows);
         const std::string cols_s = std::to_string(c.cols);
         const std::string imx_s = c.imatrix ? imx_p.string() : std::string("-");
-        const char* args[] = {ref_exe.string().c_str(), type_s.c_str(), rows_s.c_str(), cols_s.c_str(),
-                              in_p.string().c_str(), imx_s.c_str(), ref_bin.string().c_str(),
-                              ref_f32.string().c_str(), nullptr};
-        const intptr_t rc = _spawnv(_P_WAIT, ref_exe.string().c_str(), args);
+        const std::string in_s = in_p.string();
+        const std::string bin_s = ref_bin.string();
+        const std::string f32_s = ref_f32.string();
+        const std::string exe_s = ref_exe.string();
+        // argv[0] is the name the child sees, not the file spawned: a full path with spaces would be split
+        // again by the child's parser (three extra argv entries, observed on this machine).
+        const std::string argv0_s = ref_exe.filename().string();
+        const char* args[] = {argv0_s.c_str(),    type_s.c_str(), rows_s.c_str(), cols_s.c_str(),
+                              in_s.c_str(),       imx_s.c_str(),  bin_s.c_str(),  f32_s.c_str(),
+                              nullptr};
+        const intptr_t rc = _spawnv(_P_WAIT, exe_s.c_str(), args);
         if (rc != 0) {
             fail("the ik reference binary failed (" + std::to_string((long long) rc) + ")");
             continue;
@@ -319,7 +355,7 @@ int main(int argc, char** argv) {
         std::printf("\nquantize speed (%lldx%lld f32 expert rows, 8 threads)\n", (long long) rows, (long long) cols);
         const auto big = make_tensor(rows, cols, 0xfeedfaceull);
         const auto w = make_imatrix(cols, 0xdeadbeefull);
-        for (int type : {kIQ2KT, kIQ3KT}) {
+        for (int type : {kIQ2KT, kIQ3KT, kIQ3K, kIQ4KS, kIQ2KL}) {
             std::vector<char> out((size_t) rows * strata::kernels::ikq::row_bytes(type, cols));
             quantize_rows(type, big.data(), out.data(), rows, cols, w.data(), 8);   // warm: codebook
             auto t0 = std::chrono::steady_clock::now();
