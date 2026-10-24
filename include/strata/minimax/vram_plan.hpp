@@ -31,6 +31,12 @@ struct VramSlotPlan {
 /// Auto keeps the invariant <c>reserve + prefill + slot_bytes &lt;= free_bytes</c>.  It does not clamp the slot count
 /// to leave the prefill space unclaimed only when it is needed: the prefill allocation is not optional once
 /// <c>--minimax-prefill-batch</c> is on, so it is always subtracted.
+///
+/// P12: that subtraction is what starves decode.  The workspace is only needed while a prompt runs, so the engine's
+/// default (<c>--minimax-prefill-vram swap</c>) sizes the slots with <c>prefill_bytes = 0</c> and lets the prompt pass
+/// release the slots it displaces (<c>Impl::pf_acquire</c>), re-allocating them afterwards.  This function is
+/// unchanged: the swap mode simply passes 0, and <c>--minimax-prefill-vram reserve</c> passes the real figure,
+/// restoring the P10 rule exactly.
 inline VramSlotPlan plan_vram_slots(size_t free_bytes, size_t reserve_bytes, size_t prefill_bytes,
                                     size_t expert_bytes, int moe_layers, int n_expert, int requested) {
     VramSlotPlan p;

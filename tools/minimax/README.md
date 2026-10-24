@@ -1396,3 +1396,78 @@ region), because a per-region completion tag deadlocked after the full model's p
 completion was not reaped on its shard. On the slice, prefetch on reads 48 % more bytes and spends more time in
 `ssd_wait` (60 -> 124 ms); the default stays **off**, and the flag remains opt-in while a per-region drain that
 does not leak is written.
+
+## P12: the prompt workspace borrows the decode slots
+
+A batched prompt needs a device workspace (137 KiB/token/device plus the rows scratch, the expert ring and, with
+the KV in RAM, one layer's staged K/V). P10 made the auto slot count subtract that workspace up front so a big
+card could not fail in `cudaMalloc` at startup -- correct, but the workspace then sat in VRAM for the whole
+session while decode used the rest. With `--minimax-prefill-batch 4096` that is ~1.5 GiB per card; on a 12 GB card
+it was the difference between a usable slot pool and almost none.
+
+The workspace is only needed *while a prompt is being processed*, so the two no longer coexist:
+
+* `--minimax-prefill-vram swap`: the slots are sized as if there were no workspace. At the start of a prompt the
+  engine frees the slots it needs (round-robin over a device's MoE layers, so no layer is emptied), allocates the
+  workspace, and at the end of the prompt frees it and re-allocates exactly the slots it took
+  (`Impl::pf_acquire` / `pf_release`, `PrefillWs` in `Engine::generate` and `teacher_forced`). The slots come back
+  empty, which is the state a decode-only run starts in: the token path's compulsory admission fills them.
+* `--minimax-prefill-vram reserve` (**the default**): the P10 rule, unchanged -- the workspace is subtracted at
+  startup and lives for the run. It is the default because the swap measured slower on this box's full model (see
+  the table below); a placement with a slot pool worth having should turn it on.
+
+`include/strata/minimax/vram_plan.hpp` is untouched: swap mode passes `prefill_bytes = 0`, reserve passes the real
+figure. An explicit `--minimax-vram-slots-per-layer N` never swaps (the operator asked for N), so its workspace
+still comes out of the free VRAM as before.
+
+**The admission path reads the pinned tier now.** `vram_fill` used to copy a compulsory-admitted expert out of the
+file mapping even when the pinned RAM tier already held the same bytes, so every fill re-faulted 15 MB through the
+page cache (or the drive). It now copies from the arena when the expert is resident there -- same bytes, and the
+`pick` phase of a token stops paying for the drive.
+
+### Measured
+
+Bit-identical gates on the 15-layer real-weight slice (`models/quant-d3/p5a-l0-14-iq2xs.gguf`, 96 real-text
+tokens, `--gpus 0 --minimax-dense-layers-gpu 15 --minimax-tiers --minimax-kv vram --cpu-threads 12
+--memory-limit-mib 20000`), merged base `4658d3c3` against this branch:
+
+| arm | max abs | KL | top-1 |
+| --- | ---: | ---: | ---: |
+| `--minimax-vram-slots-per-layer 6 --minimax-prefill-batch 32` (the reserve path, this branch's default) | 0.0 | 0.0 | 1.000 |
+| `--minimax-vram-slots-per-layer -1 --minimax-prefill-batch 0` (the token path) | 0.0 | 0.0 | 1.000 |
+| the same with `--minimax-prefill-vram swap` (auto slots, 32 a layer, workspace borrowed) | 0.0 | 0.0 | 1.000 |
+
+The swap costs 21-23 ms per turn on that slice: two turns of 96 + 112 tokens, `--decode 8`, borrowed 34 then 38
+slots in 9 ms, workspace released and 32 slots a layer re-allocated in 12-14 ms, both turns `DONE`, and the second
+turn's decode is 69 ms/token against the first turn's 177 (the slots it filled are warm again).
+
+**Full model, the released server's flags.** MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB
+DDR4-3200, 512-token real-text prompt, 64 greedy tokens, 2 reps, all arms interleaved with a fresh process each
+rep: `--gpus 0,1 --max-context 32768 --minimax-kv vram --minimax-tiers --vram-reserve-mib 700
+--minimax-prefill-batch 4096 --minimax-prefill-expert-gemm mmvq --memory-limit-mib 90000 --minimax-stats
+--minimax-profile-time`, auto slots (`--minimax-vram-slots-per-layer -1`):
+
+| arm | slots/layer | decode tok/s | ms/token | ssd/token | ssd MB/token | ssd wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| P10 reserve (base) | 0 | **3.33** | 300.2 | 56.7 | 981 | 30.3 ms |
+| swap, after the admission fix | 2 | 3.15 | 317.1 | 57.4 | 994 | 35.1 ms |
+
+The per-token breakdown says exactly why: the two slots move work off the CPU lane (`cpu_ram` 184.4 -> 164.9 ms)
+but the compulsory admissions that fill them cost more than they save (`pick` 0.6 -> 12.7 ms, plus `gpu_begin`
+4.0, `gpu_stream` 3.4 and `gpu_finish` 1.3) -- net **-5.4 %** in this window. Before the admission fix (which
+copies a resident expert out of the pinned tier instead of re-faulting the file mapping) the same pair was 3.44
+against 2.95 tok/s on 32 decode tokens: the fix takes the loss from -14 % to -5 %.
+
+The reason is the placement, not the mechanism: at 32 K context with the KV in VRAM and 60 dense layers on the
+two 12 GB cards, the automatic slot pool is **2 experts a layer** (0 in the reserve arm -- the 1.5 GiB workspace
+ate the whole pool, which is the starvation this flag removes). Two of 128 experts cannot pay for their own
+fill-in inside a 64-token reply. `--minimax-vram-slots-per-layer 0` (what `sparsa.py` passes today) is unchanged
+by any of this: there is no slot pool to borrow from or reserve.
+
+**So the default stays `reserve`.** The flag exists, is bit-identical, and gives decode the decode-only slot count
+where a slot pool is worth having; on this box's full model it is a wash that costs 5 %, and the honest next step
+is not a bigger workspace but a cheaper admission: the compulsory fill is three synchronous H2D copies on the
+default stream, which wait behind the layer's queued GPU work, while `prefetch_for` already knows how to enqueue
+the same bytes on the side stream.
+
+

@@ -802,6 +802,14 @@ struct Engine::Impl {
     // device that owns the layer being computed (one set per device).  Off unless --minimax-prefill-batch > 1.
     bool batch_on = false;
     int batch_cap = 0;
+    // P12: the batched-prompt workspace and the VRAM expert slots share the card.  `prefill_ws_swap` says the
+    // prompt pass must free slots to make room (and put them back afterwards); `prefill_ws_bytes` is the workspace's
+    // over-estimated size per device; `ws_taken[layer]` counts the slots currently freed on that layer, so the
+    // restore re-allocates exactly what came out.
+    bool prefill_ws_swap = false;
+    size_t prefill_ws_bytes = 0;
+    bool ws_live = false;            // the device side of the workspace is allocated right now
+    std::vector<int> ws_taken;       // per layer: slots freed for the prompt
     bool prefill_gpu_experts = true;
     bool prefill_dense_f32 = true;
     // P10: the routed experts' batched projection.  "mmvq" keeps the int8 iq_mmvq dots; "tc" dequantizes each
@@ -1301,12 +1309,7 @@ struct Engine::Impl {
             w.kstage_h = w.vstage_h = nullptr;
         }
         if (kv_arena) cu::host_free(kv_arena);
-        for (PfBuf& p : pf) {
-            if (p.ring) cu::dealloc(p.ring);
-            p.ring = nullptr;
-            if (p.pin) cu::host_free(p.pin);
-            p.pin = nullptr;
-        }
+        pf_free();   // P12: the prompt workspace is allocated only while a prompt runs; free it if the run ended mid-prompt
         if (ssd_stage) strata::platform::DirectFile::free_aligned(ssd_stage);
         if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
         if (ssd_slots) strata::platform::DirectFile::free_aligned(ssd_slots);
@@ -2174,9 +2177,10 @@ struct Engine::Impl {
     // buffers for the requested batch (the prompt cap is also ctx); the 224 MiB fixed headroom is the same one
     // init_prefill keeps for itself.  This is an over-estimate when the batch is later reduced to fit, which is the
     // safe direction: it can only cost a slot, never a failed allocation.
-    size_t prefill_device_bytes() const {
+    size_t prefill_device_bytes(int t_override = 0) const {
         if (opt.prefill_batch <= 1 || dump_on) return 0;
-        const int64_t T = std::min<int64_t>(opt.prefill_batch, ctx);
+        const int64_t T = t_override > 0 ? std::min<int64_t>(t_override, ctx)
+                                         : std::min<int64_t>(opt.prefill_batch, ctx);
         if (T < 2) return 0;
         const size_t t = (size_t)T;
         const size_t rc = t < 1024 ? t : 1024;
@@ -2252,21 +2256,40 @@ struct Engine::Impl {
         // sizing.  Auto slot sizing must leave it room or a card large enough for the slots to fill the card dies in
         // cudaMalloc (the 96 GB / 153 GB-model startup OOM).  The rule is in vram_plan.hpp and unit-tested; it also
         // covers the rows_cap scratch, the expert ring and the RAM tier's staged K/V, not just the per-token buffers.
+        //
+        // P12: the workspace never coexists with the *decode* slots -- it is only needed while a prompt is being
+        // processed.  `--minimax-prefill-vram swap` therefore sizes the slots as if the workspace did not exist and
+        // lets the prompt pass free the slots it displaces (`pf_acquire`), re-allocating them when the prompt
+        // finishes, so a batched prompt leaves decode the decode-only slot count.  The default ("reserve") keeps the
+        // P10 rule: measured a wash on a 2 x RTX 5070 12 GB box whose slot pool is 2 experts a layer either way (see
+        // tools/minimax/README.md), so the swap stays opt-in until a placement with a real slot pool is measured.
         const size_t prefill_need = tiers_gpu_possible() ? prefill_device_bytes() : 0;
-        if (prefill_need > 0 && opt.vram_slots_per_layer < 0)
-            std::fprintf(stderr,
-                         "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
-                         "workspace before sizing expert slots\n",
-                         (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
+        prefill_ws_bytes = prefill_need;
+        const bool prefill_swap = prefill_need > 0 && opt.vram_slots_per_layer < 0 && opt.prefill_vram == "swap";
+        prefill_ws_swap = prefill_swap;
+        if (prefill_need > 0 && opt.vram_slots_per_layer < 0) {
+            if (prefill_swap)
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots the %d-token batched prompt workspace (%.0f MiB/device) "
+                             "borrows the expert slots for the prompt and returns them after it; decode keeps the "
+                             "full slot count\n",
+                             (int)std::min<int64_t>(opt.prefill_batch, ctx), (double)prefill_need / 1048576.0);
+            else
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
+                             "workspace before sizing expert slots\n",
+                             (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
+        }
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
                 if (dev_moe[d] <= 0) continue;
                 // dev_budget is already free - reserve; the plan takes the batched-prefill workspace out before it
-                // counts slots.  The explicit-count path (`requested >= 0`) is unchanged: init_prefill shrinks the
-                // batch to whatever room that count left, as before.
-                const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_need, max_expert_bytes,
-                                                        (int)dev_moe[d], (int)cfg.n_expert, -1);
+                // counts slots -- except in the swap mode, where the prompt pass takes the slots back for the
+                // duration of the prompt instead.  The explicit-count path (`requested >= 0`) is unchanged:
+                // init_prefill shrinks the batch to whatever room that count left, as before.
+                const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_swap ? 0 : prefill_need,
+                                                        max_expert_bytes, (int)dev_moe[d], (int)cfg.n_expert, -1);
                 if (pl.slots < q) q = pl.slots;
             }
             if (q < 0) q = 0;
@@ -2615,9 +2638,24 @@ struct Engine::Impl {
         Layer::VramSlot& s = L.vram[(size_t)slot];
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         uint8_t* p = (uint8_t*)s.mem.p;
-        cu::copy_h2d(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        cu::copy_h2d(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        cu::copy_h2d(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        // P12: if the expert is already in the pinned RAM tier, copy it from there.  It used to be read out of the
+        // file mapping even when the arena held the same bytes, so every compulsory admission re-faulted 15 MB of
+        // the model through the page cache (or the drive) instead of a 20 GB/s memcpy from RAM.  Same bytes.
+        const uint8_t* g = L.egate.host + (size_t)expert * L.expert_gu;
+        const uint8_t* u = L.eup.host + (size_t)expert * L.expert_gu;
+        const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
+        if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
+            const int rs = L.ram_of[(size_t)expert];
+            if (rs >= 0 && rs < L.ram_n) {
+                const uint8_t* base = ram_arena->data() + L.ram_off + (uint64_t)rs * L.expert_bytes;
+                g = base;
+                u = base + L.expert_gu;
+                d = base + 2 * L.expert_gu;
+            }
+        }
+        cu::copy_h2d(p, g, L.expert_gu);
+        cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
+        cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
     }
@@ -4880,7 +4918,11 @@ struct Engine::Impl {
         for (size_t d = 0; d < devs.size(); ++d) {
             const cu::MemInfo mi = cu::mem_on(devs[d]);
             const size_t reserve = ((size_t)std::max(opt.vram_reserve_mib, 256) << 20) + fixed;
-            if (mi.free_bytes <= reserve) {
+            // P12: in the swap mode the prompt pass may take the expert slots back for its workspace, so what the
+            // batch may use is the free VRAM plus every slot on this card.
+            const size_t reclaim = prefill_ws_swap ? slotted_bytes_on((int)d) : 0;
+            const size_t budget = mi.free_bytes + reclaim;
+            if (budget <= reserve) {
                 std::fprintf(stderr,
                              "strata-minimax: batched prefill needs workspace on device %d but only %zu MiB is free. "
                              "Lower --minimax-prefill-batch or --minimax-dense-layers-gpu.\n",
@@ -4888,11 +4930,12 @@ struct Engine::Impl {
                 batch_cap = 0;
                 return;
             }
-            const size_t fit = (mi.free_bytes - reserve) / per_tok;
+            const size_t fit = (budget - reserve) / per_tok;
             std::fprintf(stderr,
-                         "INFO minimax-prefill-workspace dev=%d free=%zu MiB reserve=%zu MiB per_token=%.1f KiB "
+                         "INFO minimax-prefill-workspace dev=%d free=%zu MiB%s reserve=%zu MiB per_token=%.1f KiB "
                          "fit=%zu tokens\n",
-                         devs[d], mi.free_bytes >> 20, reserve >> 20, (double)per_tok / 1024.0, fit);
+                         devs[d], mi.free_bytes >> 20, reclaim ? (" +slots=" + std::to_string(reclaim >> 20) + " MiB").c_str() : "",
+                         reserve >> 20, (double)per_tok / 1024.0, fit);
             if ((size_t)batch_cap > fit) batch_cap = (int)fit;
         }
         if (batch_cap < 2) {
@@ -4914,6 +4957,148 @@ struct Engine::Impl {
             ssd_tmp_bytes = (size_t)max_expert_bytes + 4096;
         }
         pf.resize(devs.size());
+        ws_taken.assign(layers.size(), 0);
+        // P12: `pf_max_blk` is read by the host buffers below and by the device allocation later, so it is settled
+        // here with the rest of the batch geometry.  It used to be set inside the allocation loop, which now runs at
+        // the first prompt.
+        pf_max_blk = (int)cfg.idx_top_k;
+        // P12: the pinned expert-slot layout is host arithmetic that both the prompt ring and the decode path's
+        // direct reads use, so it is computed here once, not with the (per-prompt) device buffers.
+        if (prefill_gpu_experts && max_expert_bytes > 0) {
+            size_t gu = 0, dn = 0;
+            for (const Layer& L : layers)
+                if (L.moe) {
+                    if (L.expert_gu > gu) gu = L.expert_gu;
+                    if (L.expert_down > dn) dn = L.expert_down;
+                }
+            const size_t A = strata::platform::DirectFile::alignment();
+            auto up = [&](size_t x) { return (x + A - 1) & ~(A - 1); };
+            for (PfBuf& p : pf) {
+                p.ring_slot = max_expert_bytes;
+                p.role_off[0] = A;
+                p.role_off[1] = up(p.role_off[0] + gu) + A;
+                p.role_off[2] = up(p.role_off[1] + gu) + A;
+                p.pin_slot_bytes = up(p.role_off[2] + dn) + A;
+            }
+        }
+        // The workspace's size on one device, from the settled batch: with the tiers off there are no slots to
+        // borrow from and the allocation is just the free VRAM.
+        prefill_ws_bytes = prefill_device_bytes(batch_cap);
+        batch_on = true;
+        pf_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
+        pf_q.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
+        pf_kv.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0.f);
+        pf_router.assign((size_t)batch_cap * (size_t)cfg.n_expert, 0.f);
+        pf_blk.assign((size_t)batch_cap * (size_t)cfg.idx_heads * (size_t)pf_max_blk, 0);
+        pf_nblk.assign((size_t)batch_cap * (size_t)cfg.idx_heads, 0);
+        pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
+        pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
+        pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
+        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
+        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
+        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
+        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
+        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
+        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_dense_h.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
+        pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
+        pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
+        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
+                     batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
+                     (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
+        if (prefill_gpu_experts)
+            std::fprintf(stderr, "INFO minimax-prefill-expert-gemm=%s%s\n", prefill_expert_gemm.c_str(),
+                         prefill_expert_gemm == "auto" ? " (tensor cores from 16 rows per expert)" : "");
+        if (ikq_experts)
+            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
+                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
+    }
+
+        PfBuf& P() { return pf[(size_t)cur]; }
+
+    // =========================================================== P12: the prompt workspace and the slots share VRAM
+    //
+    // The batched prompt workspace is only needed while a prompt is being processed; the decode expert slots are
+    // only needed after it.  Before P12 both were reserved at startup, so a server that always passes
+    // `--minimax-prefill-batch 4096` gave the workspace ~700 MiB of every card out of the decode slot pool for the
+    // whole session.  Now the workspace is allocated at the start of a prompt (freeing the slots it displaces) and
+    // released when the prompt ends, and the slots are re-allocated, so decode runs with the decode-only count.
+    // The kernels and their arguments are untouched: only the residency of the slots changes, exactly as the
+    // adaptive swaps already change it during a run.
+
+    /// Every VRAM expert slot on device `d`, in bytes: what the prompt workspace may take back.
+    size_t slotted_bytes_on(int d) const {
+        size_t b = 0;
+        for (const Layer& L : layers)
+            if (L.moe && L.dev == d) b += (size_t)L.vram.size() * L.expert_bytes;
+        return b;
+    }
+
+    /// Release the device side of the batched-prompt workspace.  Idempotent.  The pinned slot *layout*
+    /// (`role_off`, `pin_slot_bytes`, `ring_slot`) is host-side arithmetic that the decode path's direct reads also
+    /// use, so it is computed once in init_prefill and survives this: only the buffers go away.
+    void pf_free() {
+        if (!ws_live) return;
+        for (size_t d = 0; d < pf.size(); ++d) {
+            PfBuf& p = pf[d];
+            use_device_index((int)d);
+            cu::dealloc(p.h16);          p.h16 = nullptr;
+            cu::dealloc(p.a16);          p.a16 = nullptr;
+            cu::dealloc(p.y32);          p.y32 = nullptr;
+            cu::dealloc(p.p32);          p.p32 = nullptr;
+            cu::dealloc(p.sh);           p.sh = nullptr;
+            cu::dealloc(p.w16);          p.w16 = nullptr;
+            cu::dealloc(p.w32);          p.w32 = nullptr;
+            cu::dealloc(p.gx);           p.gx = nullptr;
+            cu::dealloc(p.gx32);         p.gx32 = nullptr;
+            cu::dealloc(p.gy);           p.gy = nullptr;
+            cu::dealloc(p.gu);           p.gu = nullptr;
+            cu::dealloc(p.gh);           p.gh = nullptr;
+            cu::dealloc(p.gh32);         p.gh32 = nullptr;
+            cu::dealloc(p.gd);           p.gd = nullptr;
+            cu::dealloc(p.xq);           p.xq = nullptr;
+            cu::dealloc(p.hq);           p.hq = nullptr;
+            cu::dealloc(p.d_rows.p);     p.d_rows.p = nullptr;
+            cu::dealloc(p.d_ent_row.p);  p.d_ent_row.p = nullptr;
+            cu::dealloc(p.d_ent_w.p);    p.d_ent_w.p = nullptr;
+            cu::dealloc(p.d_iq16.p);     p.d_iq16.p = nullptr;
+            cu::dealloc(p.d_q16.p);      p.d_q16.p = nullptr;
+            cu::dealloc(p.d_bs.p);       p.d_bs.p = nullptr;
+            cu::dealloc(p.d_blk.p);      p.d_blk.p = nullptr;
+            cu::dealloc(p.d_nblk.p);     p.d_nblk.p = nullptr;
+            cu::dealloc(p.d_pos.p);      p.d_pos.p = nullptr;
+            cu::dealloc(p.kv_k.p);       p.kv_k.p = nullptr;
+            cu::dealloc(p.kv_v.p);       p.kv_v.p = nullptr;
+            for (void* r : p.ring_v) cu::dealloc(r);
+            for (void* h : p.pin_v) cu::host_free(h);
+            for (void* e : p.ev_copy) cu::event_destroy(e);
+            for (void* e : p.ev_comp) cu::event_destroy(e);
+            p.ring_v.clear();
+            p.pin_v.clear();
+            p.ev_copy.clear();
+            p.ev_comp.clear();
+            p.ring = nullptr;
+            p.pin = nullptr;
+            p.ring_n = 0;
+            p.x16 = nullptr;
+            p.y32_elems = p.p32_elems = p.sh_elems = 0;
+            p.w16_elems = 0;
+            p.rows_cap = 0;
+        }
+        use_device_index(0);
+        ws_live = false;
+    }
+
+    /// Allocate the device side of the batched-prompt workspace for `batch_cap` tokens.  The caller has already made
+    /// room (`pf_acquire`).  A cudaMalloc that still does not fit throws, which is the honest failure: the plan
+    /// above counted these bytes.
+    void pf_alloc() {
+        if (ws_live) return;
+        // Mark it live first: a cudaMalloc that throws part-way leaves a half-filled PfBuf that pf_free() must be
+        // able to release (every pointer starts null and is set one at a time).
+        ws_live = true;
         for (size_t d = 0; d < devs.size(); ++d) {
             use_device_index((int)d);
             PfBuf& p = pf[d];
@@ -4956,7 +5141,6 @@ struct Engine::Impl {
             p.d_q16 = DevPtr(cu::alloc(T * (size_t)(cfg.n_head * cfg.head_dim) * 2 + 4096));
             const int64_t nbmax = (ctx + cfg.idx_block - 1) / cfg.idx_block;
             p.d_bs = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)nbmax * sizeof(float) + 4096));
-            pf_max_blk = (int)cfg.idx_top_k;
             p.d_blk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)pf_max_blk * sizeof(int32_t) + 4096));
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
             p.d_pos = DevPtr(cu::alloc((size_t)T * sizeof(int32_t) + 64));
@@ -4980,21 +5164,8 @@ struct Engine::Impl {
                 }
             }
             if (prefill_gpu_experts && max_expert_bytes > 0) {
-                p.ring_slot = max_expert_bytes;
                 // P10: the pinned slot's role layout (see PfBuf::role_off): gate, up and down each at a 4 KiB
                 // boundary with 4 KiB of headroom, so an unbuffered read of the aligned superset can land there.
-                size_t gu = 0, dn = 0;
-                for (const Layer& L : layers)
-                    if (L.moe) {
-                        if (L.expert_gu > gu) gu = L.expert_gu;
-                        if (L.expert_down > dn) dn = L.expert_down;
-                    }
-                const size_t A = strata::platform::DirectFile::alignment();
-                auto up = [&](size_t x) { return (x + A - 1) & ~(A - 1); };
-                p.role_off[0] = A;
-                p.role_off[1] = up(p.role_off[0] + gu) + A;
-                p.role_off[2] = up(p.role_off[1] + gu) + A;
-                p.pin_slot_bytes = up(p.role_off[2] + dn) + A;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
                 // expert stream, which is what the chunk's MoE time is actually spent on.
                 size_t slot = p.ring_slot;
@@ -5018,39 +5189,146 @@ struct Engine::Impl {
             }
         }
         use_device_index(0);
-        batch_on = true;
-        pf_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
-        pf_q.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
-        pf_kv.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0.f);
-        pf_router.assign((size_t)batch_cap * (size_t)cfg.n_expert, 0.f);
-        pf_blk.assign((size_t)batch_cap * (size_t)cfg.idx_heads * (size_t)pf_max_blk, 0);
-        pf_nblk.assign((size_t)batch_cap * (size_t)cfg.idx_heads, 0);
-        pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
-        pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
-        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
-        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
-        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
-        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
-        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_dense_h.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
-        pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
-        pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
-        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
-                     batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
-                     (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
-        if (prefill_gpu_experts)
-            std::fprintf(stderr, "INFO minimax-prefill-expert-gemm=%s%s\n", prefill_expert_gemm.c_str(),
-                         prefill_expert_gemm == "auto" ? " (tensor cores from 16 rows per expert)" : "");
-        if (ikq_experts)
-            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
-                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
+        ws_live = true;
     }
 
-    PfBuf& P() { return pf[(size_t)cur]; }
+    // `--minimax-prefill-vram swap`'s two halves.  `pf_acquire` frees expert slots until every card has room for
+    // the workspace and then allocates it; `pf_release` frees the workspace and re-allocates exactly the slots it
+    // took.  Slots come back empty (the experts they held are marked non-resident), which is the same state a
+    // decode-only run starts in; the pinning tier and the retier loop refill them on the next tokens.
+    void pf_release() {
+        if (!ws_live) return;
+        const auto ws_t0 = std::chrono::steady_clock::now();
+        cu::sync();
+        for (size_t d = 0; d < work.size(); ++d) {
+            if (!work[d].side) continue;
+            use_device_index((int)d);
+            cu::stream_sync(work[d].side);
+        }
+        use_device_index(0);
+        pf_free();
+        int restored = 0;
+        for (size_t li = 0; li < layers.size(); ++li) {
+            Layer& L = layers[li];
+            if (ws_taken[li] <= 0) continue;
+            use_device_index(L.dev);
+            for (int s = 0; s < ws_taken[li]; ++s) {
+                Layer::VramSlot slot;
+                slot.mem = DevPtr(cu::alloc(L.expert_bytes));
+                L.vram.push_back(std::move(slot));
+                ++restored;
+            }
+            ws_taken[li] = 0;
+        }
+        use_device_index(0);
+        cu::sync();
+        if (restored > 0) {
+            int lo = std::numeric_limits<int>::max(), hi = 0;
+            for (const Layer& L : layers)
+                if (L.moe && !L.vram.empty()) {
+                    lo = std::min(lo, (int)L.vram.size());
+                    hi = std::max(hi, (int)L.vram.size());
+                }
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-vram workspace released, %d expert slots re-allocated (%d..%d per "
+                         "layer) in %.0f ms\n",
+                         restored, lo, hi,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ws_t0).count());
+        }
+    }
+
+    /// Make room for the workspace by taking slots away (swap mode only), then allocate it.  Returns false when the
+    /// allocation still does not fit (the caller then keeps the token path).  `--minimax-prefill-vram reserve` and an
+    /// explicit `--minimax-vram-slots-per-layer` never take a slot away: their workspace comes out of whatever
+    /// free VRAM init_prefill sized the batch against, exactly as before P12.
+    bool pf_acquire() {
+        if (ws_live) return true;
+        // cudaFree is a device-wide sync: do it before the prompt, never inside one.  The expert side streams get
+        // an explicit sync too, because the adaptive retier and the lookahead copy into slots asynchronously and a
+        // slot must not be freed while a copy into it is still in flight.
+        cu::sync();
+        for (size_t d = 0; d < work.size(); ++d) {
+            if (!work[d].side) continue;
+            use_device_index((int)d);
+            cu::stream_sync(work[d].side);
+        }
+        use_device_index(0);
+        const auto ws_t0 = std::chrono::steady_clock::now();
+        const size_t margin = (size_t)std::max(opt.vram_reserve_mib, 256) << 20;
+        const size_t need = prefill_ws_bytes + margin;
+        int freed = 0;
+        if (prefill_ws_swap) {
+            for (size_t d = 0; d < devs.size(); ++d) {
+                // Round-robin over this device's MoE layers so no single layer loses its whole pool.
+                std::vector<size_t> moe_on_d;
+                for (size_t li = 0; li < layers.size(); ++li)
+                    if (layers[li].moe && layers[li].dev == (int)d) moe_on_d.push_back(li);
+                size_t turn = 0;
+                bool any = true;
+                while (any && cu::mem_on(devs[d]).free_bytes < need) {
+                    any = false;
+                    for (size_t k = 0; k < moe_on_d.size(); ++k) {
+                        const size_t li = moe_on_d[(turn + k) % moe_on_d.size()];
+                        Layer& L = layers[li];
+                        if (L.vram.empty()) continue;
+                        use_device_index(L.dev);
+                        Layer::VramSlot& s = L.vram.back();
+                        if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
+                        // `VramSlot::mem` is an RAII DevPtr: free it here and null it, or pop_back's destructor
+                        // frees the same pointer again (a double free that surfaces later as a bogus launch error).
+                        cu::dealloc(s.mem.p);
+                        s.mem.p = nullptr;
+                        L.vram.pop_back();
+                        ++ws_taken[li];
+                        ++freed;
+                        any = true;
+                        break;   // re-check the free bytes before taking another
+                    }
+                    ++turn;
+                }
+                if (cu::mem_on(devs[d]).free_bytes < need) {
+                    use_device_index(0);
+                    std::fprintf(stderr,
+                                 "WARN minimax-prefill-vram device %d still has only %zu MiB free after taking %d "
+                                 "slots; the batched prompt may not fit\n",
+                                 devs[d], cu::mem_on(devs[d]).free_bytes >> 20, freed);
+                }
+            }
+        }
+        use_device_index(0);
+        if (freed > 0)
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-vram borrowed %d expert slots for the prompt workspace in %.0f ms\n",
+                         freed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ws_t0).count());
+        try {
+            pf_alloc();
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                         "WARN minimax-prefill-vram the %.0f MiB/device prompt workspace did not fit (%s); keeping "
+                         "the token path for this run\n",
+                         (double)prefill_ws_bytes / 1048576.0, ex.what());
+            pf_release();
+            batch_on = false;
+            batch_cap = 0;
+            return false;
+        }
+        return ws_live;
+    }
+
+    /// RAII: the prompt workspace exists for exactly the duration of a prompt.  Every path that runs
+    /// `forward_batch` opens one; the destructor gives the slots back even when a run is cancelled.
+    struct PrefillWs {
+        Impl* im = nullptr;
+        bool on = false;
+        explicit PrefillWs(Impl* i) : im(i) {
+            if (i->batch_on) on = i->pf_acquire();
+        }
+        ~PrefillWs() {
+            if (on) im->pf_release();
+        }
+        PrefillWs(const PrefillWs&) = delete;
+        PrefillWs& operator=(const PrefillWs&) = delete;
+    };
 
     // P9: the batched prompt workspace, bytes per token per device.  Kept in one place because the tier sizing
     // (which must leave room for it) and the allocator below both need it.
@@ -6498,6 +6776,8 @@ void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std:
     if ((int64_t)n > impl_->ctx) fail("teacher-forced sequence is longer than the context");
     impl_->dump_seq = n;
     std::vector<float> all((size_t)n * vocab);
+    // P12: the batched workspace (and the slots it borrows) lives for the teacher-forced pass only.
+    Impl::PrefillWs ws(impl_);
     const int batch = impl_->batch_on ? impl_->batch_cap : 1;
     for (int i = 0; i < n;) {
         const int k = std::min(batch, n - i);
@@ -6601,39 +6881,44 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
         return std::chrono::duration<double, std::milli>(clock::now() - a).count();
     };
     const int chunk = impl_->opt.chunk > 0 ? impl_->opt.chunk : 16;
-    const int batch = impl_->batch_on ? impl_->batch_cap : 1;
-    for (int i = (int)begin; i < (int)prompt.size();) {
-        if (stop.load(std::memory_order_relaxed)) {
-            gr.finish = "cancel";
-            gr.prompt_ms = ms_since(t0);
-            return gr;
+    // P12: the batched-prompt workspace borrows the decode expert slots for the prompt and returns them when it
+    // ends, so decode starts with the decode-only slot count.  The scope is the prompt: the brace closes before the
+    // decode loop, and the guard releases on every early return.
+    {
+        Impl::PrefillWs ws(impl_);
+        const int batch = impl_->batch_on ? impl_->batch_cap : 1;
+        for (int i = (int)begin; i < (int)prompt.size();) {
+            if (stop.load(std::memory_order_relaxed)) {
+                gr.finish = "cancel";
+                gr.prompt_ms = ms_since(t0);
+                return gr;
+            }
+            if (reforward && i == (int)begin) impl_->n_past = begin;
+            const int k = std::min(batch, (int)prompt.size() - i);
+            if (k > 1) {
+                impl_->forward_batch(prompt.data() + i, k, impl_->last_logits.data(), 1);
+                for (int j = 0; j < k; ++j) impl_->held.push_back(prompt[(size_t)(i + j)]);
+                i += k;
+            } else {
+                impl_->forward_token(prompt[(size_t)i], impl_->last_logits.data());
+                impl_->held.push_back(prompt[(size_t)i]);
+                ++i;
+            }
+            impl_->have_logits = true;
+            const int done = i;
+            if (on_pp && (done == (int)prompt.size() || done % chunk == 0 || done > (int)prompt.size() - batch))
+                on_pp(done, (int)prompt.size(), ms_since(t0));
+            if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
+                gr.finish = "nonfinite";
+                gr.prompt_ms = ms_since(t0);
+                return gr;
+            }
         }
-        if (reforward && i == (int)begin) impl_->n_past = begin;
-        const int k = std::min(batch, (int)prompt.size() - i);
-        if (k > 1) {
-            impl_->forward_batch(prompt.data() + i, k, impl_->last_logits.data(), 1);
-            for (int j = 0; j < k; ++j) impl_->held.push_back(prompt[(size_t)(i + j)]);
-            i += k;
-        } else {
-            impl_->forward_token(prompt[(size_t)i], impl_->last_logits.data());
-            impl_->held.push_back(prompt[(size_t)i]);
-            ++i;
-        }
-        impl_->have_logits = true;
-        const int done = i;
-        if (on_pp && (done == (int)prompt.size() || done % chunk == 0 || done > (int)prompt.size() - batch))
-            on_pp(done, (int)prompt.size(), ms_since(t0));
-        if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
-            gr.finish = "nonfinite";
-            gr.prompt_ms = ms_since(t0);
-            return gr;
-        }
-    }
+    }   // the prompt workspace's scope
     gr.prompt_ms = ms_since(t0);
     if (!impl_->have_logits) {
         gr.finish = "length";
-        return gr;
-    }
+        return gr;    }
 
     const auto t1 = clock::now();
     std::vector<int32_t> hist = impl_->held;
