@@ -859,9 +859,38 @@ ids) through the serve protocol and reports the engine's own prefill/decode numb
 
 ```powershell
 python tools/minimax/bench_longctx.py --model m.gguf --text docs/DETAILS.md --length 32768 --decode 64 `
-  --cap-s 1500 -- --gpus 1 --minimax-tiers --minimax-profile mm3-d3.bin --minimax-kv ram `
-  --minimax-prefill-batch 32768 --memory-limit-mib 66000
+  --ctx 33280 --cap-s 1500 -- --gpus 0,1 --minimax-tiers --minimax-profile mm3-d3.bin --minimax-kv ram `
+  --minimax-prefill-batch 32768 --minimax-vram-slots-per-layer 0 --memory-limit-mib 66000
 ```
+
+### Measured: 32 K of real text on the full model
+
+MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4-3200, Ryzen 5900X, prompt = 32 768 tokens of
+this repository's `docs/DETAILS.md`. Flags as above plus `--cpu-threads 12`; RAM tier 64.5 GiB pinned (3 815
+slots), KV f16 4.28 GiB in pinned RAM.
+
+| | value |
+|---|---|
+| chunk achieved | **22 473 tokens** (binding card GPU1, 3 938 MiB free; workspace 2 879 MiB/device) |
+| chunks | 2 (22 473 + 10 295) |
+| prefill | **866.7 s, 37.8 tok/s** |
+| decode, 64 tokens | **34.9 s, 1.83 tok/s** (546 ms/token) |
+| peak working set | **83.4 GiB** |
+| minimum available RAM | **39.8 GiB** |
+| startup (weights, pin, fill, workspace) | 76 s |
+
+Round 1 stopped this prompt at 20 min with 25 of 60 layers done and 0.3 GB of RAM left. The per-chunk split (an
+earlier run, same flags, `--ctx 32768`) was 22 991 tokens in **554.3 s (41.5 tok/s)** and 9 777 tokens in
+**310.4 s (31.5 tok/s)** — the second chunk pays more per token because the indexer and MSA grow with position while
+the expert bytes per chunk do not.
+
+The read paths agree on real weights: the 15-layer slice (`p5a-l0-14-iq2xs.gguf`), 4 096 real tokens, is
+`np.array_equal` between `--minimax-prefill-read mmap` and `direct` (4 096 x 200 064 logits, max abs 0.0, top-1
+4 096/4 096).
+
+128 K fits in RAM (16.9 GiB of KV + a 55 GiB tier leaves ~35 GiB available) but not in a 25-min run: at 37.8 tok/s it
+is ~57 min, and the per-token cost grows with position, so nearer 1.5-2 h. It was not run. The next lever there is
+the expert GEMM (an MMVQ at 1 024 rows/expert), not the chunk size.
 
 ## P7b: the route nudge, the lane's spin window, and page-cache-in-place
 
