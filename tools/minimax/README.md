@@ -808,7 +808,61 @@ instead of dereferencing a null host pointer (it used to take an access violatio
   long-context prompt is still slow. The RAM tier at long context wants fp16 for prefill and q8 for capacity: those
   two do not yet coexist.
 * Prefill is still CPU-expert-bound on the full model; the expert bytes per chunk, not the attention, are the
-  ceiling. See §3.3 of the analysis.
+  ceiling. See ï¿½3.3 of the analysis.
+## P9: the budget has to cover the page cache, and the chunk the caller asked for
+
+Round 1's 32 K run held **112.8 GB of working set with 0.3 GB of RAM available** while the pinned expert tier was
+inside its 74 GiB `--memory-limit-mib` budget. The budget bounded the arena; nothing bounded the 146 GB model being
+streamed through the OS page cache by `--minimax-prefill-read mmap` (the default), and memcpy-ing the tier out of
+that mapping left the same bytes cached a second time.
+
+### `--minimax-prefill-read auto|mmap|direct` (default auto)
+
+`auto` means: **direct when `--memory-limit-mib` is set**, mmap otherwise. `direct` reads every streamed expert
+unbuffered (`DirectFile`) into the pinned staging buffer, so it costs no page cache; `mmap` is unchanged and is
+still the faster choice when the whole expert set is meant to be cached. The bytes are identical, so the logits are
+identical -- `tools/minimax/test_p9_direct_read.py` asserts `np.array_equal` against the mmap path on the synthetic
+runnable model (CPU only, no CUDA), and the plan line says which path ran:
+
+```
+INFO minimax-prefill-read=direct (implied by --memory-limit-mib; --minimax-prefill-read mmap keeps the page cache)
+```
+
+The three places that read the model now honour it: the profile/static RAM-tier fill (`ram_copy`), the batched CPU
+MoE (`moe_batch_cpu`, which also reads a resident expert from the pinned arena instead of the mapping), and the
+batched device MoE ring (unchanged `direct` path). On Windows the process working set is also trimmed
+(`EmptyWorkingSet`, after the fill and every 8 layers) so the clean mapped pages the upload faulted in go back to
+the standby list instead of sitting next to the pinned arena.
+
+### The batched workspace is 137 KiB/token, and the expert slots no longer take its VRAM
+
+Two separate space bugs kept `--minimax-prefill-batch 32768` from being honoured:
+
+* The per-token workspace was sized at `max_dense_n` (12288) for three fp32 buffers and one fp16 buffer that
+  nothing read -- 188 KiB/token. Only the dense MLP's `rows_cap` tile needs that width; the T-wide buffers need the
+  attention width (8192) and the hidden size (6144). It is now 137 KiB/token, and the sizes are printed:
+  `INFO minimax-prefill-workspace dev=1 free=... MiB reserve=... per_token=137.3 KiB fit=... tokens`.
+* `init_tiers` sized the automatic VRAM expert slots *before* the prompt workspace existed, so the slot count spent
+  all of the free VRAM and `init_prefill` then clamped the chunk to the leftovers. With `--minimax-prefill-batch`
+  set (and no explicit `--minimax-vram-slots-per-layer`) the workspace is now reserved first:
+  `INFO minimax-vram-slots reserving N MiB/device for the 32768-token batched prompt workspace`.
+  A run that does not ask for a batch sizes exactly as before.
+
+`--minimax-prefill-read` and the workspace layout change nothing about the numbers a chunk produces: the same
+kernels read the same bytes. `--minimax-vram-slots-per-layer 0` still forces the old "no VRAM slots" behaviour.
+
+### Measuring it
+
+`tools/minimax/bench_longctx.py` runs a real-text prompt (tokenized with the model's `tokenizer.json`, not random
+ids) through the serve protocol and reports the engine's own prefill/decode numbers plus **peak working set** and
+**minimum available RAM**, sampled every 2 s, and kills the run at `--cap-s` with the per-chunk `PP` lines intact:
+
+```powershell
+python tools/minimax/bench_longctx.py --model m.gguf --text docs/DETAILS.md --length 32768 --decode 64 `
+  --cap-s 1500 -- --gpus 1 --minimax-tiers --minimax-profile mm3-d3.bin --minimax-kv ram `
+  --minimax-prefill-batch 32768 --memory-limit-mib 66000
+```
+
 ## P7b: the route nudge, the lane's spin window, and page-cache-in-place
 
 **`--minimax-route-bias on` (default off): rank the router's top-k on the expert's score plus a residency

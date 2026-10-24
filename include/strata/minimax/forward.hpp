@@ -74,8 +74,9 @@ struct EngineOptions {
     std::string prefill_experts;    ///< "auto" (chunk size decides), "cpu" or "gpu": where a batched chunk's routed
                                     ///< experts are computed
     std::string prefill_dense;      ///< "f32" (default: fp32 cuBLAS, matches the per-token GPU GEMV) or "f16"
-    std::string prefill_read;       ///< "mmap" (default: the OS page cache, best when the expert set fits in RAM) or
-                                    ///< "direct" (unbuffered 16 MiB reads, for a set larger than RAM)
+    std::string prefill_read;       ///< "" / "auto": the OS page cache, except when --memory-limit-mib is set (the
+                                    ///< budget cannot bound the page cache, so streamed experts are read unbuffered);
+                                    ///< "mmap": always the page cache; "direct": always unbuffered 16 MiB reads
     // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
