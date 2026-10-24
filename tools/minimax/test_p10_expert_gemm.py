@@ -30,7 +30,6 @@ from make_synthetic_gguf import build  # noqa: E402
 
 def _exe():
     for c in [os.environ.get('STRATA_MINIMAX_EXE'),
-              str(ROOT / 'build-prefill' / 'strata-minimax.exe'),
               str(ROOT / 'build' / 'strata-minimax.exe'),
               str(ROOT / 'build' / 'strata-minimax')]:
         if c and Path(c).exists():
