@@ -739,9 +739,62 @@ default: 0 keeps the old behaviour.
 
 **`--minimax-ram-mode pinned|inplace` (default pinned): whether the RAM tier is a copy at all.** Maya's DeepSeek
 engine reads experts in place and records that its own opt-in RAM tier was *slower* than the page cache on a
-V100/64 GB, and that copies "were measured no faster than the page cache … a part copied cost decode speed on
+V100/64 GB, and that copies "were measured no faster than the page cache ï¿½ a part copied cost decode speed on
 64 GB and on 32 GB of RAM" (`ds4_model.cu:1206-1211`, `5164-5166`). `inplace` builds no arena: the ranked set is
 only a ranking decision, `PrefetchVirtualMemory` walks the ranked experts' pages once at startup (Maya's
 Windows prefetch of only the non-resident pages measured +6-7% decode, `ds4_os.hpp:250-332`), and the CPU lane
 reads the mapping. The A/B is in the table below; the default stays `pinned` until the measurement says
 otherwise on this box.
+
+Measured on the 15-layer real-weight IQ2_XS slice with the SSD-heavy placement
+(`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 11`, i.e. 11 of 128 experts per layer resident and
+~27 of 48 routes a token read from the drive), one RTX 5070, 128-token prompt then 24 greedy tokens, one round,
+`--minimax-stats`. **The box was not idle**: another agent's full-model quality job shared the drive for the whole
+round, so the tok/s column is noisy to about +-4% and the *bytes* column is the load-independent part. Raw rows in
+`bench_p7b_arms.json`.
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| exact routing | 4.85 | 206.0 | 27.1 | 423 | 295.5 ms |
+| `--minimax-route-bias on` (0.25 / 0.15, protect 2, pool 12) | **4.90** | 204.2 | **17.4 (-36%)** | **271 (-36%)** | **213.8 ms (-28%)** |
+| `--minimax-ram-mode inplace` | 3.08 | 325.1 | 43.8 | 684 | 157.9 ms |
+| `inplace` + route bias | 3.31 | 302.3 | 36.5 | 570 | 122.4 ms |
+
+What the nudge costs in quality, against this engine's own exact-routing logits on the same teacher-forced prompt
+(`gate_logits.py`, real G3 text): mean **KL 0.0348**, 8-row top-1 **0.886**; the 0.5 / 0.3 setting gives KL 0.0348,
+top-1 0.877. The meter says **35.3% of picks swapped, 96.6% of the router weight kept** -- a much larger swap share
+than Xolotl's 26.1% at the same 0.25, because only 11 of 128 experts per layer are resident in this placement; on the
+full model ~110 of 128 are, so the same bias should move far fewer picks. The default stays **off** until the
+full-model numbers say what it buys and what it costs there.
+
+**Page-cache-in-place is slower here, and the reason is measurable.** `--minimax-ram-mode inplace` removes the
+pinned copy and reads the mapping, exactly what Maya's DeepSeek engine does -- and on this box it costs **-36%**
+decode. The counters say why: the token's CPU lane is 2.3 GB of expert reads, and the pinned copy delivers them at
+the ~20 GB/s this engine measures for the IQ2_XS dot while the page-cache reads came in at ~5 GB/s in the same slot
+(the drive's own wait went *down*, 295 -> 158 ms, so the loss is entirely on the CPU-read side). Maya's own note says
+its CPU lane is compute-bound at ~46 GB/s "from either" source on 2 Xeon sockets -- the copy only pays there because
+the page cache is already as fast; at 20 GB/s it does not. **The default stays `pinned`.**
+
+### Full model: MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4
+
+Real text (a 512-token prefix of `ppl_text.bin` from the G3 dump set), 32 greedy tokens, 2 reps per arm, one
+round, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin`, box otherwise idle for the first two arms:
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before: P5c build (auto 98/layer, uniform) | 2.64 | 379.5 | 10.4 | 180 | not measured (no P6 path) |
+| **after: this branch** (auto 94.6/layer, 69..110 by profile) | **2.88** | 347.4 | **7.8** | **135** | **13.5 ms** |
+| after: same build, `--minimax-ram-experts-per-layer 87` (the old uniform size) | 2.58 | 386.9 | 8.9 | 154 | 75.9 ms |
+
+**+9.1%** against the P5c build and **+11.6%** against the same build with the old 87-experts/layer uniform tier.
+Caveat, stated plainly: the arms ran one after another on the same box, so the later arms found the file's pages
+in the OS cache and the first did not; part of the difference is that ordering. The load-independent numbers -
+7.8 against 10.4 SSD routes a token, 135 against 180 MB, 13.5 against 75.9 ms of drive wait on the same build - are
+the honest measure of what this branch changes, and a cold-start A/B is still to be run with the box to itself.
+The tier size in slots barely moves (5394 against 5586): what moves is *which* experts are in it, because the
+profile's hot-to-cold split gives the busiest layers 110 and the coldest 69 instead of 98 everywhere. The engine also
+reported **21 SSD-tier routes per token served straight from the page cache** (`ssd_mapped`) in this run, which is
+the same warming effect and should be read as "the path fires on a warm box", not as a steady-state rate.
+
+At 347 ms/token the drive is now ~4% of a token, the CPU expert lane and the GPU are the rest - which is why the
+route nudge (fewer, better-placed experts) and the lane shape are the next levers rather than more I/O work.
