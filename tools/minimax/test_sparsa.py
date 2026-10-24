@@ -53,7 +53,25 @@ def test_plan_is_the_minimax_format_and_starts_at_part_one(tmp_path):
     # the measured arm: the RAM tier on, the VRAM expert slots off (auto starves prefill)
     assert "--minimax-tiers" in cfg["args"]
     assert cfg["args"][cfg["args"].index("--minimax-vram-slots-per-layer") + 1] == "0"
+    # chat reads the prompt in one batched chunk by default ("auto" -> 4096, the engine shrinks it to what fits)
     assert cfg["args"][cfg["args"].index("--minimax-prefill-batch") + 1] == "4096"
+    # ... with the int8 expert dots: the tensor-core arm failed the full-model G3 gate, so it is opt-in
+    assert cfg["args"][cfg["args"].index("--minimax-prefill-expert-gemm") + 1] == "mmvq"
+
+
+def test_prefill_batch_takes_auto_a_count_or_off(tmp_path):
+    model, engine = make_files(tmp_path)
+    cfg, _ = plan(model, engine, tmp_path, "--prefill-batch", "512")
+    assert cfg["args"][cfg["args"].index("--minimax-prefill-batch") + 1] == "512"
+    for off in ("0", "off"):
+        cfg, _ = plan(model, engine, tmp_path, "--prefill-batch", off)
+        assert "--minimax-prefill-batch" not in cfg["args"]
+        assert "--minimax-prefill-expert-gemm" not in cfg["args"]
+    cfg, _ = plan(model, engine, tmp_path, "--prefill-expert-gemm", "mmvq")
+    assert cfg["args"][cfg["args"].index("--minimax-prefill-expert-gemm") + 1] == "mmvq"
+    with pytest.raises(SystemExit) as e:
+        plan(model, engine, tmp_path, "--prefill-batch", "lots")
+    assert "--prefill-batch" in str(e.value)
 
 
 def test_a_slice_is_named_and_needs_the_flag(tmp_path):

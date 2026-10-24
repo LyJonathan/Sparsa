@@ -1,4 +1,4 @@
-"""P5a gate: batched prompt processing keeps the per-token math, and the decode prefetch changes nothing.
+﻿"""P5a gate: batched prompt processing keeps the per-token math, and the decode prefetch changes nothing.
 
 The batched path is per layer: dense projections as one batched GEMM (cuBLAS), MSA attention over the whole chunk
 with the top-k block selection done once per query, then the routed experts grouped per expert so each expert's
@@ -188,3 +188,47 @@ def test_serve_prefill_batch_matches_token_prefill(gguf, tmp_path):
     a = gen(['--minimax-dense-layers-gpu', '0'])
     b = gen(['--minimax-dense-layers-gpu', '0', '--minimax-prefill-batch', '32'])
     assert a == b
+
+
+def test_serve_second_turn_prefills_only_the_new_tokens(gguf, tmp_path):
+    """A growing conversation: turn 2 reuses the cached prefix, so the batched path runs on a non-empty KV over the
+    new tokens only.  The continuation must be the token path's, and the engine must report the reuse it claims."""
+    p1 = _ids(40)
+    new = [(i * 29 + 7) % RUNNABLE['vocab'] for i in range(12)]
+
+    def serve(extra, lines):
+        cmd = [EXE, '--model', str(gguf), '--serve', '--minimax-allow-nonstandard',
+               '--max-context', '512', '--cpu-threads', '4', *extra]
+        p = subprocess.run(cmd, input='\n'.join(lines) + '\nSTOP\n', capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=900)
+        assert p.returncode == 0, p.stderr
+        toks = [line.split()[1] for line in p.stdout.splitlines() if line.startswith('T ')]
+        done = [line.split() for line in p.stdout.splitlines() if line.startswith('DONE ')]
+        return toks, done
+
+    def turn(n, ids):
+        return f'GEN {n} temperature=0 ' + ' '.join(str(i) for i in ids)
+
+    cpu = ['--minimax-dense-layers-gpu', '0']
+    bat = cpu + ['--minimax-prefill-batch', '32']
+    # turn 1 (token path) fixes the assistant tokens the conversation carries into turn 2
+    cont, _ = serve(cpu, [turn(8, p1)])
+    assert len(cont) == 8
+    p2 = p1 + [int(t) for t in cont] + new
+
+    def two_turns(extra):
+        toks, done = serve(extra, [turn(8, p1), turn(8, p2)])
+        assert len(toks) == 16, toks
+        assert len(done) == 2, done
+        return toks[:8], toks[8:], int(done[1][-1]), float(done[1][3]), float(done[1][4])
+
+    a1, a2, a_reused, a_ms, _ = two_turns(cpu)
+    b1, b2, b_reused, b_ms, _ = two_turns(bat)
+    assert a1 == cont
+    assert a2 == b2, (a2, b2)
+    # turn 2 is a cached prefix + 12 new tokens: the batched path runs on the new ones only
+    assert a_reused == b_reused and b_reused >= len(p1), (a_reused, b_reused)
+    # ... and it is the fast path: the token path pays the expert read per new token
+    assert b_ms < a_ms
+
+

@@ -360,6 +360,65 @@ measured on the real checkpoint (its 4th/5th-place ties). `--minimax-prefill-den
 `python -m pytest tools/minimax/test_p5a.py -q` runs the table, plus an end-to-end serve check that the greedy
 continuation after a 40-token prompt is identical with and without `--minimax-prefill-batch`.
 
+### Tensor-core routed experts (P11)
+
+`--minimax-prefill-expert-gemm` chooses how a batched chunk's routed experts are projected:
+
+- `mmvq` (default) keeps the int8 `iq_mmvq` dots: the expert's weights are decoded and dotted against a q8_1
+  activation, one group of tokens at a time.
+- `tc` dequantizes each routed expert's gate/up/down weight matrix to FP16 **once per chunk** and runs every token
+  routed to that expert through one cuBLAS HGEMM per projection (FP16 tensor cores, FP32 accumulation). The weight
+  decode is the same amount of work the int8 kernel already does; it is now amortized over the group's rows instead
+  of feeding a dot. The dequantized matrix is a tile of the existing 48 MiB weight scratch, so no VRAM is added.
+- `auto` takes `tc` for a group of at least 16 rows and keeps `mmvq` below it. A 200-token prompt routes about six
+  tokens per expert; dequantizing 18.9 M weights for six rows is not worth it, a 4 K chunk routes ~128.
+
+The default is `mmvq`, so an existing command keeps the int8 math. On the 15-layer real-weight slice (4 K real
+tokens, IQ2_XS gate/up + Q2_0 down) `tc` against `mmvq` measured **KL 1.34e-4 nats, top-1 32/32**, max abs 0.30 on a
+logit std of ~1.7 (the router's 4th-expert flips, the same effect P5a measured), and the same run was 28.2 s against
+36.3 s. `tools/minimax/test_p10_expert_gemm.py` checks the same shape on a synthetic IQ2_XS model plus the `auto`
+selection (2 passed).
+
+**The full model's G3 gate failed, so `mmvq` stays the default.** On the whole IQ2_XS-D3 file (whose experts are
+IQ2_XS gate/up + **IQ3_XXS** down) `tc` against `mmvq`, same six short prompts, 679 positions, 512-token chunks,
+`--minimax-prefill-experts gpu`: KL64 1.2346 -> 1.2998, full-vocab KL 1.4409 -> 1.4886, top-1 60.82 % -> 58.17 %,
+and `code_lru` alone 38.6 % -> 30.7 % top-1. That is far past fp16 rounding, and the slice gate above passed with a
+Q2_0 down, so the next thing to check is the iq3_xxs down projection on this path (`tc_d_ok` admits any type
+`tc_expert_type` accepts, not only the 256-block types the gate covered).
+
+
+The unbuffered read path was also tightened: an expert that the pinned RAM tier already holds is copied from the
+arena instead of being re-read from the file, and a real miss is read straight into the three role windows of the
+pinned ring slot with the three requests in flight (no 19 MiB staging copy). The bytes are identical: on the slice,
+`--minimax-prefill-read direct` against `mmap` was `np.array_equal` (max abs 0.0). `STRATA_MM_TIME=1`'s
+`batch-ring` line now prints the direct-read milliseconds, the MiB and the drive's GB/s, plus the per-layer group
+counts (`vram= ram= disk= tc=`), so a drive-speed swing is visible next to the layer time.
+
+Measured on the full IQ2_XS-D3 model, 2x RTX 5070, `--minimax-tiers` + `mm3-d3.bin`,
+`--minimax-kv ram --minimax-vram-slots-per-layer 0 --memory-limit-mib 86000 --cpu-threads 12`, real text, one
+batched chunk per prompt (32 K splits into 22 991 + 9 777). Drive rate 4.4-5.6 GB/s on every run below.
+
+| prompt | `mmvq` prefill | `tc`/`auto` prefill | speedup |
+|---|---|---|---|
+| 200 | 7.85 tok/s (25.5 s) | same (`auto` keeps mmvq) | - |
+| 512 | 15.85 tok/s (32.3 s) | 16.26 tok/s (31.5 s) | 1.03x |
+| 4 K | 42.62 tok/s (96.1 s) | **56.67 tok/s (72.3 s)** | **1.33x** |
+| 32 K | not re-run | 44.3 tok/s (739.6 s) | vs 37.8 tok/s in P9 |
+
+Below 1 K tokens the chunk is the expert byte wall: all 128 experts of all 57 MoE layers are routed (139 GB, read
+once per chunk) and the GEMM is not the cost. At 4 K the tensor-core path takes the routed MoE from ~700 ms to
+~470 ms per layer while the read (320-540 ms/layer) and the MSA kernel (274 ms/layer) stay. At 32 K the chunk is
+read-bound and attention-bound: the last chunk's MoE is 0.72 s/layer against 4.25 s/layer of attention
+(`msa=112 s`, `idx=70 s`, `topk=6.7 s` over its 60 layers), so 32 K needs the attention kernel, not a faster expert
+GEMM.
+
+A 200-token chat prompt is 3.5 tok/s on the token path (`--minimax-prefill-batch 0`) and 7.85 tok/s batched: the
+token path re-reads each expert once per token that routes to it, so the same prompt reads the expert set about six
+times. `sparsa.py serve` has passed `--minimax-prefill-batch 4096` since 0.1.1 and it stays on by default
+(`--prefill-batch auto`), so chat reads its prompt the fast way; a 411-token message measures 30.5 s against 124 s on
+the token path.
+
+
 ### Real weights: a 15-layer slice of MiniMax-M3.1-Flash
 
 No complete local IQ2_XS pack existed (the D3 upload has 3 of 13 shards, and the full 133 GB does not fit next to
@@ -711,6 +770,190 @@ CPU when its weights are not on the device; `attend_host()` also refuses a missi
 `tools/minimax/test_p7_kv_prefill.py` holds the combination to `prefill=batch` + `kv_space=vram` and compares it
 with the token path (max abs < 1e-2 on the synthetic fixture), plus the `--minimax-kv host` decode comparison.
 
+## P8: long context (32 K, 128 K, 256 K)
+
+Everything before this phase was measured at 512-4096 tokens. Two costs grow with the context and neither was
+addressable by a flag: the KV cache's size, and the MSA *indexer*'s score loop, which is linear in the context and
+ran as scalar dots on one thread. The analysis (bytes per token, placement, decode traffic, the prefill ceiling) is
+in `_ref/research/LONG_CONTEXT.md`; this is what the engine does about it.
+
+### What the KV cache costs
+
+| context | f16 | q8_0 K/V + f16 indexer | q8_0 everything |
+|---|---|---|---|
+| 32 K | 4.22 GiB | 2.46 GiB | 2.24 GiB |
+| 128 K | 16.88 GiB | 9.84 GiB | 8.96 GiB |
+| 256 K | 33.75 GiB | 19.69 GiB | 17.92 GiB |
+| 1 M | 135.0 GiB | 78.75 GiB | 71.75 GiB |
+
+2304 bytes/token/layer at f16 (K 1024 + V 1024 + indexer K 256), 60 layers. The indexer keys stay fp16 in every
+mode: they only *rank* blocks, and a flipped rank is a discrete change in what a query sees, not a small error.
+
+### `--minimax-kv-quant f16|q8_0|auto` (default f16, byte-identical)
+
+q8_0 blocks: 32 values share one fp16 scale, 34 bytes per block, laid out along `head_dim` so one 128-dim head is
+four whole blocks and a head row is self-contained. K and V independently. The host and pinned-RAM tiers hold the
+blocks; the device attention kernels read fp16 rows, so `--minimax-kv vram` with `q8_0` is refused by name rather
+than silently ignored.
+
+Measured on the synthetic runnable fixture (4 layers, head_dim 32 -> one block per head, the worst case for q8_0):
+mean KL 6.0e-4 nats over 96 rows, top-1 agreement 94-97%, max abs logit difference 0.093 on a logit standard
+deviation of 1.0. That is inside the project's accepted quantized-path KL (the fp16 prefill activation was
+accepted at 1.7e-3). `tools/minimax/test_p8_longctx.py` gates on that KL.
+
+`auto` is a capacity decision, not a default: fp16 unless the process cannot commit it, and the plan line says which
+way it went and why.
+
+### The plan line
+
+One parseable line at startup, on every path:
+
+```
+INFO minimax-kv plan: ctx=131072 quant=f16 kv=16.875GiB placement=ram source=auto indexer=f16 rows=294912B/layer host_attn=fast
+```
+
+`placement` is `host` (fp16 in std::vector, CPU attention), `vram` (per-layer device tensors) or `ram` (pinned host
+memory, indexer keys on the card). `source` says whether `--minimax-kv` decided it or the engine did. In the `vram`
+tier the line also carries `per_card=[...]` so an unequal split is visible before the run.
+
+**A placement bug, fixed.** The pinned-RAM tier used to charge the host KV against the *VRAM* budget, so
+`--minimax-kv ram` refused any context whose KV was larger than the cards' free memory -- exactly the case that
+tier exists for (17 GiB of f16 KV at 128 K against ~7 GiB of free VRAM). The host KV is now what decides, and the
+run refuses with the byte count and the available commit when it cannot fit.
+
+### `--minimax-host-attn fast|legacy` (default fast, byte-identical)
+
+`attend_host` allocated 65 vectors per token per layer (five in `select_slots`, one `prob` per query head) and ran
+the indexer's block scores -- `idx_heads x every key x 128` dots -- on the calling thread. It is now:
+
+* allocation-free: the block scores, the selection scratch and one `prob` slice per pool band are sized once;
+* parallel over (indexer head, block) for the scores and over query heads for the attention, using the same pool
+  the GEMV rowwise splits use. Every output is independent of every other, and each row's dots and softmax run in
+  the original order, so the arithmetic is unchanged.
+
+Measured on a 6-layer synthetic fixture with the real attention geometry (hidden 1024, 16 q / 4 kv heads,
+head_dim 128, 4 indexer heads, ctx 32768), 2048-token prompt, `--cpu-threads 12`, CPU-only:
+
+| attention | wall | rate |
+|---|---|---|
+| `legacy` | 251.3 s | 8.15 tok/s |
+| `fast` | 73.6 s | **27.82 tok/s** |
+
+3.4x on that workload, and the speedup grows with context because the indexer's share of the time grows with it.
+The logits are bit-identical (`test_p8_longctx.py::test_host_attn_fast_is_bit_identical` requires
+`np.array_equal`, not a tolerance).
+
+### `--minimax-prefill-kv auto|off` (default auto): the prompt pass on the card, whatever holds the KV
+
+With the KV in pinned RAM, batched prefill had no device path (`dev_attn = kv_mode == 1`), so it fell back to
+`attend_host` per token -- the ~1 s/token at 32 K above. It now **stages one layer's whole K/V prefix on the card**
+(a single large copy per layer, `[pos0+T][n_head_kv][head_dim]` fp16, the same layout the device tier uses, so the
+selected block ids are absolute positions in both) and runs the existing `msa_attn_batch`. The staging buffer costs
+one layer's KV -- 256 MiB of K plus 256 MiB of V at 256 K -- not the whole cache.
+
+That move is `60 x KV_size` bytes for a prompt, i.e. **the whole cache once**, against the per-token gather the
+decode path uses, which re-reads the same block for every query that selects it (32x more at 32 K):
+
+| context | staged bytes for the prompt | at 22 GB/s (Gen4 x16) |
+|---|---|---|
+| 32 K | 4.2 GB | 0.19 s |
+| 128 K | 16.9 GB | 0.77 s |
+| 256 K | 33.8 GB | 1.54 s |
+
+`off` keeps the P7 behaviour. In the pinned-RAM tier the indexer keys are device-only, so `off` now refuses by name
+instead of dereferencing a null host pointer (it used to take an access violation), and it says what to do.
+
+### What is not done
+
+* q8_0 is not wired to `--minimax-kv vram`; that needs a dequantizing MSA kernel.
+* `--minimax-kv ram` + `q8_0` keeps the host attention in prefill (the staged path wants fp16 rows), so a q8
+  long-context prompt is still slow. The RAM tier at long context wants fp16 for prefill and q8 for capacity: those
+  two do not yet coexist.
+* Prefill is still CPU-expert-bound on the full model; the expert bytes per chunk, not the attention, are the
+  ceiling. See �3.3 of the analysis.
+## P9: the budget has to cover the page cache, and the chunk the caller asked for
+
+Round 1's 32 K run held **112.8 GB of working set with 0.3 GB of RAM available** while the pinned expert tier was
+inside its 74 GiB `--memory-limit-mib` budget. The budget bounded the arena; nothing bounded the 146 GB model being
+streamed through the OS page cache by `--minimax-prefill-read mmap` (the default), and memcpy-ing the tier out of
+that mapping left the same bytes cached a second time.
+
+### `--minimax-prefill-read auto|mmap|direct` (default auto)
+
+`auto` means: **direct when `--memory-limit-mib` is set**, mmap otherwise. `direct` reads every streamed expert
+unbuffered (`DirectFile`) into the pinned staging buffer, so it costs no page cache; `mmap` is unchanged and is
+still the faster choice when the whole expert set is meant to be cached. The bytes are identical, so the logits are
+identical -- `tools/minimax/test_p9_direct_read.py` asserts `np.array_equal` against the mmap path on the synthetic
+runnable model (CPU only, no CUDA), and the plan line says which path ran:
+
+```
+INFO minimax-prefill-read=direct (implied by --memory-limit-mib; --minimax-prefill-read mmap keeps the page cache)
+```
+
+The three places that read the model now honour it: the profile/static RAM-tier fill (`ram_copy`), the batched CPU
+MoE (`moe_batch_cpu`, which also reads a resident expert from the pinned arena instead of the mapping), and the
+batched device MoE ring (unchanged `direct` path). On Windows the process working set is also trimmed
+(`EmptyWorkingSet`, after the fill and every 8 layers) so the clean mapped pages the upload faulted in go back to
+the standby list instead of sitting next to the pinned arena.
+
+### The batched workspace is 137 KiB/token, and the expert slots no longer take its VRAM
+
+Two separate space bugs kept `--minimax-prefill-batch 32768` from being honoured:
+
+* The per-token workspace was sized at `max_dense_n` (12288) for three fp32 buffers and one fp16 buffer that
+  nothing read -- 188 KiB/token. Only the dense MLP's `rows_cap` tile needs that width; the T-wide buffers need the
+  attention width (8192) and the hidden size (6144). It is now 137 KiB/token, and the sizes are printed:
+  `INFO minimax-prefill-workspace dev=1 free=... MiB reserve=... per_token=137.3 KiB fit=... tokens`.
+* `init_tiers` sized the automatic VRAM expert slots *before* the prompt workspace existed, so the slot count spent
+  all of the free VRAM and `init_prefill` then clamped the chunk to the leftovers. With `--minimax-prefill-batch`
+  set (and no explicit `--minimax-vram-slots-per-layer`) the workspace is now reserved first:
+  `INFO minimax-vram-slots reserving N MiB/device for the 32768-token batched prompt workspace`.
+  A run that does not ask for a batch sizes exactly as before.
+
+`--minimax-prefill-read` and the workspace layout change nothing about the numbers a chunk produces: the same
+kernels read the same bytes. `--minimax-vram-slots-per-layer 0` still forces the old "no VRAM slots" behaviour.
+
+### Measuring it
+
+`tools/minimax/bench_longctx.py` runs a real-text prompt (tokenized with the model's `tokenizer.json`, not random
+ids) through the serve protocol and reports the engine's own prefill/decode numbers plus **peak working set** and
+**minimum available RAM**, sampled every 2 s, and kills the run at `--cap-s` with the per-chunk `PP` lines intact:
+
+```powershell
+python tools/minimax/bench_longctx.py --model m.gguf --text docs/DETAILS.md --length 32768 --decode 64 `
+  --ctx 33280 --cap-s 1500 -- --gpus 0,1 --minimax-tiers --minimax-profile mm3-d3.bin --minimax-kv ram `
+  --minimax-prefill-batch 32768 --minimax-vram-slots-per-layer 0 --memory-limit-mib 66000
+```
+
+### Measured: 32 K of real text on the full model
+
+MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4-3200, Ryzen 5900X, prompt = 32 768 tokens of
+this repository's `docs/DETAILS.md`. Flags as above plus `--cpu-threads 12`; RAM tier 64.5 GiB pinned (3 815
+slots), KV f16 4.28 GiB in pinned RAM.
+
+| | value |
+|---|---|
+| chunk achieved | **22 473 tokens** (binding card GPU1, 3 938 MiB free; workspace 2 879 MiB/device) |
+| chunks | 2 (22 473 + 10 295) |
+| prefill | **866.7 s, 37.8 tok/s** |
+| decode, 64 tokens | **34.9 s, 1.83 tok/s** (546 ms/token) |
+| peak working set | **83.4 GiB** |
+| minimum available RAM | **39.8 GiB** |
+| startup (weights, pin, fill, workspace) | 76 s |
+
+Round 1 stopped this prompt at 20 min with 25 of 60 layers done and 0.3 GB of RAM left. The per-chunk split (an
+earlier run, same flags, `--ctx 32768`) was 22 991 tokens in **554.3 s (41.5 tok/s)** and 9 777 tokens in
+**310.4 s (31.5 tok/s)** — the second chunk pays more per token because the indexer and MSA grow with position while
+the expert bytes per chunk do not.
+
+The read paths agree on real weights: the 15-layer slice (`p5a-l0-14-iq2xs.gguf`), 4 096 real tokens, is
+`np.array_equal` between `--minimax-prefill-read mmap` and `direct` (4 096 x 200 064 logits, max abs 0.0, top-1
+4 096/4 096).
+
+128 K fits in RAM (16.9 GiB of KV + a 55 GiB tier leaves ~35 GiB available) but not in a 25-min run: at 37.8 tok/s it
+is ~57 min, and the per-token cost grows with position, so nearer 1.5-2 h. It was not run. The next lever there is
+the expert GEMM (an MMVQ at 1 024 rows/expert), not the chunk size.
+
 ## P7b: the route nudge, the lane's spin window, and page-cache-in-place
 
 **`--minimax-route-bias on` (default off): rank the router's top-k on the expert's score plus a residency
@@ -801,3 +1044,282 @@ the same warming effect and should be read as "the path fires on a warm box", no
 
 At 347 ms/token the drive is now ~4% of a token, the CPU expert lane and the GPU are the rest - which is why the
 route nudge (fewer, better-placed experts) and the lane shape are the next levers rather than more I/O work.
+
+### Real weights on the 15-layer slice
+
+`models/quant-d3/p5a-l0-14-iq2xs.gguf`, batched prompt pass, `--gpus 0 --minimax-dense-layers-gpu 15
+--minimax-prefill-batch 4096 --cpu-threads 12`, real-text token ids, last-K logits compared:
+
+| arm | context | prompt | wall | logits |
+|---|---|---|---|---|
+| `--minimax-kv host` (host attention, the P5a path) | 4096 | 4096 tok | 544 s | reference |
+| `--minimax-kv ram` (**staged**, new) | 4096 | 4096 tok | **32 s** | KL 6.1e-4 nats, top-1 4/4 |
+| `--minimax-kv vram` (device attention, pre-existing) | 4096 | 4096 tok | 42.7 s | KL 6.1e-4 nats, top-1 4/4 |
+| `--minimax-kv ram` (**staged**) | 32768 | 8192 tok | 67.7 s | reference |
+| `--minimax-kv vram` (device attention) | 32768 | 8192 tok | 64.5 s | `np.array_equal`, max abs 0.0 |
+
+17x on the 4K slice prompt, and the staged path is **bit-identical to the existing VRAM device-attention path**.
+The 6.1e-4-nat difference against host attention is the pre-existing device-kernel difference: the `vram` arm
+produces the same delta to four digits. 8192 tokens at a 32 K context is 64 blocks with top-16, so the indexer
+genuinely drops 48 blocks per query.
+
+q8_0 K/V on the same slice, 2048 tokens: 0.1318 -> 0.0769 GiB (0.583x), **mean KL 3.8e-5 nats, top-1 2/2**, and
+faster (136 s against 269 s) because that path is bandwidth-bound.
+
+## P8: what a decode token is made of, and the three phases it pointed at
+
+After P7 the drive was ~4 % of a token (7.8 SSD experts, 13.5 ms of wait) and the rest was unattributed. The first
+job here was to attribute it, because "the GPUs are idle and the expert dots are slow" is an inference and not a
+measurement. `--minimax-profile-time` is that measurement; the three changes below are the phases it named.
+
+### `--minimax-profile-time`
+
+One line per decode token on stderr, and the mean of the run in the `--minimax-stats` totals line:
+
+```
+INFO minimax-profile token=527 total=232.1 embed=0.46 attn=36.4 idx_sync=12.9 msa_sync=3.9 router=5.3 pick=0.1
+gpu_begin=4.58 cpu_ram=142.8 ssd_wait=3.5 cpu_ssd=1.9 gpu_finish=1.9 gpu_stream=4.8 combine=1.3 shared=26.7
+admit=2.0 prefetch=0.0 lm_head=1.8 other=3.1 cpu_exp=178 cpu_gbs=22.3 ssd_exp=2
+```
+
+Every key is one wall-clock pair around work that already existed, so the flag changes no arithmetic. Off by
+default; with it off the token path tests one `bool` per phase.
+
+| key | what it times |
+| --- | --- |
+| `embed` | the token's embedding row |
+| `attn` | the attention blocks of every layer: the norms, the per-layer graph launch (q8_1, q/k/v MMVQ, norm+rope, fp16), the MSA attention kernel, the output projection and the residual add. The indexer readback and the MSA sync are inside this window and reported separately below, so they are a breakdown of `attn`, not extra time |
+| `idx_sync` | the MSA indexer's block scores: kernel, device sync, and the readback of the scores to the host that decides the slots |
+| `msa_sync` | the MSA attention kernel's device sync and the readback of its output |
+| `router` | the router GEMV, the sigmoids, the top-k selection (including the P7b nudge) and the skip renormalisation |
+| `pick` | classifying each route into VRAM / pinned RAM / SSD, including the page-cache probes |
+| `gpu_begin` | uploading the expert pointers and launching the GPU experts on the side stream |
+| `cpu_ram` | the CPU lane's pass over the pinned-RAM experts |
+| `ssd_wait` | the wait for the layer's queued SSD reads |
+| `cpu_ssd` | the CPU lane's pass over the experts that had to be read |
+| `gpu_finish` | the side stream's join and the copy-back of the GPU experts |
+| `gpu_stream` | the **device-busy** time of that side stream, measured with timing events: the pair `gpu_stream` / `gpu_finish` separates "the card was slow" from "the card was idle" |
+| `combine` | the weighted sum of the routes |
+| `shared` | the shared expert's MLP |
+| `admit` | copying this layer's SSD experts into the RAM tier |
+| `prefetch` | the next layer's lookahead (off by default) |
+| `lm_head` | the final norm and the output projection |
+| `other` | everything the clocks did not name (the residual adds, the counters). A large value is a missing timer, not work |
+| `cpu_exp`, `ssd_exp`, `cpu_gbs` | experts on the CPU lane, how many of them came off the drive, and the lane's achieved GB/s (the lane's bytes over its two passes) |
+
+`bench_p6_ssd.py` parses these lines and prints the phase table under the decode table when an arm runs with the
+flag.
+
+### The full model, measured
+
+MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4-3200, Ryzen 9 5900X. A 512-token prefix of
+`ppl_text.bin` (real G3 text), 16 greedy tokens, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin
+--memory-limit-mib 90000 --minimax-prefill-batch 512 --minimax-prefill-read direct`, box to itself. **The prompt ran
+token by token in this path** (the run's profile covers 527 tokens = 512 prompt + 16 decode-1, so `prefill_batch`
+did not engage; each arm therefore costs ~5 min, most of it the prompt). The RAM tier came out at 65..106 experts a
+layer (mean 91.3, 5203 slots); the token's routes were **66 VRAM / 136 pinned RAM / 9.3 SSD** (161 MB from the
+drive). One round, arms in this order, so the later arms found a warmer drive:
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token |
+| --- | ---: | ---: | ---: | ---: |
+| pre-P8 build | 4.17 | 239.8 | not counted (no `--minimax-stats`) | — |
+| **this branch** (12 threads, the default) | **4.37** | **229.0** | 9.3 | 161 |
+| this branch, `--cpu-threads 24` | 4.31 | 232.1 | 9.4 | 162 |
+| this branch, `--minimax-route-bias on` | **4.70** | **212.9** | **4.3** | **75** |
+
+**+4.8 %** for this branch at the default thread count. The phase table below is the deliverable; everything else
+in this section is measured against it.
+
+| phase | ms/token | share | what it says |
+| --- | ---: | ---: | --- |
+| `cpu_ram` | **108.4** | 44 % | the CPU lane's pinned-RAM pass: 146 experts a token, ~2.5 GB, **~22 GB/s** (see the lane section) |
+| `attn` | 41.6 | 17 % | the attention blocks of 60 layers; `idx_sync` (~14) and `msa_sync` (~6) inside it are device syncs + host readbacks |
+| `shared` | 27.5 | 11 % | the shared expert's MLP: three `gemv` calls a layer, each with its own stream sync |
+| `ssd_wait` | 19.6 | 8 % | the drive, for 161 MB a token |
+| `pick` | 13.5 | 5.5 % | classifying 212 routes, including the page-cache probes |
+| `admit` | 9.5 | 4 % | copying the 9.3 SSD experts into the RAM tier (162 MB, 17 GB/s over the pool) |
+| `cpu_ssd` | 6.6 | 2.7 % | the same lane, for the experts that had to be read |
+| `router` | 5.4 | 2.2 % | the router GEMV, sigmoid and top-k per layer |
+| `gpu_begin` | 4.3 | 1.8 % | the expert pointer uploads and launches |
+| `gpu_stream` / `gpu_finish` | 4.7 / 1.9 | 2.7 % | the card was **busy 4.7 ms** of the token and the host waited 1.9 ms for it |
+| `other` | 3.4 | 1.4 % | residual adds and counters |
+| `lm_head` | 1.7 | 0.7 % | the final norm and the 200 K output projection |
+| `combine` | 1.1 | 0.5 % | the weighted sum of four routes |
+| **total** | **244.4** | | |
+
+`attn` splits, in the run's own mean over its 527 tokens, into `idx_sync` 13.8 ms (57 device syncs and readbacks of
+the block scores, one per layer) and `msa_sync` 6.1 ms of device sync, with the rest - the norms, the per-layer
+graph, the output projection, the residual add - about 22 ms. Both syncs are host round trips that a device-side
+slot selection and a device-side combine would remove; that is the "de-synchronise" item, and it is worth ~20 ms
+(8 %) before any graph work.
+
+Two things fall out. **The CPU lane is the token** (108 + 6.6 ms, 47 %), and **the idle GPUs are idle by
+construction**: the GPU expert stream is busy 4.7 ms, the attention kernels sit inside their own syncs, and the
+cards never have more than one layer's work queued. The drive is 8 %, and `pick` + `admit` together are 9.5 % -
+more than the drive.
+
+### The CPU lane: two parallel regions instead of twelve
+
+`mlp_ptr` ran `dot_rows_base` for gate, up and down as three separate `pool.run` calls per expert: twelve barriers
+a layer for four routed experts, and with the pool's spin window at its default 0 every barrier after the first
+wakes eleven sleeping threads. `mlp_ptr_multi` dispatches the whole pass instead - gate and up rows of all four
+experts in one region (they share one activation image), the down rows in a second - so a layer pays two barriers
+and quantizes its activation once instead of twice.
+
+Measured on the 15-layer real-weight IQ2_XS slice with every expert in the pinned tier (`--minimax-tiers
+--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`, 48 routes a token all on the CPU, one RTX
+5070, 512-token prompt then 16 greedy tokens, one round):
+
+| arm | decode tok/s | ms/token | lane ms/token | lane GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| pre-P8 build, 12 threads | 17.52 | 57.1 | — | — |
+| **this branch, 12 threads** | **19.38** | **51.6** | 36.0 | 20.8 |
+| **this branch, 24 threads (SMT)** | **24.64** | **40.6** | **26.1** | **28.7** |
+
+**+10.6 %** from the fused regions alone, and **+27 %** more from using the second thread of each core. On this
+placement the lane is compute-bound (the 24-thread lane moves 28.7 GB/s against 20.8 GB/s, and a raw stream of the
+same bytes is 39.5 GB/s), so the second SMT thread is not contention - it is the difference between 17.5 and
+24.6 tok/s.
+
+**That does not transfer to the full model**, and the full-model table says why: there the same arm at 24 threads
+was 4.31 against 4.37 tok/s (**-1.4 %**). The lane in the full model runs beside the SSD reader threads and the
+admissions that copy 162 MB a token, and 22-23 GB/s is what the memory system gives this access pattern once the
+drive and the copies are in it; the extra SMT threads only add contention. So the default stays the physical core
+count, and the slice's SMT result is recorded as placement-specific rather than as a default change.
+
+A software-prefetch probe (`STRATA_LANE_PF=N`, rows ahead) is in the lane's row loops for the same reason the
+default is 0: the hardware prefetcher already sees the sequential row stride, and an unmeasured prefetch hint is
+the kind of change `SPEED_RESEARCH.md` §4 measured *slower* (15-18 tok/s against 24). It is an environment probe,
+not a flag, and off unless set.
+
+### The RAM-tier admission
+
+Admitting a routed expert into the pinned tier is a 17.4 MB copy that used to run on the calling thread, between
+two layers, once per SSD miss. `ram_admit_many` picks the victims serially (still LRU) and then copies the whole
+layer's admissions in ~1 MiB pieces over the pool. On the full model the phase now costs **9.5 ms for 162 MB
+(17 GB/s across 12 threads)**, measured with `--minimax-profile-time` above. The before number is from the
+SSD-heavy slice placement earlier in this round (`--minimax-ram-experts-per-layer 11`, 27-30 of 48 routes read
+from the drive), where the serial per-expert copy showed up as **16-60 ms a token** in the same profile; that is a
+different file and placement, so it is a scale, not a delta. **A clean slice A/B of this change was cut for box
+time and is not in the table.**
+
+### The route nudge: measured speed, unmeasured quality
+
+With the whole box, the same placement and the same prompt, `--minimax-route-bias on` (the P7b defaults: in 0.25,
+out 0.15, protect 2, pool 12) is **4.70 against 4.37 tok/s (+7.5 %)** and halves the drive's share of the token
+(9.3 -> 4.3 SSD experts, 161 -> 75 MB). The engine's own meter says **9.1 % of expert picks are swapped and 99.5 %
+of the router weight is kept** - against 35.3 % swapped on the slice placement that has only 11 of 128 experts
+resident, because the full model's tier holds 91 of 128.
+
+What is *not* measured: KL and top-1 for the nudge on the full model. The plan was
+`tools/minimax/gate_logits.py` over the six short G3 prompts concatenated into one 320-position teacher-forced
+pass (one model load an arm); the PC window ran out after the speed arms. The extrapolation from the meter -
+Xolotl's own table has 26.1 % swapped at 85.2 % API top-1 against 86.2 % exact, so 9.1 % should cost well under a
+point - is an extrapolation, not a measurement. **The default stays off** until that run exists.
+
+## P10: the shared expert beside the lane, the indexer on the card, and a prefill-aware slot count
+
+P8 named three phases to attack: the shared expert's three host round trips, the indexer's readback, and the
+page-cache walk inside `pick`. This round does those three, plus the automatic-slot OOM on a big card.
+
+### The shared expert runs beside the routed-expert CPU lane (bit-identical)
+
+The shared MLP is three dense GEMVs (Q8_0 here) and the old path ran them with three host round trips between the
+routed experts and the next layer. Nothing about it depends on routing: its input is the layer's MoE input and its
+result is added after the combine. `shared_begin` now enqueues the gate/up pair on its own stream **after routing**
+(so the router's GEMV is not delayed) and just before the CPU lane; `shared_finish` waits after the lane, runs the
+host `swigluoai` and the down GEMV, and returns. The tensors, the q8_1 activation, the native MMVQ kernels and the
+host swiglu are the same ones `mlp` used, so the result is bit-identical. Only the blocking cost is left in
+`shared=`, which is the wait plus swiglu plus the down GEMV.
+
+### The indexer and the attention output stay on the card (`--minimax-kv vram`)
+
+`idx_select` is the host's `select_slots` as a device kernel: one thread per indexer head, the same ranking
+(score desc, block index asc), the same forced local blocks, and the same ascending position order in the slot
+list. With the KV in VRAM the block scores and the slot lists no longer cross PCIe and there is no sync between the
+indexer and the MSA kernel. The attention output also stays on the card: `gemv_dev_in` feeds it to the output
+projection through the legacy default stream (native MMVQ needs a non-null handle but must stay ordered with the
+MSA kernel), so the D2H of `att` and the H2D back are gone. The pinned-RAM KV tier still selects on the host,
+because it needs the counts to know how many rows to copy.
+
+### `--minimax-page-probe N` (default 32; 0 = walk every page)
+
+P7b sampled eight spread pages, then walked all 4-8 K pages of a 17 MB expert when the sample passed. A sampled
+"yes" is only ever a page fault on the pages it did not see, never a wrong byte, so the default is now 32 sampled
+pages and no walk. `0` restores the full walk.
+
+### Automatic VRAM slots reserve the batched-prefill workspace
+
+The old rule was `slots = (free - reserve) / (layers * expert)` at sizing time. The batched-prefill workspace,
+the rows_cap scratch, the expert ring and the RAM tier's staged prompt K/V are allocated later (`init_prefill`), so
+on a card big enough for the slots to fill it - the 1 x RTX PRO 6000 96 GB, 153 GB model report - the prefill
+allocation died in `cudaMalloc` at startup. `prefill_device_bytes()` mirrors those allocations and the auto plan
+subtracts them before counting slots. The rule lives in `include/strata/minimax/vram_plan.hpp`, is header-only and
+is unit-tested with no GPU (`tests/minimax/vram_plan_test.cpp`, `tools/minimax/test_vram_plan.py`). An explicit
+`--minimax-vram-slots-per-layer` is unchanged: the prefill batch shrinks to the room that count left, as before.
+With `--minimax-prefill-batch 0` (this engine's default) the plan is byte-for-byte the old one.
+
+### Measured
+
+**Bit-identical gate.** Real-weight 15-layer slice `models/quant-d3/p5a-l0-14-iq2xs.gguf`, 96 real-text tokens,
+`--gpus 0 --minimax-dense-layers-gpu 15 --minimax-tiers --minimax-vram-slots-per-layer 0
+--minimax-ram-experts-per-layer 128 --minimax-kv vram --cpu-threads 12 --memory-limit-mib 40000`, merged base
+(`1390bdb8`) against this branch: **max abs 0.0, KL 0.0, top-1 1.000, identical**.
+
+**Full model, same run setup.** MiniMax-M3.1-Flash IQ2_XS-D3, 2 x RTX 5070 12 GB, `--gpus 0,1 --layer-split auto
+--minimax-profile mm3-d3.bin --memory-limit-mib 90000 --minimax-prefill-batch 0 --minimax-profile-time`, 64-token
+real-text prompt then 32 greedy tokens, one round, merged base against this branch:
+
+| phase | base ms/token | this branch | delta |
+| --- | ---: | ---: | ---: |
+| `attn` | 37.6 | **27.8** | -9.8 |
+| - `idx_sync` | 13.9 | **0.6** | -13.3 |
+| - `msa_sync` | 4.2 | **0.3** | -3.9 |
+| `shared` | 27.4 | **15.5** | -11.9 |
+| `pick` | 0.8 | **0.4** | -0.4 |
+| `cpu_ram` | 134.3 | 135.7 | +1.4 |
+| `ssd_wait` | 26.1 | 75.7 | +49.6 (drive) |
+| `admit` | 13.4 | 13.0 | -0.4 |
+| `total` | 271.3 | 300.4 | +29.1 |
+| **total - `ssd_wait`** | **245.2** | **224.7** | **-20.5 (-8.4 %)** |
+
+The CPU lane, the drive and the admissions are the same work in both arms; the raw wall time moved the wrong way
+because the second arm hit a slower drive window (26.1 -> 75.7 ms of wait for the same ~248 MB). **The compute-side
+cost of a token fell 20.5 ms (-8.4 %).** Raw decode was 3.44 tok/s (base) and 3.30 (this branch) in that pair; an
+isolated run of this branch on the same box measured **4.34 tok/s** (8 greedy tokens, 1.84 s) with the drive
+slower than either, which is why the raw number is reported as drive-bound rather than as a win.
+
+The box was not idle (the desktop agent, browser and Task Manager were running) and the NVMe fluctuated between
+0.12 and 2.1 GB/s over the session, so the raw tok/s is not comparable to the round-3 4.37 measured on an idle box.
+What is comparable is the per-phase table on the same pair of processes.
+
+### The route nudge: now measured, and it stays opt-in
+
+`tools/minimax/route_bias_quality.py` builds one teacher-forced stream from the six short G3 prompts and runs
+`--minimax-route-bias off` and `on` with the P7b defaults (0.25 / 0.15, protect 2, pool 12). 156 positions, full
+model, same placement as the speed run:
+
+| arm | KL64 mean | top-1 agreement |
+| --- | ---: | ---: |
+| `off` (reference) | 0 | 100 % |
+| `on` | **0.343** | **59.0 %** |
+
+The engine's meter says **9.97 % of picks swapped and 98.97 % of the router weight kept**, the same first-order
+numbers round 3 reported (9.1 % / 99.5 %). A two-identical-arms control is bit-identical (KL 0.0), and `on` with
+`--minimax-route-bias-in 0 --minimax-route-bias-out 0` is also bit-identical, so the code path itself is neutral
+and the loss comes from the nudge. **The decision rule (top-1 drop <= 1 point, KL64 increase <= 0.02) fails by a
+wide margin: the default stays off.** This is a different result from the P7b slice (KL 0.0348 at 35 % swaps): with
+112 of 128 experts resident, the nudge demotes the few file-resident experts that carry real weight, while the
+slice's 35 % were near-tied swaps.
+
+### The 96 GB auto plan
+
+`vram_plan_test` covers the big-card case directly (`reserve + prefill + slots * layers * expert <= free`), the
+12 GB case (the prefill reserve costs at most one slot), the no-prefill case (identical to the old rule) and the
+degenerate inputs. It passes with the host compiler. The 2 x 5070 auto plan is unchanged when prefill is off
+(this engine's default); when `--minimax-prefill-batch` is on, the workspace is taken out first, which is what PR
+#19 already did for its per-token part and this branch extends to the rows scratch, ring and staged K/V.
+
+**Tests.** `python -m pytest tools/minimax`: **68 passed**. The two setup errors in `test_g3_sparsa.py`
+(`ref_dir`, `name`, `logits`, `ids` are used as fixtures but are not defined) reproduce on the merged base
+`1390bdb8` in 0.19 s and are unrelated to this branch.
