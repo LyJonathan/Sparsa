@@ -22,16 +22,20 @@ parameters. The measured box below is 2x RTX 5070 12 GB, 128 GB DDR4, one NVMe.
 
 | folder | size | bits/weight | loads in | quality |
 | --- | ---: | ---: | --- | --- |
-| `MiniMax-M3.1-Flash-IQ2_XS` | 133.1 GB | 2.50 | llama.cpp (patched), Sparsa | measured |
-| `MiniMax-M3.1-Flash-IQ2_XS-D3` | 146.1 GB | 2.74 | llama.cpp (patched), Sparsa | measured, best of the two |
-| `MiniMax-M3.1-Flash-IQ3_K` | 191.2 GB | 3.59 | **Sparsa only** | not measured |
-| `MiniMax-M3.1-Flash-IQ4_KS` | 233.6 GB | 4.38 | **Sparsa only** | not measured |
-| `MiniMax-M3.1-Flash-IQ2_KL` | 152.7 GB | 2.87 | **Sparsa only** | not measured |
+| `MiniMax-M3.1-Flash-IQ2_XS` | 133.1 GB | 2.50 | llama.cpp (patched), Sparsa | KL64 1.92, top-1 46.8 % ¹ |
+| `MiniMax-M3.1-Flash-IQ2_XS-D3` | 146.1 GB | 2.74 | llama.cpp (patched), Sparsa | KL64 1.211, top-1 59.4 % |
+| `MiniMax-M3.1-Flash-IQ3_K` | 191.2 GB | 3.59 | **Sparsa only** | KL64 0.847, top-1 69.8 % |
+| `MiniMax-M3.1-Flash-IQ4_KS` | 233.6 GB | 4.38 | **Sparsa only** | KL64 0.760, top-1 74.4 % |
+| `MiniMax-M3.1-Flash-IQ2_KL` | 152.7 GB | 2.87 | **Sparsa only** | KL64 1.184, top-1 59.8 % |
 | `MiniMax-M3.1-Flash-NVFP4` | 246.1 GB | 4.62 | **Sparsa only** | not measured |
 
 `Sparsa only` means the expert types (ik_llama.cpp's IQ3_K / IQ4_KS / IQ2_KL, and the checkpoint's
-NVFP4 values) are Strata's own type ids; upstream llama.cpp cannot read those files. IQ3_K, IQ4_KS,
-IQ2_KL and NVFP4 were uploaded on 2026-10-24 and have not been through the quality gate yet.
+NVFP4 values) are Strata's own type ids; upstream llama.cpp cannot read those files. IQ3_K, IQ4_KS
+and IQ2_KL were through the G3 gate on 2026-10-24 (numbers below); NVFP4 has not been measured.
+
+¹ The IQ2_XS row is patched llama.cpp on the same file, 935 positions (the six short prompts plus the
+two long ones). The unmarked rows are Sparsa's own G3 gate over the 679 positions of the six short
+prompts.
 
 The `IQ1_M` folder on the Hub is incomplete (2 of 13 parts) and cannot be loaded.
 
@@ -183,6 +187,21 @@ Quality, `MM-IQ2_XS-D3` against an fp32 reference of the checkpoint's own weight
 The engine matches llama.cpp on the same file. Both sit at KL ~0.7-1.0 where the reference is
 confident: the residual is the 2-bit expert tier, not the engine.
 
+Quality across the tiers, G3 vs the same fp32 reference, the same six short prompts (679 positions),
+teacher-forced:
+
+| tier | KL64 mean | full-vocab KL | top-1 agreement |
+| --- | ---: | ---: | ---: |
+| `MM-IQ2_XS-D3` | 1.211 | 1.472 | 59.4 % |
+| `MM-IQ2_KL` | 1.184 | 1.387 | 59.8 % |
+| `MM-IQ3_K` | 0.847 | 0.982 | 69.8 % |
+| `MM-IQ4_KS` | 0.760 | 0.905 | 74.4 % |
+
+KL64 is the KL over the reference's top-64 tokens, full-vocab KL over all 200,064. The IQ2_XS-D3 row
+was measured on the Windows box above; the three ik_llama tiers on rig-2 (Ryzen 9 5900X, 121 GB RAM,
+RTX 4060 Ti + RTX 5060 Ti, Linux) with the experts on the CPU. The gain from 2-bit to 3-bit is real
+(59 % to 70 % top-1); from 3-bit to 4-bit it is another 4.6 points.
+
 ## Known limits
 
 - **Speed.** 2.4-2.9 tokens a second on the measured box. A prompt of a few thousand tokens takes
@@ -193,8 +212,7 @@ confident: the residual is the 2-bit expert tier, not the engine.
 - **Tool calls** work through the XML form MiniMax's template uses, and are parsed whole (arguments
   are not streamed as fragments).
 - **Sampling** is the card's (temperature 1.0, top_p 0.95) unless the request says otherwise.
-- **IQ3_K, IQ4_KS, IQ2_KL and NVFP4** have not been through the quality gate. They run; their quality
-  is unmeasured.
+- **NVFP4** has not been through the quality gate. It runs; its quality is unmeasured.
 - **CI.** GitHub Actions do not run in this fork (the account's Actions budget); the checks in this
   tree were run locally.
 
