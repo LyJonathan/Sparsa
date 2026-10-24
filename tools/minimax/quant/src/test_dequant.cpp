@@ -125,12 +125,48 @@ int main() {
         expect(!pack_nvfp4_row(packed, scales, 3.0f, 64, blk), "packer refuses G=3");
     }
 
+    // Exact MM-NVFP4 packing: verbatim E4M3 scale bytes + nibble remap, G kept aside.
+    // The GGUF block dequantized through the side divisor must equal spec A bit for bit.
+    {
+        uint8_t packed[32];
+        uint8_t scales[4] = {0x71, 0x81, 0x6A, 0x90};   // 144.0, 0.012... (as in the checkpoint), ...
+        for (int i = 0; i < 32; ++i) {
+            packed[i] = static_cast<uint8_t>(((i * 7 + 3) & 0x0F) | (((i * 11 + 5) & 0x0F) << 4));
+        }
+        uint8_t blk[36];
+        pack_nvfp4_row_exact(packed, scales, 64, blk);
+        bool copied = true;
+        for (int s = 0; s < 4; ++s) {
+            if (blk[s] != scales[s]) {
+                copied = false;
+            }
+        }
+        expect(copied, "exact pack copies every E4M3 scale byte verbatim");
+
+        const float G = 15123.6923828125f;
+        float got[64];
+        float spec[64];
+        dequant_ggml_nvfp4_row(blk, G, 64, got);
+        dequant_nvfp4_row(packed, scales, G, 64, spec);
+        bool match = true;
+        for (int i = 0; i < 64; ++i) {
+            if (got[i] != spec[i]) {
+                std::fprintf(stderr, "FAIL exact pack i=%d got %.9g spec %.9g\n", i, got[i], spec[i]);
+                match = false;
+                break;
+            }
+        }
+        expect(match, "exact pack: block dequant / G == spec A dequant (0 diff, G=15123.69)");
+        expect(ggml_validate_row_data(GGML_TYPE_NVFP4, blk, sizeof(blk)), "exact NVFP4 block validates");
+    }
+
     if (g_fail) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
         return 1;
     }
     std::printf("dequant tests passed\n");
-    std::printf("NVFP4: ggml type id %d is present. Lossless GGUF copy is the nibble remap plus an exact E4M3 fold of weight_global_scale. This checkpoint's G does not fold.\n",
+    std::printf("NVFP4: ggml type id %d. MM-NVFP4 copies nibbles (remapped) and E4M3 scale bytes verbatim and\n"
+                "stores weight_global_scale as blk.N.ffn_*_exps.scale (f32 [n_expert]). No fold, no gain error.\n",
                 GGML_TYPE_NVFP4);
     return 0;
 }

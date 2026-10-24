@@ -112,6 +112,9 @@ struct Layer {
     size_t expert_gu = 0;           // one gate matrix (up is the same)
     size_t expert_down = 0;
     size_t expert_bytes = 0;
+    // MM-NVFP4: per-expert global scales (a DIVISOR) from blk.N.ffn_*_exps.scale. Empty when the
+    // layer's expert tensors carry no side scale. Applied exactly once per projection.
+    std::vector<float> egate_scale, eup_scale, edown_scale;
     struct VramSlot {
         DevPtr mem;
         int32_t expert = -1;
@@ -573,6 +576,7 @@ struct Engine::Impl {
     int32_t max_slot = 0;            // selected positions one KV head can have
     struct Work {
         DevPtr x, y, scratch, ex_ptr, ex_xq, ex_hq, ex_h, ex_out;
+        DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
         DevPtr qd, bs, slots, counts, kstage, vstage, att;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
         uint16_t* vstage_h = nullptr;
@@ -723,11 +727,10 @@ struct Engine::Impl {
         if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
     }
 
-    Tensor must(const std::string& name) {
+    bool try_must(const std::string& name, Tensor& t) {
         size_t shard = 0;
         const TensorInfo* info = model.find(name, &shard);
-        if (!info) fail("missing tensor " + name);
-        Tensor t;
+        if (!info) return false;
         t.name = name;
         t.type = (int)info->type;
         t.ne0 = (int64_t)info->shape[0];
@@ -748,7 +751,31 @@ struct Engine::Impl {
             fail(name + ": no ggml to_float for type " + std::to_string(t.type));
         ggml_quantize_init((ggml_type)t.type);
         if (t.cpu && t.cpu->vec_dot_type != (ggml_type)t.type) ggml_quantize_init(t.cpu->vec_dot_type);
+        return true;
+    }
+
+    Tensor must(const std::string& name) {
+        Tensor t;
+        if (!try_must(name, t)) fail("missing tensor " + name);
         return t;
+    }
+
+    // blk.N.ffn_*_exps.scale: f32 [n_expert], the MM-NVFP4 per-expert global scale (a divisor).
+    bool load_scale_vec(const std::string& name, std::vector<float>& out, int64_t n) {
+        Tensor t;
+        if (!try_must(name, t)) return false;
+        if (t.type != kF32 || t.ne0 != n || t.ne1 != 1 || t.ne2 != 1)
+            fail(name + ": expected f32 [" + std::to_string(n) + "] (got type " + std::to_string(t.type) + ", " +
+                 std::to_string(t.ne0) + "x" + std::to_string(t.ne1) + "x" + std::to_string(t.ne2) + ")");
+        out.resize((size_t)n);
+        decode_f32(t, t.host, out.data(), n);
+        for (float v : out)
+            if (!(v > 0.f) || !std::isfinite(v))
+                fail(name + ": a global scale is not a positive finite float");
+        // The tensor stores the DIVISOR (spec A.3). The kernels multiply, so keep the reciprocal here:
+        // one division per expert at load, never per token, and the scale is applied exactly once.
+        for (float& v : out) v = 1.0f / v;
+        return true;
     }
 
     std::vector<float> norm_vec(const Tensor& t) {
@@ -849,6 +876,22 @@ struct Engine::Impl {
                     fail(L.edown.name + ": unexpected shape");
                 if (L.egate.type != L.eup.type)
                     fail(b + "gate and up experts have different ggml types");
+                // MM-NVFP4: per-expert global scale side tensors. Present only for the exact NVFP4 layout.
+                const bool sg = load_scale_vec(b + "ffn_gate_exps.scale", L.egate_scale, cfg.n_expert);
+                const bool su = load_scale_vec(b + "ffn_up_exps.scale", L.eup_scale, cfg.n_expert);
+                const bool sd = load_scale_vec(b + "ffn_down_exps.scale", L.edown_scale, cfg.n_expert);
+                if (sg != su) fail(b + " has only one of ffn_gate_exps.scale / ffn_up_exps.scale");
+                if ((L.egate.type == 40 || L.eup.type == 40) && !sg)
+                    fail(b + " stores gate/up experts as NVFP4 but has no blk.N.ffn_{gate,up}_exps.scale "
+                            "(a per-expert global scale is a divisor, not foldable into the E4M3 byte)");
+                if (L.edown.type == 40 && !sd)
+                    fail(b + " stores down experts as NVFP4 but has no blk.N.ffn_down_exps.scale");
+                if (sg && L.egate.type != 40)
+                    fail(b + " has ffn_gate_exps.scale but the expert type is " + std::to_string(L.egate.type) +
+                                ", not NVFP4 (40)");
+                if (sd && L.edown.type != 40)
+                    fail(b + " has ffn_down_exps.scale but the expert type is " + std::to_string(L.edown.type) +
+                                ", not NVFP4 (40)");
                 if (L.egate.ne2 > 0) L.expert_gu = L.egate.bytes / (size_t)L.egate.ne2;
                 if (L.eup.ne2 > 0 && L.eup.bytes / (size_t)L.eup.ne2 != L.expert_gu)
                     fail(b + "gate and up experts have different byte sizes");
@@ -1649,16 +1692,42 @@ struct Engine::Impl {
         const int gt = L.egate.type, dt = L.edown.type;
         const bool iq = iq_expert_type(gt) && iq_expert_type(dt);
         const bool raw = raw_expert_type(gt) && raw_expert_type(dt);
+        // MM-NVFP4: per-selected-expert divisors, applied once inside the kernel (gate/up before swigluoai).
+        const bool nv = !L.egate_scale.empty() || !L.edown_scale.empty();
+        const float* sg = nullptr;
+        const float* su = nullptr;
+        const float* sd = nullptr;
+        if (nv) {
+            if ((int)L.egate_scale.size() != (int)cfg.n_expert) fail("internal: expert scale vector is short");
+            std::vector<float> a((size_t)k), b((size_t)k), c((size_t)k);
+            for (int i = 0; i < k; ++i) {
+                const int e = exps[(size_t)i];
+                a[(size_t)i] = L.egate_scale[(size_t)e];
+                b[(size_t)i] = L.eup_scale[(size_t)e];
+                c[(size_t)i] = L.edown_scale[(size_t)e];
+            }
+            const size_t bytes = (size_t)cfg.n_expert_used * sizeof(float);
+            if (!w.ex_sg.p) w.ex_sg = DevPtr(cu::alloc(bytes));
+            if (!w.ex_su.p) w.ex_su = DevPtr(cu::alloc(bytes));
+            if (!w.ex_sd.p) w.ex_sd = DevPtr(cu::alloc(bytes));
+            cu::copy_h2d(w.ex_sg.p, a.data(), (size_t)k * sizeof(float));
+            cu::copy_h2d(w.ex_su.p, b.data(), (size_t)k * sizeof(float));
+            cu::copy_h2d(w.ex_sd.p, c.data(), (size_t)k * sizeof(float));
+            sg = (const float*)w.ex_sg.p;
+            su = (const float*)w.ex_su.p;
+            sd = (const float*)w.ex_sd.p;
+        }
         if (iq) {
             if (cfg.n_embd % 32 != 0 || cfg.n_ff_exp % 32 != 0)
                 fail("the GPU IQ expert path needs rounded 32-wide activations");
             h2d(w, w.x.p, in, (size_t)n_embd * sizeof(float));
-            strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, n_embd, w.ex_xq.p, nullptr);            strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k,
+            strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, n_embd, w.ex_xq.p, nullptr);
+            strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k,
                                             n_embd, n_ff, L.egate.row_bytes, w.ex_xq.p, (float*)w.ex_h.p, alpha, limit,
-                                            nullptr);
+                                            nullptr, sg, su);
             strata::kernels::quantize_q8_1_rows((const float*)w.ex_h.p, k, n_ff, w.ex_hq.p, nullptr);
             strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
-                                              L.edown.row_bytes, w.ex_hq.p, (float*)w.ex_out.p, nullptr);
+                                              L.edown.row_bytes, w.ex_hq.p, (float*)w.ex_out.p, nullptr, sd);
             cu::sync();
         } else if (raw) {
             if (gt != dt)
@@ -1782,7 +1851,10 @@ struct Engine::Impl {
             } else {
                 const CpuExpert* c = cpu_of[(size_t)e];
                 if (!c) fail("internal: routed expert has no source");
-                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp);
+                const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
+                const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
+                const float* sd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp, sg, su, sd);
             }
             const float WJ = w[(size_t)j];
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
@@ -1969,22 +2041,35 @@ struct Engine::Impl {
     }
 
     void mlp(const Tensor& gate, const Tensor& up, const Tensor& down, int64_t expert, const float* in, float* yout,
-             int ff) {
+             int ff, const float* sg = nullptr, const float* su = nullptr, const float* sd = nullptr) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         apply(gate, expert, in, ff_g.data(), ff, (int)gate.ne0);
+        if (sg)
+            for (int i = 0; i < ff; ++i) ff_g[(size_t)i] *= *sg;
         apply(up, expert, in, ff_u.data(), ff, (int)up.ne0);
+        if (su)
+            for (int i = 0; i < ff; ++i) ff_u[(size_t)i] *= *su;
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
         apply(down, expert, ff_h.data(), yout, (int)down.ne1, ff);
+        if (sd)
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= *sd;
     }
 
     // The same MLP from three explicit byte slices (a RAM arena slot or an SSD staging buffer).
     void mlp_ptr(const Tensor& gate, const uint8_t* gb, const Tensor& up, const uint8_t* ub, const Tensor& down,
-                 const uint8_t* db, const float* in, float* yout, int ff) {
+                 const uint8_t* db, const float* in, float* yout, int ff, const float* sg = nullptr,
+                 const float* su = nullptr, const float* sd = nullptr) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         dot_rows_base(gate, gb, in, ff_g.data(), ff, (int)gate.ne0);
+        if (sg)
+            for (int i = 0; i < ff; ++i) ff_g[(size_t)i] *= *sg;
         dot_rows_base(up, ub, in, ff_u.data(), ff, (int)up.ne0);
+        if (su)
+            for (int i = 0; i < ff; ++i) ff_u[(size_t)i] *= *su;
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
         dot_rows_base(down, db, ff_h.data(), yout, (int)down.ne1, ff);
+        if (sd)
+            for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= *sd;
     }
 
     void moe(const Layer& L, const float* in, float* yout) {
@@ -2032,7 +2117,11 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
         for (int j = 0; j < top; ++j) {
-            mlp(L.egate, L.eup, L.edown, order[(size_t)j], in, ye.data(), ff);
+            const int e = order[(size_t)j];
+            const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
+            const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
+            const float* sd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
+            mlp(L.egate, L.eup, L.edown, e, in, ye.data(), ff, sg, su, sd);
             const float WJ = w[(size_t)j];
             if (dbg) {
                 const int e = order[(size_t)j];
