@@ -102,6 +102,41 @@ def test_download_prints_the_hf_command(tmp_path, capsys):
     assert "MiniMax-M3.1-Flash-IQ3_K/*" in capsys.readouterr().out
 
 
+def test_download_mmproj_names_the_one_vision_file(tmp_path, capsys):
+    assert sparsa.main(["download", "mmproj", "--dir", str(tmp_path), "--print-only"]) == 0
+    out = capsys.readouterr().out
+    assert "mmproj-MiniMax-M3.1-Flash-F16.gguf" in out
+    assert "LyJonathan/MiniMax-M3.1-Flash-GGUF" in out
+
+
+def test_a_mmproj_beside_the_model_turns_vision_on(tmp_path, capsys):
+    model, engine = make_files(tmp_path)
+    mmproj = model / "mmproj-MiniMax-M3.1-Flash-F16.gguf"
+    mmproj.write_bytes(b"GGUF")
+    cfg, text = plan(model, engine, tmp_path)
+    assert cfg["vision"]["engine"] is True
+    assert cfg["vision"]["mmproj"] == str(mmproj)
+    assert cfg["args"][cfg["args"].index("--mmproj") + 1] == str(mmproj)
+    assert "vision" in text
+
+
+def test_no_vision_keeps_the_mmproj_out(tmp_path):
+    model, engine = make_files(tmp_path)
+    (model / "mmproj-MiniMax-M3.1-Flash-F16.gguf").write_bytes(b"GGUF")
+    cfg, _ = plan(model, engine, tmp_path, "--no-vision")
+    assert "vision" not in cfg
+    assert "--mmproj" not in cfg["args"]
+
+
+def test_explicit_mmproj_path_is_used(tmp_path):
+    model, engine = make_files(tmp_path)
+    other = tmp_path / "elsewhere" / "vision.gguf"
+    other.parent.mkdir()
+    other.write_bytes(b"GGUF")
+    cfg, _ = plan(model, engine, tmp_path, "--mmproj", str(other))
+    assert cfg["vision"]["mmproj"] == str(other)
+
+
 def test_lan_access_makes_a_key_and_reuses_it(tmp_path, capsys):
     model, engine = make_files(tmp_path)
     config = tmp_path / "run.json"
