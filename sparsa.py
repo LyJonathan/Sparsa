@@ -196,6 +196,19 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def prepare_libs(engine: Path) -> None:
+    """The release puts the CUDA runtime libraries beside the engine; Linux needs them on the library path.
+
+    Windows looks next to the .exe by itself, so this only does anything for the Linux tarball (whose libs
+    sit in the engine's folder).  Harmless when the folder has no libraries."""
+    if os.name == "nt":
+        return
+    folder = str(engine.parent)
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    if folder not in current.split(os.pathsep):
+        os.environ["LD_LIBRARY_PATH"] = folder + ((os.pathsep + current) if current else "")
+
+
 def cmd_serve(args) -> int:
     from strata_cli.launch import access as access_mod
 
@@ -208,6 +221,7 @@ def cmd_serve(args) -> int:
             print(f"sparsa: no run settings at {config_path} yet")
         return 0
     cfg = build_config(args)
+    prepare_libs(Path(cfg["exe"]))
     host = args.host or access_mod.host_for(args.access)
     key = ""
     if args.access != "local":
@@ -251,6 +265,7 @@ def cmd_serve(args) -> int:
 def cmd_inspect(args) -> int:
     first, parts = find_model_guf(args.model)
     engine = find_engine(args.engine)
+    prepare_libs(engine)
     say(f"sparsa: {first} ({len(parts)} part(s))")
     command = [str(engine), "--model", str(first), "--minimax-inspect"]
     return subprocess.call(command, cwd=ROOT)
