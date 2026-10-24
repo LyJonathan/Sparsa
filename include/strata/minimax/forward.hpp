@@ -27,6 +27,7 @@ struct EngineOptions {
     int64_t max_context = 0;     ///< 0: the model's context, still clamped by what was asked
     int dense_layers_gpu = -1;   ///< -1: fit as many leading layers as VRAM allows; 0: all dense on the CPU
     int cpu_threads = 0;         ///< 0: the machine's hardware concurrency, capped
+    int pool_spin_us = 0;        ///< P7b: micro-seconds an idle pool worker spins before sleeping (0 = condvar only)
     int chunk = 16;              ///< prompt tokens between PP lines
     bool allow_nonstandard = false;
 
@@ -42,6 +43,8 @@ struct EngineOptions {
     int vram_reserve_mib = 700;     ///< VRAM kept free for the driver / display after dense weights and workspace
     int memory_limit_mib = 0;       ///< 0: auto from available RAM; else the pinned tier's byte budget
     int ram_headroom_mib = 0;       ///< 0: 1/16 of physical RAM clamped to 3-10 GiB; else RAM kept unpinned
+    std::string ram_mode;           ///< "" / "pinned": the RAM tier is a pinned copy; "inplace": the OS page cache
+                                    ///< is the tier and the CPU lane reads the mapping (nothing is copied)
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
@@ -100,6 +103,14 @@ struct EngineOptions {
                                     ///< mapping with no read; "off": always issue the read (P6 behaviour)
     std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
                                     ///< MoE, so they are in flight across that layer's attention
+    // ---- P7b: the route nudge (Xolotl's selection bias toward resident experts).
+    std::string route_bias;         ///< "" / off: "on" ranks the router's top-k on the expert's score plus a
+                                    ///< residency bonus / file penalty; the weights stay unbiased
+    float route_bias_in = 0.25f;    ///< bonus for an expert in the VRAM or pinned-RAM tier
+    float route_bias_out = 0.15f;   ///< penalty for an expert in neither (it would be read from the file)
+    int route_protect = 2;          ///< the exact top-N experts are never displaced
+    int route_pool = 12;            ///< a pick must stay inside the exact top-N
+    float route_margin = 0.f;       ///< 0: nudge every expert in the pool; else only within this of the cutoff
 };
 
 struct SampleParams {
