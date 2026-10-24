@@ -66,6 +66,8 @@ void usage() {
                  "  --vram-reserve-mib N              VRAM kept free (default 700)\n"
                  "  --memory-limit-mib N              pinned-tier budget (default: sized from the box)\n"
                  "  --minimax-ram-headroom-mib N      RAM kept out of the pinned tier (default: 1/16 of physical, 3-10 GiB)\n"
+                 "  --minimax-ram-mode pinned|inplace pinned: copy the ranked experts into locked RAM (default);\n"
+                 "                                    inplace: no copy, the OS page cache is the tier (Maya)\n"
                  "  --minimax-profile PATH            STRP profile for the static fill\n"
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
@@ -88,7 +90,15 @@ void usage() {
                  "                                    be read from the SSD; 0 (default) keeps every route\n"
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
-                 "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n");
+                 "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n"
+                 "  --minimax-route-bias on|off       rank the router's top-k on score + a residency bonus / file\n"
+                 "                                    penalty (Xolotl); weights stay unbiased; default off\n"
+                 "  --minimax-route-bias-in A         bonus for a resident expert (default 0.25)\n"
+                 "  --minimax-route-bias-out C        penalty for an expert in neither tier (default 0.15)\n"
+                 "  --minimax-route-protect P         the exact top-P experts are never displaced (default 2)\n"
+                 "  --minimax-route-pool M            a pick must stay inside the exact top-M (default 12)\n"
+                 "  --minimax-route-margin D          nudge only experts within D of the cutoff (default 0 = all)\n"
+                 "  --minimax-pool-spin-us N          CPU pool workers spin N us before sleeping (default 0)\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -515,6 +525,7 @@ int run(int argc, char** argv) {
     bool tiers = false;
     std::string profile, profile_save, routing_counts;
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
+    int pool_spin_us = 0;
     bool stats = false, stats_per_layer = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
@@ -528,6 +539,10 @@ int run(int argc, char** argv) {
     int ssd_chunks = 1, expert_skip_ssd = 0;
     std::string ssd_zerocopy;
     std::string ssd_prefetch;
+    std::string ram_mode;
+    std::string route_bias;
+    float route_bias_in = 0.25f, route_bias_out = 0.15f, route_margin = 0.f;
+    int route_protect = 2, route_pool = 12;
     std::string graphs;
 
     for (int i = 1; i < argc; ++i) {
@@ -566,6 +581,12 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
         else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
+        else if (a == "--minimax-route-bias") route_bias = next();
+        else if (a == "--minimax-route-bias-in") route_bias_in = (float)std::atof(next().c_str());
+        else if (a == "--minimax-route-bias-out") route_bias_out = (float)std::atof(next().c_str());
+        else if (a == "--minimax-route-protect") route_protect = std::atoi(next().c_str());
+        else if (a == "--minimax-route-pool") route_pool = std::atoi(next().c_str());
+        else if (a == "--minimax-route-margin") route_margin = (float)std::atof(next().c_str());
         else if (a == "--minimax-graphs") graphs = next();
         else if (a == "--minimax-expert-resident") expert_resident = next();
         else if (a == "--minimax-tiers") tiers = true;
@@ -578,6 +599,7 @@ int run(int argc, char** argv) {
             vram_reserve_mib = std::atoi(next().c_str());
         else if (a == "--memory-limit-mib") memory_limit_mib = std::atoi(next().c_str());
         else if (a == "--minimax-ram-headroom-mib") ram_headroom_mib = std::atoi(next().c_str());
+        else if (a == "--minimax-ram-mode") ram_mode = next();
         else if (a == "--minimax-stats") stats = true;
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
@@ -599,6 +621,7 @@ int run(int argc, char** argv) {
         }
         else if (a == "--prefill" || a == "--chunk") chunk = parse_chunk(next());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
+        else if (a == "--minimax-pool-spin-us") pool_spin_us = std::atoi(next().c_str());
         else if (a == "--pool-workers") pool_workers = std::atoi(next().c_str());
         else if (a == "--gpu") (void)next();
         else if (a == "--max-new" || a == "--n" || a == "--tokens" || a == "--force" || a == "--mtp" ||
@@ -690,6 +713,8 @@ int run(int argc, char** argv) {
     opt.vram_reserve_mib = vram_reserve_mib;
     opt.memory_limit_mib = memory_limit_mib;
     opt.ram_headroom_mib = ram_headroom_mib;
+    opt.ram_mode = ram_mode;
+    opt.pool_spin_us = pool_spin_us;
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
@@ -712,6 +737,12 @@ int run(int argc, char** argv) {
     opt.expert_skip_ssd = expert_skip_ssd;
     opt.ssd_zerocopy = ssd_zerocopy;
     opt.ssd_prefetch = ssd_prefetch;
+    opt.route_bias = route_bias;
+    opt.route_bias_in = route_bias_in;
+    opt.route_bias_out = route_bias_out;
+    opt.route_protect = route_protect;
+    opt.route_pool = route_pool;
+    opt.route_margin = route_margin;
     opt.graphs = graphs;
 
     Engine* engine = nullptr;

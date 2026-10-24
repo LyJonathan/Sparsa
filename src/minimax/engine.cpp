@@ -160,6 +160,7 @@ struct Pool {
     int epoch = 0;
     int pending = 0;
     bool stop = false;
+    int spin_us = 0;      // P7b: how long an idle worker spins before it sleeps on the condition variable
 
     Pool() = default;
     Pool(const Pool&) = delete;
@@ -190,6 +191,19 @@ struct Pool {
             int a = 0, b = 0;
             {
                 std::unique_lock<std::mutex> lk(mu);
+                if (spin_us > 0) {
+                    // P7b: spin before sleeping.  A token's layers hand the pool several small jobs in a row, and
+                    // a condvar wake per job is a context switch each; Project Maya's pool spins 20 ms through a
+                    // token's layers for exactly that reason (ds4_model.cu:5560).  The window is measured, not
+                    // assumed: --minimax-pool-spin-us, default 0 = the old behaviour.
+                    const auto until = std::chrono::steady_clock::now() +
+                                       std::chrono::microseconds(spin_us);
+                    while (!stop && epoch == seen && std::chrono::steady_clock::now() < until) {
+                        std::this_thread::yield();
+                        lk.unlock();
+                        lk.lock();
+                    }
+                }
                 cv_work.wait(lk, [&] { return stop || epoch != seen; });
                 if (stop) return;
                 seen = epoch;
@@ -868,10 +882,88 @@ struct Engine::Impl {
     }
     int apply_expert_skip(std::vector<float>& w) { return apply_expert_skip_range(w.data(), (int)w.size()); }
 
+    bool ram_inplace = false;      // P7b: --minimax-ram-mode inplace: the page cache is the tier, nothing is copied
     // P6: --minimax-ssd-chunks and --minimax-expert-skip-ssd.  P7: --minimax-ssd-zerocopy.
     int ssd_chunks = 1;
     int ssd_skip_rank = 0;
     bool ssd_zero_copy = true;
+
+    // ---- P7b: the route nudge.  Xolotl (Indras-Mirror/Xolotl, MIT) measures 9.7 -> 19.1 -> 21.7 tok/s on one
+    // RTX 3090 + 128 GB answering a 148 GB model by biasing the *selection* toward experts that are already
+    // resident, and its quality table says why the guards are not optional: the default flat bias of 1.0 costs 14
+    // points of top-1, while 0.25 keeps 85.2% against 86.2% exact.  Its three guards, here:
+    //   PROTECT P  the exact top-P experts are never displaced (`+1e4` in the biased score);
+    //   POOL M     a pick must stay inside the exact top-M (arXiv:2412.00099's max-rank window);
+    //   MARGIN d   the nudge only applies to experts whose exact score is within d of the k-th exact score;
+    //              anything confidently above the cutoff is kept, anything confidently below is not promoted.
+    // The nudge changes which experts are chosen and nothing else: the weights are still the unbiased sigmoid
+    // probabilities of the picks, renormalised as the model does, so the layer's scale is unchanged.  With the
+    // flag off (the default) the selection is the model's own choice, bit for bit.
+    bool route_bias = false;
+    float rb_in = 0.25f;         // VRAM or pinned-RAM resident
+    float rb_out = 0.15f;        // in neither tier: would be read from the file
+    int rb_protect = 2;
+    int rb_pool = 12;
+    float rb_margin = 0.f;
+    int64_t rb_swapped = 0;      // route meter: positions where a pick differs from the exact pick
+    int64_t rb_picks = 0;
+    double rb_wnum = 0, rb_wden = 0;   // router weight of the picks against the weight of the exact picks
+
+    // Rank the experts of one layer.  `prob` is the unbiased sigmoid router output; `order` comes back with the
+    // `top` selected ids, best first, under the model's own bias plus (when enabled) the residency nudge.
+    void select_routes(const Layer& L, const std::vector<float>& prob, std::vector<int>& order, int top,
+                       bool meter = true) {
+        const int nexp = (int)prob.size();
+        std::vector<float> sc((size_t)nexp);
+        for (int i = 0; i < nexp; ++i) sc[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
+        order.resize((size_t)nexp);
+        std::iota(order.begin(), order.end(), 0);
+        auto better = [&](int a, int b) {
+            if (sc[(size_t)a] != sc[(size_t)b]) return sc[(size_t)a] > sc[(size_t)b];
+            return a < b;
+        };
+        if (!route_bias || !tiers_on) {
+            std::partial_sort(order.begin(), order.begin() + top, order.end(), better);
+            return;
+        }
+        // The exact ranking first: it defines the cutoff, the protected prefix and the pool.
+        const int pool = std::min(nexp, std::max(top, rb_pool));
+        std::vector<int> ex(order);
+        std::partial_sort(ex.begin(), ex.begin() + pool, ex.end(), better);
+        const float cutoff = sc[(size_t)ex[(size_t)(top - 1)]];
+        std::vector<float> sel(sc);
+        std::vector<char> eligible((size_t)nexp, 0);
+        for (int r = 0; r < pool; ++r) {
+            const int e = ex[(size_t)r];
+            eligible[(size_t)e] = 1;
+            if (r < rb_protect) {
+                sel[(size_t)e] += 1e4f;
+                continue;
+            }
+            if (rb_margin > 0.f && std::fabs(sc[(size_t)e] - cutoff) > rb_margin) continue;
+            const bool resident = L.vram_of[(size_t)e] >= 0 || (L.ram_n > 0 && L.ram_of[(size_t)e] >= 0);
+            sel[(size_t)e] += resident ? rb_in : -rb_out;
+        }
+        auto better_sel = [&](int a, int b) {
+            if (sel[(size_t)a] != sel[(size_t)b]) return sel[(size_t)a] > sel[(size_t)b];
+            return a < b;
+        };
+        std::vector<int> cand;
+        cand.reserve((size_t)pool);
+        for (int r = 0; r < pool; ++r) cand.push_back(ex[(size_t)r]);
+        std::partial_sort(cand.begin(), cand.begin() + top, cand.end(), better_sel);
+        for (int j = 0; j < top; ++j) order[(size_t)j] = cand[(size_t)j];
+        // The meter: how far the nudge moved the choice, and how much of the exact picks' router weight it kept.
+        if (!meter) return;
+        int swaps = 0;
+        for (int j = 0; j < top; ++j) swaps += order[(size_t)j] != ex[(size_t)j];
+        rb_swapped += swaps;
+        for (int j = 0; j < top; ++j) {
+            rb_wnum += prob[(size_t)order[(size_t)j]];
+            rb_wden += prob[(size_t)ex[(size_t)j]];
+        }
+        rb_picks += top;
+    }
 
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
@@ -899,6 +991,21 @@ struct Engine::Impl {
         ssd_skip_rank = opt.expert_skip_ssd;
         ssd_zero_copy = opt.ssd_zerocopy != "off";
         ssd_prefetch = opt.ssd_prefetch != "off" && !opt.ssd_prefetch.empty();
+        route_bias = opt.route_bias == "on";
+        ram_inplace = opt.ram_mode == "inplace";
+        if (ram_inplace && opt.memory_limit_mib > 0)
+            std::fprintf(stderr, "INFO minimax-ram-mode=inplace (--memory-limit-mib still sets how much of the "
+                                 "model the ranking calls resident)\n");
+        rb_in = opt.route_bias_in;
+        rb_out = opt.route_bias_out;
+        rb_protect = std::max(0, opt.route_protect);
+        rb_pool = std::max(1, opt.route_pool);
+        rb_margin = std::max(0.f, opt.route_margin);
+        if (route_bias)
+            std::fprintf(stderr,
+                         "INFO minimax-route-bias in=%.2f out=%.2f protect=%d pool=%d margin=%.2f (selection only; "
+                         "the weights stay unbiased)\n",
+                         rb_in, rb_out, rb_protect, rb_pool, rb_margin);
         if (ssd_skip_rank > 0)
             std::fprintf(stderr, "INFO minimax-expert-skip-ssd rank=%d (a route at or past it is left out when it "
                                  "would be read from the SSD)\n", ssd_skip_rank);
@@ -926,6 +1033,7 @@ struct Engine::Impl {
         }
         if (threads <= 0) threads = 4;
         if (threads > 64) threads = 64;
+        pool.spin_us = std::max(0, opt.pool_spin_us);
         std::fprintf(stderr, "INFO minimax-threads=%d (source=%s, logical=%d)\n", threads,
                      opt.cpu_threads > 0 ? "--cpu-threads" : "physical cores",
                      (int)std::thread::hardware_concurrency());
@@ -1964,12 +2072,17 @@ struct Engine::Impl {
                 ram_bytes = off;
             };
             lay_out();
-            ram_arena = std::make_unique<strata::core::PinnedArena>(ram_bytes);
+            if (ram_inplace) {
+                // No arena at all: every slot is a ranking decision (see ram_fill).
+                ram_arena.reset();
+            } else {
+                ram_arena = std::make_unique<strata::core::PinnedArena>(ram_bytes);
+            }
             // An automatic budget that the OS will not let us pin is not an error: the estimate is the operating
             // system's to refuse, and a box with a smaller locked-page allowance (or a competing process holding
             // RAM) would otherwise fail to start the model at all.  Step down until it fits, and say so.
             int attempt = 0;
-            while (!ram_arena->valid() && ram_bytes > 0) {
+            while (!ram_inplace && !ram_arena->valid() && ram_bytes > 0) {
                 if (opt.memory_limit_mib > 0 || opt.ram_experts_per_layer >= 0 || ++attempt > 8) {
                     fail("the pinned RAM expert tier could not reserve " +
                          std::to_string(ram_bytes / (1024 * 1024)) + " MiB (" + ram_arena->note +
@@ -2007,14 +2120,15 @@ struct Engine::Impl {
                 std::fprintf(stderr,
                              "INFO minimax-ram-tier plan budget=%.1f GiB headroom=%.1f GiB dense_host=%.1f GiB "
                              "kv=%.1f GiB reserved=%.1f GiB slots=%zu experts/layer=%d..%d mean=%.1f "
-                             "source=%s\n",
+                             "source=%s mode=%s\n",
                              (double)ram_budget / 1073741824.0, (double)headroom / 1073741824.0,
                              (double)dense_host_bytes / 1073741824.0, (double)host_kv_bytes / 1073741824.0,
                              (double)ram_bytes / 1073741824.0, slots, rmin, rmax,
                              slots ? (double)slots / (double)moe_layers : 0.0,
                              opt.memory_limit_mib > 0
                                  ? "--memory-limit-mib"
-                                 : (opt.ram_experts_per_layer >= 0 ? "--minimax-ram-experts-per-layer" : "auto"));
+                                 : (opt.ram_experts_per_layer >= 0 ? "--minimax-ram-experts-per-layer" : "auto"),
+                             ram_inplace ? "inplace" : "pinned");
             }
             (void)bytes;
         }
@@ -2096,7 +2210,9 @@ struct Engine::Impl {
 
         // P5c: every static RAM slot is filled here, once, in parallel, instead of on the first token that
         // routes to it.
-        if (expert_resident && ram_bytes > 0 && ram_arena && ram_arena->valid()) fill_ram_static();
+        if (expert_resident && (ram_bytes > 0 || (ram_inplace && ram_per_layer > 0)) &&
+            ((ram_arena && ram_arena->valid()) || ram_inplace))
+            fill_ram_static();
     }
 
     bool tiers_gpu_possible() const { return opt.dense_layers_gpu != 0 || opt.tiers; }
@@ -2128,10 +2244,22 @@ struct Engine::Impl {
     }
 
     uint8_t* ram_slot_ptr(Layer& L, int slot) const {
+        if (ram_inplace) fail("internal: an in-place RAM tier has no arena slot");
         return ram_arena->data() + L.ram_off + (uint64_t)slot * L.expert_bytes;
     }
 
     void ram_fill(Layer& L, int slot, int expert) {
+        if (ram_inplace) {
+            // --minimax-ram-mode inplace: the "slot" is a ranking decision, not storage.  The expert stays where it
+            // is in the mapping and the OS page cache is the tier (Project Maya's DeepSeek engine reads in place
+            // and measured its own opt-in RAM copy as no faster: ds4_model.cu:1206-1211, 5164-5166).
+            for (int32_t& v : L.ram_of)
+                if (v == slot) v = kNotResident;
+            L.ram_of[(size_t)expert] = slot;
+            L.ram_expert_of[(size_t)slot] = expert;
+            L.ram_tick[(size_t)slot] = ++lru_tick;
+            return;
+        }
         if (!ram_arena || !ram_arena->valid()) fail("RAM tier is not allocated");
         uint8_t* p = ram_slot_ptr(L, slot);
         ram_copy(L, expert, p);
@@ -2204,6 +2332,48 @@ struct Engine::Impl {
             }
         }
         if (jobs.empty()) return;
+        if (ram_inplace) {
+            // P7b: in-place mode.  Record the ranked set (so the route nudge and the counters know what is meant to
+            // be resident) and hint the pages into the page cache, but copy nothing.  Project Maya's Windows
+            // prefetch of only the non-resident pages measured +6-7% decode (CHANGELOG v1.1.26, ds4_os.hpp:250-332).
+            for (const Job& j : jobs) {
+                j.L->ram_of[(size_t)j.expert] = j.slot;
+                j.L->ram_expert_of[(size_t)j.slot] = j.expert;
+                j.L->ram_tick[(size_t)j.slot] = ++lru_tick;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t bytes = 0;
+            std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+            ranges.reserve(jobs.size() * 3);
+            for (const Job& j : jobs) {
+                const Layer& L = *j.L;
+                const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,
+                                         L.eup.host + (size_t)j.expert * L.expert_gu,
+                                         L.edown.host + (size_t)j.expert * L.expert_down};
+                const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+                for (int r = 0; r < 3; ++r) {
+                    bytes += len[r];
+#if defined(_WIN32)
+                    ranges.push_back({(PVOID)src[r], len[r]});
+#else
+                    (void)src[r];
+                    madvise((void*)src[r], len[r], MADV_WILLNEED);
+#endif
+                }
+            }
+#if defined(_WIN32)
+            // One call per 512 ranges: PrefetchVirtualMemory is a page-table walk (~50 ns per 4 KiB page).
+            for (size_t at = 0; at < ranges.size(); at += 512) {
+                const DWORD n = (DWORD)std::min<size_t>(512, ranges.size() - at);
+                PrefetchVirtualMemory(GetCurrentProcess(), n, ranges.data() + at, 0);
+            }
+#endif
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr,
+                         "INFO minimax-ram-tier inplace experts=%zu gib=%.1f prefetch_seconds=%.1f reads_from=mmap\n",
+                         jobs.size(), (double)bytes / 1073741824.0, s);
+            return;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         // ONE pool.run OVER PIECES, NOT a pool.run per expert from our own thread band: Pool::run is not
         // reentrant, and a band of threads each calling it deadlocked the tier fill (measured: 27 s of CPU and no
@@ -2256,7 +2426,7 @@ struct Engine::Impl {
     // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
     // in `src`; a later SSD miss for this expert then costs a RAM read instead.
     void ram_admit(Layer& L, int expert, const uint8_t* src) {
-        if (!opt.adaptive || !ram_arena || L.ram_n <= 0) return;
+        if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
             if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
@@ -2272,7 +2442,7 @@ struct Engine::Impl {
     // P6: the same admission from the three role buffers of a staging slot (the P6 read path keeps a role's bytes
     // in place instead of assembling one contiguous blob).
     void ram_admit3(Layer& L, int expert, const uint8_t* g, const uint8_t* u, const uint8_t* d) {
-        if (!opt.adaptive || !ram_arena || L.ram_n <= 0) return;
+        if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
             if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
@@ -2403,6 +2573,17 @@ struct Engine::Impl {
         const uintptr_t a1 = ((uintptr_t)p + len + A - 1) & ~(A - 1);
         const size_t n = (a1 - a0) / A;
         if (n == 0 || n > ((size_t)1 << 21)) return false;
+        // P7b: sample 8 spread pages first.  A cold expert (the common case on a model larger than RAM) is
+        // rejected by that sample, which is 8 entries instead of 4,200 for a 17 MB expert; Project Maya's
+        // prefetch does the same (ds4_os.hpp:289-314, and it warns the full walk costs 0.34 ms per 6.3 MB).
+        // A sampled "no" is only ever a missed opportunity, never a wrong pointer: a full walk still decides.
+        if (n > 16) {
+            PSAPI_WORKING_SET_EX_INFORMATION probe[8];
+            for (int i = 0; i < 8; ++i) probe[i].VirtualAddress = (PVOID)(a0 + (A * (size_t)i * (n - 1)) / 7);
+            if (!qws(GetCurrentProcess(), probe, (DWORD)sizeof(probe))) return false;
+            for (int i = 0; i < 8; ++i)
+                if (!probe[i].VirtualAttributes.Valid) return false;
+        }
         std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q(n);
         for (size_t i = 0; i < n; ++i) q[i].VirtualAddress = (PVOID)(a0 + i * A);
         if (!qws(GetCurrentProcess(), q.data(), (DWORD)(n * sizeof(q[0])))) return false;
@@ -2565,18 +2746,11 @@ struct Engine::Impl {
         // from (VRAM / pinned RAM / SSD) and who computes it change.
         const int nexp = (int)cfg.n_expert;
         const int top = (int)cfg.n_expert_used;
-        std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp), score((size_t)nexp);
+        std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp);
         gemv(L.router, in, logits_r.data());
-        for (int i = 0; i < nexp; ++i) {
-            prob[(size_t)i] = sigmoid(logits_r[(size_t)i]);
-            score[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
-        }
-        std::vector<int> order(nexp);
-        std::iota(order.begin(), order.end(), 0);
-        std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
-            if (score[(size_t)a] != score[(size_t)b]) return score[(size_t)a] > score[(size_t)b];
-            return a < b;
-        });
+        for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(logits_r[(size_t)i]);
+        std::vector<int> order;
+        select_routes(L, prob, order, top);
         std::vector<float> w((size_t)top);
         float sum = 0.f;
         for (int j = 0; j < top; ++j) {
@@ -2648,8 +2822,15 @@ struct Engine::Impl {
             }
             const int rs = L.ram_of[(size_t)e];
             if (rs >= 0) {
-                const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
-                cpu.push_back({e, j, false, p, p + L.expert_gu, p + 2 * L.expert_gu});
+                if (ram_inplace) {
+                    // The page cache is the tier: read the expert where it is in the mapping.
+                    cpu.push_back({e, j, false, L.egate.host + (size_t)e * L.expert_gu,
+                                   L.eup.host + (size_t)e * L.expert_gu,
+                                   L.edown.host + (size_t)e * L.expert_down});
+                } else {
+                    const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
+                    cpu.push_back({e, j, false, p, p + L.expert_gu, p + 2 * L.expert_gu});
+                }
                 ++tok_stats.ram;
                 continue;
             }
@@ -2812,21 +2993,14 @@ struct Engine::Impl {
             wv = &w;
         }
         const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
-        std::vector<float> logits((size_t)nexp), score((size_t)nexp), prob((size_t)nexp);
+        std::vector<float> logits((size_t)nexp), prob((size_t)nexp);
         // The router reads the post-FFN-norm input, not the raw residual (moe() applies ffn_norm first).
         std::vector<float> hnorm((size_t)cfg.n_embd);
         rms(x.data(), L.ffn_norm.data(), hnorm.data(), (int)cfg.n_embd, eps);
         gemv(L.router, hnorm.data(), logits.data());
-        for (int i = 0; i < nexp; ++i) {
-            prob[(size_t)i] = sigmoid(logits[(size_t)i]);
-            score[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
-        }
-        std::vector<int> order((size_t)nexp);
-        std::iota(order.begin(), order.end(), 0);
-        std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
-            if (score[(size_t)a] != score[(size_t)b]) return score[(size_t)a] > score[(size_t)b];
-            return a < b;
-        });
+        for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(logits[(size_t)i]);
+        std::vector<int> order;
+        select_routes(L, prob, order, top, false);
         int started = 0;
         for (int j = 0; j < top && started < prefetch_slots && wv; ++j) {
             const int e = order[(size_t)j];
@@ -3122,18 +3296,11 @@ struct Engine::Impl {
         const std::string pfx = "L" + std::to_string(src_layer[(size_t)li]);
         const int nexp = (int)cfg.n_expert;
         const int top = (int)cfg.n_expert_used;
-        std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp), score((size_t)nexp);
+        std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp);
         gemv(L.router, in, logits_r.data());
-        for (int i = 0; i < nexp; ++i) {
-            prob[(size_t)i] = sigmoid(logits_r[(size_t)i]);
-            score[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
-        }
-        std::vector<int> order(nexp);
-        std::iota(order.begin(), order.end(), 0);
-        std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
-            if (score[(size_t)a] != score[(size_t)b]) return score[(size_t)a] > score[(size_t)b];
-            return a < b;
-        });
+        for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(logits_r[(size_t)i]);
+        std::vector<int> order;
+        select_routes(L, prob, order, top);
         std::vector<float> w((size_t)top);
         float sum = 0.f;
         for (int j = 0; j < top; ++j) {
@@ -4029,19 +4196,12 @@ struct Engine::Impl {
         wts.assign((size_t)T * top, 0.f);
         const int64_t li = (int64_t)(&L - layers.data());
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
-        std::vector<float> prob((size_t)nexp), score((size_t)nexp);
-        std::vector<int> order((size_t)nexp);
+        std::vector<float> prob((size_t)nexp);
+        std::vector<int> order;
         for (int t = 0; t < T; ++t) {
             const float* lg = logits + (size_t)t * nexp;
-            for (int i = 0; i < nexp; ++i) {
-                prob[(size_t)i] = sigmoid(lg[i]);
-                score[(size_t)i] = prob[(size_t)i] + L.bias[(size_t)i];
-            }
-            std::iota(order.begin(), order.end(), 0);
-            std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
-                if (score[(size_t)a] != score[(size_t)b]) return score[(size_t)a] > score[(size_t)b];
-                return a < b;
-            });
+            for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(lg[i]);
+            select_routes(L, prob, order, top);
             float sum = 0.f;
             for (int j = 0; j < top; ++j) {
                 ids[(size_t)t * top + j] = order[(size_t)j];
@@ -4176,7 +4336,7 @@ struct Engine::Impl {
             // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
             // to ignore the tier and re-fault every page of every expert once per chunk.
             const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
-            const uint8_t* base = rs >= 0 ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
+            const uint8_t* base = rs >= 0 && !ram_inplace ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
             const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
                                      base ? base + gu : L.eup.host + (size_t)e * gu,
                                      base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
@@ -4832,6 +4992,10 @@ std::string Engine::stats() const {
       << " skipped=" << impl_->total_stats.skipped
       << " ssd_mapped=" << impl_->total_stats.ssd_mapped
       << " ssd_pf_hit=" << impl_->ssd_pf_hit << " ssd_pf_waste=" << impl_->ssd_pf_waste;
+    if (impl_->rb_picks > 0)
+        o << " route_swapped=" << (100.0 * (double)impl_->rb_swapped / (double)impl_->rb_picks)
+          << "% route_weight_kept="
+          << (impl_->rb_wden > 0 ? 100.0 * impl_->rb_wnum / impl_->rb_wden : 100.0) << "%";
     return o.str();
 }
 

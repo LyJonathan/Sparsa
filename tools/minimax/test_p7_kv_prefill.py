@@ -187,3 +187,50 @@ def test_auto_ram_tier_reports_its_plan(gguf, tmp_path):
     lo, hi = plan['experts/layer'].split('..')
     assert 0 <= int(lo) <= int(hi)
 
+
+
+# ---- P7b: the route nudge and the in-place RAM tier must not change anything unless asked.
+
+def _tiered_arm(gguf, ids, out, extra):
+    return subprocess.run(_cmd(gguf, ids, out,
+                               ['--gpus', '0', '--minimax-tiers', '--minimax-vram-slots-per-layer', '0',
+                                '--minimax-ram-experts-per-layer', '1', *extra]),
+                          capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=900)
+
+
+def test_route_bias_off_is_the_model_routing(gguf, tmp_path):
+    """With the flag absent the selection must be the model's own: identical to an explicit `off`."""
+    if NDEV < 1:
+        pytest.skip('needs a CUDA device')
+    ids = _ids(48)
+    a, b = tmp_path / 'rb_absent.npy', tmp_path / 'rb_off.npy'
+    p = _tiered_arm(gguf, ids, a, [])
+    assert p.returncode == 0, p.stderr[-3000:]
+    p = _tiered_arm(gguf, ids, b, ['--minimax-route-bias', 'off'])
+    assert p.returncode == 0, p.stderr[-3000:]
+    assert np.array_equal(np.load(a), np.load(b))
+
+
+def test_route_bias_on_runs_and_meters(gguf, tmp_path):
+    if NDEV < 1:
+        pytest.skip('needs a CUDA device')
+    out = tmp_path / 'rb_on.npy'
+    p = _tiered_arm(gguf, _ids(48), out, ['--minimax-route-bias', 'on', '--minimax-stats'])
+    assert p.returncode == 0, p.stderr[-3000:]
+    assert 'route_swapped=' in p.stderr and 'route_weight_kept=' in p.stderr
+    z = np.load(out)
+    assert np.isfinite(z).all()
+
+
+def test_inplace_ram_tier_is_bit_identical(gguf, tmp_path):
+    """The page-cache tier reads the same bytes from the same mapping: the logits cannot move."""
+    if NDEV < 1:
+        pytest.skip('needs a CUDA device')
+    ids = _ids(48)
+    a, b = tmp_path / 'pinned.npy', tmp_path / 'inplace.npy'
+    p = _tiered_arm(gguf, ids, a, [])
+    assert p.returncode == 0, p.stderr[-3000:]
+    p = _tiered_arm(gguf, ids, b, ['--minimax-ram-mode', 'inplace'])
+    assert p.returncode == 0, p.stderr[-3000:]
+    assert 'mode=inplace' in p.stderr, p.stderr[-2000:]
+    assert np.array_equal(np.load(a), np.load(b)), float(np.abs(np.load(a) - np.load(b)).max())

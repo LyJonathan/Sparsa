@@ -707,3 +707,41 @@ choice now follows the KV's home (`dev_attn = kv_mode == 1`) and the layer's att
 CPU when its weights are not on the device; `attend_host()` also refuses a missing host K/V by name.
 `tools/minimax/test_p7_kv_prefill.py` holds the combination to `prefill=batch` + `kv_space=vram` and compares it
 with the token path (max abs < 1e-2 on the synthetic fixture), plus the `--minimax-kv host` decode comparison.
+
+## P7b: the route nudge, the lane's spin window, and page-cache-in-place
+
+**`--minimax-route-bias on` (default off): rank the router's top-k on the expert's score plus a residency
+bonus, and take the weights from the unbiased scores.** This is Xolotl's lever (Indras-Mirror/Xolotl, MIT:
+9.7 -> 19.1 -> 21.7 tok/s on one RTX 3090 + 128 GB answering a 148 GB model, `docs/DEEPSEEK_V41.md:60-71`,
+`tools/v41/engine/ds41_dense.cpp:1176-1244`) and it is the one change that reduces *which* experts the token
+needs instead of making the same bytes faster. With the flag off the selection is the model's own, bit for bit
+(the gate below checks exactly that).
+
+* `--minimax-route-bias-in A` (default 0.25) is added to an expert that is in the VRAM or the pinned-RAM tier;
+  `--minimax-route-bias-out C` (default 0.15) is subtracted from one that is in neither, i.e. one the token would
+  read from the drive.
+* The three guards are Xolotl's, and its own quality table is why they are not optional: an unguarded flat bias
+  of 1.0 costs 14 points of API top-1 and loops on some prompts, while 0.25 keeps 85.2% against 86.2% exact.
+  `--minimax-route-protect P` (default 2) keeps the exact top-P experts always; `--minimax-route-pool M`
+  (default 12) makes every pick stay inside the exact top-M (the max-rank window of arXiv:2412.00099);
+  `--minimax-route-margin D` (default 0 = everywhere) applies the nudge only to experts whose exact score is
+  within D of the k-th exact score.
+* The route meter is printed by `--minimax-stats`: `route_swapped` (share of expert picks that differ from the
+  exact choice) and `route_weight_kept` (the router weight of the picks against the exact picks' weight).
+* The same selection runs in all four routing loops (the tiered token path, the all-CPU token path, the batched
+  prompt path and the lookahead in `prefetch_for`), so the prefetch prediction agrees with the decision it is
+  predicting.
+
+**`--minimax-pool-spin-us N` (default 0): the CPU pool spins before it sleeps.** A token's layers hand the pool
+several small jobs in a row, and a condition-variable wake per job is a context switch each; Project Maya's pool
+spins 20 ms through a token's layers for that reason (`ds4_model.cu:5560`). This is a measured knob, not a new
+default: 0 keeps the old behaviour.
+
+**`--minimax-ram-mode pinned|inplace` (default pinned): whether the RAM tier is a copy at all.** Maya's DeepSeek
+engine reads experts in place and records that its own opt-in RAM tier was *slower* than the page cache on a
+V100/64 GB, and that copies "were measured no faster than the page cache … a part copied cost decode speed on
+64 GB and on 32 GB of RAM" (`ds4_model.cu:1206-1211`, `5164-5166`). `inplace` builds no arena: the ranked set is
+only a ranking decision, `PrefetchVirtualMemory` walks the ranked experts' pages once at startup (Maya's
+Windows prefetch of only the non-resident pages measured +6-7% decode, `ds4_os.hpp:250-332`), and the CPU lane
+reads the mapping. The A/B is in the table below; the default stays `pinned` until the measurement says
+otherwise on this box.
