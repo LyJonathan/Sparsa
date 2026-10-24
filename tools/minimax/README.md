@@ -357,6 +357,55 @@ measured on the real checkpoint (its 4th/5th-place ties). `--minimax-prefill-den
 `python -m pytest tools/minimax/test_p5a.py -q` runs the table, plus an end-to-end serve check that the greedy
 continuation after a 40-token prompt is identical with and without `--minimax-prefill-batch`.
 
+### Tensor-core routed experts (P11)
+
+`--minimax-prefill-expert-gemm` chooses how a batched chunk's routed experts are projected:
+
+- `mmvq` (default) keeps the int8 `iq_mmvq` dots: the expert's weights are decoded and dotted against a q8_1
+  activation, one group of tokens at a time.
+- `tc` dequantizes each routed expert's gate/up/down weight matrix to FP16 **once per chunk** and runs every token
+  routed to that expert through one cuBLAS HGEMM per projection (FP16 tensor cores, FP32 accumulation). The weight
+  decode is the same amount of work the int8 kernel already does; it is now amortized over the group's rows instead
+  of feeding a dot. The dequantized matrix is a tile of the existing 48 MiB weight scratch, so no VRAM is added.
+- `auto` takes `tc` for a group of at least 16 rows and keeps `mmvq` below it. A 200-token prompt routes about six
+  tokens per expert; dequantizing 18.9 M weights for six rows is not worth it, a 4 K chunk routes ~128.
+
+The default is `mmvq`, so an existing command keeps the int8 math. On the 15-layer real-weight slice (4 K real
+tokens, IQ2_XS gate/up + Q2_0 down) `tc` against `mmvq` measured **KL 1.34e-4 nats, top-1 32/32**, max abs 0.30 on a
+logit std of ~1.7 (the router's 4th-expert flips, the same effect P5a measured), and the same run was 28.2 s against
+36.3 s. `tools/minimax/test_p10_expert_gemm.py` checks the same shape on a synthetic IQ2_XS model plus the `auto`
+selection (2 passed).
+
+The unbuffered read path was also tightened: an expert that the pinned RAM tier already holds is copied from the
+arena instead of being re-read from the file, and a real miss is read straight into the three role windows of the
+pinned ring slot with the three requests in flight (no 19 MiB staging copy). The bytes are identical: on the slice,
+`--minimax-prefill-read direct` against `mmap` was `np.array_equal` (max abs 0.0). `STRATA_MM_TIME=1`'s
+`batch-ring` line now prints the direct-read milliseconds, the MiB and the drive's GB/s, plus the per-layer group
+counts (`vram= ram= disk= tc=`), so a drive-speed swing is visible next to the layer time.
+
+Measured on the full IQ2_XS-D3 model, 2x RTX 5070, `--minimax-tiers` + `mm3-d3.bin`,
+`--minimax-kv ram --minimax-vram-slots-per-layer 0 --memory-limit-mib 86000 --cpu-threads 12`, real text, one
+batched chunk per prompt (32 K splits into 22 991 + 9 777). Drive rate 4.4-5.6 GB/s on every run below.
+
+| prompt | `mmvq` prefill | `tc`/`auto` prefill | speedup |
+|---|---|---|---|
+| 200 | 7.85 tok/s (25.5 s) | same (`auto` keeps mmvq) | - |
+| 512 | 15.85 tok/s (32.3 s) | 16.26 tok/s (31.5 s) | 1.03x |
+| 4 K | 42.62 tok/s (96.1 s) | **56.67 tok/s (72.3 s)** | **1.33x** |
+| 32 K | not re-run | 44.3 tok/s (739.6 s) | vs 37.8 tok/s in P9 |
+
+Below 1 K tokens the chunk is the expert byte wall: all 128 experts of all 57 MoE layers are routed (139 GB, read
+once per chunk) and the GEMM is not the cost. At 4 K the tensor-core path takes the routed MoE from ~700 ms to
+~470 ms per layer while the read (320-540 ms/layer) and the MSA kernel (274 ms/layer) stay. At 32 K the chunk is
+read-bound and attention-bound: the last chunk's MoE is 0.72 s/layer against 4.25 s/layer of attention
+(`msa=112 s`, `idx=70 s`, `topk=6.7 s` over its 60 layers), so 32 K needs the attention kernel, not a faster expert
+GEMM.
+
+A 200-token chat prompt is 3.5 tok/s on the token path (`--minimax-prefill-batch 0`) and 7.85 tok/s batched: the
+token path re-reads each expert once per token that routes to it, so the same prompt reads the expert set about six
+times. Turn batching on for chat.
+
+
 ### Real weights: a 15-layer slice of MiniMax-M3.1-Flash
 
 No complete local IQ2_XS pack existed (the D3 upload has 3 of 13 shards, and the full 133 GB does not fit next to

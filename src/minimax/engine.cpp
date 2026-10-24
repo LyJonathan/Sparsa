@@ -5653,6 +5653,8 @@ struct Engine::Impl {
             if (v < 0) streamed.push_back((int)i);
         }
         // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
+        double t_disk = 0;                 // STRATA_MM_TIME: the direct-read side alone (the drive's rate)
+        int64_t disk_bytes = 0;
         auto stage_si = [&](int si) {
             const int slot = si % ring_n;
             const Grp& g = grps[(size_t)streamed[(size_t)si]];
@@ -5671,9 +5673,12 @@ struct Engine::Impl {
                 src[1] = base + L.expert_gu;
                 src[2] = base + 2 * L.expert_gu;
             } else if (prefill_direct && !ssd_files.empty()) {
+                const auto td0 = std::chrono::steady_clock::now();
                 std::string err;
                 if (!ssd_read_roles_direct(L, g.e, pin, src, err))
                     fail("batched prefill: " + err);
+                t_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                disk_bytes += (int64_t)L.expert_bytes;
             } else {
                 read_expert(g.e, pin);
                 src[0] = pin + p.role_off[0];
@@ -5797,8 +5802,12 @@ struct Engine::Impl {
             at = end;
         }
         if (std::getenv("STRATA_MM_TIME"))
-            std::fprintf(stderr, "INFO batch-ring read=%.1f copywait=%.1f ms experts=%zu vram=%d ram=%d disk=%d tc=%d\n",
-                         t_read, t_copywait, streamed.size(), n_vram, n_ram, n_disk, n_tc);
+            std::fprintf(stderr,
+                         "INFO batch-ring read=%.1f copywait=%.1f disk_ms=%.1f disk_mb=%.1f disk_gbs=%.2f ms "
+                         "experts=%zu vram=%d ram=%d disk=%d tc=%d\n",
+                         t_read, t_copywait, t_disk, (double)disk_bytes / 1048576.0,
+                         t_disk > 0.0 ? (double)disk_bytes / (t_disk * 1.0e6) : 0.0, streamed.size(), n_vram, n_ram,
+                         n_disk, n_tc);
         cu::sync();
         cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;
