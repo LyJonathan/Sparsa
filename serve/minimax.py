@@ -267,7 +267,10 @@ class MiniMaxOutputParser:
         self.unread_names: list[str] = []
 
     def feed(self, delta):
-        self.buf += delta
+        # The namespace token is a prompt delimiter the model sometimes repeats in its output (it did on
+        # the full model, right after a tool call's text).  It is never part of an answer, so it is removed
+        # before anything is shown; a partial one at a chunk's end is held, like a split tag.
+        self.buf = (self.buf + delta).replace(NS, '')
         out: list[Event] = []
         while self.buf:
             if self.state in ('reasoning', 'content'):
@@ -275,7 +278,7 @@ class MiniMaxOutputParser:
                         else (THINK_END, CALL_START))
                 found = [(self.buf.find(tag), tag) for tag in tags if tag in self.buf]
                 if not found:
-                    hold = OutputParser._hold(self, self.buf, tags)
+                    hold = OutputParser._hold(self, self.buf, tags + (NS,))
                     safe = len(self.buf) - hold
                     if safe:
                         out.append(Event(self.state, self.buf[:safe]))

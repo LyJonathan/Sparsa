@@ -132,6 +132,15 @@ def test_parser_reasoning_then_content_across_deltas():
     assert not any(e.kind == "tool_call" for e in events)
 
 
+def test_parser_strips_the_namespace_token_from_text():
+    parser = MiniMaxOutputParser(thinking=False)
+    events = []
+    for ch in f"hello {NS}world":
+        events += parser.feed(ch)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "content") == "hello world"
+
+
 def test_parser_tool_call_with_namespace_and_param_types():
     text = (f"<mm:think>t</mm:think>I will call.\n{CALL_START}\n{NS}<invoke name=\"get_weather\">\n"
             f"{NS}<city>Paris</city>\n{NS}<days>2</days>\n{NS}<flags><item>a</item><item>b</item></flags>\n"
