@@ -130,6 +130,8 @@ def gpu_devices(explicit: str | None) -> list[int]:
 
 
 def build_config(args) -> dict:
+    if not args.model:
+        raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
     first, parts = find_model_guf(args.model)
     engine = find_engine(args.engine)
     tokenizer = find_tokenizer(first, args.tokenizer)
@@ -197,7 +199,6 @@ def cmd_plan(args) -> int:
 def cmd_serve(args) -> int:
     from strata_cli.launch import access as access_mod
 
-    cfg = build_config(args)
     config_path = Path(args.config).expanduser()
     if args.show_key:
         try:
@@ -206,6 +207,7 @@ def cmd_serve(args) -> int:
         except (OSError, ValueError):
             print(f"sparsa: no run settings at {config_path} yet")
         return 0
+    cfg = build_config(args)
     host = args.host or access_mod.host_for(args.access)
     key = ""
     if args.access != "local":
@@ -281,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def serving(name: str, help_text: str):
         p = sp.add_parser(name, help=help_text)
-        p.add_argument("--model", required=True, help="folder of GGUF parts, or the first part")
+        p.add_argument("--model", help="folder of GGUF parts, or the first part")
         p.add_argument("--tokenizer", help="folder holding tokenizer.json (default: beside the model)")
         p.add_argument("--engine", help=f"path to {ENGINE_NAME} (default: build/, PATH)")
         p.add_argument("--context", type=int, default=32768, help="context length (default 32768)")
