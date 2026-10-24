@@ -326,3 +326,39 @@ One thread to twelve is 5.1× on the short sample, and twelve to twenty-four is 
 The Q8_0 smoke GGUF is 10.196 GB and was written in 19.5 s. It is not in git. `llama-cli -m smoke-l3-q8.gguf -p "]~b]" -n 8 -c 128 -fa on -ngl 0 --ignore-eos -st` loaded the file, generated 8 tokens, and exited 0. The printed pieces are the placeholder spellings `t######` because the real BPE merges are not available yet. Token quality on a 1-layer model is not a quality check.
 
 No full-size tier file was written.
+
+## Publishing a tier from two machines (`run_tier_ikq.py`, `part_verify.py`)
+
+`run_tier_ikq.py` drives one machine's share of one tier end to end: fetch the source shards the
+part needs, quantize, verify, upload, check the uploaded bytes, delete the part, delete the shards.
+The four tiers it knows are `IQ3_K`, `IQ4_KS`, `IQ2_KL` and `NVFP4`. The 13-layer-range plan is
+shared by all four, so the parts of a tier concatenate in layer order; part 0 carries the KV
+metadata and the globals. The split follows measured time, not layer count: rig-2 (24 threads) owns
+34 of the 57 MoE layers, rig-3 (16 threads) owns 23, which is 1.48x the work for 1.4-1.6x the speed.
+
+```sh
+run_tier_ikq.py --plan --tier IQ3_K
+run_tier_ikq.py --tier IQ3_K --machine rig-2
+```
+
+`part_verify.py` reads the part's header itself and requires, in this order: `GGUF` v3,
+`general.architecture` `minimax-m3`, `split.no` / `split.count` matching the part asked for,
+`split.tensors.count` present, the tokenizer keys on part 0, every routed-expert tensor at the
+tier's type, a file size exactly `data_offset` + the last tensor's end, and then the sha256. The
+upload is only accepted when the repository's `lfs.oid` for the path equals that sha256 (the resolve
+URL's ETag is not the LFS oid once a file is on Xet storage). `MM-NVFP4` additionally runs
+`verify_nvfp4_gguf.py` before the upload and requires `max |diff| = 0.0`.
+
+Measured with `--bench` on layer 3, 8 experts of `w1`, every logical processor (2026-10-24), routed
+experts, logical f32:
+
+| tier | rig-2 5900X, 24 threads | rig-3 5700G, 16 threads |
+|---|---:|---:|
+| IQ3_K | 1.009 GB/s | 0.720 GB/s |
+| IQ4_KS | 0.685 GB/s | 0.439 GB/s |
+| IQ2_KL | 0.352 GB/s | 0.220 GB/s |
+| NVFP4 | 3.108 GB/s | 2.031 GB/s |
+
+The first real IQ3_K part on rig-2 (two MoE layers plus the globals) took 80.5 s for 9.981 GB of
+output, 0.72 GB/s of logical f32 on the expert tensors, because a real part also reads and
+dequantizes the checkpoint shards that `--bench` does not touch.
