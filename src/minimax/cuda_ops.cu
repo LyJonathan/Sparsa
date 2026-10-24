@@ -944,6 +944,76 @@ void idx_block_scores(const void* ik, int64_t ntok, const float* q, int heads, i
     check(cudaGetLastError(), "idx_scores launch");
 }
 
+// P9: the host's `select_slots` on the card.  One thread per indexer head: nb is at most a few thousand (256 K / 128),
+// kk is top_k (<= 16), and the selection is a k-element insertion sort, which costs less than the round trip it
+// removes.  The ordering is the host's: score descending, block index ascending, the last `local` blocks of the query
+// forced in, and slots emitted in ascending block order (not rank order).
+__global__ void idx_select_kernel(const float* __restrict__ bs, int nb, int kk, int blk, long long pos, int local,
+                                  int maxslot, int32_t* __restrict__ slots, int32_t* __restrict__ counts) {
+    const int h = (int)blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const int qb = (int)(pos / (long long)blk);
+    float sc[32];
+    int bi[32];
+    int n = 0;
+    const float* row = bs + (size_t)h * nb;
+    for (int b = 0; b < nb; ++b) {
+        float s = row[b];
+        if (s == -INFINITY) continue;   // a block past the prompt, exactly as the host skips it
+        for (int l = 0; l < local; ++l) {
+            int lb = qb - l;
+            if (lb < 0) lb = 0;
+            if (lb == b) s = INFINITY;
+        }
+        if (n == kk) {
+            // Worse than the current last pick: score lower, or equal with a larger block index.
+            if (sc[kk - 1] > s || (sc[kk - 1] == s && bi[kk - 1] < b)) continue;
+        }
+        int p = n < kk ? n : kk - 1;
+        while (p > 0 && (sc[p - 1] < s || (sc[p - 1] == s && bi[p - 1] > b))) {
+            sc[p] = sc[p - 1];
+            bi[p] = bi[p - 1];
+            --p;
+        }
+        sc[p] = s;
+        bi[p] = b;
+        if (n < kk) ++n;
+    }
+    // The host emits the selected blocks in ascending block order.
+    for (int i = 1; i < n; ++i) {
+        const int v = bi[i];
+        int j = i - 1;
+        while (j >= 0 && bi[j] > v) {
+            bi[j + 1] = bi[j];
+            --j;
+        }
+        bi[j + 1] = v;
+    }
+    const long long Tk = pos + 1;
+    int at = 0;
+    for (int i = 0; i < n; ++i) {
+        long long begin = (long long)bi[i] * blk;
+        long long end = begin + blk;
+        if (end > Tk) end = Tk;
+        for (long long t = begin; t < end; ++t) {
+            if (at >= maxslot) break;
+            slots[(size_t)h * maxslot + (size_t)at] = (int32_t)t;
+            ++at;
+        }
+    }
+    counts[h] = at;
+}
+
+void idx_select(const float* bs, int heads, int nb, int top_k, int blk, int64_t pos, int local, int maxslot,
+                int32_t* slots, int32_t* counts, void* stream) {
+    if (heads <= 0 || nb <= 0 || maxslot <= 0) return;
+    int kk = top_k < nb ? top_k : nb;
+    if (kk < 1) kk = 1;
+    if (kk > 32) kk = 32;
+    idx_select_kernel<<<heads, 1, 0, (cudaStream_t)stream>>>(bs, nb, kk, blk, pos, local, maxslot, slots, counts);
+    check(cudaGetLastError(), "idx_select launch");
+}
+
 void kv_gather(const void* k, const void* v, int hkv, int dim, const int32_t* slot_pos, const int32_t* counts,
                int maxslot, void* kdst, void* vdst, void* stream) {
     if (hkv <= 0 || maxslot <= 0) return;
