@@ -670,6 +670,13 @@ struct Engine::Impl {
         void* ring = nullptr;        // expert streaming slot (raw GGUF bytes)
         size_t ring_slot = 0;
         void* pin = nullptr;         // page-locked staging for the ring (same bytes)
+        // P5b: the ring is multi-slot.  Every slot has its own page-locked staging buffer, its own H2D event on
+        // the copy stream and a "compute finished" event on the main stream, so a copy can be in flight while the
+        // previous expert's GEMM runs and a slot is only rewritten after the math that reads it has completed.
+        int ring_n = 0;
+        std::vector<void*> ring_v, pin_v;
+        std::vector<void*> ev_copy, ev_comp;
+        void* copy_stream = nullptr;
         DevPtr d_iq16, d_bs, d_blk, d_nblk, d_rows, d_ent_row, d_ent_w;
 
         DevPtr d_q16;                // fp16 attention queries for the batched MSA kernel
@@ -2748,8 +2755,26 @@ struct Engine::Impl {
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
             if (prefill_gpu_experts && max_expert_bytes > 0) {
                 p.ring_slot = max_expert_bytes;
-                p.ring = cu::alloc(p.ring_slot);
-                p.pin = cu::host_alloc(p.ring_slot);
+                // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
+                // expert stream, which is what the chunk's MoE time is actually spent on.
+                size_t slot = p.ring_slot;
+                int want = 4;
+                const size_t per_slot = slot + (16u << 20);
+                while (want > 1) {
+                    const cu::MemInfo mi = cu::mem_on(devs[d]);
+                    if (mi.free_bytes > per_slot * (size_t)want) break;
+                    --want;
+                }
+                p.ring_n = want;
+                for (int s = 0; s < p.ring_n; ++s) {
+                    p.ring_v.push_back(cu::alloc(slot));
+                    p.pin_v.push_back(cu::host_alloc(slot));
+                    p.ev_copy.push_back(cu::event_create());
+                    p.ev_comp.push_back(cu::event_create());
+                }
+                p.ring = p.ring_v[0];
+                p.pin = p.pin_v[0];
+                if (!p.copy_stream) p.copy_stream = cu::stream_create();
             }
         }
         use_device_index(0);
@@ -3151,6 +3176,78 @@ struct Engine::Impl {
         bool zero = true;
         std::vector<int32_t> row_t((size_t)rows_cap);
         std::vector<float> row_w((size_t)rows_cap);
+
+        // ---- P5b: the staged expert ring.  The chunk's route entries are already sorted by expert, so each
+        // expert's bytes are read once per chunk either way; what changes here is that the read is spread over the
+        // CPU pool and the H2D copy of expert i+1 rides the copy stream while expert i's GEMMs run on the main
+        // stream.  One slot (P5a) serialized read -> copy -> compute for all 128 experts of a chunk.
+        struct Grp {
+            int e;
+            size_t at, end;
+        };
+        std::vector<Grp> grps;
+        for (size_t q = 0; q < pf_entries.size();) {
+            const int e = pf_entries[q].expert;
+            size_t end = q;
+            while (end < pf_entries.size() && pf_entries[end].expert == e) ++end;
+            grps.push_back({e, q, end});
+            q = end;
+        }
+        const int ring_n = p.ring_n > 0 ? p.ring_n : 1;
+        const int lookahead = ring_n - 1;   // slots filled before the one being computed
+
+        // One expert's [gate|up|down] into `dst`, split over the pool.  The three matrices are contiguous in the
+        // destination, so this is a flat list of copies: 8 pieces of >=1 MiB each keep every core on the mmap
+        // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
+        auto read_expert = [&](int e, uint8_t* dst) {
+            const size_t gu = L.expert_gu, dn = L.expert_down;
+            const uint8_t* src[3] = {L.egate.host + (size_t)e * gu, L.eup.host + (size_t)e * gu,
+                                     L.edown.host + (size_t)e * dn};
+            const size_t off[3] = {0, gu, 2 * gu};
+            const size_t len[3] = {gu, gu, dn};
+            // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
+            // 4 per thread per matrix lands on ~60 KiB each at MiniMax's expert size.
+            const int pieces = 4 * (threads > 0 ? threads : 4);
+            pool.run(pieces * 3, [&](int a, int b) {
+                for (int i = a; i < b; ++i) {
+                    const int m = i / pieces, c = i % pieces;
+                    const size_t p0 = len[m] * (size_t)c / (size_t)pieces;
+                    const size_t p1 = len[m] * (size_t)(c + 1) / (size_t)pieces;
+                    if (p1 > p0) std::memcpy(dst + off[m] + p0, src[m] + p0, p1 - p0);
+                }
+            });
+        };
+        // Stage streamed expert `si` (its index among the streamed groups) into slot si % ring_n.
+        std::vector<int> streamed;   // group index of each streamed expert, in order
+        for (size_t i = 0; i < grps.size(); ++i) {
+            const int v = L.vram_of.empty() ? -1 : L.vram_of[(size_t)grps[i].e];
+            if (v < 0) streamed.push_back((int)i);
+        }
+        // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
+        auto stage_si = [&](int si) {
+            const int slot = si % ring_n;
+            const Grp& g = grps[(size_t)streamed[(size_t)si]];
+            cu::event_sync(p.ev_comp[(size_t)slot]);
+            uint8_t* pin = (uint8_t*)p.pin_v[(size_t)slot];
+            if (prefill_direct && !ssd_files.empty())
+                ssd_read_expert(L, g.e, pin);
+            else
+                read_expert(g.e, pin);
+            cu::copy_h2d_async(p.ring_v[(size_t)slot], pin, L.expert_bytes, p.copy_stream);
+            cu::event_record(p.ev_copy[(size_t)slot], p.copy_stream);
+        };
+        int primed = 0;
+        double t_read = 0, t_copywait = 0;   // STRATA_MM_TIME: the two sides of the staged ring
+        auto pump = [&](int upto) {
+            while (primed < upto && primed < (int)streamed.size()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                stage_si(primed);
+                t_read += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                ++primed;
+            }
+        };
+        if (ring_n > 1 && !streamed.empty()) pump(std::min<int>(ring_n - 1, (int)streamed.size()));
+
         size_t at = 0;
         while (at < pf_entries.size()) {
             const int e = pf_entries[at].expert;
@@ -3160,6 +3257,7 @@ struct Engine::Impl {
             const uint8_t* su;
             const uint8_t* sd;
             const int slot = (L.vram_of.empty() ? -1 : L.vram_of[(size_t)e]);
+            int ring_slot = -1;
             if (slot >= 0) {
                 const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
                 sg = base;
@@ -3167,27 +3265,24 @@ struct Engine::Impl {
                 sd = base + 2 * L.expert_gu;
             } else {
                 if (!p.ring) fail("batched prefill: no expert streaming buffer");
-                uint8_t* dst = (uint8_t*)p.ring;
-                if (p.pin && prefill_direct && !ssd_files.empty()) {
-                    // Unbuffered 16 MiB reads from the shard into page-locked staging: the page cache cannot hold a
-                    // 133 GB expert set, and a cached mmap copy is both slower and evicts other work.
-                    uint8_t* pin = (uint8_t*)p.pin;
-                    ssd_read_expert(L, e, pin);
-                    cu::copy_h2d(dst, pin, L.expert_bytes);
-                } else if (p.pin) {
-                    uint8_t* pin = (uint8_t*)p.pin;
-                    std::memcpy(pin, L.egate.host + (size_t)e * L.expert_gu, L.expert_gu);
-                    std::memcpy(pin + L.expert_gu, L.eup.host + (size_t)e * L.expert_gu, L.expert_gu);
-                    std::memcpy(pin + 2 * L.expert_gu, L.edown.host + (size_t)e * L.expert_down, L.expert_down);
-                    cu::copy_h2d(dst, pin, L.expert_bytes);
-                } else {
-                    cu::copy_h2d(dst, L.egate.host + (size_t)e * L.expert_gu, L.expert_gu);
-                    cu::copy_h2d(dst + L.expert_gu, L.eup.host + (size_t)e * L.expert_gu, L.expert_gu);
-                    cu::copy_h2d(dst + 2 * L.expert_gu, L.edown.host + (size_t)e * L.expert_down, L.expert_down);
+                // This group's index among the streamed ones is its position in `streamed`; the pipeline keeps
+                // `primed` at least one slot ahead, so waiting here only costs when the copy is the slow side.
+                size_t si = 0;
+                while (si < streamed.size() && grps[(size_t)streamed[si]].at != at) ++si;
+                if (si >= streamed.size()) fail("internal: streamed expert is not in the order list");
+                pump((int)si + 1);
+                ring_slot = (int)si % ring_n;
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    cu::event_sync(p.ev_copy[(size_t)ring_slot]);
+                    t_copywait +=
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 }
+                uint8_t* dst = (uint8_t*)p.ring_v[(size_t)ring_slot];
                 sg = dst;
                 su = dst + L.expert_gu;
                 sd = dst + 2 * L.expert_gu;
+                pump((int)si + 1 + lookahead);
             }
             for (size_t a = at; a < end; a += (size_t)rows_cap) {
                 const int nt = (int)std::min<size_t>(end - a, (size_t)rows_cap);
@@ -3238,8 +3333,14 @@ struct Engine::Impl {
                                      T, zero, nullptr);
                 zero = false;
             }
+            // The slot is free for a new copy once everything the main stream enqueued for it has run.
+            if (ring_slot >= 0 && p.ev_comp.size() > (size_t)ring_slot)
+                cu::event_record(p.ev_comp[(size_t)ring_slot], nullptr);
             at = end;
         }
+        if (std::getenv("STRATA_MM_TIME"))
+            std::fprintf(stderr, "INFO batch-ring read=%.1f copywait=%.1f ms experts=%zu\n", t_read, t_copywait,
+                         streamed.size());
         cu::sync();
         cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;

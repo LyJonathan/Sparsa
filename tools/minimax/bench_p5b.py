@@ -101,7 +101,10 @@ def run_llama(bench: str, model: str, n_prompt: int, n_gen: int, reps: int, thre
     rows = json.loads(txt)
     out = {}
     for r in rows:
-        out[r['test']] = r
+        key = r.get('test')
+        if key is None:
+            key = ('pp%d' % r['n_prompt']) if r.get('n_prompt') else ('tg%d' % r['n_gen'])
+        out[key] = r
     return out
 
 

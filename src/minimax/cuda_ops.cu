@@ -635,6 +635,24 @@ void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream) {
 
 void stream_sync(void* stream) { check(cudaStreamSynchronize((cudaStream_t)stream), "stream sync"); }
 
+void* event_create() {
+    cudaEvent_t e = nullptr;
+    check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event create");
+    return (void*)e;
+}
+
+void event_record(void* event, void* stream) {
+    if (event) check(cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream), "event record");
+}
+
+void event_sync(void* event) {
+    if (event) check(cudaEventSynchronize((cudaEvent_t)event), "event sync");
+}
+
+bool event_ready(void* event) {
+    return !event || cudaEventQuery((cudaEvent_t)event) == cudaSuccess;
+}
+
 void idx_block_scores(const void* ik, int64_t ntok, const float* q, int heads, int dim, int blk, int nb, float* bs,
                       void* stream) {
     if (nb <= 0 || heads <= 0) return;
