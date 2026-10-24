@@ -84,10 +84,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// products as `iq_mmvq` (q8_1 activations).  `x_q8_1` holds `n_embd/32` q8_1 blocks, `h` is `n_entries * n_ff`
 /// floats, and the down pass's `x_q8_1` holds `n_entries * n_ff/32` blocks (quantize `h` with
 /// `quantize_q8_1_rows`).  `gu_row`/`d_row` are the ggml row sizes.  Nothing synchronizes.
+/// `s_gate`/`s_up` (optional, device f32 [n_entries]) multiply that entry's gate/up output before swigluoai;
+/// `s_down` multiplies the down output. MM-NVFP4 passes the per-expert 1/weight_global_scale here.
 void minimax_moe_gu(int type, const void* const* gate, const void* const* up, int n_entries, int n_embd, int n_ff,
-                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream);
+                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream,
+                    const float* s_gate = nullptr, const float* s_up = nullptr);
 void minimax_moe_down(int type, const void* const* down, int n_entries, int n_embd, int n_ff, size_t d_row,
-                      const void* x_q8_1, float* out, void* stream);
+                      const void* x_q8_1, float* out, void* stream, const float* s_down = nullptr);
 
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results

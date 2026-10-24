@@ -16,10 +16,16 @@ struct Expected {
     std::string name;
     TensorClass cls;
     std::vector<uint64_t> shape;
+    bool optional = false;
 };
 
 void expect(std::vector<Expected>& out, std::string name, TensorClass cls, std::vector<uint64_t> shape) {
-    out.push_back(Expected{std::move(name), cls, std::move(shape)});
+    out.push_back(Expected{std::move(name), cls, std::move(shape), false});
+}
+
+// Optional tensors: absent in a file that does not use them, accepted (and shape-checked) when present.
+void expect_opt(std::vector<Expected>& out, std::string name, TensorClass cls, std::vector<uint64_t> shape) {
+    out.push_back(Expected{std::move(name), cls, std::move(shape), true});
 }
 
 std::string shape_text(const std::vector<uint64_t>& s) {
@@ -76,6 +82,10 @@ std::vector<Expected> expected_tensors(const Config& c) {
             expect(out, b + "ffn_gate_exps.weight", TensorClass::Experts, {ne, ffe, nxp});
             expect(out, b + "ffn_down_exps.weight", TensorClass::Experts, {ffe, ne, nxp});
             expect(out, b + "ffn_up_exps.weight", TensorClass::Experts, {ne, ffe, nxp});
+            // MM-NVFP4: per-expert global scales (a divisor) beside the exact NVFP4 expert bytes.
+            expect_opt(out, b + "ffn_gate_exps.scale", TensorClass::Experts, {nxp});
+            expect_opt(out, b + "ffn_up_exps.scale", TensorClass::Experts, {nxp});
+            expect_opt(out, b + "ffn_down_exps.scale", TensorClass::Experts, {nxp});
             if (c.n_shared_experts > 0) {
                 expect(out, b + "ffn_gate_shexp.weight", TensorClass::Dense, {ne, shexp});
                 expect(out, b + "ffn_down_shexp.weight", TensorClass::Dense, {shexp, ne});
@@ -127,7 +137,10 @@ Model load_model(const std::string& path, bool require_m3_1) {
     for (const Expected& e : expected) {
         size_t shard = 0;
         const TensorInfo* t = file.find(e.name, &shard);
-        if (!t) throw std::runtime_error(path + ": missing tensor " + e.name);
+        if (!t) {
+            if (e.optional) continue;
+            throw std::runtime_error(path + ": missing tensor " + e.name);
+        }
         if (t->shape != e.shape)
             throw std::runtime_error(path + ": " + e.name + " has shape " + shape_text(t->shape) + ", expected " +
                                      shape_text(e.shape));

@@ -4181,28 +4181,33 @@ __device__ __forceinline__ float minimax_swigluoai(float gate, float up, float a
 template<int TY>
 __global__ void minimax_gu_kernel(const uint8_t* const* gate, const uint8_t* const* up,
                                   const block_q8_1* __restrict__ x, float* __restrict__ h, int n_embd, int n_ff,
-                                  int nb, size_t gu_row, float alpha, float limit) {
+                                  int nb, size_t gu_row, float alpha, float limit,
+                                  const float* __restrict__ s_gate, const float* __restrict__ s_up) {
     const int e = (int)blockIdx.z;
     const int row = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (row >= n_ff) return;
     const int lane = (int)threadIdx.x;
     const uint8_t* gr = gate[e] + (size_t)row * gu_row;
     const uint8_t* ur = up[e] + (size_t)row * gu_row;
-    const float g = row_dot<TY>(gr, x, nb, lane);
-    const float u = row_dot<TY>(ur, x, nb, lane);
+    float g = row_dot<TY>(gr, x, nb, lane);
+    float u = row_dot<TY>(ur, x, nb, lane);
+    if (s_gate) g *= s_gate[e];
+    if (s_up) u *= s_up[e];
     if (lane == 0) h[(size_t)e * n_ff + row] = minimax_swigluoai(g, u, alpha, limit);
 }
 
 template<int TY>
 __global__ void minimax_down_kernel(const uint8_t* const* down, const block_q8_1* __restrict__ hq,
-                                    float* __restrict__ out, int n_embd, int n_ff, int nb, size_t d_row) {
+                                    float* __restrict__ out, int n_embd, int n_ff, int nb, size_t d_row,
+                                    const float* __restrict__ s_down) {
     const int e = (int)blockIdx.z;
     const int row = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (row >= n_embd) return;
     const int lane = (int)threadIdx.x;
     const uint8_t* dr = down[e] + (size_t)row * d_row;
     const block_q8_1* x = hq + (size_t)e * (size_t)(n_ff / 32);
-    const float s = row_dot<TY>(dr, x, nb, lane);
+    float s = row_dot<TY>(dr, x, nb, lane);
+    if (s_down) s *= s_down[e];
     if (lane == 0) out[(size_t)e * n_embd + row] = s;
 }
 
@@ -4210,18 +4215,19 @@ __global__ void minimax_down_kernel(const uint8_t* const* down, const block_q8_1
     case TY:                                                                                                         \
         minimax_gu_kernel<TY><<<grid, block>>>((const uint8_t* const*)gate, (const uint8_t* const*)up,               \
                                                (const block_q8_1*)x_q8_1, h, n_embd, n_ff, n_embd / Fmt<TY>::qk,     \
-                                               gu_row, alpha, limit);                                                \
+                                               gu_row, alpha, limit, s_gate, s_up);                                  \
         break;
 #define STRATA_MINIMAX_LAUNCH_DOWN(TY)                                                                               \
     case TY:                                                                                                         \
         minimax_down_kernel<TY><<<grid, block>>>((const uint8_t* const*)down, (const block_q8_1*)x_q8_1, out,        \
-                                                  n_embd, n_ff, n_ff / Fmt<TY>::qk, d_row);                          \
+                                                  n_embd, n_ff, n_ff / Fmt<TY>::qk, d_row, s_down);                   \
         break;
 
 }  // namespace
 
 void minimax_moe_gu(int type, const void* const* gate, const void* const* up, int n_entries, int n_embd, int n_ff,
-                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream) {
+                    size_t gu_row, const void* x_q8_1, float* h, float alpha, float limit, void* stream,
+                    const float* s_gate, const float* s_up) {
     if (n_entries <= 0) return;
     const dim3 block(32, 4);
     const dim3 grid(1, (unsigned)((n_ff + 3) / 4), (unsigned)n_entries);
@@ -4235,7 +4241,7 @@ void minimax_moe_gu(int type, const void* const* gate, const void* const* up, in
 }
 
 void minimax_moe_down(int type, const void* const* down, int n_entries, int n_embd, int n_ff, size_t d_row,
-                      const void* x_q8_1, float* out, void* stream) {
+                      const void* x_q8_1, float* out, void* stream, const float* s_down) {
     if (n_entries <= 0) return;
     const dim3 block(32, 4);
     const dim3 grid(1, (unsigned)((n_embd + 3) / 4), (unsigned)n_entries);

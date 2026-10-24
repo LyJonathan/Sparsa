@@ -869,6 +869,7 @@ struct Item {
     std::string hf;
     std::string wkey;
     bool exact = false;
+    bool side_scale = false;   ///< f32 [n_expert]: per-expert weight_global_scale for an NVFP4 expert tensor
     Role role = Role::Embd;
     int src = -1;
     int out_i = -1;
@@ -1064,6 +1065,20 @@ std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<
                 it.ne[1] = n_out;
                 it.ne[2] = h.n_expert;
                 push_item(items, it);
+                if (ty == GGML_TYPE_NVFP4) {
+                    // Lossless experts: the per-expert divisor is a side tensor, not a fold into the scale byte.
+                    Item sc;
+                    sc.gguf = blk_name(blk, leaf, "scale");
+                    sc.hf = it.hf;
+                    sc.wkey = wkey;
+                    sc.side_scale = true;
+                    sc.role = role;
+                    sc.src = src;
+                    sc.out_i = oi;
+                    sc.type = GGML_TYPE_F32;
+                    sc.ne[0] = h.n_expert;
+                    push_item(items, sc);
+                }
             };
             add_ex("ffn_gate_exps", "w1", Role::Eg, gate_ty, h.n_embd, h.n_ff_exp);
             add_ex("ffn_up_exps", "w3", Role::Eu, gate_ty, h.n_embd, h.n_ff_exp);
@@ -1498,55 +1513,51 @@ void nvfp4_check(const Catalog & cat, const Hyp & h) {
     if (layer < 0) {
         die("nvfp4-check: no expert NVFP4 tensor in the completed shards");
     }
-    logf("NVFP4 check on source layer %d. GGML_TYPE_NVFP4 id %d, block 36 bytes, QK 64.\n", layer, static_cast<int>(GGML_TYPE_NVFP4));
-    logf("Lossless fold needs e4m3(scale)/weight_global_scale to be an unsigned E4M3 value. No side channel is written.\n");
+    logf("NVFP4 check on source layer %d. GGML_TYPE_NVFP4 id %d, block 36 bytes, QK 64.\n", layer,
+         static_cast<int>(GGML_TYPE_NVFP4));
+    logf("MM-NVFP4 copies the packed nibbles and the E4M3 scale bytes verbatim and stores the divisor\n");
+    logf("weight_global_scale as blk.N.ffn_{gate,up,down}_exps.scale (f32 [n_expert]). No fold, no gain error.\n");
     const char * keys[] = {"w1", "w2", "w3"};
     int64_t n_in_of[3] = {h.n_embd, h.n_ff_exp, h.n_embd};
     int64_t n_out_of[3] = {h.n_ff_exp, h.n_embd, h.n_ff_exp};
-    int checked_full = 0, failed = 0, exact_experts = 0;
+    int checked = 0;
     bool any = false;
-    for (int e = 0; e < h.n_expert; ++e) {
+    for (int e = 0; e < 2; ++e) {
         for (int k = 0; k < 3; ++k) {
             const std::string base = layer_base(layer) + ".block_sparse_moe.experts." + std::to_string(e) + "." + keys[k];
             Weight w = resolve_weight(cat, base, false);
             if (w.store != Weight::Store::NVFP4) {
-                continue;
+                die(base + " is not NVFP4; nothing to copy");
             }
             any = true;
             bind_shape(w, n_in_of[k], n_out_of[k], base);
-            const bool full = e == 0;
-            ScaleFail bad = first_inexact(w, n_in_of[k], n_out_of[k], !full);
-            if (full) {
-                ++checked_full;
-            }
-            if (!bad.bad && full) {
-                ++exact_experts;
-                logf("  exact  %s G=%.9g\n", base.c_str(), w.G);
-            }
-            if (bad.bad) {
-                ++failed;
-                logf("  inexact %s G=%.9g row %lld group %lld scale_byte %u (e4m3 %.9g) target %.9g nearest E4M3 byte %d = %.9g\n",
-                     base.c_str(), w.G, static_cast<long long>(bad.row), static_cast<long long>(bad.group), bad.byte,
-                     e4m3_to_f32(bad.byte), bad.target, bad.nearest, bad.nearest_v);
-                if (e == 0) {
-                    logf("MM-NVFP4 refused for this checkpoint: global scale does not fold into block_nvfp4.\n");
-                    return;
+            const ScaleFail bad = first_inexact(w, n_in_of[k], n_out_of[k], false);
+            logf("  %s G=%.9g  scale bytes fold into E4M3: %s (side tensor keeps them exact either way)\n", base.c_str(),
+                 w.G, bad.bad ? "no" : "yes");
+            ++checked;
+            bool neg = false;
+            for (int64_t r = 0; r < n_out_of[k] && !neg; ++r) {
+                const uint8_t * sc = w.scale->data + static_cast<uint64_t>(r) * static_cast<uint64_t>(w.scale_stride);
+                for (int64_t g = 0; g < n_in_of[k] / 16; ++g) {
+                    if (sc[g] & 0x80) {
+                        neg = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (e > 0 && failed > 8) {
-            break;
+            if (neg) {
+                die(base + " has a negative E4M3 scale byte; block_nvfp4 stores unsigned scales");
+            }
+            if (w.val->nbytes != static_cast<uint64_t>(n_out_of[k] * (n_in_of[k] / 2))) {
+                die(base + " packed size is not O * I/2");
+            }
         }
     }
     if (!any) {
         die("nvfp4-check: expert tensors were not NVFP4");
     }
-    if (failed == 0) {
-        logf("sampled scales folded exactly (%d full expert-0 matrices). MM-NVFP4 can be attempted.\n", checked_full);
-    } else {
-        logf("MM-NVFP4 refused: %d sampled matrices did not fold. GGML_TYPE_NVFP4 exists but this checkpoint is not lossless in it.\n", failed);
-    }
-    (void)exact_experts;
+    logf("%d sampled matrices: rows are a multiple of 64 and every scale byte is a non-negative E4M3 value.\n", checked);
+    logf("MM-NVFP4 can be written exactly for this checkpoint.\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1626,9 +1637,8 @@ void emit_weight(GgufWriter & w, const Weight & wt, ggml_type type, int64_t n_in
         for (int64_t r = 0; r < n_out; ++r) {
             const uint8_t * packed = wt.val->data + static_cast<uint64_t>(r) * static_cast<uint64_t>(wt.val_stride);
             const uint8_t * sc = wt.scale->data + static_cast<uint64_t>(r) * static_cast<uint64_t>(wt.scale_stride);
-            if (!pack_nvfp4_row(packed, sc, wt.G, n_in, q.data())) {
-                die("NVFP4 pack failed at row " + std::to_string(r) + " (scale/G is not an E4M3 value)");
-            }
+            // Exact: nibble remap + verbatim E4M3 scale bytes. G goes to the side tensor.
+            pack_nvfp4_row_exact(packed, sc, n_in, q.data());
             w.write_payload(q.data(), q.size());
         }
         return;
@@ -1656,6 +1666,20 @@ bool is_expert(const Item & it) {
     return it.role == Role::Eg || it.role == Role::Eu || it.role == Role::Ed;
 }
 
+// blk.N.ffn_*_exps.scale: f32 [n_expert], one weight_global_scale per expert, in expert
+// order. The value is the divisor from spec A (W = e2m1 * e4m3(scale) / G).
+void emit_side_scale(GgufWriter & w, const Catalog & cat, const Item & it, const Hyp & h) {
+    std::vector<float> g(static_cast<size_t>(h.n_expert));
+    for (int e = 0; e < h.n_expert; ++e) {
+        Weight wt = resolve_weight(cat, expert_base(it, e), false);
+        if (wt.store != Weight::Store::NVFP4) {
+            die(it.gguf + ": expert " + std::to_string(e) + " is not NVFP4; a side scale needs one");
+        }
+        g[static_cast<size_t>(e)] = wt.G;
+    }
+    w.write_payload(g.data(), g.size() * sizeof(float));
+}
+
 void preflight(const Catalog & cat, std::vector<Item> & items, const Hyp & h, bool placeholder) {
     std::vector<std::string> missing;
     auto note = [&](const std::string & n) {
@@ -1666,6 +1690,9 @@ void preflight(const Catalog & cat, std::vector<Item> & items, const Hyp & h, bo
         }
     };
     for (Item & it : items) {
+        if (it.side_scale) {
+            continue;
+        }
         if (is_expert(it)) {
             for (int e = 0; e < h.n_expert; ++e) {
                 const std::string base = expert_base(it, e);
@@ -1675,14 +1702,9 @@ void preflight(const Catalog & cat, std::vector<Item> & items, const Hyp & h, bo
                     continue;
                 }
                 bind_shape(w, it.ne[0], it.ne[1], base);
-                if (it.type == GGML_TYPE_NVFP4 && w.store == Weight::Store::NVFP4) {
-                    ScaleFail bad = first_inexact(w, it.ne[0], it.ne[1], false);
-                    if (bad.bad) {
-                        die(base + " cannot be stored as GGML_TYPE_NVFP4: G=" + std::to_string(w.G) +
-                            " scale_byte " + std::to_string(bad.byte) + " target " + std::to_string(bad.target) +
-                            " nearest E4M3 byte " + std::to_string(bad.nearest) + " = " + std::to_string(bad.nearest_v) +
-                            ". block_nvfp4 has no global-scale field; the tier is refused.");
-                    }
+                if (it.type == GGML_TYPE_NVFP4 && w.store != Weight::Store::NVFP4) {
+                    die(base + " is not NVFP4; " + it.gguf +
+                        " can only be the exact copy of an NVFP4 expert (MM-NVFP4 stores G as a side tensor)");
                 }
             }
             continue;
@@ -2068,9 +2090,15 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
         w.add_str("strata.expert_profile", prof.raw);
     }
     w.add_str("strata.nvfp4",
-              "GGML_TYPE_NVFP4 (40) exists. block_nvfp4 has no global-scale field. "
-              "A lossless copy requires an E4M3-exact fold of weight_scale/weight_global_scale plus a nibble remap. "
-              "This checkpoint's global scale does not fold; MM-NVFP4 is refused rather than given a new format.");
+              "MM-NVFP4 experts are GGML_TYPE_NVFP4 (40) bytes: nibbles remapped to the ggml block layout and "
+              "the checkpoint's E4M3 scale bytes copied verbatim. block_nvfp4 has no global-scale field, so the "
+              "per-tensor divisor weight_global_scale is stored beside each expert tensor as "
+              "blk.N.ffn_{gate,up,down}_exps.scale, f32 [n_expert], expert order. Dequant is "
+              "e2m1 * e4m3(scale) / scale[e], bit-for-bit equal to spec A. Not readable by llama.cpp or ik_llama: "
+              "both dequantize NVFP4 without the side tensor (and neither knows this key). Strata engine only.");
+    w.add_str("strata.expert_global_scale",
+              "blk.N.ffn_{gate,up,down}_exps.scale = f32 [n_expert]: weight_global_scale of that expert, a DIVISOR "
+              "(spec A.3). Applied exactly once, after the dot product.");
     w.add_str("strata.indexer_quant",
               "Indexer projections use the recipe indexer type (default Q8_0). "
               "llama.cpp's converter forces .indexer. to F32.");
@@ -2125,6 +2153,8 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
             require_importance(it, im);
             const int64_t nrows = it.ne[1] * it.ne[2];
             emit_constant(w, it.type, it.ne[0], nrows, value, im);
+        } else if (it.side_scale) {
+            emit_side_scale(w, cat, it, h);
         } else if (is_expert(it)) {
             for (int e = 0; e < h.n_expert; ++e) {
                 const std::string base = expert_base(it, e);
