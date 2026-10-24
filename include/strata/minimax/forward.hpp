@@ -82,6 +82,11 @@ struct EngineOptions {
     std::string prefill_read;       ///< "" / "auto": the OS page cache, except when --memory-limit-mib is set (the
                                     ///< budget cannot bound the page cache, so streamed experts are read unbuffered);
                                     ///< "mmap": always the page cache; "direct": always unbuffered 16 MiB reads
+    std::string prefill_vram;       ///< "reserve" (default): the P10 rule, the batched-prompt workspace is subtracted
+                                    ///< from the automatic VRAM slot budget at startup and lives for the run.
+                                    ///< "swap": size the slots as if the workspace did not exist; at the start of a
+                                    ///< prompt free the slots it needs, and at the end free the workspace and
+                                    ///< re-allocate exactly the slots it took, so decode keeps the decode-only count.
     // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
