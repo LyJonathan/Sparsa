@@ -54,6 +54,17 @@ struct EngineOptions {
     std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
     std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
     std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
+
+    // ---- P5a: batched prefill.  0 keeps the token path (byte-identical to P4); a positive value is the maximum
+    // prompt tokens processed per layer in one batched pass.  The prompt is then walked in chunks of that size.
+    int prefill_batch = 0;
+    std::string prefill_experts;    ///< "auto" (chunk size decides), "cpu" or "gpu": where a batched chunk's routed
+                                    ///< experts are computed
+    std::string prefill_dense;      ///< "f32" (default: fp32 cuBLAS, matches the per-token GPU GEMV) or "f16"
+    std::string prefill_read;       ///< "mmap" (default: the OS page cache, best when the expert set fits in RAM) or
+                                    ///< "direct" (unbuffered 16 MiB reads, for a set larger than RAM)
+    // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
+    int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
 };
 
 struct SampleParams {

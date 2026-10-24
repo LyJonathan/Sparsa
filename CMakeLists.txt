@@ -809,7 +809,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                              PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_minimax PUBLIC strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
-                        PRIVATE strata_warnings)
+                        PRIVATE strata_warnings ${_strata_gpu_blas_target})
   add_executable(strata-minimax src/minimax/minimax_main.cpp)
   strata_utf8_manifest(strata-minimax)
   target_link_libraries(strata-minimax PRIVATE strata_minimax ${_strata_gpu_runtime_target})
