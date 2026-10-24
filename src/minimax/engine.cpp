@@ -6220,9 +6220,6 @@ struct Engine::Impl {
         n_past = 0;
         held.clear();
         have_logits = false;
-        img_row.clear();
-        img_data.clear();
-        img_rows = 0;
     }
 
     int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
