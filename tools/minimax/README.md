@@ -246,3 +246,102 @@ Measured on the synthetic runnable model (4 layers, 200 tokens, 25 indexer block
 `python -m pytest tools/minimax/test_p4.py -q` runs those, plus an `auto` split that checks the reported
 boundary; the two-GPU cases skip on a one-card machine.
 
+
+## Batched prefill (P5a)
+
+The prompt no longer walks the decode path. `--minimax-prefill-batch N` processes `N` prompt tokens per layer pass
+(0, the default, keeps the token path and is byte-identical to P4):
+
+```powershell
+build\strata-minimax.exe --model m.gguf --serve --gpus 1 --minimax-kv vram `
+  --minimax-prefill-batch 4096 --minimax-prefill-experts gpu
+```
+
+Per chunk and layer:
+
+- Dense projections are one batched GEMM per weight matrix, not one GEMV per token: the weight tile is
+  dequantized once and multiplied against every token with cuBLAS. `--minimax-prefill-dense f32` (the default)
+  dequantizes the tile to fp32 (SGEMM) so the result matches the per-token GPU GEMV; `f16` halves the weight
+  traffic and the GEMM time at ~10^-3 relative accuracy.
+- MSA is batched: the indexer block scores are one device kernel over the whole chunk (one block per query token,
+  indexer head and 128-token block), the top-k block choice stays on the host (one row per query, as in decode),
+  and `msa_attn_batch` attends each query over its selected blocks straight out of the fp16 KV cache (no per-query
+  gather), with the scaled scores, causal clamp and softmax of the token path. KV for the chunk is written to the
+  cache in one copy per layer.
+- Routed experts are grouped: the chunk's `N x top` route entries are sorted by expert, so each expert's bytes are
+  read **once per chunk** instead of once per token. With `--minimax-prefill-experts gpu` a non-resident expert is
+  streamed over PCIe into a ring slot on the owning card, then its gate/up and down run as batched products over the
+  tokens that route to it (the int8 `iq_mmvq` kernel for IQ2_XS/Q8_0/Q2_0/IQ4_NL/NVFP4, or dequantize-to-fp32 +
+  cuBLAS for F32/F16/BF16 and the mixed IQ2_XS-gate/F32-down files). MM-NVFP4's per-expert `blk.N.ffn_*_exps.scale`
+  divisors are applied to the gate/up rows before `swigluoai` and to the down output, exactly as the token path.
+  `--minimax-prefill-experts cpu` runs the same grouping through the ggml CPU dot products.
+- The gate, up and down of the shared expert, the dense MLP layers and `lm_head` use the same batched projection
+  helper; `lm_head` is tiled by output rows (4096 at a time) so the 200 K vocabulary never needs a full device buffer.
+- `--minimax-prefill-batch` also shrinks itself to what each card's free VRAM can hold after dense weights, KV and
+  the reserve; the chosen size is printed (`INFO minimax-prefill batch=... experts=...`). Chunks of 512-8192 are
+  the useful range: at 4 K every one of the 128 experts of a layer is routed, so the expert bytes stop growing per
+  token and the PCIe stream becomes the floor.
+
+Decode overlap (P5b, on by default where it can be measured): the VRAM-tier experts of a token are launched on a
+side stream and the CPU/RAM/SSD experts are computed on the pool while the GPU works; the two are joined before the
+combine. `--minimax-expert-prefetch N` additionally applies layer `l+1`'s router to layer `l`'s output (which *is*
+`l+1`'s input, so the routes are exact) and copies up to `N` of that layer's missing experts into **free** VRAM
+slots on the side stream while layer `l` finishes. It only fills empty slots (never evicts) and it is opt-in,
+because a card behind a narrow PCIe link should not be sent expert traffic.
+
+Measured on the synthetic runnable model (4 layers, 200 tokens, 25 indexer blocks of 8, top-16). "token" is the P4
+path on the same file and placement:
+
+| case | max abs | median row | KL | top-1 |
+|---|---|---|---|---|
+| batch vs token, all-CPU placement | 0 (1e-7 float32 floor) | 1e-7 | 3e-9 | 1.000 |
+| batch vs token, GPU dense+MSA, CPU experts (F32 experts) | 6.1e-2 | 8.3e-4 | 1.2e-6 | 1.000 |
+| batch vs token, GPU grouped experts, IQ2_XS gate/up + F32 down | 5.5e-2 | 1.1e-2 | 9.4e-6 | 0.985 |
+| decode with vs without `--minimax-expert-prefetch 2` | 9.5e-7 | 2.4e-7 | 0 | 1.000 |
+
+The max-abs column is dominated by the handful of rows where the router's 4th expert flips - the same effect P4
+measured on the real checkpoint (its 4th/5th-place ties). `--minimax-prefill-dense f16` is measurably coarser
+(2.4e-2 relative on this file) and is not the default.
+
+`python -m pytest tools/minimax/test_p5a.py -q` runs the table, plus an end-to-end serve check that the greedy
+continuation after a 40-token prompt is identical with and without `--minimax-prefill-batch`.
+
+### Real weights: a 15-layer slice of MiniMax-M3.1-Flash
+
+No complete local IQ2_XS pack existed (the D3 upload has 3 of 13 shards, and the full 133 GB does not fit next to
+the 111 GB free), so the measurement uses a truncated GGUF built from the local checkpoint with
+`strata-mm-quant --layers 0..14` (layers 0-2 dense + 12 MoE layers, IQ2_XS experts + a Q8_0 dense path, 30.7 GB).
+It is a real-weight slice, not the full model: the per-token expert bytes are 12/57 of the real set, so decode
+scales down by ~4.7x on the full model and prefill's PCIe/DFS term by ~4.75x.
+
+**The machine was loaded during these runs** (another task held 99 GB of RAM, GPU0 was at ~30 % and both cards had
+7-9 GB in use), so page cache was scarce and every expert read came from the NVMe. Numbers, RTX 5070 (GPU1,
+Gen2 x16 idle -> Gen4 x16), 16 CPU threads, `--max-context 8192`, random 200 K-vocabulary ids:
+
+| prompt | engine `--minimax-prefill-batch 4096` | engine token path | llama.cpp `-ot exps=CPU` |
+| ---: | ---: | ---: | ---: |
+| 512 | 62.4 tok/s (TTFT 8.2 s) | 3.8 tok/s (TTFT 133 s) | 208.8 tok/s (pp512) |
+| 2048 | 115.5 tok/s (TTFT 17.7 s) | — (extrapolates to ~9) | — |
+| 4096 | 117.8 tok/s (TTFT 34.8 s) | — | — |
+| decode, 32 new | 4.2-4.3 tok/s | 4.9 tok/s | 23.1 tok/s (tg32) |
+
+What the numbers say, honestly:
+
+- Batching is worth **16x at 512 prompt tokens** on the same file. The gap grows with prompt length (the token path
+  pays the full 786 MB of experts per token; the batched path pays it once per chunk), but this slice is small
+  enough that llama.cpp's MMQ CPU path with a warm page cache still wins prefill on a *loaded* box.
+- Our CPU expert kernels are the bottleneck for decode: the engine uses ggml's per-row `vec_dot` (P2), llama.cpp
+  uses its int8 MMQ/multi-row kernels, and that is a ~5x difference here. Porting `src/kernels/cpu/iq_avx2.cpp`'s
+  multi-row IQ2_XS kernel into the P5b pool is the single biggest remaining decode item (SPEED_RESEARCH item 10).
+- `STRATA_MM_TIME=1` prints a per-layer `attn`/`ffn` breakdown on stderr. On the slice at 2048 tokens the batched
+  MSA kernel is ~0.38 s/layer (about 60 % of the layer) against ~30 ms of cuBLAS projections and 150 ms of
+  host-side norm/rope/fp16 work; a KV-head-tiled flash-style kernel is the next prefill item.
+
+## Not in this phase (P5b/P6)
+
+CUDA graphs for the per-layer decode work (the engine still round-trips the host for the MSA top-k and the combine,
+so a graph would have to be split around those), overlapping the expert streaming copy with the previous expert's
+compute inside a chunk (the ring is one slot: copy, compute, repeat), a measured CPU/GPU cost model per chunk (the
+switch is `--minimax-prefill-experts`, not automatic yet), the AVX2 multi-row IQ2_XS CPU kernel, and an MSA kernel
+that tiles KV heads across more than four query heads.
+
