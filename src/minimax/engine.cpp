@@ -3634,6 +3634,22 @@ struct Engine::Impl {
         if (prefill_gpu_experts && devs.empty()) {
             prefill_gpu_experts = false;
         }
+        // The device dequant path (iq_mmvq) has no kernel for the expert formats ported from ik_llama.cpp.
+        // In `auto` (the default) a model made of them computes its experts on the CPU, the path the G3 runs
+        // use, instead of failing the first batched chunk with "iq_mmvq: type 164 is not supported".  An
+        // explicit `gpu` still asks for the device and fails with that message.
+        bool ikq_experts = false;
+        if (prefill_gpu_experts && opt.prefill_experts != "gpu") {
+            for (const Layer& L : layers) {
+                if (L.moe && (strata::kernels::ikq::is_iqk_type(L.egate.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.eup.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.edown.type))) {
+                    ikq_experts = true;
+                    prefill_gpu_experts = false;
+                    break;
+                }
+            }
+        }
         if (max_expert_bytes == 0)
             for (const Layer& L : layers)
                 if (L.moe && L.expert_bytes > max_expert_bytes) max_expert_bytes = L.expert_bytes;
@@ -3765,6 +3781,9 @@ struct Engine::Impl {
         pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
         std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s\n", batch_cap,
                      prefill_gpu_experts ? "gpu" : "cpu");
+        if (ikq_experts)
+            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
+                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
@@ -3827,6 +3846,30 @@ struct Engine::Impl {
     // The same projection on the CPU: every weight row is read once and dotted with all T activations.
     void gemm_cpu_base(const Tensor& t, const uint8_t* base, const float* X, int T, int ldx, float* Y, int ldy) {
         const int N = (int)t.ne1, K = (int)t.ne0;
+        if (strata::kernels::ikq::is_iqk_type(t.type)) {
+            // The ported ik_llama.cpp formats have no ggml type id, so their batched projection uses the
+            // engine's own codec, exactly as `dot_rows_base` does one row at a time.  Without this branch a
+            // batched prefill of an IQ2_KL / IQ2_KT / IQ3_K / IQ4_KS model fails with "ggml-cpu has no
+            // vec_dot for type 164" (type 164 is IQ2_KL) before a single token runs.
+            if ((K % 256) != 0) {
+                fail(t.name + ": " + strata::kernels::ikq::type_name(t.type) +
+                     " needs a width that is a whole number of 256-value blocks");
+            }
+            const ggml_type_traits_cpu* act = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+            if (!act || !act->from_float) fail(t.name + ": no from_float for the q8_K activation");
+            const size_t act_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+            std::vector<uint8_t> aq(act_bytes * (size_t)T);
+            for (int c = 0; c < T; ++c) act->from_float(X + (size_t)c * ldx, aq.data() + (size_t)c * act_bytes, K);
+            pool.run(N, [&](int a, int b) {
+                for (int r = a; r < b; ++r) {
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
+                    for (int c = 0; c < T; ++c)
+                        Y[(size_t)c * ldy + r] = strata::kernels::ikq::dot_row(
+                            t.type, row, aq.data() + (size_t)c * act_bytes, K);
+                }
+            });
+            return;
+        }
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
             pool.run(N, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {

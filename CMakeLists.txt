@@ -1662,6 +1662,12 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    # the formats ported from ik_llama.cpp: the MSVC branch above compiles this file with /arch:AVX2, so on GCC
+    # the same AVX2 codec is selected only when the build's ISA floor is AVX2 (the default). An older-CPU build
+    # (STRATA_ISA_FLOOR) keeps the scalar codec it has today.
+    if(NOT STRATA_ISA_FLOOR)
+      set_source_files_properties(src/kernels/cpu/iqk_quants.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    endif()
     # the trellis kernels: AVX2 + FMA, and AVX-512 F/BW/VL/VBMI/VNNI (exactly what cpu_avx512_ok() checks)
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
