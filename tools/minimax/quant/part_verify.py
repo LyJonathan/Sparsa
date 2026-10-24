@@ -5,13 +5,14 @@ Reads the GGUF header itself (no ggml, no gguf-py) and reports, in this order:
 
   header   magic, version, tensor count, key metadata count
   split    split.no / split.count / split.tensors.count against the part asked for
-  experts  every routed-expert tensor is the tier's type, and there are 3 per MoE layer
+  experts  every routed-expert tensor is the tier's type (ffn_down_exps may be one step up,
+           --expert-down), and there are 3 per MoE layer
   size     the file is exactly data_offset + the last tensor's end (nothing truncated, nothing appended)
   sha256   the whole file
 
 Exit code 0 means every check passed. Any failure prints FAIL with the reason and exits 1.
 
-  part_verify.py --gguf FILE --part K --count N --expert IQ3_K [--json]
+  part_verify.py --gguf FILE --part K --count N --expert IQ3_K [--expert-down IQ1_M] [--json]
 """
 
 import argparse
@@ -34,7 +35,9 @@ TYPES = {
     17: ("iq2_xs", 256, 74, 0),
     18: ("iq3_xxs", 256, 98, 0),
     19: ("iq1_s", 256, 50, 0),
-    20: ("iq2_s", 256, 82, 0),
+    20: ("iq4_nl", 32, 18, 0),
+    22: ("iq2_s", 256, 82, 0),
+    29: ("iq1_m", 256, 56, 0),
     30: ("bf16", 1, 2, 0),
     40: ("nvfp4", 64, 36, 0),
     160: ("IQ2_KT", 256, 68, 4),
@@ -44,7 +47,7 @@ TYPES = {
     164: ("IQ2_KL", 256, 86, 2),
 }
 
-TYPE_ID = {v[0]: k for k, v in TYPES.items()}
+TYPE_ID = {v[0].upper(): k for k, v in TYPES.items()}
 TYPE_ID.update({"IQ2_KT": 160, "IQ3_K": 161, "IQ4_KS": 162, "IQ3_KT": 163, "IQ2_KL": 164, "NVFP4": 40})
 
 SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
@@ -72,14 +75,23 @@ def main():
     ap.add_argument("--part", type=int, required=True, help="zero-based part index")
     ap.add_argument("--count", type=int, required=True)
     ap.add_argument("--expert", required=True, help="expert type name of the tier, e.g. IQ3_K or NVFP4")
+    ap.add_argument("--expert-down", default="",
+                    help="type of ffn_down_exps when the recipe steps it up, e.g. IQ1_M; "
+                         "default is the same as --expert")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
-    want_expert = TYPE_ID.get(a.expert)
+    want_expert = TYPE_ID.get(a.expert.upper())
     if want_expert is None:
         raise SystemExit("unknown expert type " + a.expert)
+    want_down = want_expert
+    if a.expert_down:
+        want_down = TYPE_ID.get(a.expert_down.upper())
+        if want_down is None:
+            raise SystemExit("unknown down expert type " + a.expert_down)
     fails = []
-    info = {"file": a.gguf, "part": a.part, "count": a.count, "expert": a.expert}
+    info = {"file": a.gguf, "part": a.part, "count": a.count, "expert": a.expert,
+            "expert_down": a.expert_down or a.expert}
 
     with open(a.gguf, "rb") as f:
         magic = need(f, 4)
@@ -185,11 +197,12 @@ def main():
 
     expert_names = [t for t in tensors if t[0].endswith(("ffn_gate_exps.weight", "ffn_up_exps.weight",
                                                          "ffn_down_exps.weight"))]
-    bad = [(n, t) for n, t, _o, _b in expert_names if t != want_expert]
+    bad = [(n, t) for n, t, _o, _b in expert_names
+           if t != (want_down if n.endswith("ffn_down_exps.weight") else want_expert)]
     info["expert_tensors"] = len(expert_names)
     info["expert_types"] = sorted({TYPES.get(t, (str(t),))[0] for _n, t, _o, _b in expert_names})
     if bad:
-        fails.append("%d expert tensors are not %s: %s" % (len(bad), a.expert, bad[:3]))
+        fails.append("%d expert tensors are not %s/%s: %s" % (len(bad), a.expert, info["expert_down"], bad[:3]))
     if not expert_names:
         fails.append("no expert tensors in this part")
 
@@ -210,8 +223,9 @@ def main():
         print("split   %s  no=%r count=%r tensors.count=%r" %
               ("ok" if not [x for x in fails if x.startswith("split")] else "FAIL",
                info["split_no"], info["split_count"], info["split_tensors_count"]))
-        print("experts %s  %d tensors  types=%s  want=%s" %
-              ("ok" if not bad else "FAIL", len(expert_names), ",".join(info["expert_types"]), a.expert))
+        print("experts %s  %d tensors  types=%s  want=%s/%s" %
+              ("ok" if not bad else "FAIL", len(expert_names), ",".join(info["expert_types"]),
+               a.expert, info["expert_down"]))
         print("size    %s  %d bytes (header %d)" %
               ("ok" if actual == expected else "FAIL", actual, expected))
         print("sha256  %s" % info["sha256"])

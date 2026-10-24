@@ -8,6 +8,13 @@ The four tiers this drives are the ik_llama.cpp ports and the lossless NVFP4 cop
     IQ2_KL  152.7 GB, 164
     NVFP4   246.1 GB, 40 (GGML_TYPE_NVFP4, experts verbatim plus a per-expert f32 divisor)
 
+and the four small tiers, mainline ggml types only:
+
+    IQ2_KT   123.8 GB, experts IQ2_KT (id 160, Sparsa only)
+    IQ2_XXS  124.5 GB, gate/up IQ2_XXS, ffn_down_exps IQ2_XS
+    IQ1_M    106.6 GB, gate/up IQ1_M, ffn_down_exps IQ2_XXS, Q6_K side
+    IQ1_S     94.8 GB, gate/up IQ1_S, ffn_down_exps IQ1_M, Q6_K side
+
 Every part is one contiguous layer range and the part index is fixed, so the parts from
 different machines concatenate in layer order. Part 0 carries the KV metadata and the
 globals; later parts carry only split.no / split.count / split.tensors.count.
@@ -44,6 +51,14 @@ TIERS = {
     "IQ4_KS": {"recipe": "MM-IQ4_KS", "expert": "IQ4_KS", "gb": 233.547, "imatrix": True},
     "IQ2_KL": {"recipe": "MM-IQ2_KL", "expert": "IQ2_KL", "gb": 152.680, "imatrix": True},
     "NVFP4": {"recipe": "MM-NVFP4", "expert": "NVFP4", "gb": 246.098, "imatrix": False},
+    # small tiers; every one of these needs the importance matrix
+    "IQ2_KT": {"recipe": "MM-IQ2_KT", "expert": "IQ2_KT", "gb": 123.811, "imatrix": True},
+    "IQ2_XXS": {"recipe": "MM-IQ2_XXS", "expert": "IQ2_XXS", "down": "IQ2_XS",
+                "gb": 124.528, "imatrix": True},
+    "IQ1_M": {"recipe": "MM-IQ1_M-MIX", "expert": "IQ1_M", "down": "IQ2_XXS",
+              "gb": 106.611, "imatrix": True},
+    "IQ1_S": {"recipe": "MM-IQ1_S-MIX", "expert": "IQ1_S", "down": "IQ1_M",
+              "gb": 94.777, "imatrix": True},
 }
 
 SPLIT_COUNT = 13
@@ -68,11 +83,17 @@ PARTS = (
 )
 
 # Measured logical-f32 GB/s for the routed experts, `--bench` on layer 3, 8 experts of w1.
+# A machine with no entry is left out of the plan rather than given an invented rate.
 GBPS = {
     "IQ3_K": {"rig-2": 1.009, "rig-3": 0.720},
     "IQ4_KS": {"rig-2": 0.685, "rig-3": 0.439},
     "IQ2_KL": {"rig-2": 0.352, "rig-3": 0.220},
     "NVFP4": {"rig-2": 3.108, "rig-3": 2.031},
+    # rig-3, 16 threads, 2026-10-24
+    "IQ2_KT": {"rig-3": 0.047},
+    "IQ2_XXS": {"rig-3": 0.104},
+    "IQ1_M": {"rig-3": 0.064},
+    "IQ1_S": {"rig-3": 0.062},
 }
 GBPS_NOTE = {
     "rig-2": "Ryzen 9 5900X, 24 threads, measured",
@@ -135,7 +156,10 @@ def projected_gb(tier, lo, hi):
 
 def minutes_for(tier, machine, lo, hi):
     moe = moe_count(lo, hi)
-    return moe * (EXPERT_F32_GB / 57) / GBPS[tier][machine] / 60.0
+    rate = GBPS[tier].get(machine)
+    if not rate:
+        return None
+    return moe * (EXPERT_F32_GB / 57) / rate / 60.0
 
 
 def plan_text(tier):
@@ -150,18 +174,24 @@ def plan_text(tier):
                  "rig-3 streams the shards a part needs from Hugging Face and deletes them after.")
     lines.append("")
     lines.append("part  %-52s  machine  layers   MoE   GB    minutes" % "file")
-    totals = {m: {"moe": 0, "min": 0.0, "gb": 0.0} for m in GBPS[tier]}
+    totals = {m: {"moe": 0, "min": 0.0, "gb": 0.0} for m in ("rig-2", "rig-3")}
     for part, machine, lo, hi in rows:
         moe = moe_count(lo, hi)
         minutes = minutes_for(tier, machine, lo, hi)
         gb = projected_gb(tier, lo, hi)
         totals[machine]["moe"] += moe
-        totals[machine]["min"] += minutes
+        if minutes is not None:
+            totals[machine]["min"] += minutes
         totals[machine]["gb"] += gb
-        lines.append("%4d  %-52s  %-6s  %2d-%-2d  %3d  %5.1f  %7.1f" % (
-            part, part_name(tier, part), machine, lo, hi, moe, gb, minutes))
+        lines.append("%4d  %-52s  %-6s  %2d-%-2d  %3d  %5.1f  %7s" % (
+            part, part_name(tier, part), machine, lo, hi, moe, gb,
+            "-" if minutes is None else "%.1f" % minutes))
     lines.append("")
     for machine in ("rig-2", "rig-3"):
+        if not GBPS[tier].get(machine):
+            lines.append("%-6s  %2d MoE layers  %5.1f GB  no measured rate" % (
+                machine, totals[machine]["moe"], totals[machine]["gb"]))
+            continue
         lines.append("%-6s  %2d MoE layers  %5.1f GB  %5.1f min quant  (%.3f GB/s logical f32, %s)" % (
             machine, totals[machine]["moe"], totals[machine]["gb"], totals[machine]["min"],
             GBPS[tier][machine], GBPS_NOTE[machine]))
@@ -207,7 +237,9 @@ def main():
     ap = argparse.ArgumentParser(description="Run one machine's parts of one MiniMax tier")
     ap.add_argument("--tier", required=True, choices=sorted(TIERS))
     ap.add_argument("--machine", choices=("rig-2", "rig-3"))
-    ap.add_argument("--parts", default="", help="comma-separated part indices; default every part of this machine")
+    ap.add_argument("--parts", default="",
+                    help="comma-separated part indices, or 'all' for every part on one machine; "
+                         "default every part this machine owns in PARTS")
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-local", action="store_true", help="do not delete a part after it is verified on HF")
@@ -231,7 +263,9 @@ def main():
     log = open(log_path, "a", encoding="utf-8", buffering=1)
 
     order = [p for p, m, _lo, _hi in PARTS if m == args.machine]
-    if args.parts:
+    if args.parts == "all":
+        order = [p for p, _m, _lo, _hi in PARTS]
+    elif args.parts:
         order = [int(x) for x in args.parts.split(",")]
     rows = {p: (lo, hi) for p, _m, lo, hi in PARTS}
 
@@ -281,6 +315,8 @@ def main():
         cmd = [sys.executable, os.path.join(c["quant_dir"], "part_verify.py"),
                "--gguf", path, "--part", str(part), "--count", str(SPLIT_COUNT),
                "--expert", t["expert"], "--json"]
+        if t.get("down"):
+            cmd.extend(["--expert-down", t["down"]])
         log.flush()
         proc = subprocess.run(cmd, capture_output=True, text=True)
         log.write(proc.stdout.strip() + "\n")
