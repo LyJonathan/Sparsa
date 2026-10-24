@@ -48,6 +48,7 @@ struct EngineOptions {
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
+    bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 
     // ---- parity probes (P4).  Both are opt-in and add nothing to a normal run.
     std::string dump_dir;           ///< write per-layer activations as npy files here (empty: off)

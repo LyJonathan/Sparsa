@@ -50,6 +50,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>   // STRATA_LANE_PF's _mm_prefetch
+#endif
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -742,6 +745,7 @@ struct Engine::Impl {
         void* side = nullptr;
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
         void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
+        void* prof_ev[2] = {nullptr, nullptr};   // P8: timing events around the expert side stream
     };
     std::vector<Work> work;          // one entry per device in `devs`
     Work& W() { return work[(size_t)cur]; }
@@ -908,6 +912,70 @@ struct Engine::Impl {
     int64_t tokens_seen = 0;
     int64_t profile_saves = 0;
 
+    // ---- P8: --minimax-profile-time.  One decode token's wall time, split by the phase that spent it, on stderr
+    // after every token; `stats()` prints the mean of the run.  Every timer is a steady_clock pair around work that
+    // already exists, and with the flag off only a `bool` is tested per phase, so the default path is unchanged.
+    // `cpu_*` are the CPU lane's own passes (so the 20 GB/s question has a numerator and a denominator),
+    // `gpu_stream` is the DEVICE-busy time of the expert side stream between two timing events and `gpu_finish` the
+    // host time blocked on it: the pair separates "the card was slow" from "the card was idle".
+    struct Prof {
+        double embed = 0, attn = 0, attn_idx_sync = 0, attn_sync = 0, router = 0, pick = 0, gpu_begin = 0,
+               cpu_ram = 0, ssd_wait = 0, cpu_ssd = 0, gpu_finish = 0, combine = 0, shared = 0, admit = 0,
+               prefetch = 0, lm_head = 0, total = 0;
+        double cpu_bytes = 0, ssd_bytes = 0, gpu_stream = 0;
+        int64_t cpu_experts = 0, gpu_experts = 0, ram_experts = 0, ssd_experts = 0;
+    };
+    Prof prof, prof_sum;
+    int64_t prof_tokens = 0;
+    static double pms(std::chrono::steady_clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    }
+    static void prof_acc(Prof& a, const Prof& b) {
+        a.embed += b.embed; a.attn += b.attn; a.attn_idx_sync += b.attn_idx_sync; a.attn_sync += b.attn_sync;
+        a.router += b.router; a.pick += b.pick; a.gpu_begin += b.gpu_begin; a.cpu_ram += b.cpu_ram;
+        a.ssd_wait += b.ssd_wait; a.cpu_ssd += b.cpu_ssd; a.gpu_finish += b.gpu_finish; a.combine += b.combine;
+        a.shared += b.shared; a.admit += b.admit; a.prefetch += b.prefetch; a.lm_head += b.lm_head;
+        a.total += b.total; a.cpu_bytes += b.cpu_bytes; a.ssd_bytes += b.ssd_bytes; a.gpu_stream += b.gpu_stream;
+        a.cpu_experts += b.cpu_experts; a.gpu_experts += b.gpu_experts; a.ram_experts += b.ram_experts;
+        a.ssd_experts += b.ssd_experts;
+    }
+    // The phases that are timed, added up.  `other` is whatever the clock did not see (a float comparison, a loop
+    // the phases do not name): if it is large, a timer is missing, not work.
+    static std::string prof_line(const Prof& p, int64_t idx) {
+        const double named = p.embed + p.attn + p.router + p.pick + p.gpu_begin + p.cpu_ram + p.ssd_wait + p.cpu_ssd +
+                             p.gpu_finish + p.combine + p.shared + p.admit + p.prefetch + p.lm_head;
+        // bytes/ms -> GB/s, both from this token's own counters.
+        const double gbs = p.cpu_ram + p.cpu_ssd > 0 ? p.cpu_bytes / (p.cpu_ram + p.cpu_ssd) / 1.0e6 : 0.0;
+        char buf[1024];
+        std::snprintf(buf, sizeof(buf),
+                      "INFO minimax-profile token=%lld total=%.1f embed=%.2f attn=%.1f idx_sync=%.1f msa_sync=%.1f "
+                      "router=%.1f pick=%.1f gpu_begin=%.2f cpu_ram=%.1f ssd_wait=%.1f cpu_ssd=%.1f gpu_finish=%.1f "
+                      "gpu_stream=%.1f combine=%.1f shared=%.1f admit=%.1f prefetch=%.1f lm_head=%.1f other=%.1f "
+                      "cpu_exp=%lld cpu_gbs=%.1f ssd_exp=%lld",
+                      (long long)idx, p.total, p.embed, p.attn, p.attn_idx_sync, p.attn_sync, p.router, p.pick,
+                      p.gpu_begin, p.cpu_ram, p.ssd_wait, p.cpu_ssd, p.gpu_finish, p.gpu_stream, p.combine,
+                      p.shared, p.admit, p.prefetch, p.lm_head, p.total - named, (long long)p.cpu_experts, gbs,
+                      (long long)p.ssd_experts);
+        return std::string(buf);
+    }
+    static Prof prof_mean(const Prof& s, int64_t n) {
+        Prof m;
+        if (n <= 0) return m;
+        const double d = (double)n;
+        m.embed = s.embed / d; m.attn = s.attn / d; m.attn_idx_sync = s.attn_idx_sync / d;
+        m.attn_sync = s.attn_sync / d; m.router = s.router / d; m.pick = s.pick / d; m.gpu_begin = s.gpu_begin / d;
+        m.cpu_ram = s.cpu_ram / d; m.ssd_wait = s.ssd_wait / d; m.cpu_ssd = s.cpu_ssd / d;
+        m.gpu_finish = s.gpu_finish / d; m.combine = s.combine / d; m.shared = s.shared / d; m.admit = s.admit / d;
+        m.prefetch = s.prefetch / d; m.lm_head = s.lm_head / d; m.total = s.total / d;
+        m.gpu_stream = s.gpu_stream / d;
+        m.cpu_bytes = s.cpu_bytes / d; m.ssd_bytes = s.ssd_bytes / d;
+        m.cpu_experts = (int64_t)std::llround((double)s.cpu_experts / d);
+        m.gpu_experts = (int64_t)std::llround((double)s.gpu_experts / d);
+        m.ram_experts = (int64_t)std::llround((double)s.ram_experts / d);
+        m.ssd_experts = (int64_t)std::llround((double)s.ssd_experts / d);
+        return m;
+    }
+
     // P5c: --minimax-expert-skip.  Drop a routed expert whose RENORMALIZED weight is below `expert_skip` and
     // renormalize what is left, so the routed sum keeps its scale.  Returns the number kept; a route whose every
     // weight is below the threshold keeps everything rather than produce a zero vector.
@@ -1029,6 +1097,11 @@ struct Engine::Impl {
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
         graphs_on = opt.graphs != "off";
+        if (const char* pf = std::getenv("STRATA_LANE_PF")) {
+            lane_pf = std::atoi(pf);
+            if (lane_pf < 0) lane_pf = 0;
+            if (lane_pf > 0) std::fprintf(stderr, "INFO minimax-lane-prefetch rows=%d\n", lane_pf);
+        }
         if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
         if (expert_skip > 0.f)
             std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
@@ -2621,6 +2694,65 @@ struct Engine::Impl {
         L.ram_tick[(size_t)victim] = ++lru_tick;
     }
 
+    // An SSD-tier route whose bytes are in a staging slot now, to be admitted into the RAM tier after the layer.
+    struct SsdAdmit {
+        int e;
+        const uint8_t* g;
+        const uint8_t* u;
+        const uint8_t* d;
+    };
+
+    // P8: a whole layer's admissions in one parallel copy.  `ram_admit3` moves 17.4 MB on the calling thread for
+    // every SSD miss, and on the 15-layer slice that is 16-60 ms a token (--minimax-profile-time, `admit=`), which
+    // sat between two layers with nothing to hide behind.  The victim choice is still serial and LRU; only the
+    // memcpys are spread, in ~1 MiB pieces (the same shape as `fill_ram_static`).  A slot picked by an earlier
+    // admission of the same layer is skipped, so two copies never land on the same bytes.
+    void ram_admit_many(Layer& L, const std::vector<SsdAdmit>& list) {
+        if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0 || list.empty()) return;
+        struct Piece {
+            const uint8_t* src;
+            uint8_t* dst;
+            size_t len;
+        };
+        std::vector<Piece> pieces;
+        pieces.reserve(list.size() * 12);
+        std::vector<int> used;
+        used.reserve(list.size());
+        std::vector<std::pair<int, int>> placed;   // (expert, slot)
+        placed.reserve(list.size());
+        const size_t kPiece = (size_t)1 << 20;
+        for (const SsdAdmit& a : list) {
+            if (L.ram_of[(size_t)a.e] >= 0) continue;   // one route of this layer already admitted it
+            int victim = -1;
+            for (int s = 0; s < L.ram_n; ++s) {
+                if (std::find(used.begin(), used.end(), s) != used.end()) continue;
+                if (victim < 0 || L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
+            }
+            if (victim < 0) break;
+            used.push_back(victim);
+            uint8_t* p = ram_slot_ptr(L, victim);
+            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+            const uint8_t* src[3] = {a.g, a.u, a.d};
+            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+            for (int r = 0; r < 3; ++r)
+                for (size_t at = 0; at < len[r]; at += kPiece)
+                    pieces.push_back({src[r] + at, p + off[r] + at, std::min(kPiece, len[r] - at)});
+            placed.push_back({a.e, victim});
+        }
+        if (pieces.empty()) return;
+        pool.run((int)pieces.size(), [&](int x, int y) {
+            for (int i = x; i < y; ++i)
+                std::memcpy(pieces[(size_t)i].dst, pieces[(size_t)i].src, pieces[(size_t)i].len);
+        });
+        for (const auto& pr : placed) {
+            for (int32_t& v : L.ram_of)
+                if (v == pr.second) v = kNotResident;
+            L.ram_of[(size_t)pr.first] = pr.second;
+            L.ram_expert_of[(size_t)pr.second] = pr.first;
+            L.ram_tick[(size_t)pr.second] = ++lru_tick;
+        }
+    }
+
     void ssd_read_role(const Tensor& t, int64_t expert, uint8_t* dst) {
         const size_t len = t.bytes / (size_t)t.ne2;
         const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
@@ -2845,6 +2977,11 @@ struct Engine::Impl {
         }
         if (!w.side) w.side = cu::stream_create();
         void* st = w.side;
+        if (opt.profile_time) {
+            if (!w.prof_ev[0]) w.prof_ev[0] = cu::event_create_timed();
+            if (!w.prof_ev[1]) w.prof_ev[1] = cu::event_create_timed();
+            cu::event_record(w.prof_ev[0], st);
+        }
         h2d(w, w.x.p, in, (size_t)n_embd * sizeof(float));
         strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, n_embd, w.ex_xq.p, st);
         strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k, n_embd,
@@ -2853,12 +2990,15 @@ struct Engine::Impl {
         strata::kernels::quantize_q8_1_rows((const float*)w.ex_h.p, k, n_ff, w.ex_hq.p, st);
         strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
                                           L.edown.row_bytes, w.ex_hq.p, (float*)w.ex_out.p, st, sd);
+        if (opt.profile_time && w.prof_ev[1]) cu::event_record(w.prof_ev[1], st);
         return true;
     }
 
     void gpu_experts_finish(int k, std::vector<float>& out) {
         Work& w = W();
         cu::stream_sync(w.side);
+        if (opt.profile_time && w.prof_ev[0] && w.prof_ev[1])
+            prof.gpu_stream += cu::event_elapsed_ms(w.prof_ev[0], w.prof_ev[1]);
         out.resize((size_t)k * (size_t)cfg.n_embd);
         cu::copy_d2h(out.data(), w.ex_out.p, out.size() * sizeof(float));
     }
@@ -2905,9 +3045,23 @@ struct Engine::Impl {
         cu::copy_d2h(out.data(), w.ex_out.p, out.size() * sizeof(float));
     }
 
+    // One CPU-lane expert of the current pass: where its three matrices are, and where its [n_embd] result goes.
+    // Hoisted out of `moe_tiered` so `mlp_ptr_multi` can take a whole pass at once.
+    struct CpuExpertRef {
+        int e;
+        int j;
+        bool ssd;
+        const uint8_t* gate;
+        const uint8_t* up;
+        const uint8_t* down;
+        float* out;
+    };
+
     void moe_tiered(const Layer& L, const float* in, float* yout) {
         // The router and the combine are the CPU path's, unchanged.  Only where each selected expert's bytes come
         // from (VRAM / pinned RAM / SSD) and who computes it change.
+        const bool pt = opt.profile_time;
+        auto t_ph = std::chrono::steady_clock::now();
         const int nexp = (int)cfg.n_expert;
         const int top = (int)cfg.n_expert_used;
         std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp);
@@ -2924,7 +3078,10 @@ struct Engine::Impl {
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
         apply_expert_skip(w);
-
+        if (pt) {
+            prof.router += pms(t_ph);
+            t_ph = std::chrono::steady_clock::now();
+        }
         const int64_t li = (int64_t)(&L - layers.data());
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
         if (!usage.empty()) {
@@ -2944,12 +3101,6 @@ struct Engine::Impl {
             const uint8_t* down;
         };
         std::vector<CpuExpert> cpu;
-        struct SsdAdmit {
-            int e;
-            const uint8_t* g;
-            const uint8_t* u;
-            const uint8_t* d;
-        };
         std::vector<SsdAdmit> ssd_admits;
         gpu_e.reserve((size_t)top);
         cpu.reserve((size_t)top);
@@ -3048,17 +3199,29 @@ struct Engine::Impl {
         }
 
         // P5b: start the GPU experts on the side stream, compute the CPU ones while it runs, then join and combine.
+        if (pt) {
+            prof.pick += pms(t_ph);
+            t_ph = std::chrono::steady_clock::now();
+        }
         std::vector<float> gpu_out;
         bool gpu_async = false;
         if (!gpu_e.empty()) {
             use_device_index(L.dev);
             gpu_async = gpu_experts_begin(L, gpu_e, in);
         }
+        if (pt) {
+            prof.gpu_begin += pms(t_ph);
+            prof.gpu_experts += (int64_t)gpu_e.size();
+            t_ph = std::chrono::steady_clock::now();
+        }
         std::vector<std::vector<float>> cpu_ye((size_t)top);
+        int64_t pass_experts = 0;
         auto run_cpu_experts = [&](bool want_ssd) {
             std::vector<const CpuExpert*> cpu_of((size_t)cfg.n_expert, nullptr);
             for (const CpuExpert& c : cpu)
                 if (c.ssd == want_ssd) cpu_of[(size_t)c.e] = &c;
+            std::vector<CpuExpertRef> refs;
+            refs.reserve((size_t)top);
             for (int j = 0; j < top; ++j) {
                 if (w[(size_t)j] == 0.f) continue;
                 const int e = order[(size_t)j];
@@ -3066,22 +3229,49 @@ struct Engine::Impl {
                 const CpuExpert* c = cpu_of[(size_t)e];
                 if (!c) continue;   // an SSD expert that has not landed yet: its pass comes after the wait
                 cpu_ye[(size_t)j].resize((size_t)cfg.n_embd);
-                const float* cg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
-                const float* cu = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
-                const float* cd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
-                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, cpu_ye[(size_t)j].data(),
-                        (int)cfg.n_ff_exp, cg, cu, cd);
+                refs.push_back({c->e, j, c->ssd, c->gate, c->up, c->down, cpu_ye[(size_t)j].data()});
             }
+            // P8: the pass is one call, so its gate/up rows are one parallel region and its down rows a second --
+            // two barriers for four experts instead of twelve.
+            std::vector<const CpuExpertRef*> jobs;
+            jobs.reserve(refs.size());
+            for (const CpuExpertRef& r : refs) jobs.push_back(&r);
+            mlp_ptr_multi(L, jobs, in);
+            pass_experts += (int64_t)refs.size();
         };
         run_cpu_experts(false);
+        if (pt) {
+            prof.cpu_ram += pms(t_ph);
+            prof.ram_experts += pass_experts;
+            prof.cpu_experts += pass_experts;
+            prof.cpu_bytes += (double)pass_experts * (double)L.expert_bytes;
+            pass_experts = 0;
+            t_ph = std::chrono::steady_clock::now();
+        }
         if (ssd_n > 0) {
             // The drive has had the GPU stream and this pass's RAM experts to hide behind.
             ssd_wait_all();
+            if (pt) {
+                prof.ssd_wait += pms(t_ph);
+                t_ph = std::chrono::steady_clock::now();
+            }
             run_cpu_experts(true);
+            if (pt) {
+                prof.cpu_ssd += pms(t_ph);
+                prof.ssd_experts += pass_experts;
+                prof.cpu_experts += pass_experts;
+                prof.cpu_bytes += (double)pass_experts * (double)L.expert_bytes;
+                pass_experts = 0;
+                t_ph = std::chrono::steady_clock::now();
+            }
         }
         if (!gpu_e.empty()) {
             if (gpu_async) gpu_experts_finish((int)gpu_e.size(), gpu_out);
             else gpu_experts(L, gpu_e, in, gpu_out);
+            if (pt) {
+                prof.gpu_finish += pms(t_ph);
+                t_ph = std::chrono::steady_clock::now();
+            }
         }
 
         std::fill(yout, yout + cfg.n_embd, 0.f);
@@ -3102,11 +3292,20 @@ struct Engine::Impl {
         }
         const float s = scale_routed;
         for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= s;
+        if (pt) {
+            prof.combine += pms(t_ph);
+            t_ph = std::chrono::steady_clock::now();
+        }
         if (L.have_shared) {
             mlp(L.gate, L.up, L.down, 0, in, ye.data(), (int)L.gate.ne1);
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += ye[(size_t)i];
+            if (pt) {
+                prof.shared += pms(t_ph);
+                t_ph = std::chrono::steady_clock::now();
+            }
         }
-        for (const auto& a : ssd_admits) ram_admit3(const_cast<Layer&>(L), a.e, a.g, a.u, a.d);
+        ram_admit_many(const_cast<Layer&>(L), ssd_admits);
+        if (pt) prof.admit += pms(t_ph);
         if (ssd_prefetch && (int)li < (int)ssd_pf_n.size() && ssd_pf_n[(size_t)li] > 0) {
             ssd_pf_hit += pf_hits;
             ssd_pf_waste += ssd_pf_n[(size_t)li] - pf_hits;
@@ -3448,6 +3647,148 @@ struct Engine::Impl {
         dot_rows_base(down, db, ff_h.data(), yout, (int)down.ne1, ff);
         if (sd)
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] *= *sd;
+    }
+
+    // ---- P8: the CPU lane's row kernel, split out of `dot_rows_base` so that a whole layer's experts can be
+    // dispatched in two parallel regions instead of three regions per expert.
+    //
+    // `mlp_ptr` runs `dot_rows_base` for gate, up and down, and each of those is its own `pool.run`: with four routed
+    // experts on the CPU lane that is twelve barriers a layer, and with the pool's spin window at its default 0 every
+    // barrier after the first wakes eleven sleeping threads.  The experts of one layer share one activation, so the
+    // gate and up rows of all of them are one region and the down rows a second.  Nothing about the arithmetic
+    // changes: same rows, same kernel, same activation bytes, so the logits are bit-identical.
+    struct RowKernel {
+        int type = -1;
+        bool iqk = false;
+        int cols = 0;
+        const ggml_type_traits_cpu* act = nullptr;   // the activation format this row kernel dots against
+        ggml_vec_dot_t vec = nullptr;                // ggml's row kernel (iqk formats carry their own)
+        size_t act_bytes = 0;
+        bool raw = false;                            // F32/F16/BF16: no packed activation
+    };
+
+    RowKernel row_kernel(const Tensor& t, int cols) {
+        RowKernel k;
+        k.type = t.type;
+        k.cols = cols;
+        if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
+            k.raw = true;
+            return k;
+        }
+        if (strata::kernels::ikq::is_iqk_type(t.type)) {
+            if ((cols % 256) != 0)
+                fail(t.name + ": " + strata::kernels::ikq::type_name(t.type) +
+                     " needs a width that is a whole number of 256-value blocks");
+            k.iqk = true;
+            k.act = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        } else {
+            if (!t.cpu || !t.cpu->vec_dot)
+                fail(t.name + ": ggml-cpu has no vec_dot for type " + std::to_string(t.type));
+            k.vec = t.cpu->vec_dot;
+            k.act = ggml_get_type_traits_cpu(t.cpu->vec_dot_type);
+        }
+        if (!k.act || !k.act->from_float) fail(t.name + ": no from_float for the activation type");
+        k.act_bytes = ggml_row_size(k.iqk ? GGML_TYPE_Q8_K : t.cpu->vec_dot_type, cols);
+        return k;
+    }
+
+    inline float row_dot(const RowKernel& k, const uint8_t* row, const uint8_t* aq) {
+        if (k.iqk) return strata::kernels::ikq::dot_row(k.type, row, aq, k.cols);
+        float s = 0.f;
+        k.vec(k.cols, &s, 0, row, 0, aq, 0, 1);
+        return s;
+    }
+
+    // Everything the CPU lane needs to run a layer's experts, reused across layers and tokens so a layer allocates
+    // nothing: gate/up/hidden tiles for every routed expert on the CPU, and one activation image per matrix.
+    std::vector<float> cpu_gbuf, cpu_ubuf, cpu_hbuf;
+    std::vector<uint8_t> cpu_aq, cpu_hq;
+    // STRATA_LANE_PF=N: software-prefetch N rows ahead in the lane's row loops (0 = off, a measured probe, not a
+    // default: every thread walks its rows sequentially and the hardware prefetcher already sees that stride).
+    int lane_pf = 0;
+    static inline void prefetch_row(const void* p) {
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+        _mm_prefetch((const char*)p, _MM_HINT_T0);
+#else
+        (void)p;
+#endif
+    }
+
+    // One layer's CPU experts, two parallel regions.  `jobs` are (expert, gate/up/down bytes, out[n_embd]); the
+    // per-expert NVFP4 divisors are read from the layer, as `mlp_ptr` does.
+    void mlp_ptr_multi(const Layer& L, const std::vector<const CpuExpertRef*>& jobs, const float* in) {
+        const int n = (int)jobs.size();
+        if (n == 0) return;
+        const int ff = (int)cfg.n_ff_exp;
+        const int embd = (int)cfg.n_embd;
+        const RowKernel kg = row_kernel(L.egate, embd);
+        const RowKernel ku = row_kernel(L.eup, embd);
+        const RowKernel kd = row_kernel(L.edown, ff);
+        if (kg.raw || ku.raw || kd.raw) {
+            // F32/F16/BF16 experts: the plain per-matrix path (this is the synthetic test fixture, not the pack).
+            for (const CpuExpertRef* c : jobs)
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, c->out, ff,
+                        L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)c->e],
+                        L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)c->e],
+                        L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)c->e]);
+            return;
+        }
+        cpu_gbuf.resize((size_t)n * (size_t)ff);
+        cpu_ubuf.resize((size_t)n * (size_t)ff);
+        cpu_hbuf.resize((size_t)n * (size_t)ff);
+        cpu_aq.resize(kg.act_bytes);
+        kg.act->from_float(in, cpu_aq.data(), embd);
+        const size_t g_row = L.egate.row_bytes, u_row = L.eup.row_bytes;
+        // Region 1: every gate row and every up row of the pass, one contiguous run of rows per thread.
+        if ((int)L.egate.ne1 != ff || (int)L.eup.ne1 != ff)
+            fail("gate/up rows do not match the expert feed-forward width");
+        if (ku.act_bytes != kg.act_bytes) fail("gate and up need different activation widths");
+        pool.run(n * 2 * ff, [&](int a, int b) {
+            for (int i = a; i < b; ++i) {
+                const int j = i / (2 * ff);
+                const int k = i - j * 2 * ff;
+                const bool is_up = k >= ff;
+                const int r = is_up ? k - ff : k;
+                const CpuExpertRef* c = jobs[(size_t)j];
+                const size_t stride = is_up ? u_row : g_row;
+                const uint8_t* row = (is_up ? c->up : c->gate) + (size_t)r * stride;
+                if (lane_pf > 0) prefetch_row(row + stride * (size_t)lane_pf);
+                const RowKernel& kk = is_up ? ku : kg;
+                const float s = row_dot(kk, row, cpu_aq.data());
+                (is_up ? cpu_ubuf : cpu_gbuf)[(size_t)j * (size_t)ff + (size_t)r] = s;
+            }
+        });
+        // swigluoai and the divisors: n * ff values, ~12 K multiply-adds per expert, cheaper than a barrier.
+        for (int j = 0; j < n; ++j) {
+            const float* g = &cpu_gbuf[(size_t)j * (size_t)ff];
+            const float* u = &cpu_ubuf[(size_t)j * (size_t)ff];
+            const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)jobs[(size_t)j]->e];
+            const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)jobs[(size_t)j]->e];
+            float* h = &cpu_hbuf[(size_t)j * (size_t)ff];
+            for (int i = 0; i < ff; ++i) h[i] = swigluoai(g[i] * fg, u[i] * fu, alpha, limit);
+        }
+        // Region 2: every down row.  Each expert's hidden state needs its own activation image; the quantizer is
+        // cheap (ff values) and the rows are 6 K long.
+        cpu_hq.resize((size_t)n * kd.act_bytes);
+        for (int j = 0; j < n; ++j)
+            kd.act->from_float(&cpu_hbuf[(size_t)j * (size_t)ff], cpu_hq.data() + (size_t)j * kd.act_bytes, ff);
+        const size_t d_row = L.edown.row_bytes;
+        pool.run(n * embd, [&](int a, int b) {
+            for (int i = a; i < b; ++i) {
+                const int j = i / embd;
+                const int r = i - j * embd;
+                const CpuExpertRef* c = jobs[(size_t)j];
+                const uint8_t* row = c->down + (size_t)r * d_row;
+                if (lane_pf > 0) prefetch_row(row + d_row * (size_t)lane_pf);
+                c->out[r] = row_dot(kd, row, cpu_hq.data() + (size_t)j * kd.act_bytes);
+            }
+        });
+        for (int j = 0; j < n; ++j) {
+            if (L.edown_scale.empty()) continue;
+            const float sd = L.edown_scale[(size_t)jobs[(size_t)j]->e];
+            float* o = jobs[(size_t)j]->out;
+            for (int i = 0; i < embd; ++i) o[i] *= sd;
+        }
     }
 
     void moe(const Layer& L, const float* in, float* yout) {
@@ -3847,6 +4188,7 @@ struct Engine::Impl {
         const int64_t Tk = pos + 1;
         const int nb = (int)((Tk + BLK - 1) / BLK);
         std::vector<float> bs((size_t)HI * nb, -std::numeric_limits<float>::infinity());
+        const auto t_idx = std::chrono::steady_clock::now();
         if (L.indexer) {
             if (iqdev) {
                 cu::idx_block_scores(L.d_ik.p, Tk, iqdev, HI, (int)cfg.idx_dim, BLK, nb, (float*)w.bs.p, nullptr);
@@ -3858,6 +4200,7 @@ struct Engine::Impl {
             cu::sync();
             cu::copy_d2h(bs.data(), w.bs.p, (size_t)HI * (size_t)nb * sizeof(float));
         }
+        if (opt.profile_time) prof.attn_idx_sync += pms(t_idx);
         std::vector<int32_t> slots;
         std::vector<int> off;
         select_slots(layer, pos, bs.data(), nb, slots, off);
@@ -3909,6 +4252,7 @@ struct Engine::Impl {
                 }
             }
         }
+        const auto t_msa = std::chrono::steady_clock::now();
         if (qdev) {
             cu::msa_attn(w.kstage.p, w.vstage.p, qdev, (float*)w.att.p, H, q_per_kv, (int)max_slot,
                          (const int32_t*)w.counts.p, D, nullptr);
@@ -3919,6 +4263,7 @@ struct Engine::Impl {
         }
         cu::sync();
         cu::copy_d2h(att, w.att.p, (size_t)H * (size_t)D * sizeof(float));
+        if (opt.profile_time) prof.attn_sync += pms(t_msa);
     }
 
     void attend(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
@@ -4316,12 +4661,16 @@ struct Engine::Impl {
         tok_stats = TokenStats{};
         ssd_wait_ms = 0.0;
         decay_usage();
+        const bool pt = opt.profile_time;
+        const auto t_tok = std::chrono::steady_clock::now();
+        if (pt) prof = Prof{};
         if (!seed_h.empty()) {
             if (pos >= seed_rows) fail("--minimax-seed-hidden has only " + std::to_string(seed_rows) + " rows");
             std::memcpy(x.data(), seed_h.data() + (size_t)pos * (size_t)cfg.n_embd, (size_t)cfg.n_embd * sizeof(float));
         } else {
             decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
         }
+        if (pt) prof.embed = pms(t_tok);
 
         const bool time_on = std::getenv("STRATA_MM_TIME") != nullptr;
         using tokclock = std::chrono::steady_clock;
@@ -4557,19 +4906,34 @@ struct Engine::Impl {
                 moe(L, h.data(), proj.data());
             }
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
-            if ((prefetch_slots > 0 || ssd_prefetch) && li + 1 < cfg.n_layers) prefetch_for(li + 1);
+            if ((prefetch_slots > 0 || ssd_prefetch) && li + 1 < cfg.n_layers) {
+                const auto t_pf = std::chrono::steady_clock::now();
+                prefetch_for(li + 1);
+                if (pt) prof.prefetch += pms(t_pf);
+            }
             if (dbg) dbuf_put(pfx + "/layer_out", x.data(), (int)cfg.n_embd);
             if (time_on) {
                 const double f = ms(t_ffn);
                 std::fprintf(stderr, "INFO token-time layer=%lld attn=%.2f ffn=%.2f moe=%d\n", (long long)li,
                              ms(t_layer) - f, f, L.moe ? 1 : 0);
             }
+            if (pt)
+                prof.attn += std::chrono::duration<double, std::milli>(t_ffn - t_layer).count();
         }
 
+        const auto t_lm = std::chrono::steady_clock::now();
         rms(x.data(), out_norm.data(), h.data(), (int)cfg.n_embd, eps);
         if (output_gpu) use_device_index(layer_dev[(size_t)(cfg.n_layers - 1)]);
         gemv(output, h.data(), logit_out);
+        if (pt) prof.lm_head = pms(t_lm);
         ++n_past;
+        if (pt) {
+            prof.total = pms(t_tok);
+            prof_acc(prof_sum, prof);
+            ++prof_tokens;
+            const std::string line = prof_line(prof, prof_tokens);
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
         if (tiers_on) {
             total_stats.vram += tok_stats.vram;
             total_stats.ram += tok_stats.ram;
@@ -5400,7 +5764,7 @@ std::string Engine::describe() const {
 }
 
 std::string Engine::stats() const {
-    if (!impl_->tiers_on && impl_->total_stats.skipped == 0) return std::string();
+    if (!impl_->tiers_on && impl_->total_stats.skipped == 0 && impl_->prof_tokens == 0) return std::string();
     std::ostringstream o;
     o << "tiers=on vram_slots_per_layer=" << impl_->vram_per_layer << " ram_experts_per_layer="
       << impl_->ram_per_layer << " tokens=" << impl_->tokens_seen << " vram_hits=" << impl_->total_stats.vram
@@ -5413,6 +5777,9 @@ std::string Engine::stats() const {
         o << " route_swapped=" << (100.0 * (double)impl_->rb_swapped / (double)impl_->rb_picks)
           << "% route_weight_kept="
           << (impl_->rb_wden > 0 ? 100.0 * impl_->rb_wnum / impl_->rb_wden : 100.0) << "%";
+    if (impl_->prof_tokens > 0)
+        o << " | mean of " << impl_->prof_tokens << " tokens: "
+          << Impl::prof_line(Impl::prof_mean(impl_->prof_sum, impl_->prof_tokens), impl_->prof_tokens).substr(5);
     return o.str();
 }
 

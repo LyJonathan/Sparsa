@@ -72,6 +72,7 @@ void usage() {
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
                  "  --minimax-stats [--minimax-stats-per-layer]   tier counters on stderr\n"
+                 "  --minimax-profile-time            one line per decode token: the wall time of every phase\n"
                  "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n"
                  "  --minimax-dump-dir DIR            write per-layer activations as npy (parity probes)\n"
                  "  --minimax-dump-layers LIST|all    which source layers to dump (default all)\n"
@@ -531,7 +532,7 @@ int run(int argc, char** argv) {
     std::string profile, profile_save, routing_counts;
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
     int pool_spin_us = 0;
-    bool stats = false, stats_per_layer = false, adaptive = true;
+    bool stats = false, stats_per_layer = false, profile_time = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
@@ -611,6 +612,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ram-mode") ram_mode = next();
         else if (a == "--minimax-stats") stats = true;
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
+        else if (a == "--minimax-profile-time") profile_time = true;
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
         else if (a == "--minimax-pack-quant" || a == "--minimax-pack-iq2xs") {
             pack = true;
@@ -727,6 +729,7 @@ int run(int argc, char** argv) {
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
+    opt.profile_time = profile_time;
     opt.dump_dir = dump_dir;
     opt.dump_layers = dump_layers;
     opt.seed_hidden = seed_hidden;
@@ -865,7 +868,7 @@ int run(int argc, char** argv) {
     while (lines.pop(line)) {
         if (line == "QUIT") break;
         if (starts_with(line, "GEN ")) {
-            handle_gen(*engine, line, gate, greedy, stats);
+            handle_gen(*engine, line, gate, greedy, stats || profile_time);
             continue;
         }
         if (starts_with(line, "GENI ") || starts_with(line, "GENI")) {
