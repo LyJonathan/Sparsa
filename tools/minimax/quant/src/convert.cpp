@@ -1166,8 +1166,12 @@ Sizes sizes_of_plan(const std::vector<Item> & items) {
 
 struct Imp {
     std::unordered_map<std::string, std::vector<float>> rows;
+    // Per-expert calibration token counts, only for stacked expert tensors.
+    std::unordered_map<std::string, std::vector<float>> counts;
     std::vector<std::string> datasets;
     bool test_only = false;
+    int blended_experts = 0;
+    int empty_experts = 0;
 
     const float * at(const std::string & name, int64_t n_in, int64_t nmat, int64_t expert) const {
         const auto it = rows.find(name);
@@ -1183,6 +1187,11 @@ struct Imp {
         }
         die("imatrix length for " + name + " is " + std::to_string(v.size()) + ", expected " +
             std::to_string(n_in) + " or " + std::to_string(n_in * nmat));
+    }
+
+    const std::vector<float> * counts_of(const std::string & name) const {
+        const auto it = counts.find(name);
+        return it == counts.end() ? nullptr : &it->second;
     }
 };
 
@@ -1247,7 +1256,7 @@ void write_test_imatrix(const fs::path & path, const std::vector<Item> & items) 
     logf("WARNING: %s\n", kTestNote);
 }
 
-Imp load_imatrix(const fs::path & path) {
+Imp load_imatrix(const fs::path & path, int min_count, float blend) {
     ggml_context * gctx = nullptr;
     gguf_init_params params{};
     params.no_alloc = false;
@@ -1280,7 +1289,7 @@ Imp load_imatrix(const fs::path & path) {
         logf("WARNING: imatrix is TEST-ONLY uniform importance, not a real activation imatrix\n");
     }
     std::unordered_map<std::string, const float *> sums;
-    std::unordered_map<std::string, std::pair<const float *, int64_t>> counts;
+    std::unordered_map<std::string, std::pair<const float *, int64_t>> count_tensors;
     std::unordered_map<std::string, int64_t> sum_n;
     for (ggml_tensor * cur = ggml_get_first_tensor(gctx); cur; cur = ggml_get_next_tensor(gctx, cur)) {
         std::string name = cur->name;
@@ -1292,12 +1301,12 @@ Imp load_imatrix(const fs::path & path) {
             sum_n[name] = ggml_nelements(cur);
         } else if (name.size() > cs.size() && name.compare(name.size() - cs.size(), cs.size(), cs) == 0) {
             name.resize(name.size() - cs.size());
-            counts[name] = {static_cast<const float *>(cur->data), ggml_nelements(cur)};
+            count_tensors[name] = {static_cast<const float *>(cur->data), ggml_nelements(cur)};
         }
     }
     for (const auto & kv : sums) {
-        const auto cit = counts.find(kv.first);
-        if (cit == counts.end() || cit->second.second <= 0) {
+        const auto cit = count_tensors.find(kv.first);
+        if (cit == count_tensors.end() || cit->second.second <= 0) {
             die("imatrix missing counts for " + kv.first);
         }
         const int64_t ncounts = cit->second.second;
@@ -1316,11 +1325,67 @@ Imp load_imatrix(const fs::path & path) {
                 row[static_cast<size_t>(j * ne0 + i)] = s[j * ne0 + i] / div;
             }
         }
+        if (ncounts > 1) {
+            // Stacked expert tensor. The per-layer mean is the average of every
+            // expert row that saw at least one token.
+            std::vector<double> mean(static_cast<size_t>(ne0), 0.0);
+            int used = 0;
+            for (int64_t j = 0; j < ncounts; ++j) {
+                if (!(c[j] > 0.f)) {
+                    continue;
+                }
+                for (int64_t i = 0; i < ne0; ++i) {
+                    mean[static_cast<size_t>(i)] += row[static_cast<size_t>(j * ne0 + i)];
+                }
+                ++used;
+            }
+            if (used == 0) {
+                logf("WARNING: imatrix %s has no calibration tokens on any expert; using uniform importance\n",
+                     kv.first.c_str());
+                std::fill(mean.begin(), mean.end(), 1.0);
+            } else {
+                for (double & v : mean) {
+                    v /= used;
+                }
+            }
+            std::vector<float> mean_f(static_cast<size_t>(ne0));
+            for (int64_t i = 0; i < ne0; ++i) {
+                mean_f[static_cast<size_t>(i)] = static_cast<float>(mean[static_cast<size_t>(i)]);
+            }
+            std::vector<float> counts_f(static_cast<size_t>(ncounts));
+            for (int64_t j = 0; j < ncounts; ++j) {
+                counts_f[static_cast<size_t>(j)] = c[j];
+                float * r = row.data() + static_cast<size_t>(j * ne0);
+                const float count = c[j];
+                if (!(count > 0.f)) {
+                    // Rule from the calibration study: a zero-count expert must
+                    // not fall back to 1.0 across the board.
+                    std::memcpy(r, mean_f.data(), static_cast<size_t>(ne0) * sizeof(float));
+                    ++imp.empty_experts;
+                    continue;
+                }
+                if (blend > 0.f && (min_count <= 0 || count < static_cast<float>(min_count))) {
+                    const float a = count / (count + blend);
+                    for (int64_t i = 0; i < ne0; ++i) {
+                        r[i] = a * r[i] + (1.f - a) * mean_f[static_cast<size_t>(i)];
+                    }
+                    ++imp.blended_experts;
+                }
+            }
+            imp.counts.emplace(kv.first, std::move(counts_f));
+        }
         imp.rows.emplace(kv.first, std::move(row));
     }
     gguf_free(gf);
     ggml_free(gctx);
-    logf("loaded imatrix entries %zu\n", imp.rows.size());
+    logf("loaded imatrix entries %zu", imp.rows.size());
+    if (blend > 0.f) {
+        logf("  blend K=%.0f min-count=%d blended=%d zero-count=%d", blend, min_count,
+             imp.blended_experts, imp.empty_experts);
+    } else if (imp.empty_experts > 0) {
+        logf("  zero-count experts filled from the layer mean: %d", imp.empty_experts);
+    }
+    logf("\n");
     return imp;
 }
 
@@ -2206,6 +2271,417 @@ void bench(const Catalog & cat, const Hyp & h, const Recipe & r, const std::vect
 }
 
 // ---------------------------------------------------------------------------
+// Experiment: one MoE layer, every expert, measured error per matrix kind.
+
+struct NpyArray {
+    std::string descr;
+    std::vector<int64_t> shape;
+    std::vector<uint8_t> raw;
+};
+
+NpyArray read_npy(const fs::path & path) {
+    FILE * f = std::fopen(path.string().c_str(), "rb");
+    if (!f) {
+        die("cannot open " + path.string());
+    }
+    unsigned char magic[8] = {0};
+    if (std::fread(magic, 1, 8, f) != 8 || magic[0] != 0x93 || std::memcmp(magic + 1, "NUMPY", 5) != 0) {
+        std::fclose(f);
+        die("not an npy file: " + path.string());
+    }
+    const int major = magic[6];
+    if (major != 1 && major != 2 && major != 3) {
+        std::fclose(f);
+        die("unsupported npy version in " + path.string());
+    }
+    uint32_t hlen = 0;
+    if (major == 1) {
+        uint16_t h16 = 0;
+        if (std::fread(&h16, 2, 1, f) != 1) {
+            std::fclose(f);
+            die("short npy header");
+        }
+        hlen = h16;
+    } else if (std::fread(&hlen, 4, 1, f) != 1) {
+        std::fclose(f);
+        die("short npy header");
+    }
+    std::string h(static_cast<size_t>(hlen), '\0');
+    if (std::fread(h.data(), 1, hlen, f) != hlen) {
+        std::fclose(f);
+        die("short npy header");
+    }
+    NpyArray a;
+    const size_t dk = h.find("'descr':");
+    const size_t q1 = dk == std::string::npos ? std::string::npos : h.find('\'', dk + 8);
+    const size_t q2 = q1 == std::string::npos ? std::string::npos : h.find('\'', q1 + 1);
+    if (q1 == std::string::npos || q2 == std::string::npos) {
+        std::fclose(f);
+        die("unreadable npy header in " + path.string());
+    }
+    a.descr = h.substr(q1 + 1, q2 - q1 - 1);
+    if (h.find("'fortran_order': True") != std::string::npos) {
+        std::fclose(f);
+        die("npy file is Fortran-ordered; expected C order: " + path.string());
+    }
+    const size_t op = h.find('(', q2);
+    const size_t cp = op == std::string::npos ? std::string::npos : h.find(')', op);
+    if (op == std::string::npos || cp == std::string::npos) {
+        std::fclose(f);
+        die("npy header has no shape: " + path.string());
+    }
+    std::string dims = h.substr(op + 1, cp - op - 1);
+    size_t pos = 0;
+    while (pos < dims.size()) {
+        while (pos < dims.size() && (dims[pos] == ' ' || dims[pos] == ',')) {
+            ++pos;
+        }
+        if (pos >= dims.size()) {
+            break;
+        }
+        char * end = nullptr;
+        const long long v = std::strtoll(dims.c_str() + pos, &end, 10);
+        if (end == dims.c_str() + pos) {
+            break;
+        }
+        a.shape.push_back(static_cast<int64_t>(v));
+        pos = static_cast<size_t>(end - dims.c_str());
+    }
+    int64_t n = 1;
+    for (int64_t d : a.shape) {
+        n *= d;
+    }
+    int64_t itemsize = 1;
+    if (a.descr.size() >= 3) {
+        const char k = a.descr[1];
+        if (k == 'f') {
+            itemsize = 4;
+        } else if (k == 'i' || k == 'u') {
+            itemsize = 8;
+        } else if (k == 'b') {
+            itemsize = 1;
+        }
+    }
+    a.raw.resize(static_cast<size_t>(n) * static_cast<size_t>(itemsize));
+    if (std::fread(a.raw.data(), 1, a.raw.size(), f) != a.raw.size()) {
+        std::fclose(f);
+        die("short npy payload in " + path.string());
+    }
+    std::fclose(f);
+    return a;
+}
+
+std::vector<float> npy_f32(const fs::path & path, int64_t & n0, int64_t & n1) {
+    NpyArray a = read_npy(path);
+    if (a.descr != "<f4" && a.descr != "|f4" && a.descr != "=f4") {
+        die("expected float32 npy: " + path.string() + " has " + a.descr);
+    }
+    n0 = a.shape.empty() ? 0 : a.shape[0];
+    n1 = a.shape.size() > 1 ? a.shape[1] : 1;
+    if (static_cast<int64_t>(a.raw.size()) != n0 * n1 * 4) {
+        die("float32 npy shape does not match payload: " + path.string());
+    }
+    std::vector<float> out(a.raw.size() / 4);
+    std::memcpy(out.data(), a.raw.data(), out.size() * sizeof(float));
+    return out;
+}
+
+std::vector<int64_t> npy_i64(const fs::path & path, int64_t & n) {
+    NpyArray a = read_npy(path);
+    if (a.descr != "<i8" && a.descr != "|i8" && a.descr != "=i8") {
+        die("expected int64 npy: " + path.string() + " has " + a.descr);
+    }
+    std::vector<int64_t> out(a.raw.size() / 8);
+    std::memcpy(out.data(), a.raw.data(), out.size() * sizeof(int64_t));
+    n = static_cast<int64_t>(out.size());
+    return out;
+}
+
+struct KindResult {
+    std::string name;
+    std::string tensor;
+    int64_t experts = 0;
+    double plain_num = 0, plain_den = 0;
+    double plain_mean = 0;      // mean of per-expert relative Frobenius
+    double weighted_mean = 0;   // mean of per-row weighted ratio
+    double weighted_num = 0, weighted_den = 0;
+    double out_num = 0, out_den = 0;
+    int64_t out_tokens = 0;
+    int64_t out_experts = 0;
+    double quant_sec = 0;
+};
+
+// ||W x - Q x|| / ||W x|| accumulated over the given input rows.
+void matvec_error(const float * w, const float * qw, int64_t n_out, int64_t n_in,
+                  const std::vector<const float *> & rows, int threads, double & num, double & den) {
+    if (threads < 1) {
+        threads = 1;
+    }
+    if (static_cast<int64_t>(threads) > n_out) {
+        threads = static_cast<int>(n_out);
+    }
+    std::vector<double> pn(static_cast<size_t>(threads), 0.0);
+    std::vector<double> pd(static_cast<size_t>(threads), 0.0);
+    auto worker = [&](int t, int64_t a, int64_t b) {
+        double ln = 0.0, ld = 0.0;
+        for (int64_t r = a; r < b; ++r) {
+            const float * wr = w + r * n_in;
+            const float * qr = qw + r * n_in;
+            for (const float * x : rows) {
+                float y = 0.f, yq = 0.f;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    y += wr[i] * x[i];
+                    yq += qr[i] * x[i];
+                }
+                const double d = static_cast<double>(y) - static_cast<double>(yq);
+                ln += d * d;
+                ld += static_cast<double>(y) * static_cast<double>(y);
+            }
+        }
+        pn[static_cast<size_t>(t)] = ln;
+        pd[static_cast<size_t>(t)] = ld;
+    };
+    if (threads <= 1) {
+        worker(0, 0, n_out);
+    } else {
+        const int64_t chunk = (n_out + threads - 1) / threads;
+        std::vector<std::thread> ws;
+        for (int t = 0; t < threads; ++t) {
+            const int64_t a = static_cast<int64_t>(t) * chunk;
+            if (a >= n_out) {
+                break;
+            }
+            ws.emplace_back(worker, t, a, std::min(n_out, a + chunk));
+        }
+        for (std::thread & th : ws) {
+            th.join();
+        }
+    }
+    for (int t = 0; t < threads; ++t) {
+        num += pn[static_cast<size_t>(t)];
+        den += pd[static_cast<size_t>(t)];
+    }
+}
+
+void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Options & opt,
+                const Imp * imp, int threads) {
+    if (opt.exp_layer < 0 || opt.exp_layer >= h.n_layer) {
+        die("--exp-layer is outside 0.." + std::to_string(h.n_layer - 1));
+    }
+    if (!h.is_moe(opt.exp_layer)) {
+        die("layer " + std::to_string(opt.exp_layer) + " has no routed experts");
+    }
+    const ggml_type type = opt.exp_type.empty() ? r.experts : parse_type(opt.exp_type);
+    const int nexp = opt.exp_experts > 0 ? std::min(opt.exp_experts, h.n_expert) : h.n_expert;
+    const std::string lb = layer_base(opt.exp_layer);
+    std::vector<const float *> xrows;
+    std::vector<float> xdata;
+    if (!opt.exp_x.empty()) {
+        int64_t nx = 0, ncol = 0;
+        xdata = npy_f32(opt.exp_x, nx, ncol);
+        if (ncol != h.n_embd) {
+            die("--exp-x has " + std::to_string(ncol) + " columns, expected " + std::to_string(h.n_embd));
+        }
+        for (int64_t t = 0; t < nx; ++t) {
+            xrows.push_back(xdata.data() + t * ncol);
+        }
+        logf("experiment activations: %lld rows x %lld from %s\n", static_cast<long long>(nx),
+             static_cast<long long>(ncol), opt.exp_x.string().c_str());
+    }
+    if (imp && imp->test_only) {
+        logf("WARNING: experiment uses the TEST-ONLY uniform imatrix\n");
+    }
+    const char * kinds[3] = {"gate", "up", "down"};
+    const char * leaves[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    const char * wkeys[3] = {"w1", "w3", "w2"};
+    const bool is_down[3] = {false, false, true};
+    std::vector<KindResult> results;
+    for (int k = 0; k < 3; ++k) {
+        KindResult res;
+        res.name = kinds[k];
+        res.tensor = blk_name(opt.exp_layer, leaves[k]);
+        const int64_t n_in = k == 2 ? h.n_ff_exp : h.n_embd;
+        const int64_t n_out = k == 2 ? h.n_embd : h.n_ff_exp;
+        const size_t row_q = ggml_row_size(type, n_in);
+        const ggml_type_traits * traits = ggml_get_type_traits(type);
+        if (!traits || !traits->to_float) {
+            die("no dequantizer for " + std::string(ggml_type_name(type)));
+        }
+        std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
+        std::vector<float> dq(f32.size());
+        std::vector<uint8_t> q(row_q * static_cast<size_t>(n_out));
+        std::vector<float> uniform_row;
+        const auto tk0 = std::chrono::steady_clock::now();
+        for (int e = 0; e < nexp; ++e) {
+            const std::string base = lb + ".block_sparse_moe.experts." + std::to_string(e) + "." + wkeys[k];
+            Weight w = resolve_weight(cat, base, false);
+            if (w.store == Weight::Store::Missing) {
+                die("experiment: missing " + base);
+            }
+            bind_shape(w, n_in, n_out, base);
+            const float * im = imp ? imp->at(res.tensor, n_in, h.n_expert, e) : nullptr;
+            if (!im) {
+                if (type_needs_imatrix(type)) {
+                    die(std::string("experiment: ") + ggml_type_name(type) + " needs an imatrix");
+                }
+                uniform_row.assign(static_cast<size_t>(n_in), 1.f);
+                im = uniform_row.data();
+            }
+            dequant_rows(w, 0, n_out, n_in, f32.data(), 0.f, threads);
+            const auto tq0 = std::chrono::steady_clock::now();
+            quantize_rows(type, f32.data(), q.data(), n_out, n_in, im, threads);
+            res.quant_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+            for (int64_t row = 0; row < n_out; ++row) {
+                traits->to_float(q.data() + static_cast<size_t>(row) * row_q, dq.data() + row * n_in, n_in);
+            }
+            double pnum = 0.0, pden = 0.0, wnum = 0.0, wden = 0.0, wrow = 0.0;
+            int64_t wrow_n = 0;
+            for (int64_t row = 0; row < n_out; ++row) {
+                const float * wr = f32.data() + row * n_in;
+                const float * qr = dq.data() + row * n_in;
+                double rn = 0.0, rd = 0.0, rwn = 0.0, rwd = 0.0;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    const double wv = wr[i];
+                    const double d = wv - qr[i];
+                    const double iw = im[i];
+                    rn += d * d;
+                    rd += wv * wv;
+                    rwn += iw * d * d;
+                    rwd += iw * wv * wv;
+                }
+                pnum += rn;
+                pden += rd;
+                wnum += rwn;
+                wden += rwd;
+                if (rwd > 0.0) {
+                    wrow += std::sqrt(rwn / rwd);
+                    ++wrow_n;
+                }
+            }
+            res.plain_num += pnum;
+            res.plain_den += pden;
+            res.plain_mean += pden > 0.0 ? std::sqrt(pnum / pden) : 0.0;
+            res.weighted_num += wnum;
+            res.weighted_den += wden;
+            res.weighted_mean += wrow_n > 0 ? wrow / static_cast<double>(wrow_n) : 0.0;
+            ++res.experts;
+            if (!is_down[k] && !xrows.empty() && !opt.exp_dumps.empty()) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "expert_%03d_token_idx.npy", e);
+                const fs::path tp = opt.exp_dumps / buf;
+                if (fs::is_regular_file(tp)) {
+                    int64_t nt = 0;
+                    std::vector<int64_t> idx = npy_i64(tp, nt);
+                    std::vector<const float *> rows;
+                    rows.reserve(static_cast<size_t>(nt));
+                    for (int64_t t = 0; t < nt; ++t) {
+                        if (idx[static_cast<size_t>(t)] < 0 ||
+                            idx[static_cast<size_t>(t)] >= static_cast<int64_t>(xrows.size())) {
+                            die("token index out of range in " + tp.string());
+                        }
+                        rows.push_back(xrows[static_cast<size_t>(idx[static_cast<size_t>(t)])]);
+                    }
+                    matvec_error(f32.data(), dq.data(), n_out, n_in, rows, threads, res.out_num, res.out_den);
+                    res.out_tokens += nt;
+                    ++res.out_experts;
+                }
+            }
+            if (is_down[k] && !opt.exp_dumps.empty()) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "expert_%03d_hidden.npy", e);
+                const fs::path hp = opt.exp_dumps / buf;
+                if (fs::is_regular_file(hp)) {
+                    int64_t nh = 0, ncol = 0;
+                    std::vector<float> hv = npy_f32(hp, nh, ncol);
+                    if (ncol != n_in) {
+                        die(hp.string() + " has " + std::to_string(ncol) + " columns, expected " +
+                            std::to_string(n_in));
+                    }
+                    std::vector<const float *> rows;
+                    rows.reserve(static_cast<size_t>(nh));
+                    for (int64_t t = 0; t < nh; ++t) {
+                        rows.push_back(hv.data() + t * ncol);
+                    }
+                    matvec_error(f32.data(), dq.data(), n_out, n_in, rows, threads, res.out_num, res.out_den);
+                    res.out_tokens += nh;
+                    ++res.out_experts;
+                }
+            }
+        }
+        res.quant_sec += 0.0;
+        (void)tk0;
+        results.push_back(std::move(res));
+    }
+
+    char line[512];
+    for (const KindResult & res : results) {
+        const double plain = res.plain_den > 0 ? std::sqrt(res.plain_num / res.plain_den) : 0.0;
+        const double wglobal = res.weighted_den > 0 ? std::sqrt(res.weighted_num / res.weighted_den) : 0.0;
+        const double outc = res.out_den > 0 ? std::sqrt(res.out_num / res.out_den) : 0.0;
+        std::snprintf(line, sizeof(line),
+                      "exp %-4s %-8s experts %d  plain %.6f  plain_mean %.6f  weighted %.6f  weighted_global %.6f  output %.6f  tokens %lld  outEX %d  outNum %.6g  outDen %.6g  quant %.1fs\n",
+                      res.name.c_str(), ggml_type_name(type), static_cast<int>(res.experts), plain,
+                      res.plain_mean / std::max<int64_t>(1, res.experts),
+                      res.weighted_mean / std::max<int64_t>(1, res.experts), wglobal, outc,
+                      static_cast<long long>(res.out_tokens), static_cast<int>(res.out_experts),
+                      res.out_num, res.out_den, res.quant_sec);
+        logf("%s", line);
+    }
+    if (!opt.exp_out.empty()) {
+        if (!opt.exp_out.parent_path().empty()) {
+            fs::create_directories(opt.exp_out.parent_path());
+        }
+        std::ofstream o(opt.exp_out);
+        if (!o) {
+            die("cannot write " + opt.exp_out.string());
+        }
+        auto js = [](const std::string & s) {
+            std::string r;
+            for (char c : s) {
+                if (c == '\\' || c == '"') {
+                    r.push_back('\\');
+                }
+                r.push_back(c);
+            }
+            return r;
+        };
+        char num[2048];
+        o << "{\n";
+        o << "  \"layer\": " << opt.exp_layer << ",\n";
+        o << "  \"type\": \"" << ggml_type_name(type) << "\",\n";
+        o << "  \"experts\": " << nexp << ",\n";
+        o << "  \"imatrix\": \"" << js(opt.imatrix.string()) << "\",\n";
+        o << "  \"imatrix_test_only\": " << (imp && imp->test_only ? "true" : "false") << ",\n";
+        o << "  \"imatrix_min_count\": " << opt.imatrix_min_count << ",\n";
+        o << "  \"imatrix_blend\": " << opt.imatrix_blend << ",\n";
+        o << "  \"exp_x\": \"" << js(opt.exp_x.string()) << "\",\n";
+        o << "  \"exp_dumps\": \"" << js(opt.exp_dumps.string()) << "\",\n";
+        o << "  \"kinds\": {\n";
+        for (size_t i = 0; i < results.size(); ++i) {
+            const KindResult & res = results[i];
+            const double plain = res.plain_den > 0 ? std::sqrt(res.plain_num / res.plain_den) : 0.0;
+            const double wglobal = res.weighted_den > 0 ? std::sqrt(res.weighted_num / res.weighted_den) : 0.0;
+            const double outc = res.out_den > 0 ? std::sqrt(res.out_num / res.out_den) : 0.0;
+            o << "    \"" << res.name << "\": {";
+            std::snprintf(num, sizeof(num),
+                          "\"tensor\": \"%s\", \"experts\": %d, \"plain_rel\": %.9g, \"plain_rel_mean\": %.9g, "
+                          "\"weighted_rel\": %.9g, \"weighted_rel_global\": %.9g, \"output_rel\": %.9g, "
+                          "\"output_tokens\": %lld, \"output_experts\": %d, \"quant_seconds\": %.3f",
+                          res.tensor.c_str(), static_cast<int>(res.experts), plain,
+                          res.plain_mean / std::max<int64_t>(1, res.experts),
+                          res.weighted_mean / std::max<int64_t>(1, res.experts), wglobal, outc,
+                          static_cast<long long>(res.out_tokens), static_cast<int>(res.out_experts),
+                          res.quant_sec);
+            o << num << "}";
+            o << (i + 1 < results.size() ? ",\n" : "\n");
+        }
+        o << "  }\n}\n";
+        o.close();
+        logf("wrote experiment report %s\n", opt.exp_out.string().c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 fs::path find_python() {
     if (const char * e = std::getenv("PYTHON")) {
@@ -2314,7 +2790,7 @@ int run_mmproj(const Options & opt) {
 }
 
 bool need_recipe(const Options & opt) {
-    return opt.dry_run || opt.bench || !opt.out.empty() || !opt.write_imatrix.empty();
+    return opt.dry_run || opt.bench || !opt.out.empty() || !opt.write_imatrix.empty() || opt.exp_layer >= 0;
 }
 
 }  // namespace
@@ -2401,7 +2877,8 @@ int run(const Options & opt) {
             write_test_imatrix(opt.write_imatrix, items);
         }
 
-        const bool need_weights = opt.nvfp4_check || !opt.dump_name.empty() || opt.bench || !opt.out.empty();
+        const bool need_weights = opt.nvfp4_check || !opt.dump_name.empty() || opt.bench || !opt.out.empty() ||
+                                  opt.exp_layer >= 0;
         Catalog cat;
         if (need_weights) {
             std::vector<std::string> needles;
@@ -2427,7 +2904,7 @@ int run(const Options & opt) {
         Imp loaded;
         const Imp * imp = nullptr;
         if (!opt.imatrix.empty()) {
-            loaded = load_imatrix(opt.imatrix);
+            loaded = load_imatrix(opt.imatrix, opt.imatrix_min_count, opt.imatrix_blend);
             imp = &loaded;
         }
         if (opt.nvfp4_check) {
@@ -2442,6 +2919,9 @@ int run(const Options & opt) {
         if (opt.bench) {
             bench(cat, h, recipe, sel, imp, opt, threads);
         }
+        if (opt.exp_layer >= 0) {
+            experiment(cat, h, recipe, opt, imp, threads);
+        }
         if (!opt.out.empty()) {
             Options wopt = opt;
             wopt.split_tensors = split_tensors;
@@ -2452,8 +2932,8 @@ int run(const Options & opt) {
             rc = run_mmproj(opt);
         }
         if (!opt.dry_run && opt.out.empty() && opt.write_imatrix.empty() && opt.dump_name.empty() && !opt.bench &&
-            !opt.nvfp4_check && opt.mmproj_out.empty()) {
-            die("nothing to do: pass --out, --dry-run, --bench, --nvfp4-check, --dump-dequant, --write-test-imatrix, or --mmproj");
+            !opt.nvfp4_check && opt.mmproj_out.empty() && opt.exp_layer < 0) {
+            die("nothing to do: pass --out, --dry-run, --bench, --nvfp4-check, --dump-dequant, --write-test-imatrix, --exp-layer, or --mmproj");
         }
         return rc;
     } catch (const std::exception & e) {

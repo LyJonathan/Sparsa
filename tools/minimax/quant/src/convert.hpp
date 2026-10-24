@@ -45,6 +45,18 @@ struct Options {
     int bench_experts = 8;
     bool nvfp4_check = false;
     float placeholder_value = 0.02f;
+    // Imatrix tail blending. Experts with count < imatrix_min_count (0 = every
+    // expert) get w = (c*w_e + K*w_layer)/(c + K) with K = imatrix_blend.
+    // imatrix_blend <= 0 disables blending.
+    int imatrix_min_count = 0;
+    float imatrix_blend = 0.f;
+    // Experiment mode: one MoE layer, all experts, measured error per matrix.
+    int exp_layer = -1;
+    std::string exp_type;
+    std::filesystem::path exp_out;
+    std::filesystem::path exp_x;
+    std::filesystem::path exp_dumps;
+    int exp_experts = 0;  // 0 = all
     std::vector<std::pair<std::string, std::string>> overrides;
 };
 
