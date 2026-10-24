@@ -44,8 +44,12 @@ def _write_tokenizer(directory):
         "version": "1.0",
         "added_tokens": [{"id": i, "content": t, "special": True, "single_word": False, "lstrip": False,
                           "rstrip": False, "normalized": False} for t, i in added],
-        "normalizer": None,
-        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
+        # The released tokenizer.json's shape: NFC, and a Split that keeps only its matches before ByteLevel.
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "behavior": "Removed", "invert": True,
+             "pattern": {"Regex": r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"}},
+            {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]},
         "post_processor": None,
         "decoder": {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
         "model": {"type": "BPE", "vocab": vocab, "merges": merges, "unk_token": None, "byte_fallback": False},
@@ -75,6 +79,12 @@ def test_tokenizer_added_tokens(tok):
     assert tok.encode("[e~[", parse_special=True) == [tok.ids["[e~["]]
     assert tok.encode("]~b]", parse_special=True) == [tok.ids["]~b]"]]
     assert tok.encode(NS + "<mm:think>", parse_special=True) == [tok.ids[NS], tok.ids["<mm:think>"]]
+
+
+def test_tokenizer_normalizes_to_nfc(tok):
+    """The released tokenizer.json normalizes to NFC, so a decomposed prompt is the composed prompt's ids."""
+    assert tok.encode("e\u0301", parse_special=True) == tok.encode("\u00e9", parse_special=True)
+    assert tok.decode(tok.encode("e\u0301", parse_special=True)) == "\u00e9"
 
 
 def test_template_renders_roles_thinking_and_generation_prompt():

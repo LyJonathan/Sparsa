@@ -51,9 +51,20 @@ class MiniMaxTokenizer(Tokenizer):
         model = data.get('model') or {}
         if model.get('type') != 'BPE':
             raise ValueError(f"MiniMax requires a byte-level BPE tokenizer, got {model.get('type')!r}")
+        # The released tokenizer.json normalizes to NFC (a Sequence holding it in some exports).  NFC is applied
+        # per pre-tokenizer piece below, which is where it can change the bytes: the pattern keeps a letter and
+        # its combining marks in one piece, so composition never crosses a split.
         normalizer = data.get('normalizer')
-        if normalizer not in (None, {'type': 'Sequence', 'normalizers': []}):
-            raise ValueError('MiniMax tokenizer has a normalizer; only the released identity normalizer is supported')
+        if isinstance(normalizer, dict) and normalizer.get('type') == 'Sequence':
+            parts = normalizer.get('normalizers') or []
+            if len(parts) == 1:
+                normalizer = parts[0]
+        if normalizer in (None, {'type': 'Sequence', 'normalizers': []}):
+            self.nfc = False
+        elif isinstance(normalizer, dict) and normalizer.get('type') == 'NFC':
+            self.nfc = True
+        else:
+            raise ValueError(f'MiniMax tokenizer has an unsupported normalizer ({normalizer!r}); only NFC is known')
 
         vocab = dict(model['vocab'])
         added = data.get('added_tokens') or []
@@ -93,9 +104,12 @@ class MiniMaxTokenizer(Tokenizer):
             for part in parts:
                 if part.get('type') == 'Split':
                     pattern = part.get('pattern') or {}
-                    if (part.get('behavior') != 'Isolated' or part.get('invert') or 'Regex' not in pattern):
+                    behavior, invert = part.get('behavior'), bool(part.get('invert'))
+                    # The released tokenizer keeps ONLY what the pattern matches ("Removed" + invert, the
+                    # GPT-4 split); "Isolated" keeps the matches and the text between them.
+                    if 'Regex' not in pattern or (behavior, invert) not in (('Isolated', False), ('Removed', True)):
                         raise ValueError('unsupported MiniMax Split pre-tokenizer')
-                    self.splits.append(regex.compile(pattern['Regex']))
+                    self.splits.append((regex.compile(pattern['Regex']), behavior == 'Removed'))
                     continue
                 if part.get('type') != 'ByteLevel':
                     raise ValueError(f"unsupported MiniMax pre-tokenizer {part.get('type')!r}")
@@ -114,9 +128,12 @@ class MiniMaxTokenizer(Tokenizer):
 
     def _pieces(self, text: str):
         pieces = [text]
-        for pattern in self.splits:
+        for pattern, keep_only in self.splits:
             split = []
             for piece in pieces:
+                if keep_only:
+                    split.extend(m.group() for m in pattern.finditer(piece) if m.end() > m.start())
+                    continue
                 pos = 0
                 for match in pattern.finditer(piece):
                     if match.start() > pos:
@@ -134,13 +151,23 @@ class MiniMaxTokenizer(Tokenizer):
 
     def _encode_plain(self, text: str):
         out: list[int] = []
+        cache = self._piece_ids
         for piece in self._pieces(text):
-            mapped = ''.join(BYTE_TO_UNICODE[b] for b in piece.encode('utf-8'))
-            for token in self._bpe(mapped):
-                i = self.ids.get(token)
-                if i is None:
-                    raise KeyError(f'BPE produced a token outside the vocabulary: {token!r}')
-                out.append(i)
+            if self.nfc:
+                import unicodedata
+                piece = unicodedata.normalize('NFC', piece)
+            got = cache.get(piece)
+            if got is None:
+                mapped = ''.join(BYTE_TO_UNICODE[b] for b in piece.encode('utf-8'))
+                got = []
+                for token in self._bpe(mapped):
+                    i = self.ids.get(token)
+                    if i is None:
+                        raise KeyError(f'BPE produced a token outside the vocabulary: {token!r}')
+                    got.append(i)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
+            out.extend(got)
         return out
 
     def token_bytes(self, i):

@@ -7983,6 +7983,10 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # MiniMax-M3.1-Flash: generation_config.json carries one set (temperature 1.0, top_p 0.95); the card does not
+    # split thinking from answering, so both states use it
+    "minimax_m3": {"thinking": {"temperature": 1.0, "top_p": 0.95},
+                   "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
 
 
