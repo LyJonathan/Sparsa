@@ -379,6 +379,14 @@ logit std of ~1.7 (the router's 4th-expert flips, the same effect P5a measured),
 36.3 s. `tools/minimax/test_p10_expert_gemm.py` checks the same shape on a synthetic IQ2_XS model plus the `auto`
 selection (2 passed).
 
+**The full model's G3 gate failed, so `mmvq` stays the default.** On the whole IQ2_XS-D3 file (whose experts are
+IQ2_XS gate/up + **IQ3_XXS** down) `tc` against `mmvq`, same six short prompts, 679 positions, 512-token chunks,
+`--minimax-prefill-experts gpu`: KL64 1.2346 -> 1.2998, full-vocab KL 1.4409 -> 1.4886, top-1 60.82 % -> 58.17 %,
+and `code_lru` alone 38.6 % -> 30.7 % top-1. That is far past fp16 rounding, and the slice gate above passed with a
+Q2_0 down, so the next thing to check is the iq3_xxs down projection on this path (`tc_d_ok` admits any type
+`tc_expert_type` accepts, not only the 256-block types the gate covered).
+
+
 The unbuffered read path was also tightened: an expert that the pinned RAM tier already holds is copied from the
 arena instead of being re-read from the file, and a real miss is read straight into the three role windows of the
 pinned ring slot with the three requests in flight (no 19 MiB staging copy). The bytes are identical: on the slice,
@@ -406,7 +414,9 @@ GEMM.
 
 A 200-token chat prompt is 3.5 tok/s on the token path (`--minimax-prefill-batch 0`) and 7.85 tok/s batched: the
 token path re-reads each expert once per token that routes to it, so the same prompt reads the expert set about six
-times. Turn batching on for chat.
+times. `sparsa.py serve` has passed `--minimax-prefill-batch 4096` since 0.1.1 and it stays on by default
+(`--prefill-batch auto`), so chat reads its prompt the fast way; a 411-token message measures 30.5 s against 124 s on
+the token path.
 
 
 ### Real weights: a 15-layer slice of MiniMax-M3.1-Flash

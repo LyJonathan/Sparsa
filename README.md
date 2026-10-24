@@ -161,31 +161,48 @@ fetches the pinned llama.cpp commit (network needed). Details and every engine f
 ## Measured, not estimated
 
 Full `MM-IQ2_XS-D3` (146.1 GB), 2x RTX 5070 12 GB, Ryzen 9 5900X, 128 GB DDR4, Windows, NVMe, this
-branch. Real 512-token text from the quality set, 32 greedy tokens, `--gpus 0,1 --layer-split auto`,
-the box idle for the first two arms:
+release, `python sparsa.py serve` with its defaults (one 4096-token prompt chunk, the int8 expert dots, the
+RAM tier capped at 84 GiB), the box idle, real text from the quality set:
 
-| arm | decode tok/s | ms/token | experts read from the SSD per token |
-| --- | ---: | ---: | ---: |
-| earlier build (uniform RAM tier) | 2.64 | 379.5 | 10.4 |
-| **this build** (RAM tier sized per layer) | **2.88** | 347.4 | 7.8 |
-| this build, the old uniform tier | 2.58 | 386.9 | 8.9 |
+| what | result | drive read rate during the run |
+| --- | ---: | ---: |
+| **decode**, 753-token prompt, 64 greedy tokens | **4.17 tok/s** (240 ms/token) | 891 MB/s mean, 1.74 GB/s peak |
+| prefill, 411-token chat prompt (time to first token) | 30.5 s = **13.5 tok/s** | 0.9-1.7 GB/s |
+| prefill, 753 tokens | 33.8 s = **22.3 tok/s** | 891 MB/s mean |
+| prefill, 4,686 tokens | 112.9 s = **41.5 tok/s** | 0.9-1.7 GB/s |
+| prefill, 32 K tokens (P11 measurement, same box) | 739.6 s = 44.3 tok/s | 4.4-5.6 GB/s |
 
-**About 2.9 tokens a second.** That is experimental and slow: speed work is ongoing, and the arms ran
-one after another, so part of the difference is the file's pages being warm in the second arm (the
-load-independent rows, 7.8 against 10.4 experts and 135 against 180 MB per token, are what the change
-itself buys). Prefill on the earlier build was 16.5-17.7 tok/s for a 512-token prompt, so the first
-token takes about half a minute before decode starts.
+The NVMe on this box swings between 0.12 and 5.6 GB/s seen; every number above is a drive-bound number, so it
+moves with the drive. The same 753-token prompt took 33.8 s in one run and 59.9 s in another with nothing else
+running, so read the prefill rows as "about half a minute for a chat message, a minute or two for a few thousand
+tokens", not as a fixed rate.
+
+**Chat reads its prompt in one batched chunk.** That is what the 13.5-22 tok/s rows are: the same 411-token
+message through the per-token path (`--prefill-batch 0`) takes **124 s** (3.3 tok/s) because it re-reads every
+routed expert once per token. Batching is the 4x, and it is the default.
+
+**About 4.2 tokens a second decoding.** That is experimental and slow. Decode is bound by the experts that are
+not in the RAM tier: 7.8 experts per token come off the SSD, and the tier holds 87 of the 128 experts per layer
+at 84 GiB (`--ram-gib` raises it if the box has the memory).
 
 Quality, `MM-IQ2_XS-D3` against an fp32 reference of the checkpoint's own weights, six prompts,
-679 positions, teacher-forced:
+679 positions, teacher-forced, the experts projected on the card (the server's path):
 
 | metric | llama.cpp | Sparsa |
 | --- | ---: | ---: |
-| top-1 agreement | 59.20 % | 59.35 % |
-| KL64 mean | 1.3446 | 1.2110 |
+| top-1 agreement | 59.20 % | 60.82 % |
+| KL64 mean | 1.3446 | 1.2346 |
+| full-vocab KL mean | - | 1.4409 |
 
-The engine matches llama.cpp on the same file. Both sit at KL ~0.7-1.0 where the reference is
-confident: the residual is the 2-bit expert tier, not the engine.
+The engine matches llama.cpp on the same file, and the earlier CPU-expert arm measured KL64 1.2110 /
+top-1 59.35 %, so the placement of the expert projection is not what the residual is. Both sit at KL
+~0.7-1.0 where the reference is confident: the residual is the 2-bit expert tier, not the engine.
+
+The same gate rejects the tensor-core expert GEMM (`--minimax-prefill-expert-gemm tc`): KL64 1.2998,
+full-vocab KL 1.4886, top-1 58.17 %, and one prompt (code_lru) drops from 38.6 % to 30.7 % top-1. It is
+1.33x on a 4 K chunk, so it is kept as an option and is not the default. The slice parity run (a 15-layer
+file, IQ2_XS gate/up + Q2_0 down) passed at KL 1.34e-4, which points at the iq3_xxs down projection of
+this tier rather than at the idea; that is the next thing to check there.
 
 Quality across the tiers, G3 vs the same fp32 reference, the same six short prompts (679 positions),
 teacher-forced:
@@ -204,8 +221,8 @@ RTX 4060 Ti + RTX 5060 Ti, Linux) with the experts on the CPU. The gain from 2-b
 
 ## Known limits
 
-- **Speed.** 2.4-2.9 tokens a second on the measured box. A prompt of a few thousand tokens takes
-  a minute or two before the first token.
+- **Speed.** 3.3-4.2 tokens a second on the measured box. A 200-400 token chat message takes about half
+  a minute before the first token; a few thousand tokens take a minute or two.
 - **Long context.** The model supports 1M tokens; this engine has a working 8K-32K path and a long
   context rework in progress. Above 32K expect it to be slow or to fail.
 - **Vision.** Not implemented. The image tokens exist in the tokenizer; the encoder does not.

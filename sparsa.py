@@ -129,6 +129,23 @@ def gpu_devices(explicit: str | None) -> list[int]:
     return [int(line) for line in out.stdout.split() if line.strip().isdigit()]
 
 
+def prefill_batch_value(text: str) -> int:
+    """`--prefill-batch`: `auto` (the default) asks for 4096 tokens a chunk and lets the engine shrink it to the
+    free VRAM, `0`/`off` keeps the token path, and a number is that many tokens a chunk."""
+    t = str(text).strip().lower()
+    if t in ("", "auto", "default"):
+        return 4096
+    if t in ("off", "no", "none"):
+        return 0
+    try:
+        n = int(t)
+    except ValueError:
+        raise SystemExit(f"sparsa: --prefill-batch wants auto, 0 or a token count, not {text!r}") from None
+    if n < 0:
+        raise SystemExit(f"sparsa: --prefill-batch cannot be negative ({n})")
+    return n
+
+
 def build_config(args) -> dict:
     if not args.model:
         raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
@@ -160,8 +177,18 @@ def build_config(args) -> dict:
                      "--vram-reserve-mib", str(args.vram_reserve_mib)]
         if args.ram_gib:
             cfg_args += ["--memory-limit-mib", str(int(args.ram_gib * 1024))]
-    if not args.cpu and args.prefill_batch:
-        cfg_args += ["--minimax-prefill-batch", str(args.prefill_batch)]
+    prefill_batch = prefill_batch_value(args.prefill_batch)
+    if not args.cpu and prefill_batch:
+        # Chat always walks the batched prompt path: a prompt is read once per chunk instead of once per token,
+        # which is the difference between ~14 and ~3.5 tok/s on a 200-400 token message (the token path re-reads
+        # every routed expert for every token).  `auto` asks for 4096 and the engine shrinks the chunk to what each
+        # card's free VRAM can hold after the weights and the KV; it prints the size it chose
+        # (`INFO minimax-prefill batch=...`).  --prefill-batch 0 keeps the token path, N is a fixed chunk.
+        # The expert projection stays on the int8 dots (the engine's `mmvq`): the full-model G3 gate for the
+        # tensor-core path failed (KL64 1.235 -> 1.300, top-1 60.8 % -> 58.2 % over the six short prompts), so
+        # `--prefill-expert-gemm tc` is a choice, not the default.
+        cfg_args += ["--minimax-prefill-batch", str(prefill_batch),
+                     "--minimax-prefill-expert-gemm", args.prefill_expert_gemm]
     if args.threads:
         cfg_args += ["--cpu-threads", str(args.threads)]
     if args.allow_nonstandard:
@@ -310,7 +337,14 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--threads", type=int, help="CPU expert workers (default: the engine's own count)")
         p.add_argument("--vram-reserve-mib", type=int, default=700, help="VRAM kept free (default 700)")
         p.add_argument("--ram-gib", type=float, help="cap the RAM expert tier at this many GiB")
-        p.add_argument("--prefill-batch", type=int, default=4096, help="prompt chunk (default 4096; 0 = off)")
+        p.add_argument("--prefill-batch", default="auto",
+                       help="prompt chunk: auto (default: 4096, shrunk by the engine to the free VRAM), 0 = the "
+                            "token path, or a token count")
+        p.add_argument("--prefill-expert-gemm", choices=("auto", "mmvq", "tc"), default="mmvq",
+                       help="how a batched chunk's routed experts are projected: mmvq (default: the int8 dots), "
+                            "auto (tensor cores from 16 rows per expert, the int8 dots below), or tc. The full "
+                            "IQ2_XS-D3 G3 gate failed for tc (KL64 1.235 -> 1.300, top-1 60.8%% -> 58.2%%), so it "
+                            "stays opt-in")
         p.add_argument("--allow-nonstandard", action="store_true",
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
