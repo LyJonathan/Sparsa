@@ -59,6 +59,15 @@ struct EngineOptions {
     std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
     std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
     std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
+    // ---- P8: long context.  `kv_quant` halves the host/pinned KV (q8_0 blocks, 34 B / 32 values); the indexer
+    // keys stay fp16 because they only rank blocks and a flipped rank changes the output discretely.
+    std::string kv_quant;           ///< "" / "f16" (default, byte-identical) | "q8_0" | "auto" (q8 only when f16
+                                    ///< does not fit)
+    std::string host_attn;          ///< "" / "fast": the multithreaded, allocation-free host attention (same
+                                    ///< arithmetic order, bit-identical); "legacy": the P2 loop
+    std::string prefill_kv;         ///< "" / "auto": with the KV in pinned RAM, stage one layer's K/V on the card
+                                    ///< for the batched prompt pass instead of running attention on the host;
+                                    ///< "off": keep the host attention in prefill (P7 behaviour)
 
     // ---- P5a: batched prefill.  0 keeps the token path (byte-identical to P4); a positive value is the maximum
     // prompt tokens processed per layer in one batched pass.  The prompt is then walked in chunks of that size.

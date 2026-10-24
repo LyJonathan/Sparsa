@@ -151,6 +151,10 @@ struct Layer {
 int64_t bigger(int64_t a, int64_t b) { return a > b ? a : b; }
 
 // One pool for the whole engine. parallel_for used to spawn and join on every GEMV row-split.
+// P8: the band index is readable inside a job as `tls_part`, so a job that needs a private scratch slice (host
+// attention's score row) can index one array by band instead of allocating per row.
+thread_local int tls_part = 0;
+
 struct Pool {
     int nthreads = 1;
     std::vector<std::thread> workers;
@@ -188,6 +192,7 @@ struct Pool {
     }
 
     void worker(int p) {
+        tls_part = p;
         int seen = 0;
         for (;;) {
             std::function<void(int, int)> job;
@@ -220,12 +225,14 @@ struct Pool {
         }
     }
 
-    void run(int nrows, const std::function<void(int, int)>& job) {
+    void run(int nrows, const std::function<void(int, int)>& job, bool force = false) {
         if (nrows <= 0) return;
-        if (nthreads <= 1 || nrows < nthreads * 4) {
+        if (nthreads <= 1 || (!force && nrows < nthreads * 4)) {
+            tls_part = 0;
             job(0, nrows);
             return;
         }
+        tls_part = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             fn = job;
@@ -468,6 +475,21 @@ size_t host_available_bytes() {
 #endif
 }
 
+// Can this process back `bytes` of new host memory?  Windows counts commit against RAM + pagefile; elsewhere shape
+// it from the available memory.  Used to size the long-context KV cache before touching any page.
+bool host_commit_ok(size_t bytes) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX mem{};
+    mem.dwLength = sizeof(mem);
+    if (!GlobalMemoryStatusEx(&mem)) return true;
+    return (unsigned long long)mem.ullAvailPageFile >= (unsigned long long)bytes;
+#else
+    const size_t avail = host_available_bytes();
+    if (avail == 0) return true;
+    return avail >= bytes;
+#endif
+}
+
 // Physical cores (one per RelationProcessorCore entry), for the automatic CPU thread count.
 int physical_cores() {
 #if defined(_WIN32)
@@ -678,12 +700,22 @@ struct Engine::Impl {
         b.i.insert(b.i.end(), p, p + n);
     }
 
+    std::vector<uint8_t> k_host_q_v, v_host_q_v;   // host-mode q8 storage (std::vector)
     std::vector<uint16_t> k_host_v, v_host_v, ik_host_v;   // host-mode storage (std::vector)
     uint16_t* k_host = nullptr;      // the active K/V/indexer-K storage: pinned when CUDA is up
     uint16_t* v_host = nullptr;
     uint16_t* ik_host = nullptr;
     void* kv_arena = nullptr;        // cudaHostAlloc'd bytes behind k_host (null in host mode)
     size_t kv_arena_bytes = 0;
+    // ---- P8: quantized host/pinned K/V.  q8_0 blocks of 32 values (2-byte fp16 scale + 32 int8 = 34 B) along
+    // head_dim, so one head's 128 values are 4 whole blocks and a row is [n_head_kv] of those.  The indexer keys
+    // stay fp16: they only rank blocks, and a flipped rank is a discrete change in the output.
+    int kv_q = 0;                    // 0 fp16, 1 q8_0 (host and pinned-RAM tiers only)
+    uint8_t* k_host_q = nullptr;     // q8 arena: K then V, [layer][ctx][n_head_kv][head_dim/32] blocks
+    uint8_t* v_host_q = nullptr;
+    size_t kv_q_row = 0;             // q8 bytes in one token's K (or V) row
+    void* kv_q_arena = nullptr;      // cudaHostAlloc'd bytes behind k_host_q (null in host mode)
+    size_t kv_q_arena_bytes = 0;
     DevPtr d_x, d_y, d_scratch;
     int64_t max_cols = 1, max_rows = 1;
 
@@ -733,6 +765,18 @@ struct Engine::Impl {
 
     std::vector<float> x, h, q, k, v, proj, ff_g, ff_u, ff_h, ff_y, iq, ik, logits, last_logits;
     std::vector<uint16_t> kv_tmp;
+
+    // ---- P8: host attention scratch.  The P2 loop allocated 65 vectors per token per layer; these are sized
+    // once.  `ah_prob`/`ah_prob_d` are one slice per pool band (see tls_part).
+    bool host_attn_fast = true;
+    std::vector<float> ah_bs, ah_bs2, ah_prob, ah_prob_d, ah_prob_s, ah_prob_ds;
+    std::vector<float> kv_f32;   // q8 store scratch (fp16 -> fp32 -> blocks)
+    std::vector<float> ah_stage; // H2D staging for one dequantized head row
+    std::vector<float> att_buf;  // the token path's attention output (P8: was a per-layer allocation)
+    std::vector<int32_t> ah_slots;
+    std::vector<int> ah_off, ah_order;
+    std::vector<char> ah_sel;
+    std::vector<int64_t> ah_ids;
     std::vector<int32_t> held;
     int64_t n_past = 0;
     int64_t cur_pos = 0;
@@ -747,6 +791,7 @@ struct Engine::Impl {
     bool prefill_gpu_experts = true;
     bool prefill_dense_f32 = true;
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
+    bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
     bool gpu_norm_rope = true;     // fused device norm+rope (--minimax-gpu-normrope off)
     bool expert_resident = true;   // pin the RAM expert tier at startup (--minimax-expert-resident off)
@@ -783,6 +828,7 @@ struct Engine::Impl {
 
         DevPtr d_q16;                // fp16 attention queries for the batched MSA kernel
         DevPtr d_pos;                // [T] token positions for the fused norm+rope kernel
+        DevPtr kv_k, kv_v;           // P8: one layer's whole K/V prefix staged on the card (RAM tier prefill)
         int64_t rows_cap = 0;
     };
     std::vector<PfBuf> pf;
@@ -1120,6 +1166,19 @@ struct Engine::Impl {
             cu::init();
             setup_devices();
             choose_split_and_kv();
+        } else {
+            // P8: the host tier does not go through choose_split_and_kv, but the q8 request and the attention
+            // implementation still apply to it.
+            kv_row_bytes = (int64_t)cfg.n_head_kv * cfg.head_dim * 2;
+            ik_row_bytes = (int64_t)cfg.idx_dim * 2;
+            max_slot = (int32_t)(cfg.idx_top_k * cfg.idx_block);
+            if (max_slot < (int32_t)cfg.idx_block) max_slot = (int32_t)cfg.idx_block;
+            host_attn_fast = opt.host_attn != "legacy";
+            if (opt.kv_quant == "q8_0" || opt.kv_quant == "q8") kv_q = 1;
+            if (kv_q && (cfg.head_dim % kQ8Block) != 0)
+                fail("--minimax-kv-quant q8_0 quantizes 32 values per block along head_dim; this file's head_dim is " +
+                     std::to_string(cfg.head_dim) + ", which is not a multiple of 32. Use f16.");
+            print_kv_plan(0, opt.kv_space.empty() ? "auto" : "cpu-only");
         }
         alloc_cache();
         // The row/col limits are also the CPU gemv guard. Device buffers exist only when a layer can be uploaded.
@@ -1500,6 +1559,11 @@ struct Engine::Impl {
             fail("failed to allocate the host fp16 KV cache for context " + std::to_string(ctx) +
                  ": the K, V, and indexer cache does not fit in the address space. Lower --max-context.");
         }
+        if (kv_q) {
+            // The commit check below is about the bytes actually asked for, so measure the q8 footprint.
+            const int qrow = cfg.n_head_kv * cfg.head_dim / kQ8Block * kQ8Bytes;
+            bytes = (size_t)qrow * 2 * (size_t)ctx * (size_t)cfg.n_layers + ip * sizeof(uint16_t);
+        }
 #if defined(_WIN32)
         // Refuse before touching pages. A commit larger than the process can back would otherwise zero
         // tens of gigabytes and grow the pagefile before bad_alloc.
@@ -1513,6 +1577,36 @@ struct Engine::Impl {
 #endif
         // P4: in the RAM tier the K/V arrays are page-locked, so the per-step gather reaches full copy-engine
         // bandwidth. The VRAM tier keeps no host copy at all; the host tier (the P2 default) keeps the vectors.
+        if (kv_q) {
+            // P8: q8_0 K/V, 34 bytes per 32 values.  The indexer keys stay fp16 (they only rank blocks).
+            kv_q_row = (size_t)(cfg.n_head_kv * cfg.head_dim / kQ8Block) * (size_t)kQ8Bytes;
+            size_t qbytes = 0;
+            if (!mul_size(kv_q_row * 2, (size_t)ctx * (size_t)cfg.n_layers, qbytes)) qbytes = 0;
+            size_t ibytes = 0;
+            if (!mul_size(ip, sizeof(uint16_t), ibytes)) ibytes = 0;
+            const size_t total = qbytes + ibytes;
+            if (kv_mode == 2 && !work.empty()) {
+                kv_q_arena = cu::host_alloc(qbytes);
+                k_host_q = (uint8_t*)kv_q_arena;
+                v_host_q = k_host_q + qbytes / 2;
+                std::memset(kv_q_arena, 0, qbytes);
+                kv_q_arena_bytes = qbytes;
+                ik_host = nullptr;
+                return;
+            }
+            try {
+                k_host_q_v.assign(qbytes / 2, 0);
+                v_host_q_v.assign(qbytes / 2, 0);
+                ik_host_v.assign(ip, 0);
+            } catch (const std::exception& e) {
+                fail("failed to allocate the host q8_0 KV cache for context " + std::to_string(ctx) + ": " +
+                     std::to_string(total) + " bytes are required. Lower --max-context. " + e.what());
+            }
+            k_host_q = k_host_q_v.data();
+            v_host_q = v_host_q_v.data();
+            ik_host = ik_host_v.data();
+            return;
+        }
         if (kv_mode == 2 && !work.empty()) {
             size_t kbytes = 0;
             if (!mul_size(kp, sizeof(uint16_t), kbytes)) kbytes = 0;
@@ -1664,7 +1758,11 @@ struct Engine::Impl {
     size_t kv_layer_bytes() const {
         // K and V for one layer at this context, plus the indexer keys (over-counted on a file without an indexer
         // on every layer, which is the safe direction).
-        return (size_t)(2 * kv_row_bytes) * (size_t)ctx + (size_t)ik_row_bytes * (size_t)ctx;
+        return kv_layer_bytes(ctx);
+    }
+    size_t kv_layer_bytes(int64_t t) const {
+        const size_t kv = kv_q ? (size_t)(cfg.n_head_kv * cfg.head_dim / kQ8Block * kQ8Bytes) : (size_t)kv_row_bytes;
+        return (size_t)2 * kv * (size_t)t + (size_t)ik_row_bytes * (size_t)t;
     }
 
     void choose_split_and_kv() {
@@ -1672,6 +1770,22 @@ struct Engine::Impl {
         ik_row_bytes = (int64_t)cfg.idx_dim * 2;
         max_slot = (int32_t)(cfg.idx_top_k * cfg.idx_block);
         if (max_slot < (int32_t)cfg.idx_block) max_slot = (int32_t)cfg.idx_block;
+        host_attn_fast = opt.host_attn != "legacy";
+
+        // ---- P8: the KV quantization.  Where the q8 tier is not implemented (the VRAM tier's device kernels read
+        // fp16 rows) the request is refused by name rather than silently ignored.
+        if (!opt.kv_quant.empty() && opt.kv_quant != "auto") {
+            if (opt.kv_quant == "q8_0" || opt.kv_quant == "q8") kv_q = 1;
+            else if (opt.kv_quant != "f16") fail("--minimax-kv-quant: unknown value '" + opt.kv_quant + "'");
+        }
+        if (kv_q == 0 && opt.kv_quant == "auto") kv_q = 0;   // decided below, once the placement is known
+        if (kv_q && (cfg.head_dim % kQ8Block) != 0)
+            fail("--minimax-kv-quant q8_0 quantizes 32 values per block along head_dim; this file's head_dim is " +
+                 std::to_string(cfg.head_dim) + ", which is not a multiple of 32. Use f16.");
+        if (kv_q && !opt.kv_space.empty() && opt.kv_space != "auto" && opt.kv_space != "ram" &&
+            opt.kv_space != "host")
+            fail("--minimax-kv-quant q8_0 covers the host and pinned-RAM KV tiers. The VRAM tier's MSA kernels "
+                 "read fp16 rows; use --minimax-kv ram (or host) for a quantized cache, or f16 for vram.");
 
         const int nd = (int)devs.size();
         const size_t reserve = (size_t)(opt.vram_reserve_mib > 0 ? opt.vram_reserve_mib : 0) << 20;
@@ -1764,19 +1878,69 @@ struct Engine::Impl {
             return "";
         };
 
-        assign(mode != 0);
-        std::string bad = check_budget(mode != 0);
-        if (!bad.empty() && mode == 1 && opt.kv_space.empty()) {
+        const bool auto_mode = opt.kv_space.empty() || opt.kv_space == "auto";
+        // Mode 2 keeps the K/V in pinned host RAM, so it must not be charged against the VRAM budget (P8: it used
+        // to be, which made `--minimax-kv ram` refuse any context whose KV exceeded the cards' free memory -- the
+        // exact case the tier exists for).
+        const bool kv_on_gpu = mode == 1;
+        assign(kv_on_gpu);
+        std::string bad = check_budget(kv_on_gpu);
+        if (!bad.empty() && mode == 1 && auto_mode) {
             std::fprintf(stderr, "INFO minimax-kv: VRAM does not fit (%s); keeping K/V in pinned RAM\n", bad.c_str());
             mode = 2;
-            assign(true);
-            bad = check_budget(true);
+            assign(false);
+            bad = check_budget(false);
+        }
+        if (bad.empty() && mode == 2 && opt.kv_quant == "auto" && !kv_q) {
+            // The quant is only chosen by capacity: fp16 unless the process cannot commit it.
+            const size_t need = kv_layer_bytes() * (size_t)cfg.n_layers;
+            if (!host_commit_ok(need)) {
+                kv_q = 1;
+                std::fprintf(stderr,
+                             "INFO minimax-kv: q8_0 K/V (f16 needs %.1f GiB and the box cannot commit it)\n",
+                             (double)need / 1073741824.0);
+            }
         }
         if (!bad.empty())
             fail(bad + ". Use --layer-split to choose the boundary, --vram-reserve-mib to change the reserve, or "
                  "--minimax-kv ram to move the KV cache to RAM.");
+        if (mode == 2) {
+            size_t need = kv_layer_bytes() * (size_t)cfg.n_layers;
+            if (!host_commit_ok(need))
+                fail("the K/V cache for context " + std::to_string(ctx) + " needs " +
+                     std::to_string((unsigned long long)need) + " bytes of " +
+                     (kv_q ? "q8_0" : "fp16") + " host memory and this box cannot commit it. Lower "
+                     "--max-context, or pass --minimax-kv-quant q8_0" +
+                     std::string(kv_q ? "" : " (it halves the cache)") + ".");
+        }
         kv_mode = mode;
         for (int64_t i = 0; i < cfg.n_layers; ++i) layers[(size_t)i].dev = layer_dev[(size_t)i];
+
+        // The plan, in one line: this is what a long-context run has to be explainable by after the fact.
+        print_kv_plan(mode, opt.kv_space.empty() ? "auto" : opt.kv_space);
+    }
+
+    // One parseable line naming the KV decision.  `key=value` tokens, the same keys on every path.
+    void print_kv_plan(int mode, const std::string& source) {
+        const size_t bytes = kv_layer_bytes() * (size_t)cfg.n_layers;
+        std::string plan = "INFO minimax-kv plan: ctx=" + std::to_string(ctx) +
+                           " quant=" + (kv_q ? "q8_0" : "f16") + " kv=" +
+                           std::to_string((double)bytes / 1073741824.0) + "GiB placement=" +
+                           (mode == 0 ? "host" : mode == 1 ? "vram" : "ram") + " source=" + source +
+                           " indexer=f16 rows=" + std::to_string((unsigned long long)kv_layer_bytes()) +
+                           "B/layer host_attn=" + (host_attn_fast ? "fast" : "legacy");
+        if (mode == 1 && !devs.empty()) {
+            plan += " per_card=[";
+            for (int d = 0; d < (int)devs.size(); ++d) {
+                int n = 0;
+                for (int64_t i = 0; i < cfg.n_layers; ++i)
+                    if (layer_dev[(size_t)i] == d) ++n;
+                plan += (d ? "," : "") + std::to_string((unsigned long long)((size_t)n * kv_layer_bytes()) >> 20) +
+                        "MiB";
+            }
+            plan += "]";
+        }
+        std::fprintf(stderr, "%s\n", plan.c_str());
     }
 
     void alloc_device_kv() {
@@ -3718,13 +3882,98 @@ struct Engine::Impl {
         for (int i = 0; i < n; ++i) dst[i] = ggml_fp32_to_fp16(src[i]);
     }
 
+    // ---- P8: the q8_0 block codec.  Every value of a 32-wide block shares one fp16 scale, exactly as ggml's q8_0:
+    // d = amax / 127, q_i = round(x_i / d) clamped to int8.  A head is 128 values = 4 blocks, so a head row is
+    // self-contained and `--minimax-kv vram`'s row layout would be the same if the device tier ever takes it.
+    static constexpr int kQ8Block = 32;
+    static constexpr int kQ8Bytes = 34;
+    static void quant_q8_block(const float* src, uint8_t* dst) {
+        float amax = 0.f;
+        for (int i = 0; i < kQ8Block; ++i) amax = std::fmax(amax, std::fabs(src[i]));
+        const float d = amax / 127.f;
+        const uint16_t dh = ggml_fp32_to_fp16(d);
+        std::memcpy(dst, &dh, 2);
+        // Quantize against the scale that was actually stored, so dequantize(quantize(x)) == d16 * q exactly.
+        const float dq = ggml_fp16_to_fp32(dh);
+        const float inv = dq > 0.f ? 1.f / dq : 0.f;
+        for (int i = 0; i < kQ8Block; ++i) {
+            float v = src[i] * inv;
+            v = v > 127.f ? 127.f : (v < -127.f ? -127.f : v);
+            ((int8_t*)dst)[2 + i] = (int8_t)std::lrintf(v);
+        }
+    }
+    static float dot_q8(const uint8_t* row, const float* q, int n) {
+        float s = 0.f;
+        for (int b = 0; b < n / kQ8Block; ++b) {
+            const uint8_t* p = row + (size_t)b * kQ8Bytes;
+            uint16_t dh;
+            std::memcpy(&dh, p, 2);
+            const int8_t* qs = (const int8_t*)(p + 2);
+            float acc = 0.f;
+            for (int i = 0; i < kQ8Block; ++i) acc += (float)qs[i] * q[(size_t)b * kQ8Block + (size_t)i];
+            s += ggml_fp16_to_fp32(dh) * acc;
+        }
+        return s;
+    }
+    static void deq_q8(const uint8_t* row, float* dst, int n) {
+        for (int b = 0; b < n / kQ8Block; ++b) {
+            const uint8_t* p = row + (size_t)b * kQ8Bytes;
+            uint16_t dh;
+            std::memcpy(&dh, p, 2);
+            const int8_t* qs = (const int8_t*)(p + 2);
+            const float d = ggml_fp16_to_fp32(dh);
+            for (int i = 0; i < kQ8Block; ++i) dst[(size_t)b * kQ8Block + (size_t)i] = d * (float)qs[i];
+        }
+    }
+    // Byte offset of the q8 block that starts at value offset `off` (always a head boundary here).
+    size_t q8_off(size_t off) const {
+        const size_t klen = (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
+        const size_t tok = off / klen;
+        const size_t rest = off % klen;
+        return tok * kv_q_row + (rest / (size_t)cfg.head_dim) * (size_t)(cfg.head_dim / kQ8Block) * (size_t)kQ8Bytes;
+    }
+    // Store one token's K or V (n = n_head_kv * head_dim values) into whichever layout is active.  `off` is the
+    // value offset, so both layouts address the same token the same way.
+    void store_kv(uint8_t* qbase, uint16_t* base, size_t off, const float* src, int n) {
+        if (kv_q) {
+            uint8_t* dst = qbase + q8_off(off);
+            for (int i = 0; i < n; i += kQ8Block) quant_q8_block(src + i, dst + (size_t)(i / kQ8Block) * kQ8Bytes);
+            return;
+        }
+        store_f16(base, off, src, n);
+    }
+    // One head's `n` values, as a dot against a fp32 query, and as fp32 values.
+    float dot_head(uint8_t* qbase, uint16_t* base, size_t off, int n, const float* q) const {
+        if (kv_q) return dot_q8(qbase + q8_off(off), q, n);
+        return dot_f16_cache(base + off, q, n);
+    }
+    void load_head(uint8_t* qbase, uint16_t* base, size_t off, int n, float* dst) const {
+        if (kv_q) {
+            deq_q8(qbase + q8_off(off), dst, n);
+            return;
+        }
+        for (int i = 0; i < n; ++i) dst[i] = ggml_fp16_to_fp32(base[off + (size_t)i]);
+    }
+    // The same store, from fp16 input (the batched path's device kernels produce fp16 K/V).
+    void store_kv16(uint8_t* qbase, uint16_t* base, size_t off, const uint16_t* src, int n) {
+        if (!kv_q) {
+            std::memcpy(base + off, src, (size_t)n * sizeof(uint16_t));
+            return;
+        }
+        if (kv_f32.size() < (size_t)n) kv_f32.assign((size_t)n, 0.f);
+        for (int i = 0; i < n; ++i) kv_f32[(size_t)i] = ggml_fp16_to_fp32(src[i]);
+        store_kv(qbase, base, off, kv_f32.data(), n);
+    }
+
     // The MSA selection, shared by the host and device attention paths: local blocks are forced in, the rest are
-    // ranked by their max-pooled indexer score, and the selected blocks expand to token positions.
+    // ranked by their max-pooled indexer score, and the selected blocks expand to token positions.  The scratch is
+    // reused (P8: this used to allocate five vectors per token per layer).
     void select_slots(int64_t li, int64_t pos, const float* bs_in, int nb, std::vector<int32_t>& slots,
                       std::vector<int>& off) {
         const int HI = (int)cfg.idx_heads;
         const int BLK = (int)cfg.idx_block;
-        std::vector<float> bs(bs_in, bs_in + (size_t)HI * nb);
+        ah_bs2.assign(bs_in, bs_in + (size_t)HI * nb);
+        std::vector<float>& bs = ah_bs2;
         for (int h = 0; h < HI; ++h) {
             const int qb = (int)(pos / BLK);
             for (int l = 0; l < (int)cfg.idx_local; ++l) {
@@ -3734,9 +3983,12 @@ struct Engine::Impl {
             }
         }
         const int kk = (int)cfg.idx_top_k < nb ? (int)cfg.idx_top_k : nb;
-        std::vector<char> sel((size_t)HI * (size_t)nb, 0);
-        std::vector<int> order((size_t)nb);
-        std::vector<int64_t> ids((size_t)HI * (size_t)cfg.idx_top_k, -1);   // probe dump, -1 padded
+        ah_sel.assign((size_t)HI * (size_t)nb, 0);
+        std::vector<char>& sel = ah_sel;
+        ah_order.resize((size_t)nb);
+        std::vector<int>& order = ah_order;
+        ah_ids.assign((size_t)HI * (size_t)cfg.idx_top_k, -1);   // probe dump, -1 padded
+        std::vector<int64_t>& ids = ah_ids;
         for (int h = 0; h < HI; ++h) {
             std::iota(order.begin(), order.end(), 0);
             std::partial_sort(order.begin(), order.begin() + kk, order.end(), [&](int a, int b) {
@@ -3756,8 +4008,6 @@ struct Engine::Impl {
         const int64_t Tk = pos + 1;
         off.assign((size_t)HI + 1, 0);
         slots.clear();
-        const int64_t cap = (int64_t)cfg.idx_top_k * BLK;
-        slots.reserve((size_t)HI * (size_t)(cap < 2048 ? cap : 2048));
         for (int ih = 0; ih < HI; ++ih) {
             off[(size_t)ih] = (int)slots.size();
             for (int b = 0; b < nb; ++b) {
@@ -3789,76 +4039,137 @@ struct Engine::Impl {
         // P7: --minimax-kv vram keeps no host K/V at all.  Calling the host path under it used to read a null
         // pointer and take an access violation tens of seconds into a batched prefill; name the combination
         // instead of dying in it.
-        if (!k_host || !v_host)
+        if ((!k_host && !k_host_q) || (!v_host && !v_host_q))
             fail("host attention was asked to run but the K/V cache is not in host memory (--minimax-kv vram "
                  "keeps it on the device). Use --minimax-kv ram or host, or put at least one dense layer on the "
                  "GPU so the batched device attention path can run.");
         const int H = (int)cfg.n_head;
         const int HKV = (int)cfg.n_head_kv;
         const int D = (int)cfg.head_dim;
+        const int ID = (int)cfg.idx_dim;
+        if (L.indexer && !ik_host)
+            fail("host attention needs the indexer keys in host memory, and this placement keeps them on the card "
+                 "only (the pinned-RAM KV tier). The batched prompt pass stages one layer's K/V on the device "
+                 "instead; do not turn that off (--minimax-prefill-kv auto), or use --minimax-kv host.");
         const int64_t Tk = pos + 1;
         const int q_per_kv = H / HKV;
         const float scale = 1.f / std::sqrt((float)D);
+        const size_t klen = (size_t)HKV * (size_t)D;
+        const size_t lbase = (size_t)layer * (size_t)ctx * klen;   // value offset of this layer's row 0
+        const bool fast = host_attn_fast;
+        const bool use_q = kv_q != 0;
+        if (fast && pool.nthreads > 1) {
+            const size_t need = (size_t)pool.nthreads * (size_t)max_slot;
+            if (ah_prob.size() < need) ah_prob.assign(need, 0.f);
+            if (use_q && ah_prob_d.size() < need * (size_t)D) ah_prob_d.assign(need * (size_t)D, 0.f);
+        }
         int nb = 0;
-        std::vector<int32_t> slots;
-        std::vector<int> slot_off;
         if (L.indexer) {
             const int HI = (int)cfg.idx_heads;
             const int BLK = (int)cfg.idx_block;
             nb = (int)((Tk + BLK - 1) / BLK);
-            std::vector<float> bs((size_t)HI * nb, -std::numeric_limits<float>::infinity());
-            for (int h = 0; h < HI; ++h) {
-                const float* qh = iq.data() + (size_t)h * cfg.idx_dim;
-                for (int b = 0; b < nb; ++b) {
-                    const int64_t begin = (int64_t)b * BLK;
-                    const int64_t end = begin + BLK < Tk ? begin + BLK : Tk;
-                    float m = -std::numeric_limits<float>::infinity();
-                    for (int64_t t = begin; t < end; ++t) {
-                        if (t > pos) break;
-                        const float sc = dot_f16_cache(ik_at(layer, t), qh, (int)cfg.idx_dim);
-                        if (sc > m) m = sc;
+            ah_bs.assign((size_t)HI * nb, -std::numeric_limits<float>::infinity());
+            if (fast) {
+                // P8: one job per (indexer head, block).  The max-pool order inside a block is unchanged, so this
+                // is bit-identical to the serial loop it replaces; at 32 K keys it is the difference between
+                // ~1 GMAC on one thread and the same work spread over the pool.
+                pool.run(HI * nb, [&](int a, int b) {
+                    for (int r = a; r < b; ++r) {
+                        const int h = r / nb;
+                        const int bl = r % nb;
+                        const float* qh = iq.data() + (size_t)h * ID;
+                        const int64_t begin = (int64_t)bl * BLK;
+                        int64_t end = begin + BLK < Tk ? begin + BLK : Tk;
+                        float m = -std::numeric_limits<float>::infinity();
+                        for (int64_t t = begin; t < end; ++t) {
+                            if (t > pos) break;
+                            const float sc = dot_f16_cache(ik_at(layer, t), qh, ID);
+                            if (sc > m) m = sc;
+                        }
+                        ah_bs[(size_t)r] = m;
                     }
-                    bs[(size_t)h * nb + b] = m;
+                });
+            } else {
+                for (int h = 0; h < HI; ++h) {
+                    const float* qh = iq.data() + (size_t)h * ID;
+                    for (int b = 0; b < nb; ++b) {
+                        const int64_t begin = (int64_t)b * BLK;
+                        const int64_t end = begin + BLK < Tk ? begin + BLK : Tk;
+                        float m = -std::numeric_limits<float>::infinity();
+                        for (int64_t t = begin; t < end; ++t) {
+                            if (t > pos) break;
+                            const float sc = dot_f16_cache(ik_at(layer, t), qh, ID);
+                            if (sc > m) m = sc;
+                        }
+                        ah_bs[(size_t)h * nb + b] = m;
+                    }
                 }
             }
-            select_slots(layer, pos, bs.data(), nb, slots, slot_off);
+            select_slots(layer, pos, ah_bs.data(), nb, ah_slots, ah_off);
         }
         const int q_per_idx = L.indexer ? H / (int)cfg.idx_heads : H;
-        for (int qh = 0; qh < H; ++qh) {
+        // One query head is independent of every other, so splitting them across the pool keeps the arithmetic
+        // identical: the same dots, in the same order, over the same slots.
+        auto one_head = [&](int qh, float* prob, float* vb) {
             const int kv = qh / q_per_kv;
             const float* qrow = q.data() + (size_t)qh * D;
             float* out = att + (size_t)qh * D;
             for (int d = 0; d < D; ++d) out[d] = 0.f;
             if (!L.indexer) {
-                std::vector<float> prob((size_t)Tk);
                 for (int64_t t = 0; t < Tk; ++t) {
                     if (t > pos) prob[(size_t)t] = -std::numeric_limits<float>::infinity();
-                    else prob[(size_t)t] = dot_f16_cache(k_at(layer, t, kv), qrow, D) * scale;
+                    else prob[(size_t)t] = dot_head(k_host_q, k_host, lbase + (size_t)t * klen + (size_t)kv * D, D, qrow) * scale;
                 }
-                softmax_inplace(prob.data(), (int)Tk);
+                softmax_inplace(prob, (int)Tk);
                 for (int64_t t = 0; t < Tk; ++t) {
                     const float p = prob[(size_t)t];
                     if (p == 0.f) continue;
-                    const uint16_t* vv = v_at(layer, t, kv);
-                    for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
+                    if (use_q) {
+                        load_head(v_host_q, v_host, lbase + (size_t)t * klen + (size_t)kv * D, D, vb);
+                        for (int d = 0; d < D; ++d) out[d] += p * vb[d];
+                    } else {
+                        const uint16_t* vv = v_host + lbase + (size_t)t * klen + (size_t)kv * D;
+                        for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
+                    }
                 }
-                continue;
+                return;
             }
             const int ih = qh / q_per_idx;
-            const int a = slot_off[(size_t)ih];
-            const int b = slot_off[(size_t)ih + 1];
+            const int a = ah_off[(size_t)ih];
+            const int b = ah_off[(size_t)ih + 1];
             const int nslot = b - a;
-            if (nslot <= 0) continue;
-            std::vector<float> prob((size_t)nslot);
-            for (int i = 0; i < nslot; ++i)
-                prob[(size_t)i] = dot_f16_cache(k_at(layer, slots[(size_t)(a + i)], kv), qrow, D) * scale;
-            softmax_inplace(prob.data(), nslot);
+            if (nslot <= 0) return;
+            for (int i = 0; i < nslot; ++i) {
+                const int32_t t = ah_slots[(size_t)(a + i)];
+                prob[(size_t)i] = dot_head(k_host_q, k_host, lbase + (size_t)t * klen + (size_t)kv * D, D, qrow) * scale;
+            }
+            softmax_inplace(prob, nslot);
             for (int i = 0; i < nslot; ++i) {
                 const float p = prob[(size_t)i];
                 if (p == 0.f) continue;
-                const uint16_t* vv = v_at(layer, slots[(size_t)(a + i)], kv);
-                for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
+                const int32_t t = ah_slots[(size_t)(a + i)];
+                if (use_q) {
+                    load_head(v_host_q, v_host, lbase + (size_t)t * klen + (size_t)kv * D, D, vb);
+                    for (int d = 0; d < D; ++d) out[d] += p * vb[d];
+                } else {
+                    const uint16_t* vv = v_host + lbase + (size_t)t * klen + (size_t)kv * D;
+                    for (int d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vv[d]);
+                }
             }
+        };
+        // The parallel path needs `nslot <= max_slot`; that is guaranteed by the indexer (top_k x block) and not by
+        // the dense fallback, whose row is as long as the context.
+        if (fast && pool.nthreads > 1 && L.indexer && ah_prob.size() >= (size_t)max_slot) {
+            pool.run(H, [&](int a, int b) {
+                float* prob = ah_prob.data() + (size_t)tls_part * (size_t)max_slot;
+                float* vb = use_q ? ah_prob_d.data() + (size_t)tls_part * (size_t)max_slot * (size_t)D : nullptr;
+                for (int qh = a; qh < b; ++qh) one_head(qh, prob, vb);
+            }, true);
+        } else {
+            const size_t pn = (size_t)(Tk > max_slot ? Tk : max_slot);
+            if (ah_prob_s.size() < pn) ah_prob_s.assign(pn, 0.f);
+            if (use_q && ah_prob_ds.size() < (size_t)D) ah_prob_ds.assign((size_t)D, 0.f);
+            for (int qh = 0; qh < H; ++qh) one_head(qh, ah_prob_s.data(), use_q ? ah_prob_ds.data() : nullptr);
         }
     }
 
@@ -3921,8 +4232,18 @@ struct Engine::Impl {
                     const size_t src = ((size_t)layer * (size_t)ctx + (size_t)t) * (size_t)HKV * (size_t)D +
                                        (size_t)h * (size_t)D;
                     const size_t dst = ((size_t)h * (size_t)max_slot + (size_t)i) * (size_t)D;
-                    std::memcpy(w.kstage_h + dst, k_host + src, row);
-                    std::memcpy(w.vstage_h + dst, v_host + src, row);
+                    if (kv_q) {
+                        // P8: the staged device buffer is fp16, so a quantized cache is dequantized on the way
+                        // across.  It still halves the host read and the copy.
+                        if (ah_stage.size() < (size_t)D * 2) ah_stage.resize((size_t)D * 2);
+                        load_head(k_host_q, k_host, src, D, ah_stage.data());
+                        to_f16(ah_stage.data(), w.kstage_h + dst, D);
+                        load_head(v_host_q, v_host, src, D, ah_stage.data());
+                        to_f16(ah_stage.data(), w.vstage_h + dst, D);
+                    } else {
+                        std::memcpy(w.kstage_h + dst, k_host + src, row);
+                        std::memcpy(w.vstage_h + dst, v_host + src, row);
+                    }
                 }
                 if (n > 0) {
                     const size_t off = (size_t)h * (size_t)max_slot * (size_t)D;
@@ -3976,6 +4297,36 @@ struct Engine::Impl {
         prefill_gpu_experts = opt.prefill_experts != "cpu";
         if (prefill_gpu_experts && devs.empty()) {
             prefill_gpu_experts = false;
+        }
+        // P8: the RAM tier''s prompt pass runs attention on the card when one layer''s K/V fits there.  The device
+        // kernel reads fp16 rows, so a q8_0 cache keeps the host path (documented in the plan line).
+        prefill_kv_stage = kv_mode == 2 && !work.empty() && opt.prefill_kv != "off" &&
+                           cfg.n_head_kv == cfg.idx_heads && cfg.idx_first_layer == 0;
+        if (prefill_kv_stage && kv_q) {
+            // Correct, just not batched: the token path''s device attention reads the q8 blocks directly.
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-kv: the device MSA kernels read fp16 rows and the cache is q8_0; "
+                         "keeping the token path for the prompt (slower, same result). Use f16 K/V, or the vram "
+                         "tier, for a batched prompt at long context.\n");
+            prefill_kv_stage = false;
+            batch_cap = 0;
+            return;
+        }
+        // The device dequant path (iq_mmvq) has no kernel for the expert formats ported from ik_llama.cpp.
+        // In `auto` (the default) a model made of them computes its experts on the CPU, the path the G3 runs
+        // use, instead of failing the first batched chunk with "iq_mmvq: type 164 is not supported".  An
+        // explicit `gpu` still asks for the device and fails with that message.
+        bool ikq_experts = false;
+        if (prefill_gpu_experts && opt.prefill_experts != "gpu") {
+            for (const Layer& L : layers) {
+                if (L.moe && (strata::kernels::ikq::is_iqk_type(L.egate.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.eup.type) ||
+                              strata::kernels::ikq::is_iqk_type(L.edown.type))) {
+                    ikq_experts = true;
+                    prefill_gpu_experts = false;
+                    break;
+                }
+            }
         }
         if (max_expert_bytes == 0)
             for (const Layer& L : layers)
@@ -4060,6 +4411,25 @@ struct Engine::Impl {
             p.d_blk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)pf_max_blk * sizeof(int32_t) + 4096));
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
             p.d_pos = DevPtr(cu::alloc((size_t)T * sizeof(int32_t) + 64));
+            // ---- P8: the long-context prompt path.  With the K/V in pinned RAM the batched attention used to fall
+            // back to attend_host(), whose indexer score loop is scalar -- ~1 s/token at 32 K.  Instead stage one
+            // layer's whole K/V prefix on the card (a single large copy per layer, ~0.06 s per 1 K tokens) and run
+            // the existing device MSA kernel.  The staging buffer is [ctx][n_head_kv][head_dim] fp16, the same
+            // layout the device KV tier uses, so the selected block ids are absolute positions in both.
+            if (prefill_kv_stage) {
+                const size_t kvb = (size_t)kv_row_bytes * (size_t)ctx;
+                const cu::MemInfo mi = cu::mem_on(devs[d]);
+                const size_t want = kvb * 2 + ((size_t)64 << 20);
+                if (mi.free_bytes > want) {
+                    p.kv_k = DevPtr(cu::alloc(kvb));
+                    p.kv_v = DevPtr(cu::alloc(kvb));
+                } else {
+                    std::fprintf(stderr,
+                                 "INFO minimax-prefill-kv: device %d cannot hold one layer's K/V (%.0f MiB "
+                                 "needed, %.0f MiB free); keeping host attention for this device\n",
+                                 devs[d], (double)want / 1048576.0, (double)mi.free_bytes / 1048576.0);
+                }
+            }
             if (prefill_gpu_experts && max_expert_bytes > 0) {
                 p.ring_slot = max_expert_bytes;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
@@ -4095,14 +4465,22 @@ struct Engine::Impl {
         pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
         pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
         pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        pf_gate_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
-        pf_up_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
-        pf_hid_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
+        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
+        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
+        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
+        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
+        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
+        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
         pf_dense_h.assign((size_t)batch_cap * (size_t)max_dense_n, 0.f);
         pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
         pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
         std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s\n", batch_cap,
                      prefill_gpu_experts ? "gpu" : "cpu");
+        if (ikq_experts)
+            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
+                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
@@ -4165,6 +4543,30 @@ struct Engine::Impl {
     // The same projection on the CPU: every weight row is read once and dotted with all T activations.
     void gemm_cpu_base(const Tensor& t, const uint8_t* base, const float* X, int T, int ldx, float* Y, int ldy) {
         const int N = (int)t.ne1, K = (int)t.ne0;
+        if (strata::kernels::ikq::is_iqk_type(t.type)) {
+            // The ported ik_llama.cpp formats have no ggml type id, so their batched projection uses the
+            // engine's own codec, exactly as `dot_rows_base` does one row at a time.  Without this branch a
+            // batched prefill of an IQ2_KL / IQ2_KT / IQ3_K / IQ4_KS model fails with "ggml-cpu has no
+            // vec_dot for type 164" (type 164 is IQ2_KL) before a single token runs.
+            if ((K % 256) != 0) {
+                fail(t.name + ": " + strata::kernels::ikq::type_name(t.type) +
+                     " needs a width that is a whole number of 256-value blocks");
+            }
+            const ggml_type_traits_cpu* act = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+            if (!act || !act->from_float) fail(t.name + ": no from_float for the q8_K activation");
+            const size_t act_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+            std::vector<uint8_t> aq(act_bytes * (size_t)T);
+            for (int c = 0; c < T; ++c) act->from_float(X + (size_t)c * ldx, aq.data() + (size_t)c * act_bytes, K);
+            pool.run(N, [&](int a, int b) {
+                for (int r = a; r < b; ++r) {
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
+                    for (int c = 0; c < T; ++c)
+                        Y[(size_t)c * ldy + r] = strata::kernels::ikq::dot_row(
+                            t.type, row, aq.data() + (size_t)c * act_bytes, K);
+                }
+            });
+            return;
+        }
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
             pool.run(N, [&](int a, int b) {
                 for (int r = a; r < b; ++r) {
@@ -4399,10 +4801,10 @@ struct Engine::Impl {
                                        (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
                     cu::f32_to_f16((const float*)w.kn.p, (uint16_t*)w.att.p, n, nullptr);
                     cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
-                    std::memcpy(k_host + koff, kv_tmp.data(), (size_t)n * 2);
+                    store_kv16(k_host_q, k_host, koff, kv_tmp.data(), n);
                     cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.att.p, n, nullptr);
                     cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
-                    std::memcpy(v_host + koff, kv_tmp.data(), (size_t)n * 2);
+                    store_kv16(v_host_q, v_host, koff, kv_tmp.data(), n);
                 }
                 }
             } else {
@@ -4418,14 +4820,14 @@ struct Engine::Impl {
                 dbuf_put(pfx + "/k_after_rope", k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
             }
             if (kv_mode == 0) {
-                store_f16(k_host, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
-                store_f16(v_host, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+                store_kv(k_host_q, k_host, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+                store_kv(v_host_q, v_host, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
             } else {
                 // The owning device's K/V (VRAM tier, one buffer per layer) or the page-locked host K/V (RAM tier).
                 const int n = (int)(cfg.n_head_kv * cfg.head_dim);
                 if (kv_mode == 2) {
-                    store_f16(k_host, koff, k.data(), n);
-                    store_f16(v_host, koff, v.data(), n);
+                    store_kv(k_host_q, k_host, koff, k.data(), n);
+                    store_kv(v_host_q, v_host, koff, v.data(), n);
                 } else {
                     to_f16(k.data(), kv_tmp.data(), n);
                     cu::copy_h2d((uint16_t*)L.d_k.p + koff_dev, kv_tmp.data(), (size_t)n * 2);
@@ -4477,11 +4879,13 @@ struct Engine::Impl {
                 }
                 }
             }
-            std::vector<float> att((size_t)cfg.n_head * (size_t)cfg.head_dim);
-            attend((int)li, L, pos, att.data(), dev_tok ? (const float*)W().qn.p : nullptr,
+            if (att_buf.size() < (size_t)cfg.n_head * (size_t)cfg.head_dim)
+                att_buf.assign((size_t)cfg.n_head * (size_t)cfg.head_dim, 0.f);
+            float* att = att_buf.data();
+            attend((int)li, L, pos, att, dev_tok ? (const float*)W().qn.p : nullptr,
                    dev_tok && L.indexer ? (const float*)W().iqn.p : nullptr);
-            if (dbg) dbuf_put(pfx + "/attn_core_out", att.data(), (int)(cfg.n_head * cfg.head_dim));
-            gemv(L.wo, att.data(), proj.data());
+            if (dbg) dbuf_put(pfx + "/attn_core_out", att, (int)(cfg.n_head * cfg.head_dim));
+            gemv(L.wo, att, proj.data());
             if (dbg) dbuf_put(pfx + "/attn_out", proj.data(), (int)cfg.n_embd);
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
 
@@ -4906,7 +5310,7 @@ struct Engine::Impl {
             Layer& L = layers[(size_t)li];
             const bool gpu = !devs.empty() && L.want_gpu;
             const auto t_layer = pfclock::now();
-            const bool dev_attn = kv_mode == 1;   // the KV is on the device: attention must run there
+            const bool dev_attn = kv_mode == 1 || (prefill_kv_stage && !pf.empty() && P().kv_k.p && P().kv_v.p);
             if (gpu || kv_mode != 0) use_layer_device(li);
             PfBuf p_dummy;
             PfBuf& p = pf.empty() ? p_dummy : P();
@@ -4946,8 +5350,8 @@ struct Engine::Impl {
                     } else {
                         pf_k16.resize((size_t)T * klen);
                         cu::copy_d2h(pf_k16.data(), kdst, (size_t)T * klen * 2);
-                        std::memcpy(k_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
-                                    pf_k16.data(), (size_t)T * klen * sizeof(uint16_t));
+                        store_kv16(k_host_q, k_host, ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                   pf_k16.data(), (int)((size_t)T * (size_t)klen));
                     }
                 }
                 gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
@@ -4960,8 +5364,8 @@ struct Engine::Impl {
                     } else {
                         pf_v16.resize((size_t)T * klen);
                         cu::copy_d2h(pf_v16.data(), vdst, (size_t)T * klen * 2);
-                        std::memcpy(v_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
-                                    pf_v16.data(), (size_t)T * klen * sizeof(uint16_t));
+                        store_kv16(v_host_q, v_host, ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                   pf_v16.data(), (int)((size_t)T * (size_t)klen));
                     }
                 }
                 if (dev_prep) cu::sync();
@@ -4980,8 +5384,8 @@ struct Engine::Impl {
                 rope(pf_kv.data() + (size_t)t * klen, HKV, D, (int)cfg.n_rot, (int)(pos0 + t), cfg.rope_theta);
                 const size_t koff = ((size_t)li * (size_t)ctx + (size_t)(pos0 + t)) * (size_t)klen;
                 if (kv_mode != 1) {
-                    store_f16(k_host, koff, pf_kv.data() + (size_t)t * klen, klen);
-                    store_f16(v_host, koff, vf.data() + (size_t)t * klen, klen);
+                    store_kv(k_host_q, k_host, koff, pf_kv.data() + (size_t)t * klen, klen);
+                    store_kv(v_host_q, v_host, koff, vf.data() + (size_t)t * klen, klen);
                 }
             }
             if (kv_mode == 1 && !dev_prep) {
@@ -5077,8 +5481,20 @@ struct Engine::Impl {
                     cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
                 }
                 cu::sync();
+                // P8: with the K/V in pinned RAM, stage this layer's used prefix on the card once and let the
+                // device MSA kernel read it.  One copy of [pos0+T] rows per layer, not one gather per query.
+                const void* kk = L.d_k.p;
+                const void* vv = L.d_v.p;
+                if (kv_mode == 2) {
+                    const size_t kvb = (size_t)klen * sizeof(uint16_t);
+                    const size_t used = (size_t)(pos0 + T) * kvb;
+                    cu::copy_h2d(p.kv_k.p, (const uint8_t*)k_host + (size_t)li * (size_t)ctx * kvb, used);
+                    cu::copy_h2d(p.kv_v.p, (const uint8_t*)v_host + (size_t)li * (size_t)ctx * kvb, used);
+                    kk = p.kv_k.p;
+                    vv = p.kv_v.p;
+                }
                 const auto tm0 = pfclock::now();
-                cu::msa_attn_batch(L.d_k.p, L.d_v.p, (const uint16_t*)p.d_q16.p, (const int32_t*)p.d_blk.p,
+                cu::msa_attn_batch(kk, vv, (const uint16_t*)p.d_q16.p, (const int32_t*)p.d_blk.p,
                                    (const int32_t*)p.d_nblk.p, H, H / HKV, L.indexer ? H / HI : 1, D, BLK,
                                    L.indexer ? 0 : 1, pos0, T, pf_max_blk, p.p32, nullptr);
                 cu::sync();
@@ -5319,9 +5735,10 @@ std::string Engine::describe() const {
           << impl_->ram_per_layer << " profile=" << (impl_->profile.empty() ? "none" : "loaded")
           << " adaptive=" << (impl_->opt.adaptive ? 1 : 0);
     }
-    o << " kv=f16 norm_add1=" << (impl_->norm_add1 ? 1 : 0) << " threads=" << impl_->threads
-      << " ctx=" << impl_->ctx;
-    if (impl_->devs.size() > 1) {
+    o << " kv=" << (impl_->kv_q ? "q8_0" : "f16") << " norm_add1=" << (impl_->norm_add1 ? 1 : 0)
+      << " threads=" << impl_->threads << " ctx=" << impl_->ctx
+      << " host_attn=" << (impl_->host_attn_fast ? "fast" : "legacy")
+      << " prefill_kv=" << (impl_->prefill_kv_stage ? "stage" : "host");    if (impl_->devs.size() > 1) {
         o << " gpus=";
         for (size_t d = 0; d < impl_->devs.size(); ++d) {
             if (d) o << ",";
