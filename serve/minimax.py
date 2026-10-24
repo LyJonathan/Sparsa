@@ -30,6 +30,9 @@ THINK_END = '</mm:think>'
 CALL_START = '<tool_call>'
 CALL_END = '</tool_call>'
 IMAGE_TOKEN = ']<]image[>['
+VISION_START = ']<]start of image[>['
+VISION_END = ']<]end of image[>['
+IMAGE_PAD_ID = 200025
 EOS_ID = 200020          # [e~[ in the released tokenizer; also read from tokenizer_config.json below
 
 # Hugging Face's ByteLevel pre-tokenizer, \p classes included: this is the split the released BPE was trained on.
@@ -91,7 +94,10 @@ class MiniMaxTokenizer(Tokenizer):
         self._special_re = self._alt(list(self.special_tokens))
         self._always_re = self._special_re
         self._added_bytes = {t['id']: t['content'].encode('utf-8') for t in added}
-        self.control_tokens = []
+        # The template's own control literals.  `literal_tags` marks these inside user text so a file an agent
+        # reads cannot open an image/tool/reasoning block (#150, #554).
+        self.control_tokens = [IMAGE_TOKEN, VISION_START, VISION_END, THINK_BEGIN, THINK_END,
+                               CALL_START, CALL_END, NS]
         self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
 
         self.splits: list[regex.Pattern] = []

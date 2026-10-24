@@ -8,6 +8,8 @@
 {%- set think_begin_token      = '<mm:think>'                     -%}
 {%- set think_end_token        = '</mm:think>'                    -%}
 {%- set image_token            = ']<]image[>['                    -%}
+{%- set vision_start_token     = ']<]start of image[>['          -%}
+{%- set vision_end_token       = ']<]end of image[>['            -%}
 {%- set video_token            = ']<]video[>['                    -%}
 {#- Recursive XML renderer for tool_call arguments ======================== -#}
 {#- None values are intentionally skipped in mapping iteration so that
@@ -47,7 +49,7 @@
             {%- if item is mapping and item.type == 'text' -%}
                 {{- item.text }}
             {%- elif item is mapping and item.type == 'image' -%}
-                {{- image_token }}
+                {{- vision_start_token ~ image_token ~ vision_end_token }}
             {%- elif item is mapping and item.type == 'video' -%}
                 {{- video_token }}
             {%- elif item is string -%}
@@ -214,7 +216,7 @@
         {%- else -%}
             {%- for tr in message.content -%}
                 {%- if tr is mapping and tr.type is defined and tr.type == 'image' -%}
-                    {{- image_token }}
+                    {{- vision_start_token ~ image_token ~ vision_end_token }}
                 {%- elif tr is mapping and tr.type is defined and tr.type == 'video' -%}
                     {{- video_token }}
                 {%- else -%}
