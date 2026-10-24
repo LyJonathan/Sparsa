@@ -135,19 +135,24 @@ def main():
         info["architecture"] = kv.get("general.architecture", "ABSENT")
         info["alignment"] = kv.get("general.alignment", 32)
 
-        if kv.get("general.architecture") != "minimax-m3":
-            fails.append("general.architecture is %r" % (kv.get("general.architecture"),))
+        if a.part == 0:
+            if kv.get("general.architecture") != "minimax-m3":
+                fails.append("general.architecture is %r" % (kv.get("general.architecture"),))
+            # the vocabulary and the chat template are the part-0 markers
+            for want in ("tokenizer.ggml.model", "tokenizer.ggml.tokens", "tokenizer.ggml.merges"):
+                if want not in present:
+                    fails.append("part 0 has no " + want)
+        else:
+            # later parts carry only split metadata; a stray architecture key would mean the
+            # globals were written twice
+            if "general.architecture" in present:
+                fails.append("part %d repeats general.architecture" % a.part)
         if kv.get("split.no") != a.part:
             fails.append("split.no is %r, expected %d" % (kv.get("split.no"), a.part))
         if kv.get("split.count") != a.count:
             fails.append("split.count is %r, expected %d" % (kv.get("split.count"), a.count))
         if "split.tensors.count" not in kv:
             fails.append("split.tensors.count is absent")
-        if a.part == 0:
-            # the vocabulary and the chat template are the part-0 markers
-            for want in ("tokenizer.ggml.model", "tokenizer.ggml.tokens", "tokenizer.ggml.merges"):
-                if want not in present:
-                    fails.append("part 0 has no " + want)
 
         tensors = []
         for _ in range(n_tensors):
