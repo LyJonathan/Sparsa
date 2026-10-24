@@ -79,6 +79,11 @@ void usage() {
                  "  --gpus 0,1                       CUDA devices to use (default: 0)\n"
                  "  --layer-split auto|K[,K2]         layer K is the first one on the next GPU (auto: by free VRAM)\n"
                  "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n"
+                 "  --minimax-kv-quant f16|q8_0|auto  fp16 (default) or q8_0 blocks for the host/pinned K/V;\n"
+                 "                                    auto picks q8_0 only when f16 does not fit\n"
+                 "  --minimax-host-attn fast|legacy   multithreaded host attention (default fast; same arithmetic)\n"
+                 "  --minimax-prefill-kv auto|off     with the KV in RAM, stage one layer's K/V on the card for the\n"
+                 "                                    batched prompt pass (default auto, the long-context path)\n"
                  "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
                  "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
@@ -532,6 +537,7 @@ int run(int argc, char** argv) {
     std::string pack_type, pack_in, pack_out;
     std::string dump_dir, dump_layers, seed_hidden;
     std::string layer_split, gpus, kv_space;
+    std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
     std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
@@ -569,6 +575,9 @@ int run(int argc, char** argv) {
         else if (a == "--layer-split") layer_split = next();
         else if (a == "--gpus" || a == "--gpu") gpus = next();
         else if (a == "--minimax-kv" || a == "--kv-space") kv_space = next();
+        else if (a == "--minimax-kv-quant" || a == "--kv-quant") kv_quant = next();
+        else if (a == "--minimax-host-attn" || a == "--host-attn") host_attn = next();
+        else if (a == "--minimax-prefill-kv") prefill_kv = next();
         else if (a == "--minimax-prefill-batch" || a == "--minimax-batch") prefill_batch = std::atoi(next().c_str());
         else if (a == "--minimax-prefill-experts") prefill_experts = next();
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
@@ -724,6 +733,9 @@ int run(int argc, char** argv) {
     opt.layer_split = layer_split;
     opt.gpus = gpus;
     opt.kv_space = kv_space;
+    opt.kv_quant = kv_quant;
+    opt.host_attn = host_attn;
+    opt.prefill_kv = prefill_kv;
     opt.prefill_batch = prefill_batch;
     opt.prefill_experts = prefill_experts;
     opt.prefill_dense = prefill_dense;
