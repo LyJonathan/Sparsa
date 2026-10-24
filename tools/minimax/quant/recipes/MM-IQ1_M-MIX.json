@@ -1,0 +1,19 @@
+{
+  "name": "MM-IQ1_M-MIX",
+  "file_type": 25,
+  "require_imatrix": true,
+  "dynamic_down": true,
+  "types": {
+    "experts": "IQ1_M",
+    "ffn_down_exps": "IQ2_XXS",
+    "hot_experts": "IQ2_XS",
+    "attention": "Q6_K",
+    "indexer": "Q6_K",
+    "dense_ffn": "Q6_K",
+    "shared_experts": "Q6_K",
+    "router": "F32",
+    "norms": "F32",
+    "token_embd": "Q6_K",
+    "output": "Q6_K"
+  }
+}
