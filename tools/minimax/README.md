@@ -644,3 +644,66 @@ rather than "available - 2 GiB" (87 experts/layer on the full pack against ~115 
 would fall to ~0.3-0.4), read the SSD tier through the page cache when the pages are already resident (Strata's
 zero-copy + `mincore`, 1.14-1.47x on its own 12 GB test), and prefetch the next layer's SSD misses (the exact next
 routes already exist in `prefetch_for`).
+## P7: the RAM tier sized from the box, the page-cache path, one-layer-early reads
+
+P6 made the SSD tier's reads overlapped. P7 attacks the bytes themselves, and the two properties of the box the
+engine used to ignore.
+
+**The pinned RAM tier is sized from the machine, not from "available - 2 GiB".** That constant was wrong at both
+ends: on a 32 GB box it is 6% of the machine, on a 128 GB box it is less than the desktop plus the tools that talk
+to the engine, and it ignored the dense weights that must stay resident. The budget is now
+
+```
+budget = min(physical, available now) - headroom - dense_host - host_kv - host_workspace
+headroom = physical / 16, clamped to 3-10 GiB     (--minimax-ram-headroom-mib overrides it)
+```
+
+* `dense_host` is every dense tensor the engine did not upload (attention projections, dense MLP, the shared
+  expert, the router, the embedding, and `lm_head` when it stays on the host). They are read on every token, so
+  a tier that takes their pages away buys SSD misses with page faults, which is worse.
+* `host_kv` is the fp16 K/V and indexer K for the whole context (zero with `--minimax-kv vram`); the workspace is
+  the token vectors, MLP scratch and the full-vocabulary logits.
+* The plan is printed once at startup (`INFO minimax-ram-tier plan budget=... headroom=... dense_host=...`) so the
+  arithmetic is visible on a machine that behaves differently from this one.
+* If the operating system refuses to pin that much (`PinnedArena` fails), an automatic budget steps down 15% at a
+  time and says so, instead of failing the run. An explicit `--memory-limit-mib` or
+  `--minimax-ram-experts-per-layer` still fails loudly: the operator asked for that number.
+* The slots are then split **per layer by the routing profile**, not uniformly: the global ranked list is walked
+  hot to cold and each entry offers its layer one more slot for its next-hottest expert that is not already going
+  to VRAM, until the byte budget is spent. A layer the profile says is routed twice as often gets twice the slots,
+  and no layer is starved (each remaining slot is filled round-robin from whatever budget is left). Layers'
+  regions are 2 MiB-aligned. With no profile the split is uniform, as before, and
+  `--minimax-ram-experts-per-layer N` still pins exactly N per layer. The idea is Project Maya's priced layer
+  split (`STRATA_GLM_*` in its `docs/SETTINGS.md`, MIT) and Strata's profile-filled cache; the arithmetic here is
+  this engine's own.
+
+**`--minimax-ssd-zerocopy on|off` (default on): an expert whose pages are already resident is not read at all.**
+Before a route's three reads are queued, the three page ranges are queried (Windows `QueryWorkingSetEx` through
+`K32QueryWorkingSetEx`; `mincore` on Linux -- the same question Strata 0.2.0 asks, `docs/DETAILS.md`: *"before,
+every such expert was first assembled into a staging buffer"*). If every page is resident the dot kernels read the
+mapping in place and nothing is queued; `ssd_mapped` in `--minimax-stats` counts the hits. This is free when it
+fires and costs one query when it does not.
+
+**`--minimax-ssd-prefetch on|off` (default off): the next layer's reads, issued a layer early.** `prefetch_for`
+already applies layer *l+1*'s router to the residual to fill VRAM slots; it now also queues *l+1*'s SSD misses, so
+they are in flight across that layer's attention, router and shared expert. The residual at that point is only a
+*prediction* of the router's input (the next layer's attention moves it before the router runs), so the routes can
+differ. The staging ring is doubled, each route's slot is recorded, and `ssd_pf_hit` / `ssd_pf_waste` in the totals
+line say how good the prediction was -- which is the number that decides whether it is worth turning on, and it is
+why the default is off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
+19.64 -> 20.22 tok/s, both with a much larger resident tier.)
+
+**CPU threads: the default is the physical core count, not the logical one.** Decode is bandwidth-bound -- the CPU
+expert dots stream 2.4-4 GB per token out of the RAM tier -- and on a 12-core/24-thread part the second SMT thread
+per core adds contention. `--cpu-threads 0` (the default) now counts `RelationProcessorCore` entries on Windows
+(`core_id`/`physical_package_id` on Linux) and prints `INFO minimax-threads=... (source=..., logical=...)`; the old
+code used `hardware_concurrency()` and capped at 24.
+
+**A crash in the batched prompt path, fixed.** With `--minimax-kv vram` and `--minimax-dense-layers-gpu 0`, batched
+prefill chose its device-attention path only when the layer's dense weights were *also* on the GPU
+(`dev_attn = gpu && kv_mode == 1`), took the host-attention branch otherwise, and read a null host K/V:
+`--minimax-kv vram` allocates none. On the full model that was an access violation about 50 s into the prompt. The
+choice now follows the KV's home (`dev_attn = kv_mode == 1`) and the layer's attention output projection runs on the
+CPU when its weights are not on the device; `attend_host()` also refuses a missing host K/V by name.
+`tools/minimax/test_p7_kv_prefill.py` holds the combination to `prefill=batch` + `kv_space=vram` and compares it
+with the token path (max abs < 1e-2 on the synthetic fixture), plus the `--minimax-kv host` decode comparison.

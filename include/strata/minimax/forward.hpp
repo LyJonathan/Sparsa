@@ -41,6 +41,7 @@ struct EngineOptions {
     int ram_experts_per_layer = -1; ///< -1: auto from RAM minus the reserve; 0: no pinned tier
     int vram_reserve_mib = 700;     ///< VRAM kept free for the driver / display after dense weights and workspace
     int memory_limit_mib = 0;       ///< 0: auto from available RAM; else the pinned tier's byte budget
+    int ram_headroom_mib = 0;       ///< 0: 1/16 of physical RAM clamped to 3-10 GiB; else RAM kept unpinned
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
@@ -85,6 +86,11 @@ struct EngineOptions {
     int expert_skip_ssd = 0;        ///< drop a route at or below this rank (0 = best) when its expert is neither in
                                     ///< VRAM nor in the pinned RAM tier, i.e. it would be read from the SSD.  0 keeps
                                     ///< every route; 4 of MiniMax's top-4 keeps only the top three misses.
+    // ---- P7: the SSD tier's page-cache path.
+    std::string ssd_zerocopy;       ///< "" / "on": an expert whose pages are already resident is computed from the
+                                    ///< mapping with no read; "off": always issue the read (P6 behaviour)
+    std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
+                                    ///< MoE, so they are in flight across that layer's attention
 };
 
 struct SampleParams {

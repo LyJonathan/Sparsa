@@ -64,7 +64,8 @@ void usage() {
                  "  --minimax-vram-slots-per-layer N  VRAM hot-expert slots per layer (-1 auto, 0 none)\n"
                  "  --minimax-ram-experts-per-layer N pinned-RAM experts per layer (-1 auto, 0 none)\n"
                  "  --vram-reserve-mib N              VRAM kept free (default 700)\n"
-                 "  --memory-limit-mib N              pinned-tier budget (default: available RAM - 2 GiB)\n"
+                 "  --memory-limit-mib N              pinned-tier budget (default: sized from the box)\n"
+                 "  --minimax-ram-headroom-mib N      RAM kept out of the pinned tier (default: 1/16 of physical, 3-10 GiB)\n"
                  "  --minimax-profile PATH            STRP profile for the static fill\n"
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
@@ -84,7 +85,10 @@ void usage() {
                  "                                    (default 1, 1-16); try 4-8 for a drive that prefers\n"
                  "                                    many small requests\n"
                  "  --minimax-expert-skip-ssd N       drop a route at or past rank N (0 = best) when its expert would\n"
-                 "                                    be read from the SSD; 0 (default) keeps every route\n");
+                 "                                    be read from the SSD; 0 (default) keeps every route\n"
+                 "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
+                 "                                    from the mapping with no read (default on)\n"
+                 "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -510,7 +514,7 @@ int run(int argc, char** argv) {
         if (std::string(argv[i]) == "--serve") serve_mode = true;
     bool tiers = false;
     std::string profile, profile_save, routing_counts;
-    int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0;
+    int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
     bool stats = false, stats_per_layer = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
@@ -522,6 +526,8 @@ int run(int argc, char** argv) {
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
     int ssd_chunks = 1, expert_skip_ssd = 0;
+    std::string ssd_zerocopy;
+    std::string ssd_prefetch;
     std::string graphs;
 
     for (int i = 1; i < argc; ++i) {
@@ -558,6 +564,8 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-expert-skip") expert_skip = (float)std::atof(next().c_str());
         else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
         else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
+        else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
+        else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
         else if (a == "--minimax-graphs") graphs = next();
         else if (a == "--minimax-expert-resident") expert_resident = next();
         else if (a == "--minimax-tiers") tiers = true;
@@ -569,6 +577,7 @@ int run(int argc, char** argv) {
         else if (a == "--vram-reserve-mib" || a == "--minimax-vram-reserve-mib")
             vram_reserve_mib = std::atoi(next().c_str());
         else if (a == "--memory-limit-mib") memory_limit_mib = std::atoi(next().c_str());
+        else if (a == "--minimax-ram-headroom-mib") ram_headroom_mib = std::atoi(next().c_str());
         else if (a == "--minimax-stats") stats = true;
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
@@ -680,6 +689,7 @@ int run(int argc, char** argv) {
     opt.ram_experts_per_layer = ram_experts;
     opt.vram_reserve_mib = vram_reserve_mib;
     opt.memory_limit_mib = memory_limit_mib;
+    opt.ram_headroom_mib = ram_headroom_mib;
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
@@ -700,6 +710,8 @@ int run(int argc, char** argv) {
     opt.expert_skip = expert_skip;
     opt.ssd_chunks = ssd_chunks;
     opt.expert_skip_ssd = expert_skip_ssd;
+    opt.ssd_zerocopy = ssd_zerocopy;
+    opt.ssd_prefetch = ssd_prefetch;
     opt.graphs = graphs;
 
     Engine* engine = nullptr;
