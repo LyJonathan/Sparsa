@@ -456,7 +456,345 @@ rows) and 3.7x faster: MSA 16.4 → 4.4 s over a 4096-token prompt (73 % → 21 
   `vec_dot`; llama.cpp is at ~23 GB/s because its weights are committed RAM rather than our mmap, which pays a soft
   page fault per 4 KiB. `--minimax-tiers --minimax-ram-experts-per-layer 128` does not help by itself (the arena is
   filled on demand, i.e. re-reads the same bytes once more).
-- `--minimax-prefill-dense f16` is 7 % faster (209.7 tok/s at 4096) but still produces non-finite logits above 512
-  prompt tokens. It is not the default; the fp32 path is now correct after the dequantizer fix.
+- `--minimax-prefill-dense f16` **is fixed** (P5c). It used to produce non-finite logits for any prompt that needed
+  more than one prefill chunk. The fault was not the HGEMM: `p.gh`, the fp16 swiglu buffer the f16 path feeds to the
+  down GEMM, was sized `rows_cap x n_ff_exp` (1024 x 3072) while the *dense* MLP's hidden is `n_ff_dense` = 12288
+  wide - a 4x write past the end of the buffer that landed in whatever was allocated after it. The f32 path never
+  touches `p.gh` in the dense MLP (it swiglu's into `p.sh`), which is why only f16 broke. It is now sized by
+  `max_dense_n`. On the real slice, 4096-token prefill: f32 270.6 tok/s, f16 294.8/296.4 tok/s (+9 %), and the
+  f16 logits against f32 over 768 tokens (two chunks) are finite at KL 1.7e-3, top-1 0.977, median |d| 0.068. It
+  stays opt-in: the coarser activation is measurable, and the default is the parity-first f32 path.
 
+## P5c: the norm+rope round trip is gone
 
+`--minimax-gpu-normrope` (default on) runs per-head RMSNorm + partial NEOX RoPE + the fp16 cache write on the
+device for both paths. P5b measured 721 ms of a 804 ms attention block at 4096 tokens as host work on q/k/v: the
+projections were copied back, normalized and rotated on one core, then converted to fp16 and copied in again.
+Now `cu::head_norm_rope` (one block per head row) reads the projection output in place and writes fp16 straight
+into the KV cache; the MSA query buffer and the indexer keys are produced by the same kernel, and the token path
+reads its query from the device buffer instead of uploading it.
+
+It is **bit-identical** to the host loop, which took two details. The RMS sum is sequential on one thread with
+`__fmul_rn`/`__fadd_rn` (nvcc contracts `a*b+c` into an FMA by default, and that last-bit difference was enough to
+flip an fp16 K/V rounding and - measured - the router's 4th expert at token 20). The cos/sin table is built from
+the same double-precision expression `rope()` evaluates per call (`pos / theta^(2i/n_rot)`), not from
+`build_rope_table`'s `pos * theta^(-2i/n_rot)` form. `test_p5c.py` holds both paths to `array_equal` on 200 tokens
+of the runnable model.
+
+The table is built once per device up to `min(ctx, 128 K)` positions (256 B per position); a longer context falls
+back to the host loop rather than reserving 256 MiB of VRAM on every card.
+
+Measured on the 15-layer real-weight IQ2_XS slice, one RTX 5070, KV in VRAM, 24 threads, box idle:
+
+| prompt | P5b | P5c | gain |
+| ---: | ---: | ---: | ---: |
+| 512 prefill | 82.2 tok/s | 90.8 | +10.5 % |
+| 4096 prefill | 168.2 tok/s | 222.6 | +32.3 % |
+| decode (32 new) | 12.63 tok/s | 13.03 | +3.2 % |
+
+`--minimax-gpu-normrope off` is the P5b path, byte for byte.
+
+### Resident experts: `--minimax-expert-resident off|auto|all`
+
+The P3 RAM tier was filled on demand: the first token that routed to an expert copied it out of the mmap into the
+pinned arena, so that token paid the fault *and* the copy, and the arena was a cold, partly-empty cache for the
+first tokens of every run. `auto` (the default, and only when a RAM tier exists) and `all` (which creates the tier
+even with the tiers off, using the device only for dense/KV) now fill every static slot at startup with a parallel
+reader (1 MiB pieces over the whole pool), print the achieved rate and the arena backing, and the batched prefill
+reads a resident expert from the arena instead of re-faulting it once per chunk.
+
+Large pages are tried first and refused on this box (`VirtualAlloc` error 1314: `SeLockMemoryPrivilege` is not
+assigned to a normal account), so the arena is 4 KB pages, `cudaHostRegister`ed and working-set locked. That is
+the documented fallback, not an error.
+
+15-layer IQ2_XS slice, RTX 5070, kv=vram, 24 threads, 4096-token prompt, 32 new tokens, page cache **cold**
+(45 GiB of anonymous memory written first to evict the mapping):
+
+| arm | prefill tok/s | decode tok/s | ms/token |
+| --- | ---: | ---: | ---: |
+| `off` (mmap, tier filled on demand) | 131.2 | 6.39 | 156.5 |
+| `all` (pinned arena, eager fill) | 104.4 | **12.07** | 82.9 |
+
+With the page cache **warm** (the model's 28.6 GB fit beside the arena) the decode difference disappears:
+16.9-17.1 tok/s both arms, and the fill buys prefill at 512 tokens instead (107-126 -> 138-151 tok/s, medians of
+three interleaved rounds). The honest reading: pinning does not make DDR4 faster - it stops the *page faults and
+SSD reads* when the system cannot keep the whole model cached. On a 128 GB box with a 146 GB model that is the
+normal case, not the exception.
+
+Effective CPU expert bandwidth (785 MB of routed experts per token at 512 context, from `STRATA_MM_TIME`): the
+expert FFN is 39.2 ms/token = **~20 GB/s**, against 16 GB/s in P5b and 39.5 GB/s for a raw 24-thread stream of the
+same RAM. The remaining gap is the single-token IQ2_XS dot kernel, not the memory system: `iq_avx2_parity --bench`
+puts Strata's own AVX2 IQ row kernel within 5 % of ggml's `vec_dot` at one token (its win is multi-token), so there
+is no cheap port left here.
+
+### Expert skipping: `--minimax-expert-skip <threshold>` (default off)
+
+A routed expert whose renormalized weight is below the threshold is dropped and the survivors are renormalized; a
+route whose every weight is below it keeps everything rather than produce a zero vector. The skip applies to the
+token path, the tiered path (so a skipped expert is never fetched from VRAM/RAM/SSD) and the batched prefill.
+
+Speed, 512-token prompt, 32 new tokens on the slice (decode):
+
+| threshold | decode tok/s | gain | skipped routes |
+| ---: | ---: | ---: | ---: |
+| 0 (off) | 18.04 | - | 0 |
+| 0.05 | 18.17 | +0.7 % | - |
+| 0.10 | 18.62 | +3.2 % | - |
+| 0.15 | 19.11 | +5.9 % | - |
+| 0.20 | 21.14 | +17.2 % | - |
+
+Quality against the engine's own no-skip logits, the short G3 reference prompts (97-114 tokens), same file and
+placement (`tools/minimax/skip_quality.py`):
+
+| threshold | mean KL | mean top-1 | worst median abs |
+| ---: | ---: | ---: | ---: |
+| 0.05 | 9.3e-4 | 0.958 | 1.7e-1 |
+| 0.10 | 1.7e-3 | 0.955 | 2.8e-1 |
+| 0.15 | 1.2e-2 | 0.894 | 7.1e-1 |
+| 0.20 | 4.9e-2 | 0.769 | 1.6 |
+
+0.10 is the only setting whose KL stays under the IQ2_XS quant noise floor this project measured on the real
+checkpoint (0.012), for +3 % decode; 0.15 is at the floor with a visible top-1 cost. The default stays **off**: a
+3 % win does not justify changing answers, and the slice's 15 layers understate what a deep-layer skip costs.
+
+### CUDA graphs: `--minimax-graphs off` (default on)
+
+The token path's attention prefix is nine small launches per layer per token: the q8_1 quantize of the activation,
+five dense MMVQs (q, k, v, indexer q, indexer k), two fused norm+rope calls and one fp16 cast. The first token of
+each layer now captures that prefix into a CUDA graph (`cudaStreamBeginCapture` on the dedicated blocking stream,
+instantiated once per layer) and every later token replays it with one launch; the host-side inputs (the activation
+h2d and the 4-byte position) stay outside the graph as addresses baked in at capture. The K/V rows land in a fixed
+fp16 staging buffer inside the graph, and two 2 KB D2D copies place them in the cache at the token's offset - the
+one pointer that changes per token.
+
+The graphs are **bit-identical** to the direct launches (`test_p5c.py`, 200 tokens) - same kernels, same
+arguments. 512-token prompt, 96 new tokens, 3 interleaved rounds, same box:
+
+| arm | ms/token | decode tok/s |
+| --- | ---: | ---: |
+| `--minimax-graphs off` | 57.71 (57.16, 57.71, 57.77) | 17.33 |
+| graphs on (default) | **54.56** (54.33, 54.56, 56.64) | **18.33** |
+
++5.8 %. It buys launch and stream-ordering overhead only: the expert reads, which dominate the token, are on the
+CPU and untouched.
+
+## P6: the SSD tier read path (a model larger than RAM)
+
+Everything above assumes the experts fit in the pinned RAM tier. MiniMax-M3.1-Flash at IQ2_XS-D3 does not: the
+engine's own counters on the full pack (`--minimax-stats`, 31 decode tokens) average **26 VRAM / 139 pinned RAM /
+63 SSD** routed experts per token, so **1,094 MB of every token comes off the NVMe** — 28% of the routed-expert
+bytes and, at the rate the old path got out of the drive, most of the token.
+
+The token path now treats the SSD like the other two resources: it is filled ahead of use and overlapped.
+
+- `ssd_slots`: one 4 KiB-aligned staging slot per routed entry, holding the three role buffers with 4 KiB of
+  headroom in front. A role's read is the aligned superset of its range and the dot kernels read the bytes at
+  `base + (off & 4095)`, so the data lands **where it is used** and the 16.4 MB copy out of a shared read buffer
+  (per expert, per token) is gone.
+- Every read of a layer is queued up front (`DirectFile::submit` only enqueues) and waited on **once**, in batches
+  of completions, after the GPU's experts have been launched on the side stream and the pinned-RAM experts have
+  been computed. The drive therefore runs while the CPU and the GPU work, instead of strictly before them.
+- `--minimax-ssd-chunks N` (default **1**): pieces one role's read is split into. On this box's NVMe one 5.45 MiB
+  read is **2.4x faster** than eight 700 KiB pieces of the same range (46 ms against 110 ms of waiting per token
+  on 261 MB of misses), so the default is 1. A drive that prefers many small requests wants 4-8 — Project Maya
+  measures +15% at 8 on a Windows laptop's Intel RST RAID, and its own docs say a Samsung PM981a *loses* 15% at 8.
+  Measure yours with `bench_p6_ssd.py`.
+- `--minimax-expert-skip-ssd RANK` (default **0 = off**): a route at or past `RANK` (0 = best) whose expert is in
+  neither the VRAM nor the pinned-RAM tier is left out, and its bytes are never read. This is Strata-DS's
+  `SSD_TAIL_SKIP` (`docs/DEEPSEEK_LAPTOP.md`: 37.8 -> 34.9 ms/token alone, 44.8 -> 28.7 with the route tail, at
+  KL 0.030-0.032 against a 0.012 noise floor). MiniMax's route is 4 deep, so `3` keeps the top three and drops the
+  fourth when it is an SSD miss; `2` keeps two.
+- `--minimax-stats` now also prints `ssd_wait_ms` (the token's time spent waiting for the drive) and `skipped`.
+
+Measured on the 15-layer real-weight IQ2_XS slice, SSD-heavy placement (`--minimax-vram-slots-per-layer 0
+--minimax-ram-experts-per-layer 4`, so 16.7 of 48 routes/token are misses = 261 MB/token), one RTX 5070, 12 CPU
+threads, 512-token batched prefill then 32 greedy tokens, medians of 3 reps, interleaved rounds, box idle:
+
+| arm | decode tok/s | ms/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: |
+| P5c (before) | 6.90 (6.86 / 6.61 / 6.46) | 144.4 | 261 | ~90 ms, interleaved and unmeasured |
+| P6, `--minimax-ssd-chunks 1` (default now) | **8.66** (8.68 / 8.64) | 115.4 | 261 | **46.1 ms** |
+| P6, `--minimax-ssd-chunks 8` | 5.69 (5.68 / 5.69 / 5.69) | 175.9 | 261 | 110.2 ms |
+
+**+25.5%**. It is bit-identical: 40 of `python -m pytest tools/minimax -q` pass (the all-SSD tier vs the all-CPU
+path is one of them), and teacher-forced logits on the real-weight slice with this placement are `array_equal`
+between the two engines (max abs 0.0, KL 0.0, top-1 1.000).
+
+**Skipping the SSD tail.** Same file and placement, 8 greedy tokens per arm, `--minimax-expert-skip-ssd`:
+
+| arm | SSD experts/token | SSD MB/token | decode tok/s | SKIP |
+| --- | ---: | ---: | ---: | ---: |
+| 0 (off) | 30.2 | 472 | 4.51 | 0.0 |
+| 3 (keep top three) | 21.9 (-28%) | 341 (-28%) | **5.46 (+21%)** | 8.4 |
+| 2 (keep top two) | 14.9 (-51%) | 232 | not measured (the box was loading another model) | 17.2 |
+
+Quality against this engine's own no-skip logits, 64 teacher-forced tokens on the slice, 8 dump rows: rank 3 gives
+mean KL **0.0237**, top-1 0.75; rank 2 gives KL **0.0430**, top-1 0.875 (8 rows is a coarse top-1). The project's
+IQ2_XS quant noise floor on the real checkpoint is 0.012 and Strata-DS ships its tail skip at 0.030-0.032, so rank
+3 is in the same band — but this is a 15-layer slice and the default stays **off**: on the full model the skip
+fires 63 times a token, and that is a decision for the operator, not for a default.
+
+`python tools/minimax/bench_p6_ssd.py --exe A/strata-minimax.exe --exe B/strata-minimax.exe --model m.gguf \
+  --prompt 512 --decode 32 --reps 3 --rounds 3 -- --gpus 1 --minimax-tiers --minimax-vram-slots-per-layer 0 \
+  --minimax-ram-experts-per-layer 4 --minimax-kv vram --minimax-stats --minimax-prefill-batch 512` runs the A/B
+above (`--arm-args " --minimax-expert-skip-ssd 3"` gives one arm its own flags).
+
+**What is left** (ranked, with sources, in `_ref/research/DECODE_GAP.md`): size the pinned RAM tier from the box
+rather than "available - 2 GiB" (87 experts/layer on the full pack against ~115 that fit — the SSD's 1.09 GB/token
+would fall to ~0.3-0.4), read the SSD tier through the page cache when the pages are already resident (Strata's
+zero-copy + `mincore`, 1.14-1.47x on its own 12 GB test), and prefetch the next layer's SSD misses (the exact next
+routes already exist in `prefetch_for`).
+## P7: the RAM tier sized from the box, the page-cache path, one-layer-early reads
+
+P6 made the SSD tier's reads overlapped. P7 attacks the bytes themselves, and the two properties of the box the
+engine used to ignore.
+
+**The pinned RAM tier is sized from the machine, not from "available - 2 GiB".** That constant was wrong at both
+ends: on a 32 GB box it is 6% of the machine, on a 128 GB box it is less than the desktop plus the tools that talk
+to the engine, and it ignored the dense weights that must stay resident. The budget is now
+
+```
+budget = min(physical, available now) - headroom - dense_host - host_kv - host_workspace
+headroom = physical / 16, clamped to 3-10 GiB     (--minimax-ram-headroom-mib overrides it)
+```
+
+* `dense_host` is every dense tensor the engine did not upload (attention projections, dense MLP, the shared
+  expert, the router, the embedding, and `lm_head` when it stays on the host). They are read on every token, so
+  a tier that takes their pages away buys SSD misses with page faults, which is worse.
+* `host_kv` is the fp16 K/V and indexer K for the whole context (zero with `--minimax-kv vram`); the workspace is
+  the token vectors, MLP scratch and the full-vocabulary logits.
+* The plan is printed once at startup (`INFO minimax-ram-tier plan budget=... headroom=... dense_host=...`) so the
+  arithmetic is visible on a machine that behaves differently from this one.
+* If the operating system refuses to pin that much (`PinnedArena` fails), an automatic budget steps down 15% at a
+  time and says so, instead of failing the run. An explicit `--memory-limit-mib` or
+  `--minimax-ram-experts-per-layer` still fails loudly: the operator asked for that number.
+* The slots are then split **per layer by the routing profile**, not uniformly: the global ranked list is walked
+  hot to cold and each entry offers its layer one more slot for its next-hottest expert that is not already going
+  to VRAM, until the byte budget is spent. A layer the profile says is routed twice as often gets twice the slots,
+  and no layer is starved (each remaining slot is filled round-robin from whatever budget is left). Layers'
+  regions are 2 MiB-aligned. With no profile the split is uniform, as before, and
+  `--minimax-ram-experts-per-layer N` still pins exactly N per layer. The idea is Project Maya's priced layer
+  split (`STRATA_GLM_*` in its `docs/SETTINGS.md`, MIT) and Strata's profile-filled cache; the arithmetic here is
+  this engine's own.
+
+**`--minimax-ssd-zerocopy on|off` (default on): an expert whose pages are already resident is not read at all.**
+Before a route's three reads are queued, the three page ranges are queried (Windows `QueryWorkingSetEx` through
+`K32QueryWorkingSetEx`; `mincore` on Linux -- the same question Strata 0.2.0 asks, `docs/DETAILS.md`: *"before,
+every such expert was first assembled into a staging buffer"*). If every page is resident the dot kernels read the
+mapping in place and nothing is queued; `ssd_mapped` in `--minimax-stats` counts the hits. This is free when it
+fires and costs one query when it does not.
+
+**`--minimax-ssd-prefetch on|off` (default off): the next layer's reads, issued a layer early.** `prefetch_for`
+already applies layer *l+1*'s router to the residual to fill VRAM slots; it now also queues *l+1*'s SSD misses, so
+they are in flight across that layer's attention, router and shared expert. The residual at that point is only a
+*prediction* of the router's input (the next layer's attention moves it before the router runs), so the routes can
+differ. The staging ring is doubled, each route's slot is recorded, and `ssd_pf_hit` / `ssd_pf_waste` in the totals
+line say how good the prediction was -- which is the number that decides whether it is worth turning on, and it is
+why the default is off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
+19.64 -> 20.22 tok/s, both with a much larger resident tier.)
+
+**CPU threads: the default is the physical core count, not the logical one.** Decode is bandwidth-bound -- the CPU
+expert dots stream 2.4-4 GB per token out of the RAM tier -- and on a 12-core/24-thread part the second SMT thread
+per core adds contention. `--cpu-threads 0` (the default) now counts `RelationProcessorCore` entries on Windows
+(`core_id`/`physical_package_id` on Linux) and prints `INFO minimax-threads=... (source=..., logical=...)`; the old
+code used `hardware_concurrency()` and capped at 24.
+
+**A crash in the batched prompt path, fixed.** With `--minimax-kv vram` and `--minimax-dense-layers-gpu 0`, batched
+prefill chose its device-attention path only when the layer's dense weights were *also* on the GPU
+(`dev_attn = gpu && kv_mode == 1`), took the host-attention branch otherwise, and read a null host K/V:
+`--minimax-kv vram` allocates none. On the full model that was an access violation about 50 s into the prompt. The
+choice now follows the KV's home (`dev_attn = kv_mode == 1`) and the layer's attention output projection runs on the
+CPU when its weights are not on the device; `attend_host()` also refuses a missing host K/V by name.
+`tools/minimax/test_p7_kv_prefill.py` holds the combination to `prefill=batch` + `kv_space=vram` and compares it
+with the token path (max abs < 1e-2 on the synthetic fixture), plus the `--minimax-kv host` decode comparison.
+
+## P7b: the route nudge, the lane's spin window, and page-cache-in-place
+
+**`--minimax-route-bias on` (default off): rank the router's top-k on the expert's score plus a residency
+bonus, and take the weights from the unbiased scores.** This is Xolotl's lever (Indras-Mirror/Xolotl, MIT:
+9.7 -> 19.1 -> 21.7 tok/s on one RTX 3090 + 128 GB answering a 148 GB model, `docs/DEEPSEEK_V41.md:60-71`,
+`tools/v41/engine/ds41_dense.cpp:1176-1244`) and it is the one change that reduces *which* experts the token
+needs instead of making the same bytes faster. With the flag off the selection is the model's own, bit for bit
+(the gate below checks exactly that).
+
+* `--minimax-route-bias-in A` (default 0.25) is added to an expert that is in the VRAM or the pinned-RAM tier;
+  `--minimax-route-bias-out C` (default 0.15) is subtracted from one that is in neither, i.e. one the token would
+  read from the drive.
+* The three guards are Xolotl's, and its own quality table is why they are not optional: an unguarded flat bias
+  of 1.0 costs 14 points of API top-1 and loops on some prompts, while 0.25 keeps 85.2% against 86.2% exact.
+  `--minimax-route-protect P` (default 2) keeps the exact top-P experts always; `--minimax-route-pool M`
+  (default 12) makes every pick stay inside the exact top-M (the max-rank window of arXiv:2412.00099);
+  `--minimax-route-margin D` (default 0 = everywhere) applies the nudge only to experts whose exact score is
+  within D of the k-th exact score.
+* The route meter is printed by `--minimax-stats`: `route_swapped` (share of expert picks that differ from the
+  exact choice) and `route_weight_kept` (the router weight of the picks against the exact picks' weight).
+* The same selection runs in all four routing loops (the tiered token path, the all-CPU token path, the batched
+  prompt path and the lookahead in `prefetch_for`), so the prefetch prediction agrees with the decision it is
+  predicting.
+
+**`--minimax-pool-spin-us N` (default 0): the CPU pool spins before it sleeps.** A token's layers hand the pool
+several small jobs in a row, and a condition-variable wake per job is a context switch each; Project Maya's pool
+spins 20 ms through a token's layers for that reason (`ds4_model.cu:5560`). This is a measured knob, not a new
+default: 0 keeps the old behaviour.
+
+**`--minimax-ram-mode pinned|inplace` (default pinned): whether the RAM tier is a copy at all.** Maya's DeepSeek
+engine reads experts in place and records that its own opt-in RAM tier was *slower* than the page cache on a
+V100/64 GB, and that copies "were measured no faster than the page cache � a part copied cost decode speed on
+64 GB and on 32 GB of RAM" (`ds4_model.cu:1206-1211`, `5164-5166`). `inplace` builds no arena: the ranked set is
+only a ranking decision, `PrefetchVirtualMemory` walks the ranked experts' pages once at startup (Maya's
+Windows prefetch of only the non-resident pages measured +6-7% decode, `ds4_os.hpp:250-332`), and the CPU lane
+reads the mapping. The A/B is in the table below; the default stays `pinned` until the measurement says
+otherwise on this box.
+
+Measured on the 15-layer real-weight IQ2_XS slice with the SSD-heavy placement
+(`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 11`, i.e. 11 of 128 experts per layer resident and
+~27 of 48 routes a token read from the drive), one RTX 5070, 128-token prompt then 24 greedy tokens, one round,
+`--minimax-stats`. **The box was not idle**: another agent's full-model quality job shared the drive for the whole
+round, so the tok/s column is noisy to about +-4% and the *bytes* column is the load-independent part. Raw rows in
+`bench_p7b_arms.json`.
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| exact routing | 4.85 | 206.0 | 27.1 | 423 | 295.5 ms |
+| `--minimax-route-bias on` (0.25 / 0.15, protect 2, pool 12) | **4.90** | 204.2 | **17.4 (-36%)** | **271 (-36%)** | **213.8 ms (-28%)** |
+| `--minimax-ram-mode inplace` | 3.08 | 325.1 | 43.8 | 684 | 157.9 ms |
+| `inplace` + route bias | 3.31 | 302.3 | 36.5 | 570 | 122.4 ms |
+
+What the nudge costs in quality, against this engine's own exact-routing logits on the same teacher-forced prompt
+(`gate_logits.py`, real G3 text): mean **KL 0.0348**, 8-row top-1 **0.886**; the 0.5 / 0.3 setting gives KL 0.0348,
+top-1 0.877. The meter says **35.3% of picks swapped, 96.6% of the router weight kept** -- a much larger swap share
+than Xolotl's 26.1% at the same 0.25, because only 11 of 128 experts per layer are resident in this placement; on the
+full model ~110 of 128 are, so the same bias should move far fewer picks. The default stays **off** until the
+full-model numbers say what it buys and what it costs there.
+
+**Page-cache-in-place is slower here, and the reason is measurable.** `--minimax-ram-mode inplace` removes the
+pinned copy and reads the mapping, exactly what Maya's DeepSeek engine does -- and on this box it costs **-36%**
+decode. The counters say why: the token's CPU lane is 2.3 GB of expert reads, and the pinned copy delivers them at
+the ~20 GB/s this engine measures for the IQ2_XS dot while the page-cache reads came in at ~5 GB/s in the same slot
+(the drive's own wait went *down*, 295 -> 158 ms, so the loss is entirely on the CPU-read side). Maya's own note says
+its CPU lane is compute-bound at ~46 GB/s "from either" source on 2 Xeon sockets -- the copy only pays there because
+the page cache is already as fast; at 20 GB/s it does not. **The default stays `pinned`.**
+
+### Full model: MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4
+
+Real text (a 512-token prefix of `ppl_text.bin` from the G3 dump set), 32 greedy tokens, 2 reps per arm, one
+round, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin`, box otherwise idle for the first two arms:
+
+| arm | decode tok/s | ms/token | SSD experts/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before: P5c build (auto 98/layer, uniform) | 2.64 | 379.5 | 10.4 | 180 | not measured (no P6 path) |
+| **after: this branch** (auto 94.6/layer, 69..110 by profile) | **2.88** | 347.4 | **7.8** | **135** | **13.5 ms** |
+| after: same build, `--minimax-ram-experts-per-layer 87` (the old uniform size) | 2.58 | 386.9 | 8.9 | 154 | 75.9 ms |
+
+**+9.1%** against the P5c build and **+11.6%** against the same build with the old 87-experts/layer uniform tier.
+Caveat, stated plainly: the arms ran one after another on the same box, so the later arms found the file's pages
+in the OS cache and the first did not; part of the difference is that ordering. The load-independent numbers -
+7.8 against 10.4 SSD routes a token, 135 against 180 MB, 13.5 against 75.9 ms of drive wait on the same build - are
+the honest measure of what this branch changes, and a cold-start A/B is still to be run with the box to itself.
+The tier size in slots barely moves (5394 against 5586): what moves is *which* experts are in it, because the
+profile's hot-to-cold split gives the busiest layers 110 and the coldest 69 instead of 98 everywhere. The engine also
+reported **21 SSD-tier routes per token served straight from the page cache** (`ssd_mapped`) in this run, which is
+the same warming effect and should be read as "the path fires on a warm box", not as a steady-state rate.
+
+At 347 ms/token the drive is now ~4% of a token, the CPU expert lane and the GPU are the rest - which is why the
+route nudge (fewer, better-placed experts) and the lane shape are the next levers rather than more I/O work.
