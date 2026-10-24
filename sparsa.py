@@ -195,19 +195,50 @@ def cmd_plan(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    from strata_cli.launch import access as access_mod
+
     cfg = build_config(args)
     config_path = Path(args.config).expanduser()
+    if args.show_key:
+        try:
+            print(json.loads(config_path.read_text(encoding="utf-8-sig")).get("api_key") or
+                  f"sparsa: {config_path} has no API key")
+        except (OSError, ValueError):
+            print(f"sparsa: no run settings at {config_path} yet")
+        return 0
+    host = args.host or access_mod.host_for(args.access)
+    key = ""
+    if args.access != "local":
+        try:
+            key = str(json.loads(config_path.read_text(encoding="utf-8-sig")).get("api_key") or "") \
+                if config_path.exists() else ""
+        except (OSError, ValueError):
+            key = ""
+        if args.no_api_key:
+            say("sparsa: WARNING no API key: anyone who can reach this port on your network can use the model.")
+        else:
+            key = key or access_mod.new_key()
+            cfg["api_key"] = key
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
     say(f"sparsa: run settings written to {config_path}")
     say(f"sparsa: engine {cfg['exe']}")
     say(f"sparsa: tokenizer {cfg['tokenizer']}")
+    if args.access != "local":
+        for ip in access_mod.lan_ips()[:2]:
+            say(f"sparsa: LAN address http://{ip}:{cfg['port']}/v1"
+                + (f"   (API key: {key})" if key else "   (no API key)"))
+        note = access_mod.firewall_note(args.access)
+        if note:
+            say("sparsa: " + note)
+        if key:
+            say(f"sparsa: the key is kept in {config_path.name}; `--show-key` prints it again")
     if args.plan:
         say(json.dumps(cfg, indent=2))
         return 0
     python = sys.executable or "python"
     command = [python, str(ROOT / "serve" / "server.py"), "--engine", "strata",
-               "--config", str(config_path), "--host", args.host, "--port", str(cfg["port"])]
+               "--config", str(config_path), "--host", host, "--port", str(cfg["port"])]
     say("sparsa: starting; the model needs a minute or two to load (EXPERIMENTAL)")
     try:
         return subprocess.call(command, cwd=ROOT)
@@ -267,14 +298,19 @@ def main(argv: list[str] | None = None) -> int:
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
         p.add_argument("--port", type=int, default=8080)
-        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--host", help="the address to listen on (default: 127.0.0.1, or 0.0.0.0 for --access lan)")
+        p.add_argument("--access", choices=("local", "lan"), default="local",
+                       help="local: this computer only (default); lan: every address, with an API key made for you")
+        p.add_argument("--no-api-key", action="store_true",
+                       help="serve on the LAN without a key (anyone who can reach the port can use the model)")
+        p.add_argument("--show-key", action="store_true", help="print the saved LAN API key and exit")
+        p.add_argument("--plan", action="store_true", help="write/print the run settings and start nothing")
         p.add_argument("--config", default=str(ROOT / "sparsa-minimax.json"), help="where the run settings go")
         p.add_argument("--log", help="engine log (default: the config's name with .log)")
         return p
 
     serving("serve", "write the run settings and start the server")
-    plan = serving("plan", "print the run settings and start nothing")
-    plan.add_argument("--plan", action="store_true", help=argparse.SUPPRESS)
+    serving("plan", "print the run settings and start nothing")
 
     ins = sp.add_parser("inspect", help="list what the engine reads from the GGUF (no CUDA, no loading)")
     ins.add_argument("--model", required=True)

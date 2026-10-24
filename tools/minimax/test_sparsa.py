@@ -82,3 +82,36 @@ def test_missing_tokenizer_says_how_to_get_it(tmp_path):
 def test_download_prints_the_hf_command(tmp_path, capsys):
     assert sparsa.main(["download", "iq3-k", "--dir", str(tmp_path), "--print-only"]) == 0
     assert "MiniMax-M3.1-Flash-IQ3_K/*" in capsys.readouterr().out
+
+
+def test_lan_access_makes_a_key_and_reuses_it(tmp_path, capsys):
+    model, engine = make_files(tmp_path)
+    config = tmp_path / "run.json"
+    argv = ["serve", "--model", str(model), "--engine", str(engine), "--config", str(config),
+            "--access", "lan", "--plan"]
+    assert sparsa.main(argv) == 0
+    first = json.loads(config.read_text(encoding="utf-8"))
+    assert first["api_key"].startswith("sk-strata-")
+    out = capsys.readouterr().out
+    assert "172.0.0.1" not in out
+    assert sparsa.main(argv) == 0
+    second = json.loads(config.read_text(encoding="utf-8"))
+    assert second["api_key"] == first["api_key"]
+
+
+def test_local_access_writes_no_key_and_binds_loopback(tmp_path, capsys):
+    model, engine = make_files(tmp_path)
+    config = tmp_path / "run.json"
+    assert sparsa.main(["serve", "--model", str(model), "--engine", str(engine),
+                        "--config", str(config), "--plan"]) == 0
+    assert "api_key" not in json.loads(config.read_text(encoding="utf-8"))
+    assert "LAN address" not in capsys.readouterr().out
+
+
+def test_no_api_key_on_the_lan_says_what_that_means(tmp_path, capsys):
+    model, engine = make_files(tmp_path)
+    config = tmp_path / "run.json"
+    assert sparsa.main(["serve", "--model", str(model), "--engine", str(engine), "--config", str(config),
+                        "--access", "lan", "--no-api-key", "--plan"]) == 0
+    assert "api_key" not in json.loads(config.read_text(encoding="utf-8"))
+    assert "anyone" in capsys.readouterr().out
