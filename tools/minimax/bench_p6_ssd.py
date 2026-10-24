@@ -42,6 +42,15 @@ def prompt_for(source: list[int], n: int, rep: int) -> list[int]:
     return out
 
 
+def read_ids(path: str) -> list[int]:
+    """int32 (the G3 dump format) or whitespace-separated text."""
+    raw = Path(path).read_bytes()
+    if path.lower().endswith('.bin') and len(raw) % 4 == 0:
+        import numpy as np
+        return [int(x) for x in np.frombuffer(raw, dtype=np.int32)]
+    return [int(x) for x in raw.decode('utf-8', 'replace').replace(',', ' ').split() if x.lstrip('-').isdigit()]
+
+
 NUM = ('vram', 'ram', 'ssd', 'ssd_bytes', 'skipped', 'swaps', 'token')
 
 
@@ -139,6 +148,8 @@ def main() -> int:
     ap.add_argument('--reps', type=int, default=2)
     ap.add_argument('--rounds', type=int, default=1, help='interleaved rounds of every arm')
     ap.add_argument('--seed', type=int, default=12345)
+    ap.add_argument('--ids', help='use these real token ids (int32 .bin or text) as the prompt text instead of '
+                                  'synthetic ids; the prompt is taken from the start and repeats if it is short')
     ap.add_argument('--timeout', type=int, default=3600)
     ap.add_argument('--json-out')
     ap.add_argument('engine_args', nargs='*')
@@ -150,7 +161,9 @@ def main() -> int:
     arm_args = [x.split() if x else [] for x in a.arm_args]
     while len(arm_args) < len(a.exe):
         arm_args.append([])
-    source = synth_ids(256, a.seed)
+    source = read_ids(a.ids) if a.ids else synth_ids(256, a.seed)
+    if a.ids:
+        print(f'prompt text: {a.ids} ({len(source)} tokens)')
     ctx = a.prompt + a.decode + 8
 
     results: dict[str, list[dict]] = {label: [] for label in labels}
