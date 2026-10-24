@@ -514,6 +514,9 @@ int run(int argc, char** argv) {
     std::string layer_split, gpus, kv_space;
     int prefill_batch = 0, expert_prefetch = 0;
     std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
+    std::string gpu_normrope, expert_resident;
+    float expert_skip = 0.f;
+    std::string graphs;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -545,6 +548,10 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-read") prefill_read = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
+        else if (a == "--minimax-gpu-normrope") gpu_normrope = next();
+        else if (a == "--minimax-expert-skip") expert_skip = (float)std::atof(next().c_str());
+        else if (a == "--minimax-graphs") graphs = next();
+        else if (a == "--minimax-expert-resident") expert_resident = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
         else if (a == "--minimax-profile-save") profile_save = next();
@@ -680,6 +687,10 @@ int run(int argc, char** argv) {
     opt.prefill_read = prefill_read;
     opt.expert_prefetch = expert_prefetch;
     opt.dense_mmvq = dense_mmvq;
+    opt.gpu_normrope = gpu_normrope;
+    opt.expert_resident = expert_resident;
+    opt.expert_skip = expert_skip;
+    opt.graphs = graphs;
 
     Engine* engine = nullptr;
     try {

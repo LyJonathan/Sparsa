@@ -55,6 +55,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
 
 namespace strata::minimax {
@@ -134,6 +135,8 @@ struct Layer {
     // P4: this layer's owning device (an index into Impl::devs) and the KV it keeps there.
     int dev = 0;
     DevPtr d_k, d_v, d_ik;          // when the KV lives in VRAM
+    // P5c: the per-head norm weights on the device, for the fused norm+rope kernel.
+    DevPtr d_qn, d_kn, d_iqn, d_ikn;
 };
 
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
@@ -609,12 +612,19 @@ struct Engine::Impl {
         DevPtr xq;                      // q8_1 image of a dense projection's activation (dense MMVQ)
         DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
         DevPtr qd, bs, slots, counts, kstage, vstage, att;
+        // P5c: the fused norm+rope step's device operands.  `qn`/`kn`/`vn` are the projection outputs of the
+        // token path (normed/rotated in place), `iqn`/`ikn` the indexer's; `pos1` is the one-token position array.
+        DevPtr qn, kn, vn, iqn, ikn, pos1;
+        DevPtr kn16, vn16, ik16;    // fp16 staging the graph writes; the cache copy is one D2D outside it
+        DevPtr rope_cos, rope_sin;   // [rope_pos_cap][n_rot/2] fp32
+        int64_t rope_pos_cap = 0;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
         uint16_t* vstage_h = nullptr;
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
+        void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
     };
     std::vector<Work> work;          // one entry per device in `devs`
     Work& W() { return work[(size_t)cur]; }
@@ -649,6 +659,8 @@ struct Engine::Impl {
     bool prefill_dense_f32 = true;
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
+    bool gpu_norm_rope = true;     // fused device norm+rope (--minimax-gpu-normrope off)
+    bool expert_resident = true;   // pin the RAM expert tier at startup (--minimax-expert-resident off)
     struct PfBuf {
         uint16_t* x16 = nullptr;     // [T][embd] fp16 hidden state
         uint16_t* h16 = nullptr;     // [T][embd] fp16 normed input to the projections
@@ -681,6 +693,7 @@ struct Engine::Impl {
         DevPtr d_iq16, d_bs, d_blk, d_nblk, d_rows, d_ent_row, d_ent_w;
 
         DevPtr d_q16;                // fp16 attention queries for the batched MSA kernel
+        DevPtr d_pos;                // [T] token positions for the fused norm+rope kernel
         int64_t rows_cap = 0;
     };
     std::vector<PfBuf> pf;
@@ -704,6 +717,7 @@ struct Engine::Impl {
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
+    std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
     std::vector<float> pf_moe_h;     // [T][embd] the layer's FFN output on the host
     std::vector<float> pf_dense_h;   // [T][max_dense_n] host intermediate for the CPU dense MLP
@@ -714,6 +728,11 @@ struct Engine::Impl {
     // stream while layer l's expert math runs.  `prefetch_pending` is the stream's work for the layer above.
     int prefetch_slots = 0;   // --minimax-expert-prefetch (0 = off)
     int prefetch_pending = -1;
+
+    // ---- P5c: CUDA graphs for the token path's per-layer GPU prefix (q8_1 -> dense MMVQ q/k/v + indexer ->
+    // norm+rope -> fp16).  One graph per layer, captured on the first token that reaches it.
+    bool graphs_on = true;
+    std::vector<void*> tok_graph;      // [n_layers], null when not captured (or capture failed)
 
     // ---- P3 expert tiers
     bool tiers_on = false;
@@ -738,12 +757,32 @@ struct Engine::Impl {
     uint64_t swaps = 0;
 
     struct TokenStats {
-        int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0;
+        int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0, skipped = 0;
     };
     TokenStats tok_stats;
     TokenStats total_stats;
     int64_t tokens_seen = 0;
     int64_t profile_saves = 0;
+
+    // P5c: --minimax-expert-skip.  Drop a routed expert whose RENORMALIZED weight is below `expert_skip` and
+    // renormalize what is left, so the routed sum keeps its scale.  Returns the number kept; a route whose every
+    // weight is below the threshold keeps everything rather than produce a zero vector.
+    float expert_skip = 0.f;
+    int apply_expert_skip_range(float* w, int n) {
+        if (expert_skip <= 0.f || n <= 0) return n;
+        int kept = 0;
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i)
+            if (w[i] >= expert_skip) {
+                ++kept;
+                sum += w[i];
+            }
+        if (kept == 0 || kept == n) return n;
+        for (int i = 0; i < n; ++i) w[i] = (w[i] >= expert_skip && sum > 0.f) ? w[i] / sum : 0.f;
+        tok_stats.skipped += n - kept;
+        return kept;
+    }
+    int apply_expert_skip(std::vector<float>& w) { return apply_expert_skip_range(w.data(), (int)w.size()); }
 
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
@@ -759,9 +798,17 @@ struct Engine::Impl {
         scale_routed = (float)cfg.routed_scale;
         renorm = cfg.expert_weights_norm;
         dense_mmvq = opt.dense_mmvq != "off";
+        gpu_norm_rope = opt.gpu_normrope != "off";
+        expert_resident = opt.expert_resident != "off";
+        expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
+        graphs_on = opt.graphs != "off";
+        if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
+        if (expert_skip > 0.f)
+            std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
+        tok_graph.assign((size_t)cfg.n_layers, nullptr);
 
         ggml_cpu_init();
         load_tensors();
@@ -791,7 +838,7 @@ struct Engine::Impl {
         if (!cpu_only) alloc_workspace();
         place_weights();
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
-        if (opt.tiers) {
+        if (opt.tiers || opt.expert_resident == "all") {
             init_tiers();
         } else if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) {
             for (const Layer& L : layers)
@@ -823,9 +870,16 @@ struct Engine::Impl {
     ~Impl() {
         write_own_profile();
         flush_dumps();
+        for (void* g : tok_graph)
+            if (g) cu::graph_destroy(g);
+        tok_graph.clear();
         for (Work& w : work) {
             if (w.side) cu::stream_destroy(w.side);
             w.side = nullptr;
+            if (w.ds) cu::stream_destroy(w.ds);
+            w.ds = nullptr;
+            if (w.dsb) cu::stream_destroy(w.dsb);
+            w.dsb = nullptr;
             if (w.kstage_h) cu::host_free(w.kstage_h);
             if (w.vstage_h) cu::host_free(w.vstage_h);
             w.kstage_h = w.vstage_h = nullptr;
@@ -1224,6 +1278,40 @@ struct Engine::Impl {
             if (kv_mode != 0) {
                 w.qd = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
                 w.att = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
+                // P5c: fused norm+rope operands.  `qn` is the normed/rotated query the device attention reads
+                // directly; `kn`/`vn` are the projection outputs before they are written to the fp16 cache.
+                w.qn = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
+                w.kn = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * sizeof(float)));
+                w.vn = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * sizeof(float)));
+                w.iqn = DevPtr(cu::alloc((size_t)cfg.idx_heads * cfg.idx_dim * sizeof(float)));
+                w.ikn = DevPtr(cu::alloc((size_t)cfg.idx_dim * sizeof(float)));
+                w.pos1 = DevPtr(cu::alloc(sizeof(int32_t)));
+                w.kn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
+                w.vn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
+                w.ik16 = DevPtr(cu::alloc((size_t)cfg.idx_dim * 2 + 64));
+                // The cos/sin table the kernel indexes.  It is built once per device up to a cap: at 256 KiB of
+                // table per 1 K positions an uncapped 1 M context would cost 256 MiB on every card, so the table
+                // stops at 128 K and a longer context keeps the host rope (correct, just not this fast path).
+                int64_t rp = ctx < 131072 ? ctx : 131072;
+                if (rp < 1) rp = 1;
+                const int half = (int)cfg.n_rot / 2;
+                w.rope_pos_cap = rp;
+                std::vector<float> ct((size_t)rp * (size_t)half), st((size_t)rp * (size_t)half);
+                // The SAME double-precision expression the host `rope()` evaluates per call, tabulated.  Using
+                // build_rope_table's `p * theta^-x` form instead differs by ~1e-13 rad, which is enough to flip an
+                // fp16 K/V rounding and (measured) a router top-4 tie: the device path then stops being bit-equal
+                // to the host path it replaces.
+                for (int64_t pp = 0; pp < rp; ++pp)
+                    for (int i = 0; i < half; ++i) {
+                        const double freq =
+                            (double)pp / std::pow(cfg.rope_theta, (2.0 * (double)i) / (double)cfg.n_rot);
+                        ct[(size_t)pp * (size_t)half + (size_t)i] = (float)std::cos(freq);
+                        st[(size_t)pp * (size_t)half + (size_t)i] = (float)std::sin(freq);
+                    }
+                w.rope_cos = DevPtr(cu::alloc(ct.size() * sizeof(float)));
+                w.rope_sin = DevPtr(cu::alloc(st.size() * sizeof(float)));
+                cu::copy_h2d(w.rope_cos.p, ct.data(), ct.size() * sizeof(float));
+                cu::copy_h2d(w.rope_sin.p, st.data(), st.size() * sizeof(float));
                 const size_t nb_max = (size_t)((ctx + cfg.idx_block - 1) / cfg.idx_block);
                 w.bs = DevPtr(cu::alloc(nb_max * (size_t)cfg.idx_heads * sizeof(float)));
                 w.slots = DevPtr(cu::alloc((size_t)cfg.n_head_kv * (size_t)max_slot * sizeof(int32_t)));
@@ -1512,6 +1600,19 @@ struct Engine::Impl {
             up(L.router);
             up(L.iq);
             up(L.ik);
+            // P5c: the head-norm weights the fused device norm+rope kernel multiplies by.  Only when the KV (and
+            // therefore the fused path) lives on a device.
+            if (kv_mode != 0) {
+                auto upn = [&](DevPtr& d, const std::vector<float>& src) {
+                    if (src.empty()) return;
+                    d = DevPtr(cu::alloc(src.size() * sizeof(float)));
+                    cu::copy_h2d(d.p, src.data(), src.size() * sizeof(float));
+                };
+                upn(L.d_qn, L.q_norm);
+                upn(L.d_kn, L.k_norm);
+                upn(L.d_iqn, L.iq_norm);
+                upn(L.d_ikn, L.ik_norm);
+            }
         }
         // lm_head goes on the device that owns the last layer (upstream's "last card" rule), if it fits there.
         if (N > 0 && out_b != std::numeric_limits<size_t>::max()) {
@@ -1561,6 +1662,9 @@ struct Engine::Impl {
             }
         }
         int q = opt.vram_slots_per_layer;
+        // `--minimax-expert-resident all` with the tiers off is a RAM-residency request, not a VRAM one: keep the
+        // device for dense/KV unless the caller named a slot count explicitly.
+        if (!opt.tiers && opt.expert_resident == "all" && opt.vram_slots_per_layer < 0) q = 0;
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
@@ -1707,6 +1811,10 @@ struct Engine::Impl {
         const size_t cells = (size_t)cfg.n_layers * (size_t)cfg.n_expert;
         if (opt.adaptive) usage.assign(cells, 0.f);
         if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) route_counts.assign(cells, 0.0);
+
+        // P5c: every static RAM slot is filled here, once, in parallel, instead of on the first token that
+        // routes to it.
+        if (expert_resident && ram_per_layer > 0 && ram_arena && ram_arena->valid()) fill_ram_static();
     }
 
     bool tiers_gpu_possible() const { return opt.dense_layers_gpu != 0 || opt.tiers; }
@@ -1744,14 +1852,123 @@ struct Engine::Impl {
     void ram_fill(Layer& L, int slot, int expert) {
         if (!ram_arena || !ram_arena->valid()) fail("RAM tier is not allocated");
         uint8_t* p = ram_slot_ptr(L, slot);
-        std::memcpy(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        std::memcpy(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        std::memcpy(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        ram_copy(L, expert, p);
         for (int32_t& v : L.ram_of)
             if (v == slot) v = kNotResident;
         L.ram_of[(size_t)expert] = slot;
         L.ram_expert_of[(size_t)slot] = expert;
         L.ram_tick[(size_t)slot] = ++lru_tick;
+    }
+
+    // One expert's three role slices into `p`, spread over the pool.  The source is the mmap, so the cost is the
+    // soft page fault per 4 KiB: many threads is the difference between 8 and 20 GB/s on a cold mapping.
+    void ram_copy(const Layer& L, int expert, uint8_t* p) {
+        const size_t gu = L.expert_gu, dn = L.expert_down;
+        const uint8_t* src[3] = {L.egate.host + (size_t)expert * gu, L.eup.host + (size_t)expert * gu,
+                                 L.edown.host + (size_t)expert * dn};
+        const size_t off[3] = {0, gu, 2 * gu};
+        const size_t len[3] = {gu, gu, dn};
+        const int pieces = 8 * (threads > 0 ? threads : 4);
+        pool.run(pieces * 3, [&](int a, int b) {
+            for (int i = a; i < b; ++i) {
+                const int m = i / pieces, c = i % pieces;
+                const size_t p0 = len[m] * (size_t)c / (size_t)pieces;
+                const size_t p1 = len[m] * (size_t)(c + 1) / (size_t)pieces;
+                if (p1 > p0) std::memcpy(p + off[m] + p0, src[m] + p0, p1 - p0);
+            }
+        });
+    }
+
+    // P5c: fill every static RAM slot at startup instead of on first use.  The on-demand fill re-read the same
+    // bytes through the mmap once per expert (at 16 GB/s in the measured decode, i.e. exactly the fault cost the
+    // tier exists to avoid) and left the arena a cold, partly-empty cache for the first tokens.
+    void fill_ram_static() {
+        struct Job {
+            Layer* L;
+            int slot;
+            int expert;
+        };
+        std::vector<Job> jobs;
+        // Priority: the profile's rank order when there is one, then the lowest unused expert ids.
+        for (int64_t li = 0; li < cfg.n_layers; ++li) {
+            Layer& L = layers[(size_t)li];
+            if (!L.moe || L.ram_n <= 0) continue;
+            std::vector<char> used((size_t)cfg.n_expert, 0);
+            std::vector<int> rank((size_t)cfg.n_expert, -1);
+            if (!profile.empty()) {
+                const int ml = (int)(li - cfg.leading_dense);
+                for (size_t i = 0; i < profile.size(); ++i) {
+                    const auto [pl, pe] = profile[i];
+                    if (pl == ml && pe >= 0 && pe < (int)cfg.n_expert) rank[(size_t)pe] = (int)i;
+                }
+            }
+            std::vector<std::pair<int, int>> order;
+            for (int e = 0; e < (int)cfg.n_expert; ++e) order.push_back({rank[(size_t)e] < 0 ? INT32_MAX : rank[(size_t)e], e});
+            std::sort(order.begin(), order.end());
+            for (int s = 0; s < L.ram_n; ++s) {
+                if (L.ram_expert_of[(size_t)s] >= 0) {
+                    used[(size_t)L.ram_expert_of[(size_t)s]] = 1;
+                    continue;
+                }
+                int pick = -1;
+                for (const auto& [r, e] : order)
+                    if (!used[(size_t)e] && L.ram_of[(size_t)e] < 0) {
+                        pick = e;
+                        break;
+                    }
+                if (pick < 0) break;
+                used[(size_t)pick] = 1;
+                jobs.push_back({&L, s, pick});
+            }
+        }
+        if (jobs.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        // ONE pool.run OVER PIECES, NOT a pool.run per expert from our own thread band: Pool::run is not
+        // reentrant, and a band of threads each calling it deadlocked the tier fill (measured: 27 s of CPU and no
+        // progress).  ~1 MiB pieces are small enough that every core gets several and large enough that the
+        // syscall/memcpy overhead disappears.
+        struct Piece {
+            const uint8_t* src;
+            uint8_t* dst;
+            size_t len;
+        };
+        std::vector<Piece> pieces;
+        const size_t kPiece = (size_t)1 << 20;
+        for (const Job& j : jobs) {
+            const Layer& L = *j.L;
+            uint8_t* dst = ram_slot_ptr(*j.L, j.slot);
+            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+            const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,
+                                     L.eup.host + (size_t)j.expert * L.expert_gu,
+                                     L.edown.host + (size_t)j.expert * L.expert_down};
+            for (int r = 0; r < 3; ++r)
+                for (size_t at = 0; at < len[r]; at += kPiece)
+                    pieces.push_back({src[r] + at, dst + off[r] + at,
+                                      std::min(kPiece, len[r] - at)});
+        }
+        pool.run((int)pieces.size(), [&](int a, int b) {
+            for (int i = a; i < b; ++i) std::memcpy(pieces[(size_t)i].dst, pieces[(size_t)i].src, pieces[(size_t)i].len);
+        });
+        uint64_t bytes = 0;
+        for (const Job& j : jobs) {
+            j.L->ram_of[(size_t)j.expert] = j.slot;
+            j.L->ram_expert_of[(size_t)j.slot] = j.expert;
+            j.L->ram_tick[(size_t)j.slot] = ++lru_tick;
+            bytes += j.L->expert_bytes;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr,
+                     "INFO minimax-ram-tier experts=%zu gib=%.1f seconds=%.1f rate=%.1f GiB/s backing=%s\n",
+                     jobs.size(), (double)bytes / 1073741824.0, s,
+                     s > 0 ? (double)bytes / 1073741824.0 / s : 0.0,
+                     ram_arena ? (ram_arena->backing == strata::core::PageBacking::LargePages
+                                      ? "large-pages"
+                                      : ram_arena->backing == strata::core::PageBacking::PinnedByCuda ? "cuda-pinned"
+                                                                                                      : "locked")
+                               : "none");
+        if (ram_arena && ram_arena->backing != strata::core::PageBacking::LargePages)
+            std::fprintf(stderr, "INFO minimax-ram-tier note: %s\n", ram_arena->note.c_str());
     }
 
     // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
@@ -1948,6 +2165,7 @@ struct Engine::Impl {
         }
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
+        apply_expert_skip(w);
 
         const int64_t li = (int64_t)(&L - layers.data());
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
@@ -1971,6 +2189,7 @@ struct Engine::Impl {
         cpu.reserve((size_t)top);
         int ssd_n = 0;
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
             // Compulsory admission when no profile filled the slots: the first distinct experts a layer routes take
             // the free slots.  A profile-filled tier has no free slot and leaves this a pure lookup.
@@ -2023,6 +2242,7 @@ struct Engine::Impl {
         for (const CpuExpert& c : cpu) cpu_of[(size_t)c.e] = &c;
         std::vector<std::vector<float>> cpu_ye((size_t)top);
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;
             const int e = order[(size_t)j];
             if (L.vram_of[(size_t)e] >= 0) continue;
             const CpuExpert* c = cpu_of[(size_t)e];
@@ -2202,27 +2422,31 @@ struct Engine::Impl {
         ++profile_saves;
     }
 
-    void gemv(const Tensor& t, const float* xin, float* yout) {
+    void gemv(const Tensor& t, const float* xin, float* yout, void* dev_out = nullptr) {
         if (t.ne2 != 1) fail(t.name + ": internal gemv is for a matrix, not a stacked expert");
         const int rows = (int)t.ne1;
         const int cols = (int)t.ne0;
         if ((int64_t)cols > max_cols || (int64_t)rows > max_rows) fail(t.name + ": gemv exceeds the workspace");
         if (t.gpu) {
             Work& w = W();
-            // P5b: a packed projection through llama.cpp's CUDA MMVQ.  The blocks are read as they are - no
-            // fp32 dequantize buffer, so a Q6_K head reads 0.82 bytes per weight instead of 4, and there is no
-            // 128-row tile loop.  The activation is q8_1, the same contract the GPU expert tier already uses.
+            // P5c: with `dev_out` the result stays on the device (the fused norm+rope step consumes it there).
+            // The kernels then stay on the DEFAULT stream, so the norm+rope launch that follows is ordered
+            // after them without a host round trip.
             if (dense_mmvq && !t.dev_f32 && mmvq_dense_fits(t.type, cols) && w.xq.p) {
-                if (!w.ds) w.ds = cu::stream_create();
+                if (!dev_out && !w.ds) w.ds = cu::stream_create();
+                if (dev_out && !w.dsb) w.dsb = cu::stream_create_blocking();
+                void* ds = dev_out ? w.dsb : w.ds;
                 h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, w.ds);
-                strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, w.ds);
+                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, ds);
+                strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)(dev_out ? dev_out : w.y.p), cols, rows,
+                                             1, ds);
+                if (dev_out) return;
                 cu::copy_d2h_async(yout, w.y.p, (size_t)rows * sizeof(float), w.ds);
                 cu::stream_sync(w.ds);
                 return;
             }
             h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-            float* dy = (float*)w.y.p;
+            float* dy = (float*)(dev_out ? dev_out : w.y.p);
             if (t.dev_f32) {
                 cu::gemv((const float*)t.dev.p, (const float*)w.x.p, dy, rows, cols);
             } else {
@@ -2232,6 +2456,7 @@ struct Engine::Impl {
                     cu::gemv((const float*)w.scratch.p, (const float*)w.x.p, dy + r, n, cols);
                 }
             }
+            if (dev_out) return;
             cu::copy_d2h(yout, dy, (size_t)rows * sizeof(float));
             return;
         }
@@ -2385,6 +2610,7 @@ struct Engine::Impl {
         }
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
+        apply_expert_skip(w);
         if (!route_counts.empty()) {
             const size_t b = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
             for (int j = 0; j < top; ++j) route_counts[b + (size_t)order[(size_t)j]] += 1.0;
@@ -2400,6 +2626,7 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
             const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
             const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
@@ -2591,7 +2818,8 @@ struct Engine::Impl {
     // P4: the same attention on the owning device.  The indexer scores are computed from the device copy of the
     // indexer keys; only the selected slots of each KV head are brought into the staging buffer (a device gather
     // when the KV lives in VRAM, one H2D copy from pinned host memory in the RAM tier).
-    void attend_dev(int layer, const Layer& L, int64_t pos, float* att) {
+    void attend_dev(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
+                    const float* iqdev = nullptr) {
         use_device_index(L.dev);
         Work& w = W();
         const int H = (int)cfg.n_head;
@@ -2603,9 +2831,13 @@ struct Engine::Impl {
         const int nb = (int)((Tk + BLK - 1) / BLK);
         std::vector<float> bs((size_t)HI * nb, -std::numeric_limits<float>::infinity());
         if (L.indexer) {
-            h2d(w, w.qd.p, iq.data(), (size_t)HI * (size_t)cfg.idx_dim * sizeof(float));
-            cu::idx_block_scores(L.d_ik.p, Tk, (const float*)w.qd.p, HI, (int)cfg.idx_dim, BLK, nb,
-                                 (float*)w.bs.p, nullptr);
+            if (iqdev) {
+                cu::idx_block_scores(L.d_ik.p, Tk, iqdev, HI, (int)cfg.idx_dim, BLK, nb, (float*)w.bs.p, nullptr);
+            } else {
+                h2d(w, w.qd.p, iq.data(), (size_t)HI * (size_t)cfg.idx_dim * sizeof(float));
+                cu::idx_block_scores(L.d_ik.p, Tk, (const float*)w.qd.p, HI, (int)cfg.idx_dim, BLK, nb,
+                                     (float*)w.bs.p, nullptr);
+            }
             cu::sync();
             cu::copy_d2h(bs.data(), w.bs.p, (size_t)HI * (size_t)nb * sizeof(float));
         }
@@ -2650,18 +2882,24 @@ struct Engine::Impl {
                 }
             }
         }
-        h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
-        cu::msa_attn(w.kstage.p, w.vstage.p, (const float*)w.qd.p, (float*)w.att.p, H, q_per_kv, (int)max_slot,
-                     (const int32_t*)w.counts.p, D, nullptr);
+        if (qdev) {
+            cu::msa_attn(w.kstage.p, w.vstage.p, qdev, (float*)w.att.p, H, q_per_kv, (int)max_slot,
+                         (const int32_t*)w.counts.p, D, nullptr);
+        } else {
+            h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
+            cu::msa_attn(w.kstage.p, w.vstage.p, (const float*)w.qd.p, (float*)w.att.p, H, q_per_kv, (int)max_slot,
+                         (const int32_t*)w.counts.p, D, nullptr);
+        }
         cu::sync();
         cu::copy_d2h(att, w.att.p, (size_t)H * (size_t)D * sizeof(float));
     }
 
-    void attend(int layer, const Layer& L, int64_t pos, float* att) {
+    void attend(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
+                const float* iqdev = nullptr) {
         if (kv_mode == 0)
             attend_host(layer, L, pos, att);
         else
-            attend_dev(layer, L, pos, att);
+            attend_dev(layer, L, pos, att, qdev, iqdev);
     }
 
 
@@ -2672,6 +2910,10 @@ struct Engine::Impl {
         if (opt.prefill_batch <= 1) return;
         prefill_dense_f32 = opt.prefill_dense != "f16";
         prefill_direct = opt.prefill_read == "direct";
+        if (!prefill_dense_f32)
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-dense=f16 (the down GEMM's activation is fp16; measured KL 1.7e-3 "
+                         "against f32 on the real slice, +9%% prefill)\n");
         if (dump_on) {
             std::fprintf(stderr, "strata-minimax: --minimax-prefill-batch is off because the parity dump needs the "
                                  "per-token path\n");
@@ -2751,8 +2993,8 @@ struct Engine::Impl {
             p.gx32 = (float*)cu::alloc(rc * embd * 4);
             p.gy = (float*)cu::alloc(rc * (size_t)cfg.n_ff_exp * 4);
             p.gu = (float*)cu::alloc(rc * (size_t)cfg.n_ff_exp * 4);
-            p.gh = (uint16_t*)cu::alloc(rc * (size_t)cfg.n_ff_exp * 2);
-            p.gh32 = (float*)cu::alloc(rc * (size_t)cfg.n_ff_exp * 4);
+            p.gh = (uint16_t*)cu::alloc(rc * (size_t)max_dense_n * 2);
+            p.gh32 = (float*)cu::alloc(rc * (size_t)max_dense_n * 4);
             p.gd = (float*)cu::alloc(rc * embd * 4);
             p.xq = cu::alloc(rc * (size_t)q8_1_bytes(cfg.n_embd));
             p.hq = cu::alloc(rc * (size_t)q8_1_bytes(cfg.n_ff_exp));
@@ -2766,6 +3008,7 @@ struct Engine::Impl {
             pf_max_blk = (int)cfg.idx_top_k;
             p.d_blk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)pf_max_blk * sizeof(int32_t) + 4096));
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
+            p.d_pos = DevPtr(cu::alloc((size_t)T * sizeof(int32_t) + 64));
             if (prefill_gpu_experts && max_expert_bytes > 0) {
                 p.ring_slot = max_expert_bytes;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
@@ -2812,6 +3055,9 @@ struct Engine::Impl {
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
+
+    // P5c: how many positions the device cos/sin table covers (all devices share the same cap).
+    int64_t p_rope_cap() const { return work.empty() ? 0 : work[0].rope_pos_cap; }
 
     // One projection for T rows: dequantize a tile of the weight rows to fp16, cuBLAS the tile, repeat.  The tile
     // size comes from the scratch buffer, so an `lm_head` of 200 K rows costs a few dozen launches, not 200 K.
@@ -2982,6 +3228,128 @@ struct Engine::Impl {
             if (dbg) dbuf_put(pfx + "/residual_in", x.data(), (int)cfg.n_embd);
             rms(x.data(), L.attn_norm.data(), h.data(), (int)cfg.n_embd, eps);
             if (dbg) dbuf_put(pfx + "/attn_input", h.data(), (int)cfg.n_embd);
+            // P5c: the token path's norm+rope on the device.  `dev_tok` keeps q/k/v on the card: the three
+            // projections write device buffers, the fused kernel norms/rotates them there and drops K/V straight
+            // into the cache, so the host sees one position update and no 16 K-float round trip per layer.
+            const bool dev_tok = kv_mode != 0 && L.want_gpu && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
+                                 pos < p_rope_cap();
+            bool graphed = false;
+            const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
+            const size_t koff_dev = (size_t)pos * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
+            if (dev_tok) {
+                Work& w = W();
+                const int H = (int)cfg.n_head, HKV = (int)cfg.n_head_kv, D = (int)cfg.head_dim;
+                const int32_t ppos = (int32_t)pos;
+                // P5c: one captured graph per layer holds the whole GPU prefix of the attention block - q8_1
+                // quantize, the dense MMVQs, the fused norm+rope and the fp16 conversions - so a token costs one
+                // graph launch per layer instead of ~9 kernel launches.  Capture does not execute the work, so
+                // the layer runs its graph (replay or first launch) right after building it.
+                if (graphs_on && kv_mode == 1 && !dbg) {
+                    const bool fits = dense_mmvq && mmvq_dense_fits(L.wq.type, (int)cfg.n_embd) &&
+                                      mmvq_dense_fits(L.wk.type, (int)cfg.n_embd) &&
+                                      mmvq_dense_fits(L.wv.type, (int)cfg.n_embd) &&
+                                      (!L.indexer || (mmvq_dense_fits(L.iq.type, (int)cfg.n_embd) &&
+                                                      mmvq_dense_fits(L.ik.type, (int)cfg.n_embd)));
+                    if (fits) {
+                        if (!w.dsb) w.dsb = cu::stream_create_blocking();
+                        auto emit = [&] {
+                            strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, (int)cfg.n_embd, w.xq.p,
+                                                                w.dsb);
+                            strata::kernels::native_mmvq(L.wq.type, L.wq.dev.p, w.xq.p, (float*)w.qn.p,
+                                                         (int)cfg.n_embd, H * D, 1, w.dsb);
+                            strata::kernels::native_mmvq(L.wk.type, L.wk.dev.p, w.xq.p, (float*)w.kn.p,
+                                                         (int)cfg.n_embd, HKV * D, 1, w.dsb);
+                            strata::kernels::native_mmvq(L.wv.type, L.wv.dev.p, w.xq.p, (float*)w.vn.p,
+                                                         (int)cfg.n_embd, HKV * D, 1, w.dsb);
+                            cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p,
+                                               nullptr, H, H, D, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                               (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, w.dsb);
+                            cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p,
+                                               (uint16_t*)w.kn16.p, HKV, HKV, D, (int)cfg.n_rot,
+                                               (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                               (const int32_t*)w.pos1.p, eps, w.dsb);
+                            cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.vn16.p, (int64_t)HKV * D, w.dsb);
+                            if (L.indexer) {
+                                const int HI = (int)cfg.idx_heads, ID = (int)cfg.idx_dim;
+                                strata::kernels::native_mmvq(L.iq.type, L.iq.dev.p, w.xq.p, (float*)w.iqn.p,
+                                                             (int)cfg.n_embd, HI * ID, 1, w.dsb);
+                                strata::kernels::native_mmvq(L.ik.type, L.ik.dev.p, w.xq.p, (float*)w.ikn.p,
+                                                             (int)cfg.n_embd, ID, 1, w.dsb);
+                                cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p,
+                                                   (float*)w.iqn.p, nullptr, (int64_t)HI, HI, ID, (int)cfg.n_rot,
+                                                   (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                                   (const int32_t*)w.pos1.p, eps, w.dsb);
+                                cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p,
+                                                   (float*)w.ikn.p, (uint16_t*)w.ik16.p, (int64_t)1, 1, ID,
+                                                   (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                                   (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps,
+                                                   w.dsb);
+                            }
+                        };
+                        if (!tok_graph[(size_t)li]) {
+                            h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
+                            cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                            cu::graph_capture_begin(w.dsb);
+                            emit();
+                            tok_graph[(size_t)li] = cu::graph_capture_end(w.dsb);
+                            if (!tok_graph[(size_t)li])
+                                std::fprintf(stderr, "INFO minimax-graphs layer=%lld capture failed; launching "
+                                                     "kernels directly\n",
+                                             (long long)li);
+                        }
+                        if (tok_graph[(size_t)li]) {
+                            // The activation and the position are host-side inputs: copied every token, outside
+                            // the graph, which only bakes in their device addresses.
+                            h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
+                            cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                            cu::graph_launch(tok_graph[(size_t)li], w.dsb);
+                            cu::copy_d2d((uint16_t*)L.d_k.p + koff_dev, w.kn16.p, (size_t)HKV * D * 2);
+                            cu::copy_d2d((uint16_t*)L.d_v.p + koff_dev, w.vn16.p, (size_t)HKV * D * 2);
+                            if (L.indexer)
+                                cu::copy_d2d((uint16_t*)L.d_ik.p + (size_t)pos * (size_t)cfg.idx_dim, w.ik16.p,
+                                             (size_t)cfg.idx_dim * 2);
+                            graphed = true;
+                        }
+                    }
+                }
+                if (!graphed) {
+                gemv(L.wq, h.data(), nullptr, w.qn.p);
+                gemv(L.wk, h.data(), nullptr, w.kn.p);
+                gemv(L.wv, h.data(), nullptr, w.vn.p);
+                cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p, nullptr, H, H, D,
+                                   (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                   (const int32_t*)w.pos1.p, eps, nullptr);
+                if (kv_mode == 1) {
+                    cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p,
+                                       (uint16_t*)L.d_k.p + koff_dev, HKV, HKV, D, (int)cfg.n_rot,
+                                       (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                       (const int32_t*)w.pos1.p, eps, nullptr);
+                    cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)L.d_v.p + koff_dev, (int64_t)HKV * D, nullptr);
+                    if (dbg) {
+                        cu::sync();
+                        cu::copy_d2h(q.data(), w.qn.p, (size_t)H * D * sizeof(float));
+                        cu::copy_d2h(k.data(), w.kn.p, (size_t)HKV * D * sizeof(float));
+                        cu::copy_d2h(v.data(), w.vn.p, (size_t)HKV * D * sizeof(float));
+                        dbuf_put(pfx + "/q_after_rope", q.data(), (int)(cfg.n_head * cfg.head_dim));
+                        dbuf_put(pfx + "/k_after_rope", k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+                    }
+                } else {
+                    // RAM tier: the rotated K/V are converted on the card and one small copy lands them in the
+                    // page-locked host cache.
+                    const int n = HKV * D;
+                    cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p, nullptr, HKV,
+                                       HKV, D, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                       (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
+                    cu::f32_to_f16((const float*)w.kn.p, (uint16_t*)w.att.p, n, nullptr);
+                    cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
+                    std::memcpy(k_host + koff, kv_tmp.data(), (size_t)n * 2);
+                    cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.att.p, n, nullptr);
+                    cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
+                    std::memcpy(v_host + koff, kv_tmp.data(), (size_t)n * 2);
+                }
+                }
+            } else {
             gemv(L.wq, h.data(), q.data());
             gemv(L.wk, h.data(), k.data());
             gemv(L.wv, h.data(), v.data());
@@ -2993,8 +3361,6 @@ struct Engine::Impl {
                 dbuf_put(pfx + "/q_after_rope", q.data(), (int)(cfg.n_head * cfg.head_dim));
                 dbuf_put(pfx + "/k_after_rope", k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
             }
-            const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
-            const size_t koff_dev = (size_t)pos * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
             if (kv_mode == 0) {
                 store_f16(k_host, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
                 store_f16(v_host, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
@@ -3011,7 +3377,30 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_v.p + koff_dev, kv_tmp.data(), (size_t)n * 2);
                 }
             }
+            }
             if (L.indexer) {
+                if (dev_tok) {
+                    Work& w = W();
+                    const int HI = (int)cfg.idx_heads, ID = (int)cfg.idx_dim;
+                    if (!graphed) {
+                        gemv(L.iq, h.data(), nullptr, w.iqn.p);
+                        gemv(L.ik, h.data(), nullptr, w.ikn.p);
+                        cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p, (float*)w.iqn.p, nullptr,
+                                           (int64_t)HI, HI, ID, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                           (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
+                        cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p, (float*)w.ikn.p,
+                                           (uint16_t*)L.d_ik.p + (size_t)pos * (size_t)ID, (int64_t)1, 1, ID,
+                                           (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                           (const int32_t*)w.pos1.p, eps, nullptr);
+                    }
+                    if (dbg) {
+                        cu::sync();
+                        cu::copy_d2h(iq.data(), w.iqn.p, (size_t)HI * ID * sizeof(float));
+                        cu::copy_d2h(ik.data(), w.ikn.p, (size_t)ID * sizeof(float));
+                        dbuf_put(pfx + "/index_q_after_rope", iq.data(), (int)(cfg.idx_heads * cfg.idx_dim));
+                        dbuf_put(pfx + "/index_k_after_rope", ik.data(), (int)cfg.idx_dim);
+                    }
+                } else {
                 gemv(L.iq, h.data(), iq.data());
                 gemv(L.ik, h.data(), ik.data());
                 rms_heads(iq.data(), (int)cfg.idx_heads, (int)cfg.idx_dim, L.iq_norm.data(), eps);
@@ -3030,9 +3419,11 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_ik.p + (size_t)pos * (size_t)cfg.idx_dim, kv_tmp.data(),
                                  (size_t)cfg.idx_dim * 2);
                 }
+                }
             }
             std::vector<float> att((size_t)cfg.n_head * (size_t)cfg.head_dim);
-            attend((int)li, L, pos, att.data());
+            attend((int)li, L, pos, att.data(), dev_tok ? (const float*)W().qn.p : nullptr,
+                   dev_tok && L.indexer ? (const float*)W().iqn.p : nullptr);
             if (dbg) dbuf_put(pfx + "/attn_core_out", att.data(), (int)(cfg.n_head * cfg.head_dim));
             gemv(L.wo, att.data(), proj.data());
             if (dbg) dbuf_put(pfx + "/attn_out", proj.data(), (int)cfg.n_embd);
@@ -3073,6 +3464,7 @@ struct Engine::Impl {
             total_stats.ram += tok_stats.ram;
             total_stats.ssd += tok_stats.ssd;
             total_stats.ssd_bytes += tok_stats.ssd_bytes;
+            total_stats.skipped += tok_stats.skipped;
             ++tokens_seen;
             if (opt.adaptive && (++rebalance_tick % 16) == 0) rebalance();
             if (opt.stats)
@@ -3115,6 +3507,7 @@ struct Engine::Impl {
             }
             if (renorm && sum > 0.f)
                 for (int j = 0; j < top; ++j) wts[(size_t)t * top + j] /= sum;
+            apply_expert_skip_range(wts.data() + (size_t)t * top, top);
             if (!usage.empty())
                 for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
             if (!route_counts.empty())
@@ -3197,8 +3590,10 @@ struct Engine::Impl {
 
         pf_entries.clear();
         for (int t = 0; t < T; ++t)
-            for (int s = 0; s < top; ++s)
+            for (int s = 0; s < top; ++s) {
+                if (wts[(size_t)t * top + s] == 0.f) continue;   // --minimax-expert-skip
                 pf_entries.push_back({t, ids[(size_t)t * top + s], wts[(size_t)t * top + s], 0});
+            }
         std::stable_sort(pf_entries.begin(), pf_entries.end(),
                          [](const PfEntry& a, const PfEntry& b) { return a.expert < b.expert; });
 
@@ -3235,8 +3630,13 @@ struct Engine::Impl {
         // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
         auto read_expert = [&](int e, uint8_t* dst) {
             const size_t gu = L.expert_gu, dn = L.expert_down;
-            const uint8_t* src[3] = {L.egate.host + (size_t)e * gu, L.eup.host + (size_t)e * gu,
-                                     L.edown.host + (size_t)e * dn};
+            // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
+            // to ignore the tier and re-fault every page of every expert once per chunk.
+            const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
+            const uint8_t* base = rs >= 0 ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
+            const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
+                                     base ? base + gu : L.eup.host + (size_t)e * gu,
+                                     base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
             const size_t off[3] = {0, gu, 2 * gu};
             const size_t len[3] = {gu, gu, dn};
             // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
@@ -3449,16 +3849,55 @@ struct Engine::Impl {
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
             const auto ta1 = pfclock::now();
+            // P5c: with the fused device path the projections never come back to the host: norm+rope runs on
+            // the device and writes fp16 straight into the KV cache (and the MSA query buffer).
+            const bool dev_prep = dev_attn && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
+                                  (int64_t)pos0 + T <= p_rope_cap();
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
                 gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
-                cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
+                else {
+                    pf_pos.resize((size_t)T);
+                    for (int t = 0; t < T; ++t) pf_pos[(size_t)t] = (int32_t)(pos0 + t);
+                    cu::copy_h2d(p.d_pos.p, pf_pos.data(), (size_t)T * sizeof(int32_t));
+                    cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H, H,
+                                       D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                }
                 gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
-                cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
+                else {
+                    uint16_t* kdst = (uint16_t*)p.a16;
+                    cu::head_norm_rope(p.y32, (const float*)L.d_kn.p, nullptr, kdst, (int64_t)T * HKV, HKV, D,
+                                       (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    if (kv_mode == 1) {
+                        cu::copy_d2d((uint16_t*)L.d_k.p + (size_t)pos0 * klen, kdst, (size_t)T * klen * 2);
+                    } else {
+                        pf_k16.resize((size_t)T * klen);
+                        cu::copy_d2h(pf_k16.data(), kdst, (size_t)T * klen * 2);
+                        std::memcpy(k_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                    pf_k16.data(), (size_t)T * klen * sizeof(uint16_t));
+                    }
+                }
                 gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
-                cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
+                else {
+                    uint16_t* vdst = (uint16_t*)p.a16;
+                    cu::f32_to_f16(p.y32, vdst, (int64_t)T * klen, nullptr);
+                    if (kv_mode == 1) {
+                        cu::copy_d2d((uint16_t*)L.d_v.p + (size_t)pos0 * klen, vdst, (size_t)T * klen * 2);
+                    } else {
+                        pf_v16.resize((size_t)T * klen);
+                        cu::copy_d2h(pf_v16.data(), vdst, (size_t)T * klen * 2);
+                        std::memcpy(v_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                    pf_v16.data(), (size_t)T * klen * sizeof(uint16_t));
+                    }
+                }
+                if (dev_prep) cu::sync();
             } else {
                 gemm_cpu(L.wq, hq, T, ne, qf.data(), qlen);
                 gemm_cpu(L.wk, hq, T, ne, pf_kv.data(), klen);
@@ -3466,6 +3905,7 @@ struct Engine::Impl {
             }
             const auto ta2 = pfclock::now();
             const auto tkv0 = pfclock::now();
+            if (!dev_prep)
             for (int t = 0; t < T; ++t) {
                 rms_heads(qf.data() + (size_t)t * qlen, H, D, L.q_norm.data(), eps);
                 rms_heads(pf_kv.data() + (size_t)t * klen, HKV, D, L.k_norm.data(), eps);
@@ -3477,7 +3917,7 @@ struct Engine::Impl {
                     store_f16(v_host, koff, vf.data() + (size_t)t * klen, klen);
                 }
             }
-            if (kv_mode == 1) {
+            if (kv_mode == 1 && !dev_prep) {
                 pf_k16.resize((size_t)T * klen);
                 pf_v16.resize((size_t)T * klen);
                 for (int t = 0; t < T; ++t) {
@@ -3494,13 +3934,24 @@ struct Engine::Impl {
                 ikf.resize((size_t)T * cfg.idx_dim);
                 if (gpu) {
                     gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
-                    cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
+                    if (!dev_prep) cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
+                    else
+                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, nullptr, (uint16_t*)p.d_iq16.p,
+                                           (int64_t)T * HI, HI, (int)cfg.idx_dim, (int)cfg.n_rot,
+                                           (const float*)W().rope_cos.p, (const float*)W().rope_sin.p,
+                                           (const int32_t*)p.d_pos.p, eps, nullptr);
                     gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
-                    cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
+                    if (!dev_prep) cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
+                    else
+                        cu::head_norm_rope(p.y32, (const float*)L.d_ikn.p, nullptr,
+                                           (uint16_t*)L.d_ik.p + (size_t)pos0 * cfg.idx_dim, (int64_t)T, 1,
+                                           (int)cfg.idx_dim, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
                 } else {
                     gemm_cpu(L.iq, hq, T, ne, iqf.data(), ilen);
                     gemm_cpu(L.ik, hq, T, ne, ikf.data(), (int)cfg.idx_dim);
                 }
+                if (!dev_prep)
                 for (int t = 0; t < T; ++t) {
                     rms_heads(iqf.data() + (size_t)t * ilen, HI, (int)cfg.idx_dim, L.iq_norm.data(), eps);
                     rms(ikf.data() + (size_t)t * cfg.idx_dim, L.ik_norm.data(), ikf.data() + (size_t)t * cfg.idx_dim,
@@ -3513,7 +3964,7 @@ struct Engine::Impl {
                     if (kv_mode == 0)
                         store_f16(ik_host, ioff, ikf.data() + (size_t)t * cfg.idx_dim, (int)cfg.idx_dim);
                 }
-                if (kv_mode != 0) {
+                if (kv_mode != 0 && !dev_prep) {
                     std::vector<uint16_t> ik16((size_t)T * cfg.idx_dim);
                     for (int t = 0; t < T; ++t)
                         to_f16(ikf.data() + (size_t)t * cfg.idx_dim, ik16.data() + (size_t)t * cfg.idx_dim,
@@ -3521,18 +3972,19 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_ik.p + (size_t)pos0 * cfg.idx_dim, ik16.data(),
                                  (size_t)T * cfg.idx_dim * 2);
                 }
-                if (dev_attn) {
+                if (dev_attn && !dev_prep) {
                     iq16.resize((size_t)T * ilen);
                     for (int t = 0; t < T; ++t)
                         to_f16(iqf.data() + (size_t)t * ilen, iq16.data() + (size_t)t * ilen, ilen);
                 }
+                if (dev_prep) cu::sync();
                 t_kvw += dur(tix0, pfclock::now());
             }
             if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
                 int nb = 0;
                 if (L.indexer) {
-                    cu::copy_h2d(p.d_iq16.p, iq16.data(), iq16.size() * 2);
+                    if (!dev_prep) cu::copy_h2d(p.d_iq16.p, iq16.data(), iq16.size() * 2);
                     const auto ti0 = pfclock::now();
                     nb = (int)((pos0 + T + BLK - 1) / BLK);
                     cu::idx_block_scores_batch(L.d_ik.p, (const uint16_t*)p.d_iq16.p, HI, (int)cfg.idx_dim, BLK, nb, T,
@@ -3553,8 +4005,10 @@ struct Engine::Impl {
                     cu::copy_h2d(p.d_blk.p, pf_blk.data(), pf_blk.size() * sizeof(int32_t));
                     cu::copy_h2d(p.d_nblk.p, pf_nblk.data(), pf_nblk.size() * sizeof(int32_t));
                 }
-                cu::copy_h2d(p.y32, qf.data(), (size_t)T * qlen * sizeof(float));
-                cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
+                if (!dev_prep) {
+                    cu::copy_h2d(p.y32, qf.data(), (size_t)T * qlen * sizeof(float));
+                    cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
+                }
                 cu::sync();
                 const auto tm0 = pfclock::now();
                 cu::msa_attn_batch(L.d_k.p, L.d_v.p, (const uint16_t*)p.d_q16.p, (const int32_t*)p.d_blk.p,
@@ -3664,6 +4118,7 @@ struct Engine::Impl {
             total_stats.ram += tok_stats.ram;
             total_stats.ssd += tok_stats.ssd;
             total_stats.ssd_bytes += tok_stats.ssd_bytes;
+            total_stats.skipped += tok_stats.skipped;
         }
     }
 
@@ -3814,12 +4269,13 @@ std::string Engine::describe() const {
 }
 
 std::string Engine::stats() const {
-    if (!impl_->tiers_on) return std::string();
+    if (!impl_->tiers_on && impl_->total_stats.skipped == 0) return std::string();
     std::ostringstream o;
     o << "tiers=on vram_slots_per_layer=" << impl_->vram_per_layer << " ram_experts_per_layer="
       << impl_->ram_per_layer << " tokens=" << impl_->tokens_seen << " vram_hits=" << impl_->total_stats.vram
       << " ram_hits=" << impl_->total_stats.ram << " ssd_reads=" << impl_->total_stats.ssd
-      << " ssd_bytes=" << impl_->total_stats.ssd_bytes << " swaps=" << impl_->swaps;
+      << " ssd_bytes=" << impl_->total_stats.ssd_bytes << " swaps=" << impl_->swaps
+      << " skipped=" << impl_->total_stats.skipped;
     return o.str();
 }
 

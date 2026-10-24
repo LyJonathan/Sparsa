@@ -456,7 +456,247 @@ rows) and 3.7x faster: MSA 16.4 → 4.4 s over a 4096-token prompt (73 % → 21 
   `vec_dot`; llama.cpp is at ~23 GB/s because its weights are committed RAM rather than our mmap, which pays a soft
   page fault per 4 KiB. `--minimax-tiers --minimax-ram-experts-per-layer 128` does not help by itself (the arena is
   filled on demand, i.e. re-reads the same bytes once more).
-- `--minimax-prefill-dense f16` is 7 % faster (209.7 tok/s at 4096) but still produces non-finite logits above 512
-  prompt tokens. It is not the default; the fp32 path is now correct after the dequantizer fix.
+- `--minimax-prefill-dense f16` **is fixed** (P5c). It used to produce non-finite logits for any prompt that needed
+  more than one prefill chunk. The fault was not the HGEMM: `p.gh`, the fp16 swiglu buffer the f16 path feeds to the
+  down GEMM, was sized `rows_cap x n_ff_exp` (1024 x 3072) while the *dense* MLP's hidden is `n_ff_dense` = 12288
+  wide - a 4x write past the end of the buffer that landed in whatever was allocated after it. The f32 path never
+  touches `p.gh` in the dense MLP (it swiglu's into `p.sh`), which is why only f16 broke. It is now sized by
+  `max_dense_n`. On the real slice, 4096-token prefill: f32 270.6 tok/s, f16 294.8/296.4 tok/s (+9 %), and the
+  f16 logits against f32 over 768 tokens (two chunks) are finite at KL 1.7e-3, top-1 0.977, median |d| 0.068. It
+  stays opt-in: the coarser activation is measurable, and the default is the parity-first f32 path.
+
+## P5c: the norm+rope round trip is gone
+
+`--minimax-gpu-normrope` (default on) runs per-head RMSNorm + partial NEOX RoPE + the fp16 cache write on the
+device for both paths. P5b measured 721 ms of a 804 ms attention block at 4096 tokens as host work on q/k/v: the
+projections were copied back, normalized and rotated on one core, then converted to fp16 and copied in again.
+Now `cu::head_norm_rope` (one block per head row) reads the projection output in place and writes fp16 straight
+into the KV cache; the MSA query buffer and the indexer keys are produced by the same kernel, and the token path
+reads its query from the device buffer instead of uploading it.
+
+It is **bit-identical** to the host loop, which took two details. The RMS sum is sequential on one thread with
+`__fmul_rn`/`__fadd_rn` (nvcc contracts `a*b+c` into an FMA by default, and that last-bit difference was enough to
+flip an fp16 K/V rounding and - measured - the router's 4th expert at token 20). The cos/sin table is built from
+the same double-precision expression `rope()` evaluates per call (`pos / theta^(2i/n_rot)`), not from
+`build_rope_table`'s `pos * theta^(-2i/n_rot)` form. `test_p5c.py` holds both paths to `array_equal` on 200 tokens
+of the runnable model.
+
+The table is built once per device up to `min(ctx, 128 K)` positions (256 B per position); a longer context falls
+back to the host loop rather than reserving 256 MiB of VRAM on every card.
+
+Measured on the 15-layer real-weight IQ2_XS slice, one RTX 5070, KV in VRAM, 24 threads, box idle:
+
+| prompt | P5b | P5c | gain |
+| ---: | ---: | ---: | ---: |
+| 512 prefill | 82.2 tok/s | 90.8 | +10.5 % |
+| 4096 prefill | 168.2 tok/s | 222.6 | +32.3 % |
+| decode (32 new) | 12.63 tok/s | 13.03 | +3.2 % |
+
+`--minimax-gpu-normrope off` is the P5b path, byte for byte.
+
+### Resident experts: `--minimax-expert-resident off|auto|all`
+
+The P3 RAM tier was filled on demand: the first token that routed to an expert copied it out of the mmap into the
+pinned arena, so that token paid the fault *and* the copy, and the arena was a cold, partly-empty cache for the
+first tokens of every run. `auto` (the default, and only when a RAM tier exists) and `all` (which creates the tier
+even with the tiers off, using the device only for dense/KV) now fill every static slot at startup with a parallel
+reader (1 MiB pieces over the whole pool), print the achieved rate and the arena backing, and the batched prefill
+reads a resident expert from the arena instead of re-faulting it once per chunk.
+
+Large pages are tried first and refused on this box (`VirtualAlloc` error 1314: `SeLockMemoryPrivilege` is not
+assigned to a normal account), so the arena is 4 KB pages, `cudaHostRegister`ed and working-set locked. That is
+the documented fallback, not an error.
+
+15-layer IQ2_XS slice, RTX 5070, kv=vram, 24 threads, 4096-token prompt, 32 new tokens, page cache **cold**
+(45 GiB of anonymous memory written first to evict the mapping):
+
+| arm | prefill tok/s | decode tok/s | ms/token |
+| --- | ---: | ---: | ---: |
+| `off` (mmap, tier filled on demand) | 131.2 | 6.39 | 156.5 |
+| `all` (pinned arena, eager fill) | 104.4 | **12.07** | 82.9 |
+
+With the page cache **warm** (the model's 28.6 GB fit beside the arena) the decode difference disappears:
+16.9-17.1 tok/s both arms, and the fill buys prefill at 512 tokens instead (107-126 -> 138-151 tok/s, medians of
+three interleaved rounds). The honest reading: pinning does not make DDR4 faster - it stops the *page faults and
+SSD reads* when the system cannot keep the whole model cached. On a 128 GB box with a 146 GB model that is the
+normal case, not the exception.
+
+Effective CPU expert bandwidth (785 MB of routed experts per token at 512 context, from `STRATA_MM_TIME`): the
+expert FFN is 39.2 ms/token = **~20 GB/s**, against 16 GB/s in P5b and 39.5 GB/s for a raw 24-thread stream of the
+same RAM. The remaining gap is the single-token IQ2_XS dot kernel, not the memory system: `iq_avx2_parity --bench`
+puts Strata's own AVX2 IQ row kernel within 5 % of ggml's `vec_dot` at one token (its win is multi-token), so there
+is no cheap port left here.
+
+### Expert skipping: `--minimax-expert-skip <threshold>` (default off)
+
+A routed expert whose renormalized weight is below the threshold is dropped and the survivors are renormalized; a
+route whose every weight is below it keeps everything rather than produce a zero vector. The skip applies to the
+token path, the tiered path (so a skipped expert is never fetched from VRAM/RAM/SSD) and the batched prefill.
+
+Speed, 512-token prompt, 32 new tokens on the slice (decode):
+
+| threshold | decode tok/s | gain | skipped routes |
+| ---: | ---: | ---: | ---: |
+| 0 (off) | 18.04 | - | 0 |
+| 0.05 | 18.17 | +0.7 % | - |
+| 0.10 | 18.62 | +3.2 % | - |
+| 0.15 | 19.11 | +5.9 % | - |
+| 0.20 | 21.14 | +17.2 % | - |
+
+Quality against the engine's own no-skip logits, the short G3 reference prompts (97-114 tokens), same file and
+placement (`tools/minimax/skip_quality.py`):
+
+| threshold | mean KL | mean top-1 | worst median abs |
+| ---: | ---: | ---: | ---: |
+| 0.05 | 9.3e-4 | 0.958 | 1.7e-1 |
+| 0.10 | 1.7e-3 | 0.955 | 2.8e-1 |
+| 0.15 | 1.2e-2 | 0.894 | 7.1e-1 |
+| 0.20 | 4.9e-2 | 0.769 | 1.6 |
+
+0.10 is the only setting whose KL stays under the IQ2_XS quant noise floor this project measured on the real
+checkpoint (0.012), for +3 % decode; 0.15 is at the floor with a visible top-1 cost. The default stays **off**: a
+3 % win does not justify changing answers, and the slice's 15 layers understate what a deep-layer skip costs.
+
+### CUDA graphs: `--minimax-graphs off` (default on)
+
+The token path's attention prefix is nine small launches per layer per token: the q8_1 quantize of the activation,
+five dense MMVQs (q, k, v, indexer q, indexer k), two fused norm+rope calls and one fp16 cast. The first token of
+each layer now captures that prefix into a CUDA graph (`cudaStreamBeginCapture` on the dedicated blocking stream,
+instantiated once per layer) and every later token replays it with one launch; the host-side inputs (the activation
+h2d and the 4-byte position) stay outside the graph as addresses baked in at capture. The K/V rows land in a fixed
+fp16 staging buffer inside the graph, and two 2 KB D2D copies place them in the cache at the token's offset - the
+one pointer that changes per token.
+
+The graphs are **bit-identical** to the direct launches (`test_p5c.py`, 200 tokens) - same kernels, same
+arguments. 512-token prompt, 96 new tokens, 3 interleaved rounds, same box:
+
+| arm | ms/token | decode tok/s |
+| --- | ---: | ---: |
+| `--minimax-graphs off` | 57.71 (57.16, 57.71, 57.77) | 17.33 |
+| graphs on (default) | **54.56** (54.33, 54.56, 56.64) | **18.33** |
+
++5.8 %. It buys launch and stream-ordering overhead only: the expert reads, which dominate the token, are on the
+CPU and untouched.
+
+## P5c: the full checkpoint on both GPUs (`bench_p5c.py`)
+
+Everything above is the 15-layer IQ2_XS slice. This is the whole `MiniMax-M3.1-Flash-IQ2_XS-D3` pack on the
+127.9 GiB box: 60 layers, 57 MoE layers x 128 experts top-4, 136 GiB of tensors (123.2 GiB of routed experts,
+10.6 GiB dense, 2.1 GiB embedding and output), two RTX 5070s (12 GiB each, ~10.9 GiB free after the displays).
+
+**The checkpoint does not fit in RAM.** 123.2 GiB of experts against 128 GiB of DIMMs means a large part of the
+expert set is read from the NVMe on demand, and that is what the numbers below are measuring. Read them as a
+cache study, not as a compute benchmark.
+
+### Harness
+
+`tools/minimax/bench_p5c.py` is the full-model counterpart of `bench_p5b.py`:
+
+- one engine process per context, several `GEN` requests inside it, so the 84 GiB pinned arena is filled once and
+  repeat requests measure the deployed (warm) state instead of paying the fill again;
+- every repeat moves the last prompt token, so the engine's prefix cache cannot turn a repeat into a hit
+  (`DONE ... reused=0` is asserted by the row); `llama-server` gets `cache_prompt: false` for the same reason;
+- peak VRAM per GPU (sampled through `nvidia-smi` while the run is in flight), peak process working set and the
+  minimum free system RAM are recorded per request;
+- `--llama-server` drives llama.cpp over its HTTP API so both engines see the same *text* (see below);
+- `--ids FILE` takes comma-separated ids or the G3 dump format (int32 `.bin`).
+
+`tools/minimax/bench_prompt.py` builds matched prompts: the same token ids for the engine and the decoded text for
+llama.cpp, from a prompts.jsonl plus the official `tokenizer.json`, and it checks that
+`encode(decode(ids)) == ids` so the two engines really see one sequence. Long contexts repeat the corpus *text*
+(with a paragraph break) rather than the id list: a repeated id list decodes into text whose re-encoding merges
+differently at every join (32 K measured 5619/32768 ids), while a repeated text round-trips exactly.
+
+### The measured arm (uniform-random ids)
+
+Synthetic ids from the `bench_p5b.py` LCG are what `llama-bench` feeds itself, so this arm is apples-to-apples -
+but uniform ids route almost uniformly over the 128 experts, which is the worst case for any residency scheme and
+makes the routing profile useless. Real-text prompts are the next arm (`bench_prompt.py`), not measured yet.
+
+```
+strata-minimax.exe --model MiniMax-M3.1-Flash-IQ2_XS-D3-00001-of-00013.gguf --serve --max-context <n+33> \
+  --gpus 0,1 --layer-split auto --minimax-kv vram --minimax-dense-layers-gpu -1 \
+  --minimax-prefill-batch 4096 --minimax-prefill-experts gpu \
+  --minimax-profile mm3-d3.bin --minimax-expert-resident all \
+  --minimax-vram-slots-per-layer 0 --memory-limit-mib 86000 --cpu-threads 24 --minimax-stats
+```
+
+`--layer-split auto` puts layers 0-27 on GPU0 and 28-59 on GPU1 (dense for all 60 layers on the device, f16 KV in
+VRAM); the engine reports `dense_gpu_layers=60 split=28 kv_space=vram`. Decode is 32 new tokens, temperature 0.
+Request 1 is the first request after the load, request 2 the next one in the same process.
+
+| context | request | prefill tok/s | TTFT s | decode tok/s | ms/token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 17.7 | 28.85 | 2.40 | 415.9 |
+| 512 | 2 | 16.5 | 31.12 | 2.90 | 344.6 |
+| 4096 | 1 | 37.4 | 109.64 | 2.40 | 416.3 |
+| 4096 | 2 | 48.8 | 83.95 | 2.43 | 412.2 |
+
+Tier counters, from `--minimax-stats` (228 routes per token = 57 MoE layers x top-4):
+
+| context | from pinned RAM | from SSD | from VRAM | SSD bytes/token |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 180-222 | 6-48 | 0 | 108-870 MiB |
+| 4096 | 188-218 | 10-40 | 0 | 217-707 MiB |
+
+So 79-97 % of the expert weight comes out of the arena and the rest off the NVMe, at 0.9-2 GB/s effective
+(`ssd_bytes` / `ms_per_token`). Decode is 3.9 GiB of expert weight per token (17.3 MiB x 228); at 400 ms that is
+~10 GB/s against the ~30-40 GB/s the 5900X's dual-channel DDR4-3200 can stream, so there is room on the token path
+too - see the thread hypothesis below.
+
+Load and memory: the 512-token process peaked at 101.9 GiB working set (arena 84 GiB + the mapped pages it
+touched) with 2.7 GiB free of 128 GiB; the 4096-token one started from 106.1 GiB free. Peak VRAM per card was not
+carried into the surviving rows of this arm (the sampler writes only in the final table/JSON, and the run was
+stopped before that); the layout is dense 10.6 GiB split over the two cards plus f16 KV (0.07 GiB at 512,
+0.55 GiB at 4096), i.e. ~5.4 GiB per card. GPU utilisation sampled during decode was 10 % on GPU0 and 2 % on GPU1
+- the token is waiting on the CPU and the SSD, not on the cards.
+
+### Two things this arm hit, both harness/auto-sizing, both fixed or worked around
+
+- **The auto VRAM expert slots starve the prefill workspace.** With the default `--minimax-vram-slots-per-layer`
+  (`-1`), the engine placed 6 slots per layer and reported `vram_used_mib=10287,12198` against 12227 MiB cards -
+  18 MiB free on device 1 - and then `batched prefill needs workspace on device 1 but only 18 MiB is free`,
+  silently falling back to per-token prefill (a 512-token prompt then prefills at 3-8 tok/s instead of ~17). The
+  measured arm therefore runs `--minimax-vram-slots-per-layer 0` and leaves VRAM to dense, KV and workspace. The
+  auto slot count should reserve the workspace before it takes slots; that is a P6 item.
+- **The harness must close the engine's stdin after the request queue.** `--serve` waits for more input while the
+  pipe is open, so a harness that reads `DONE` lines before closing stdin deadlocks (measured: two 20-minute runs
+  lost to it before the fix). `bench_p5c.py` writes the whole queue, closes stdin, then reads.
+
+### llama.cpp side (prepared, not run)
+
+The box went to the G3 quality run and then to the decode work, so the llama.cpp column is empty in the table
+above. The command is one line and the harness already speaks it:
+
+```
+llama-server.exe -m MiniMax-M3.1-Flash-IQ2_XS-D3-00001-of-00013.gguf -c 32801 -ngl 99 -cmoe -fa on -sm layer \
+  -t 24 --parallel 1 --host 127.0.0.1 --port 8099
+python tools/minimax/bench_p5c.py --model <gguf> --lengths 512,4096,32768 --skip-engine \
+  --llama-server <bin>/llama-server.exe --prompts-dir bench-prompts --llama-args '-cmoe'
+```
+
+`-cmoe` keeps every MoE expert on the CPU (the counterpart of the engine's RAM tier), `-ngl 99` puts all dense
+layers and the KV on the cards with `-sm layer` across both, `-fa on` is flash attention. `-ot exps=CPU` is the
+equivalent spelling; `-cmoe` is the documented flag in this build (11837). Each request is
+`{"prompt": text, "n_predict": 32, "temperature": 0, "cache_prompt": false}` and the numbers come from the
+server's own `timings` (`prompt_per_second`, `predicted_per_second`). This path is untested: `llama-server` never
+loaded the pack on this box.
+
+### Thread hypothesis, for the next decode pass
+
+The engine caps its pool at 24 threads and this box is a Ryzen 9 5900X: 12 cores, 24 threads. A latency-bound
+expert matvec usually wants one thread per *core*, so `--cpu-threads 12` and `16` are worth two runs against 24;
+the slice measurements above all used 24. Nothing has been measured for that yet - it is the first thing to try
+when the decode path lands.
+
+### Not measured
+
+32 K context (one 4096-token chunk per ~85-110 s at 4096 extrapolates to ~11-15 min of prefill for 32 K, plus the
+decode), 128 K and 256 K (KV fits VRAM, the expert set does not), and the in-distribution arm on real text. All
+three are the next run of the same harness.
+
+
+
+
 
 

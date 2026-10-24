@@ -67,6 +67,15 @@ struct EngineOptions {
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
                                     ///< "off": the fp32 dequantize + SGEMM path, bit-closer to the CPU dots
+    // ---- P5c: the fused device norm+rope step and the resident expert arena.
+    std::string gpu_normrope;       ///< "" / "on": per-head RMSNorm + RoPE + the fp16 cache write on the device;
+                                    ///< "off": the host rms_heads/rope/ggml_fp32_to_fp16 loop (the P5b path)
+    float expert_skip = 0.f;        ///< --minimax-expert-skip: drop a routed expert whose renormalized weight is
+                                    ///< below this; the survivors are renormalized. 0 (default) keeps every route.
+    std::string graphs;             ///< "" / "on": CUDA-graph the token path's per-layer GPU prefix; "off": launch
+                                    ///< the same kernels one at a time
+    std::string expert_resident;    ///< "" / "auto": pin the RAM tier at startup when it fits; "all": also pin the
+                                    ///< mmap-only experts (everything the RAM budget can hold); "off": on demand
 };
 
 struct SampleParams {
