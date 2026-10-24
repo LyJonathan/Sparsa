@@ -90,7 +90,7 @@ def run(model: str, prompt: list[int], max_new: int, extra: list[str], ctx: int,
 
     def rd_err():
         for line in p.stderr:
-            err.append(line.rstrip('\n'))
+            err.append(f'[{time.time() - t0:7.1f}s] {line.rstrip(chr(10))}')
 
     threading.Thread(target=rd_out, daemon=True).start()
     threading.Thread(target=rd_err, daemon=True).start()
@@ -109,18 +109,20 @@ def run(model: str, prompt: list[int], max_new: int, extra: list[str], ctx: int,
     killed = False
     while not stop.is_set():
         try:
-            ws = proc.memory_info().rss / 1073741824.0
+            mi = proc.memory_info()
+            ws = mi.rss / 1073741824.0
+            # Windows also reports the high-water mark, which a 1 s sampler can miss on a spike.
+            peak_ws = max(peak_ws, getattr(mi, 'peak_wset', 0) / 1073741824.0, ws)
         except psutil.Error:
             ws = 0.0
         av = available_mib() / 1024.0
-        peak_ws = max(peak_ws, ws)
         min_avail = min(min_avail, av)
         samples.append((time.time() - t0, ws, av))
         if time.time() - t0 > cap_s:
             killed = True
             p.kill()
             break
-        stop.wait(2.0)
+        stop.wait(0.5)
     try:
         p.wait(timeout=30)
     except subprocess.TimeoutExpired:
@@ -179,7 +181,8 @@ def main() -> int:
     out['length'] = a.length
     out['argv'] = extra
     if samples:
-        out['samples'] = [[round(t, 1), round(w, 2), round(v, 2)] for t, w, v in samples[::max(1, len(samples) // 40)]]
+        step = 1 if len(samples) <= 200 else max(1, len(samples) // 200)
+        out['samples'] = [[round(t, 1), round(w, 2), round(v, 2)] for t, w, v in samples[::step]]
     print(json.dumps(out, indent=1))
     if a.jsonl:
         with open(a.jsonl, 'a', encoding='utf-8') as f:

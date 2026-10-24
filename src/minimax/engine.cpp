@@ -837,6 +837,7 @@ struct Engine::Impl {
     // straight from the shard file into a staging buffer, so streaming the 146 GB model cannot grow the working set.
     bool stream_direct = false;
     std::vector<uint8_t> pf_expert_h;   // one streamed expert for the CPU MoE path (direct reads)
+    int mem_probe_n = 0;                // experts read since the last memory probe line
 
     struct PfEntry {
         int tid;
@@ -1137,7 +1138,9 @@ struct Engine::Impl {
         init_prefill();
         // P9: drop the mapping pages the weight upload just faulted in.  With a pinned tier the budget is a hard
         // promise; leaving 10 GiB of dense weights in the standby list next to it is what a desktop feels.
+        mem_probe("prefill-init");
         trim_mapped_pages();
+        mem_probe("ready");
 
         const int64_t qlen = cfg.n_head * cfg.head_dim;
         const int64_t klen = cfg.n_head_kv * cfg.head_dim;
@@ -2022,6 +2025,7 @@ struct Engine::Impl {
             }
         }
         use_device_index(0);
+        mem_probe("weights");
     }
 
     // ===================================================================================== P3: the expert tiers
@@ -2330,6 +2334,7 @@ struct Engine::Impl {
                                  ? "--memory-limit-mib"
                                  : (opt.ram_experts_per_layer >= 0 ? "--minimax-ram-experts-per-layer" : "auto"),
                              ram_inplace ? "inplace" : "pinned");
+                mem_probe("tier-plan");
             }
             (void)bytes;
         }
@@ -2483,6 +2488,7 @@ struct Engine::Impl {
     void ram_copy(const Layer& L, int expert, uint8_t* p) {
         if (stream_direct) {
             read_expert_roles(L, expert, p);
+            if ((++mem_probe_n % 512) == 0) mem_probe("fill");
             return;
         }
         const size_t gu = L.expert_gu, dn = L.expert_down;
@@ -2499,6 +2505,27 @@ struct Engine::Impl {
                 if (p1 > p0) std::memcpy(p + off[m] + p0, src[m] + p0, p1 - p0);
             }
         });
+    }
+
+    // P9: one line per stage with the process's working set, its high-water mark, the machine's available RAM and
+    // the system commit charge.  A budget is only kept if it can be seen; this is what bench_longctx.py's samples
+    // are cross-checked against.
+    static void mem_probe(const char* stage) {
+#if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS pmc{};
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        GlobalMemoryStatusEx(&ms);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
+            std::fprintf(stderr,
+                         "INFO minimax-mem %-12s ws=%.1f GiB peak=%.1f GiB avail=%.1f GiB commit=%.1f GiB\n",
+                         stage, (double)pmc.WorkingSetSize / 1073741824.0,
+                         (double)pmc.PeakWorkingSetSize / 1073741824.0, (double)ms.ullAvailPhys / 1073741824.0,
+                         (double)(ms.ullTotalPageFile - ms.ullAvailPageFile) / 1073741824.0);
+        }
+#else
+        (void)stage;
+#endif
     }
 
     // P9: hand the process's clean mapped pages back to the standby list.  Windows only trims a working set under
