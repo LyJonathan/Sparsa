@@ -76,6 +76,15 @@ struct EngineOptions {
                                     ///< the same kernels one at a time
     std::string expert_resident;    ///< "" / "auto": pin the RAM tier at startup when it fits; "all": also pin the
                                     ///< mmap-only experts (everything the RAM budget can hold); "off": on demand
+    // ---- P6: the SSD tier's read path (a model larger than RAM).
+    int ssd_chunks = 1;             ///< pieces one expert's read is split into, in flight together (1-16).  1 = one
+                                    ///< read a part (the default: on this box's NVMe the whole 5.5 MiB role read is
+                                    ///< 1.9x faster than eight 700 KiB pieces, 261 MB/token of misses: 46 ms of
+                                    ///< waiting against 110 ms).  A drive that prefers many small requests gains
+                                    ///< from 2-8 (Project Maya measured +15% at 8 on a Windows laptop's RAID).
+    int expert_skip_ssd = 0;        ///< drop a route at or below this rank (0 = best) when its expert is neither in
+                                    ///< VRAM nor in the pinned RAM tier, i.e. it would be read from the SSD.  0 keeps
+                                    ///< every route; 4 of MiniMax's top-4 keeps only the top three misses.
 };
 
 struct SampleParams {

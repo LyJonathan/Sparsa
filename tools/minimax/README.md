@@ -577,7 +577,69 @@ arguments. 512-token prompt, 96 new tokens, 3 interleaved rounds, same box:
 +5.8 %. It buys launch and stream-ordering overhead only: the expert reads, which dominate the token, are on the
 CPU and untouched.
 
+## P6: the SSD tier read path (a model larger than RAM)
 
+Everything above assumes the experts fit in the pinned RAM tier. MiniMax-M3.1-Flash at IQ2_XS-D3 does not: the
+engine's own counters on the full pack (`--minimax-stats`, 31 decode tokens) average **26 VRAM / 139 pinned RAM /
+63 SSD** routed experts per token, so **1,094 MB of every token comes off the NVMe** — 28% of the routed-expert
+bytes and, at the rate the old path got out of the drive, most of the token.
 
+The token path now treats the SSD like the other two resources: it is filled ahead of use and overlapped.
 
+- `ssd_slots`: one 4 KiB-aligned staging slot per routed entry, holding the three role buffers with 4 KiB of
+  headroom in front. A role's read is the aligned superset of its range and the dot kernels read the bytes at
+  `base + (off & 4095)`, so the data lands **where it is used** and the 16.4 MB copy out of a shared read buffer
+  (per expert, per token) is gone.
+- Every read of a layer is queued up front (`DirectFile::submit` only enqueues) and waited on **once**, in batches
+  of completions, after the GPU's experts have been launched on the side stream and the pinned-RAM experts have
+  been computed. The drive therefore runs while the CPU and the GPU work, instead of strictly before them.
+- `--minimax-ssd-chunks N` (default **1**): pieces one role's read is split into. On this box's NVMe one 5.45 MiB
+  read is **2.4x faster** than eight 700 KiB pieces of the same range (46 ms against 110 ms of waiting per token
+  on 261 MB of misses), so the default is 1. A drive that prefers many small requests wants 4-8 — Project Maya
+  measures +15% at 8 on a Windows laptop's Intel RST RAID, and its own docs say a Samsung PM981a *loses* 15% at 8.
+  Measure yours with `bench_p6_ssd.py`.
+- `--minimax-expert-skip-ssd RANK` (default **0 = off**): a route at or past `RANK` (0 = best) whose expert is in
+  neither the VRAM nor the pinned-RAM tier is left out, and its bytes are never read. This is Strata-DS's
+  `SSD_TAIL_SKIP` (`docs/DEEPSEEK_LAPTOP.md`: 37.8 -> 34.9 ms/token alone, 44.8 -> 28.7 with the route tail, at
+  KL 0.030-0.032 against a 0.012 noise floor). MiniMax's route is 4 deep, so `3` keeps the top three and drops the
+  fourth when it is an SSD miss; `2` keeps two.
+- `--minimax-stats` now also prints `ssd_wait_ms` (the token's time spent waiting for the drive) and `skipped`.
 
+Measured on the 15-layer real-weight IQ2_XS slice, SSD-heavy placement (`--minimax-vram-slots-per-layer 0
+--minimax-ram-experts-per-layer 4`, so 16.7 of 48 routes/token are misses = 261 MB/token), one RTX 5070, 12 CPU
+threads, 512-token batched prefill then 32 greedy tokens, medians of 3 reps, interleaved rounds, box idle:
+
+| arm | decode tok/s | ms/token | SSD MB/token | time waiting for the drive |
+| --- | ---: | ---: | ---: | ---: |
+| P5c (before) | 6.90 (6.86 / 6.61 / 6.46) | 144.4 | 261 | ~90 ms, interleaved and unmeasured |
+| P6, `--minimax-ssd-chunks 1` (default now) | **8.66** (8.68 / 8.64) | 115.4 | 261 | **46.1 ms** |
+| P6, `--minimax-ssd-chunks 8` | 5.69 (5.68 / 5.69 / 5.69) | 175.9 | 261 | 110.2 ms |
+
+**+25.5%**. It is bit-identical: 40 of `python -m pytest tools/minimax -q` pass (the all-SSD tier vs the all-CPU
+path is one of them), and teacher-forced logits on the real-weight slice with this placement are `array_equal`
+between the two engines (max abs 0.0, KL 0.0, top-1 1.000).
+
+**Skipping the SSD tail.** Same file and placement, 8 greedy tokens per arm, `--minimax-expert-skip-ssd`:
+
+| arm | SSD experts/token | SSD MB/token | decode tok/s | SKIP |
+| --- | ---: | ---: | ---: | ---: |
+| 0 (off) | 30.2 | 472 | 4.51 | 0.0 |
+| 3 (keep top three) | 21.9 (-28%) | 341 (-28%) | **5.46 (+21%)** | 8.4 |
+| 2 (keep top two) | 14.9 (-51%) | 232 | not measured (the box was loading another model) | 17.2 |
+
+Quality against this engine's own no-skip logits, 64 teacher-forced tokens on the slice, 8 dump rows: rank 3 gives
+mean KL **0.0237**, top-1 0.75; rank 2 gives KL **0.0430**, top-1 0.875 (8 rows is a coarse top-1). The project's
+IQ2_XS quant noise floor on the real checkpoint is 0.012 and Strata-DS ships its tail skip at 0.030-0.032, so rank
+3 is in the same band — but this is a 15-layer slice and the default stays **off**: on the full model the skip
+fires 63 times a token, and that is a decision for the operator, not for a default.
+
+`python tools/minimax/bench_p6_ssd.py --exe A/strata-minimax.exe --exe B/strata-minimax.exe --model m.gguf \
+  --prompt 512 --decode 32 --reps 3 --rounds 3 -- --gpus 1 --minimax-tiers --minimax-vram-slots-per-layer 0 \
+  --minimax-ram-experts-per-layer 4 --minimax-kv vram --minimax-stats --minimax-prefill-batch 512` runs the A/B
+above (`--arm-args " --minimax-expert-skip-ssd 3"` gives one arm its own flags).
+
+**What is left** (ranked, with sources, in `_ref/research/DECODE_GAP.md`): size the pinned RAM tier from the box
+rather than "available - 2 GiB" (87 experts/layer on the full pack against ~115 that fit — the SSD's 1.09 GB/token
+would fall to ~0.3-0.4), read the SSD tier through the page cache when the pages are already resident (Strata's
+zero-copy + `mincore`, 1.14-1.47x on its own 12 GB test), and prefetch the next layer's SSD misses (the exact next
+routes already exist in `prefetch_for`).

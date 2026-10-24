@@ -1,4 +1,4 @@
-﻿// src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
+// src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
 //
 // Inspect never constructs the engine (no CUDA). Serve and eval load the GGUF, refuse a non-M3.1 file unless
 // --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE. GENI and BGEN
@@ -77,7 +77,12 @@ void usage() {
                  "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
                  "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
-                 "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n");
+                 "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n"
+                 "  --minimax-ssd-chunks N            pieces one SSD expert read is split into, in flight together\n"
+                 "                                    (default 1, 1-16); try 4-8 for a drive that prefers\n"
+                 "                                    many small requests\n"
+                 "  --minimax-expert-skip-ssd N       drop a route at or past rank N (0 = best) when its expert would\n"
+                 "                                    be read from the SSD; 0 (default) keeps every route\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -440,6 +445,7 @@ int run(int argc, char** argv) {
     std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
+    int ssd_chunks = 1, expert_skip_ssd = 0;
     std::string graphs;
 
     for (int i = 1; i < argc; ++i) {
@@ -474,6 +480,8 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
         else if (a == "--minimax-gpu-normrope") gpu_normrope = next();
         else if (a == "--minimax-expert-skip") expert_skip = (float)std::atof(next().c_str());
+        else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
+        else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
         else if (a == "--minimax-graphs") graphs = next();
         else if (a == "--minimax-expert-resident") expert_resident = next();
         else if (a == "--minimax-tiers") tiers = true;
@@ -605,6 +613,8 @@ int run(int argc, char** argv) {
     opt.gpu_normrope = gpu_normrope;
     opt.expert_resident = expert_resident;
     opt.expert_skip = expert_skip;
+    opt.ssd_chunks = ssd_chunks;
+    opt.expert_skip_ssd = expert_skip_ssd;
     opt.graphs = graphs;
 
     Engine* engine = nullptr;

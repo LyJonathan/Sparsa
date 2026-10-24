@@ -1,4 +1,4 @@
-﻿// src/minimax/engine.cpp - MiniMax-M3.1-Flash forward pass.
+// src/minimax/engine.cpp - MiniMax-M3.1-Flash forward pass.
 //
 // Token-by-token, prefill and decode share one path (P2b; a batched prefill can replace it later without changing
 // the math). Dense GEMVs are fp32. Quantized routed experts are ggml-cpu vec_dot (activation quantized with the
@@ -750,6 +750,17 @@ struct Engine::Impl {
     void* ssd_tmp = nullptr;
     size_t ssd_tmp_bytes = 0;
 
+    // P6: the token path's SSD staging.  One 4 KiB-aligned slot per routed entry, each holding the three role
+    // buffers; a role is read straight into its final place (the aligned superset of the tensor's bytes starts
+    // `off & 4095` before it), so no copy out of a shared read buffer is needed any more, and every read of a layer
+    // is queued at once so the drive and the CPU experts work at the same time.
+    uint8_t* ssd_slots = nullptr;
+    size_t ssd_slot_bytes = 0;
+    size_t ssd_gu_cap = 0;
+    size_t ssd_dn_cap = 0;
+    std::vector<int> ssd_pending;   // queued, not yet completed, per shard
+    double ssd_wait_ms = 0.0;       // the last token's total time spent waiting for the SSD
+
     std::vector<float> usage;       // decayed routing counts, [n_layers * n_expert]
     std::vector<double> route_counts;   // undecayed counts for --minimax-profile-save
     uint64_t rebalance_tick = 0;
@@ -784,6 +795,10 @@ struct Engine::Impl {
     }
     int apply_expert_skip(std::vector<float>& w) { return apply_expert_skip_range(w.data(), (int)w.size()); }
 
+    // P6: --minimax-ssd-chunks and --minimax-expert-skip-ssd.
+    int ssd_chunks = 1;
+    int ssd_skip_rank = 0;
+
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
         const std::string bad = check_structure(cfg);
@@ -805,6 +820,12 @@ struct Engine::Impl {
         if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
         if (expert_skip > 0.f)
             std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
+        ssd_chunks = opt.ssd_chunks > 0 ? opt.ssd_chunks : 1;
+        if (ssd_chunks > 16) ssd_chunks = 16;
+        ssd_skip_rank = opt.expert_skip_ssd;
+        if (ssd_skip_rank > 0)
+            std::fprintf(stderr, "INFO minimax-expert-skip-ssd rank=%d (a route at or past it is left out when it "
+                                 "would be read from the SSD)\n", ssd_skip_rank);
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
@@ -893,6 +914,7 @@ struct Engine::Impl {
         }
         if (ssd_stage) strata::platform::DirectFile::free_aligned(ssd_stage);
         if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
+        if (ssd_slots) strata::platform::DirectFile::free_aligned(ssd_slots);
     }
 
     bool try_must(const std::string& name, Tensor& t) {
@@ -1795,6 +1817,27 @@ struct Engine::Impl {
         if (!ssd_tmp) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned read buffer");
         ssd_tmp_bytes = ssd_stage_bytes + 4096;
 
+        // P6: the token path reads each role straight into its own place.  A role's buffer holds the aligned
+        // superset of the tensor's bytes (`off & 4095` bytes in front, up to 4095 behind), so the read lands where
+        // the dot kernels read it and there is no copy out of a shared buffer.
+        {
+            size_t max_gu = 0, max_dn = 0;
+            for (const Layer& L : layers)
+                if (L.moe) {
+                    if (L.expert_gu > max_gu) max_gu = L.expert_gu;
+                    if (L.expert_down > max_dn) max_dn = L.expert_down;
+                }
+            const size_t A = strata::platform::DirectFile::alignment();
+            auto up = [&](size_t v) { return (v + A - 1) & ~(A - 1); };
+            ssd_gu_cap = up(max_gu + 2 * A);
+            ssd_dn_cap = up(max_dn + 2 * A);
+            ssd_slot_bytes = up(2 * ssd_gu_cap + ssd_dn_cap);
+            ssd_slots = (uint8_t*)strata::platform::DirectFile::alloc_aligned(
+                (size_t)cfg.n_expert_used * ssd_slot_bytes);
+            if (!ssd_slots) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned expert staging slots");
+            ssd_pending.assign(ssd_files.size(), 0);
+        }
+
         const size_t cells = (size_t)cfg.n_layers * (size_t)cfg.n_expert;
         if (opt.adaptive) usage.assign(cells, 0.f);
         if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) route_counts.assign(cells, 0.0);
@@ -1974,6 +2017,24 @@ struct Engine::Impl {
         L.ram_tick[(size_t)victim] = ++lru_tick;
     }
 
+    // P6: the same admission from the three role buffers of a staging slot (the P6 read path keeps a role's bytes
+    // in place instead of assembling one contiguous blob).
+    void ram_admit3(Layer& L, int expert, const uint8_t* g, const uint8_t* u, const uint8_t* d) {
+        if (!opt.adaptive || !ram_arena || L.ram_n <= 0) return;
+        int victim = 0;
+        for (int s = 1; s < L.ram_n; ++s)
+            if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
+        uint8_t* p = ram_slot_ptr(L, victim);
+        std::memcpy(p, g, L.expert_gu);
+        std::memcpy(p + L.expert_gu, u, L.expert_gu);
+        std::memcpy(p + 2 * L.expert_gu, d, L.expert_down);
+        for (int32_t& v : L.ram_of)
+            if (v == victim) v = kNotResident;
+        L.ram_of[(size_t)expert] = victim;
+        L.ram_expert_of[(size_t)victim] = expert;
+        L.ram_tick[(size_t)victim] = ++lru_tick;
+    }
+
     void ssd_read_role(const Tensor& t, int64_t expert, uint8_t* dst) {
         const size_t len = t.bytes / (size_t)t.ne2;
         const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
@@ -2006,6 +2067,79 @@ struct Engine::Impl {
         ssd_read_role(L.egate, expert, stage);
         ssd_read_role(L.eup, expert, stage + L.expert_gu);
         ssd_read_role(L.edown, expert, stage + 2 * L.expert_gu);
+        ++tok_stats.ssd;
+        tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
+    }
+
+    // ---- P6: the token path's SSD staging, queued rather than waited on.
+    //
+    // `ssd_slot_role(slot, role)` is a 4 KiB-aligned buffer with 4 KiB of headroom in front of the tensor's bytes.
+    // The aligned superset of a role's range is read into `base` and the kernel reads the data at
+    // `base + (off & 4095)`, so nothing is copied after the read.  A role is cut into `ssd_chunks` pieces of 4 KiB
+    // multiples that are all queued at once: one expert is then one queue depth instead of three serial round trips,
+    // and the layer's whole miss set is in flight while the CPU and the GPU work on the other experts.
+    uint8_t* ssd_slot_role(int slot, int role) const {
+        uint8_t* b = ssd_slots + (size_t)slot * ssd_slot_bytes;
+        return b + (role == 0 ? 0 : role == 1 ? ssd_gu_cap : 2 * ssd_gu_cap);
+    }
+
+    // Queue one role's bytes so they land in their final place; returns the pointer the dot kernels read.
+    uint8_t* ssd_submit_role(const Tensor& t, int64_t expert, uint8_t* base) {
+        const size_t len = t.bytes / (size_t)t.ne2;
+        const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
+        constexpr uint64_t A = strata::platform::DirectFile::alignment();
+        const uint64_t aoff = off & ~(A - 1);
+        const uint64_t aend = (off + len + A - 1) & ~(A - 1);
+        const uint32_t alen = (uint32_t)(aend - aoff);
+        strata::platform::DirectFile& file = *ssd_files[t.shard];
+        const int nch = ssd_chunks < 1 ? 1 : ssd_chunks;
+        uint32_t step = alen;
+        if (nch > 1) {
+            step = (uint32_t)((((uint64_t)alen + (uint64_t)nch - 1) / (uint64_t)nch + A - 1) & ~(A - 1));
+            if (step == 0) step = (uint32_t)A;
+        }
+        std::string err;
+        for (int c = 0; c < nch; ++c) {
+            const uint32_t o = (uint32_t)c * step;
+            if (o >= alen) break;
+            const uint32_t l = alen - o < step ? alen - o : step;
+            if (!file.submit(aoff + o, base + o, l, 0, err)) fail("minimax SSD read: " + err);
+            ++ssd_pending[t.shard];
+        }
+        return base + (size_t)(off - aoff);
+    }
+
+    void ssd_wait_all() {
+        if (ssd_pending.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        strata::platform::Completion buf[64];
+        for (size_t f = 0; f < ssd_pending.size(); ++f) {
+            int left = ssd_pending[f];
+            if (left <= 0) continue;
+            strata::platform::DirectFile& file = *ssd_files[f];
+            while (left > 0) {
+                // Drain a batch, not one completion at a time: a layer of a 57-layer model queues a few hundred
+                // reads, and one completion-port call each was measurable host time of its own.
+                const int want = left < 64 ? left : 64;
+                const int n = file.wait(buf, want, -1);
+                if (n <= 0) continue;
+                for (int i = 0; i < n; ++i) {
+                    if (buf[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                    if (!buf[i].ok) fail("minimax SSD read: I/O failed");
+                    --left;
+                }
+            }
+            ssd_pending[f] = 0;
+        }
+        ssd_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Queue one expert's three roles into `slot`; fills the three data pointers.
+    void ssd_submit_expert(const Layer& L, int64_t expert, int slot, const uint8_t*& g, const uint8_t*& u,
+                           const uint8_t*& d) {
+        g = ssd_submit_role(L.egate, expert, ssd_slot_role(slot, 0));
+        u = ssd_submit_role(L.eup, expert, ssd_slot_role(slot, 1));
+        d = ssd_submit_role(L.edown, expert, ssd_slot_role(slot, 2));
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
     }
@@ -2170,12 +2304,20 @@ struct Engine::Impl {
         std::vector<int> gpu_e;
         struct CpuExpert {
             int e;
+            int j;            // the route it belongs to
+            bool ssd;
             const uint8_t* gate;
             const uint8_t* up;
             const uint8_t* down;
         };
         std::vector<CpuExpert> cpu;
-        std::vector<std::pair<int, const uint8_t*>> ssd_admits;
+        struct SsdAdmit {
+            int e;
+            const uint8_t* g;
+            const uint8_t* u;
+            const uint8_t* d;
+        };
+        std::vector<SsdAdmit> ssd_admits;
         gpu_e.reserve((size_t)top);
         cpu.reserve((size_t)top);
         int ssd_n = 0;
@@ -2210,16 +2352,27 @@ struct Engine::Impl {
             const int rs = L.ram_of[(size_t)e];
             if (rs >= 0) {
                 const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
-                cpu.push_back({e, p, p + L.expert_gu, p + 2 * L.expert_gu});
+                cpu.push_back({e, j, false, p, p + L.expert_gu, p + 2 * L.expert_gu});
                 ++tok_stats.ram;
                 continue;
             }
-            uint8_t* stage = ssd_stage + (size_t)ssd_n++ * max_expert_bytes;
-            ssd_read_expert(L, e, stage);
-            cpu.push_back({e, stage, stage + L.expert_gu, stage + 2 * L.expert_gu});
+            // P6 --minimax-expert-skip-ssd: this route would be read from the SSD.  A low-ranked expert that is
+            // already a miss costs a whole blob; leaving it out is the one skip with no cache to fall back on.
+            if (ssd_skip_rank > 0 && j >= ssd_skip_rank) {
+                w[(size_t)j] = 0.f;
+                ++tok_stats.skipped;
+                continue;
+            }
+            // P6: queue the read, don't wait for it.  The bytes land in the slot's final place, and the layer's
+            // other experts (VRAM on the side stream, RAM on the pool) are computed while the drive works.
+            const uint8_t* g = nullptr;
+            const uint8_t* u = nullptr;
+            const uint8_t* d = nullptr;
+            ssd_submit_expert(L, e, ssd_n++, g, u, d);
+            cpu.push_back({e, j, true, g, u, d});
             // Deferred: admitting (and evicting) now could overwrite a RAM slot another entry of this same
             // token is still going to read.
-            ssd_admits.push_back({e, stage});
+            ssd_admits.push_back({e, g, u, d});
         }
 
         // P5b: start the GPU experts on the side stream, compute the CPU ones while it runs, then join and combine.
@@ -2229,21 +2382,30 @@ struct Engine::Impl {
             use_device_index(L.dev);
             gpu_async = gpu_experts_begin(L, gpu_e, in);
         }
-        std::vector<const CpuExpert*> cpu_of((size_t)cfg.n_expert, nullptr);
-        for (const CpuExpert& c : cpu) cpu_of[(size_t)c.e] = &c;
         std::vector<std::vector<float>> cpu_ye((size_t)top);
-        for (int j = 0; j < top; ++j) {
-            if (w[(size_t)j] == 0.f) continue;
-            const int e = order[(size_t)j];
-            if (L.vram_of[(size_t)e] >= 0) continue;
-            const CpuExpert* c = cpu_of[(size_t)e];
-            if (!c) fail("internal: routed expert has no source");
-            cpu_ye[(size_t)j].resize((size_t)cfg.n_embd);
-            const float* cg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
-            const float* cu = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
-            const float* cd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
-            mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, cpu_ye[(size_t)j].data(),
-                    (int)cfg.n_ff_exp, cg, cu, cd);
+        auto run_cpu_experts = [&](bool want_ssd) {
+            std::vector<const CpuExpert*> cpu_of((size_t)cfg.n_expert, nullptr);
+            for (const CpuExpert& c : cpu)
+                if (c.ssd == want_ssd) cpu_of[(size_t)c.e] = &c;
+            for (int j = 0; j < top; ++j) {
+                if (w[(size_t)j] == 0.f) continue;
+                const int e = order[(size_t)j];
+                if (L.vram_of[(size_t)e] >= 0) continue;
+                const CpuExpert* c = cpu_of[(size_t)e];
+                if (!c) continue;   // an SSD expert that has not landed yet: its pass comes after the wait
+                cpu_ye[(size_t)j].resize((size_t)cfg.n_embd);
+                const float* cg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
+                const float* cu = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
+                const float* cd = L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)e];
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, cpu_ye[(size_t)j].data(),
+                        (int)cfg.n_ff_exp, cg, cu, cd);
+            }
+        };
+        run_cpu_experts(false);
+        if (ssd_n > 0) {
+            // The drive has had the GPU stream and this pass's RAM experts to hide behind.
+            ssd_wait_all();
+            run_cpu_experts(true);
         }
         if (!gpu_e.empty()) {
             if (gpu_async) gpu_experts_finish((int)gpu_e.size(), gpu_out);
@@ -2254,6 +2416,7 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         size_t gi = 0;
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip / --minimax-expert-skip-ssd
             const int e = order[(size_t)j];
             const float* src;
             if (L.vram_of[(size_t)e] >= 0) {
@@ -2271,7 +2434,7 @@ struct Engine::Impl {
             mlp(L.gate, L.up, L.down, 0, in, ye.data(), (int)L.gate.ne1);
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += ye[(size_t)i];
         }
-        for (const auto& a : ssd_admits) ram_admit(const_cast<Layer&>(L), a.first, a.second);
+        for (const auto& a : ssd_admits) ram_admit3(const_cast<Layer&>(L), a.e, a.g, a.u, a.d);
         if (opt.stats_per_layer) {
             std::fprintf(stderr, "INFO minimax-stats layer=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld\n",
                          (long long)li, (long long)tok_stats.vram, (long long)tok_stats.ram,
@@ -3197,6 +3360,7 @@ struct Engine::Impl {
         const int64_t pos = n_past;
         cur_pos = pos;
         tok_stats = TokenStats{};
+        ssd_wait_ms = 0.0;
         decay_usage();
         if (!seed_h.empty()) {
             if (pos >= seed_rows) fail("--minimax-seed-hidden has only " + std::to_string(seed_rows) + " rows");
@@ -3460,10 +3624,11 @@ struct Engine::Impl {
             if (opt.adaptive && (++rebalance_tick % 16) == 0) rebalance();
             if (opt.stats)
                 std::fprintf(stderr,
-                             "INFO minimax-stats token=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld swaps=%llu\n",
+                             "INFO minimax-stats token=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld "
+                             "ssd_wait_ms=%.1f skipped=%lld swaps=%llu\n",
                              (long long)tokens_seen, (long long)tok_stats.vram, (long long)tok_stats.ram,
-                             (long long)tok_stats.ssd, (long long)tok_stats.ssd_bytes,
-                             (unsigned long long)swaps);
+                             (long long)tok_stats.ssd, (long long)tok_stats.ssd_bytes, ssd_wait_ms,
+                             (long long)tok_stats.skipped, (unsigned long long)swaps);
         }
     }
 

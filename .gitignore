@@ -92,3 +92,10 @@ node_modules/
 .env
 .env.*
 *.token
+
+# P6 measurement scratch (bench_p6_ssd.py writes these beside the worktree)
+/bench_p6_engine.err
+/bench_p6_*.json
+/p6_ids.txt
+/p6_out/
+/build-err.log
