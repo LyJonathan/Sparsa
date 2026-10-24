@@ -75,6 +75,10 @@ struct EngineOptions {
     std::string prefill_experts;    ///< "auto" (chunk size decides), "cpu" or "gpu": where a batched chunk's routed
                                     ///< experts are computed
     std::string prefill_dense;      ///< "f32" (default: fp32 cuBLAS, matches the per-token GPU GEMV) or "f16"
+    std::string prefill_expert_gemm;///< "mmvq" (default: the int8 iq_mmvq expert dots) or "tc": dequantize each
+                                    ///< routed expert once per chunk and run the rows through the FP16 tensor-core
+                                    ///< GEMM (cuBLAS), grouped over the tokens routed to that expert. "auto"
+                                    ///< picks "tc" for a group of at least 16 rows.
     std::string prefill_read;       ///< "" / "auto": the OS page cache, except when --memory-limit-mib is set (the
                                     ///< budget cannot bound the page cache, so streamed experts are read unbuffered);
                                     ///< "mmap": always the page cache; "direct": always unbuffered 16 MiB reads

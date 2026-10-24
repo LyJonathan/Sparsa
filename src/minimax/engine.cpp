@@ -790,6 +790,10 @@ struct Engine::Impl {
     int batch_cap = 0;
     bool prefill_gpu_experts = true;
     bool prefill_dense_f32 = true;
+    // P10: the routed experts' batched projection.  "mmvq" keeps the int8 iq_mmvq dots; "tc" dequantizes each
+    // expert's weights to fp16 once per chunk and runs the tokens routed to it through the FP16 tensor-core GEMM.
+    std::string prefill_expert_gemm = "mmvq";
+    int tc_expert_min_rows = 16;   // "auto": a group this small is not worth a weight dequantization
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
@@ -818,6 +822,11 @@ struct Engine::Impl {
         void* ring = nullptr;        // expert streaming slot (raw GGUF bytes)
         size_t ring_slot = 0;
         void* pin = nullptr;         // page-locked staging for the ring (same bytes)
+        // P10: with unbuffered reads the three roles are read straight into the pinned slot, each at a 4 KiB
+        // boundary with 4 KiB of headroom in front of it (DirectFile's contract), so the read no longer has to be
+        // copied out of a shared staging buffer.  The role pointer is `slot + role_off[r] + (file_off & 4095)`.
+        size_t role_off[3] = {0, 0, 0};   // offsets of gate / up / down inside one pinned slot
+        size_t pin_slot_bytes = 0;        // capacity of one pinned slot (headroom + roles + tail)
         // P5b: the ring is multi-slot.  Every slot has its own page-locked staging buffer, its own H2D event on
         // the copy stream and a "compute finished" event on the main stream, so a copy can be in flight while the
         // previous expert's GEMM runs and a slot is only rewritten after the math that reads it has completed.
@@ -2909,6 +2918,98 @@ struct Engine::Impl {
         ssd_read_role(L.edown, expert, dst + 2 * L.expert_gu);
     }
 
+    // P10: one expert's three roles read unbuffered straight into the pinned ring slot, the three requests in flight
+    // together (the old path read them one at a time into one staging buffer and then copied 19 MiB).  `slot` and
+    // each `slot + P().role_off[r]` are 4 KiB aligned; a file offset is not, so `out[r]` is the byte the role starts
+    // at inside its window.  Returns false with `err` set on a failed or short read.
+    bool ssd_read_roles_direct(const Layer& L, int64_t expert, uint8_t* slot, const uint8_t* out[3],
+                               std::string& err) {
+        const Tensor* ts[3] = {&L.egate, &L.eup, &L.edown};
+        const size_t A = strata::platform::DirectFile::alignment();
+        strata::platform::DirectFile* files[3] = {nullptr, nullptr, nullptr};
+        int need[3] = {0, 0, 0};
+        int nf = 0;
+        uint64_t want[3] = {0, 0, 0};
+        for (int r = 0; r < 3; ++r) {
+            const Tensor& t = *ts[r];
+            const size_t len = t.bytes / (size_t)t.ne2;
+            const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
+            const uint64_t aoff = off & ~(uint64_t)(A - 1);
+            const uint64_t aend = (off + len + A - 1) & ~(uint64_t)(A - 1);
+            const uint32_t alen = (uint32_t)(aend - aoff);
+            uint8_t* dst = slot + pf[(size_t)cur].role_off[r];
+            if (((uintptr_t)dst & (uintptr_t)(A - 1)) != 0) {
+                err = "the pinned expert slot is not 4 KiB aligned";
+                return false;
+            }
+            auto* f = ssd_files[t.shard].get();
+            if (!f->submit(aoff, dst, alen, (uint64_t)r, err)) return false;
+            // A read of the file's last block can be short in its aligned tail; only the role's own bytes matter.
+            want[r] = (off - aoff) + (uint64_t)len;
+            out[r] = dst + (size_t)(off - aoff);
+            int k = 0;
+            while (k < nf && files[k] != f) ++k;
+            if (k == nf) {
+                files[nf] = f;
+                need[nf] = 0;
+                ++nf;
+            }
+            ++need[k];
+        }
+        bool done[3] = {false, false, false};
+        int left = 3;
+        for (int spin = 0; left > 0 && spin < 1000000; ++spin) {
+            bool any = false;
+            for (int k = 0; k < nf; ++k) {
+                if (need[k] <= 0) continue;
+                strata::platform::Completion c{};
+                if (files[k]->wait(&c, 1, 0) != 1) continue;
+                if (c.tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                const int r = (int)c.tag;
+                if (r < 0 || r > 2 || done[r]) {
+                    err = "minimax SSD read: unexpected completion tag";
+                    return false;
+                }
+                if (!c.ok || (uint64_t)c.bytes < want[r]) {
+                    err = "minimax SSD read: I/O failed or short read";
+                    return false;
+                }
+                done[r] = true;
+                --need[k];
+                --left;
+                any = true;
+            }
+            if (!any && left > 0) {
+                for (int k = 0; k < nf; ++k) {
+                    if (need[k] <= 0) continue;
+                    strata::platform::Completion c{};
+                    if (files[k]->wait(&c, 1, -1) != 1) continue;
+                    if (c.tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                    const int r = (int)c.tag;
+                    if (r < 0 || r > 2 || done[r]) {
+                        err = "minimax SSD read: unexpected completion tag";
+                        return false;
+                    }
+                    if (!c.ok || (uint64_t)c.bytes < want[r]) {
+                        err = "minimax SSD read: I/O failed or short read";
+                        return false;
+                    }
+                    done[r] = true;
+                    --need[k];
+                    --left;
+                    break;
+                }
+            }
+        }
+        if (left != 0) {
+            err = "minimax SSD read: timed out";
+            return false;
+        }
+        ++tok_stats.ssd;
+        tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
+        return true;
+    }
+
     // ---- P6: the token path's SSD staging, queued rather than waited on.
     //
     // `ssd_slot_role(slot, role)` is a 4 KiB-aligned buffer with 4 KiB of headroom in front of the tensor's bytes.
@@ -4401,6 +4502,9 @@ struct Engine::Impl {
         prefetch_slots = opt.expert_prefetch;
         if (opt.prefill_batch <= 1) return;
         prefill_dense_f32 = opt.prefill_dense != "f16";
+        prefill_expert_gemm = opt.prefill_expert_gemm.empty() ? "mmvq" : opt.prefill_expert_gemm;
+        if (prefill_expert_gemm != "mmvq" && prefill_expert_gemm != "tc" && prefill_expert_gemm != "auto")
+            fail("--minimax-prefill-expert-gemm: '" + prefill_expert_gemm + "' is not mmvq, tc or auto");
         prefill_direct = stream_direct;
         if (!prefill_dense_f32)
             std::fprintf(stderr,
@@ -4566,6 +4670,20 @@ struct Engine::Impl {
             }
             if (prefill_gpu_experts && max_expert_bytes > 0) {
                 p.ring_slot = max_expert_bytes;
+                // P10: the pinned slot's role layout (see PfBuf::role_off): gate, up and down each at a 4 KiB
+                // boundary with 4 KiB of headroom, so an unbuffered read of the aligned superset can land there.
+                size_t gu = 0, dn = 0;
+                for (const Layer& L : layers)
+                    if (L.moe) {
+                        if (L.expert_gu > gu) gu = L.expert_gu;
+                        if (L.expert_down > dn) dn = L.expert_down;
+                    }
+                const size_t A = strata::platform::DirectFile::alignment();
+                auto up = [&](size_t x) { return (x + A - 1) & ~(A - 1); };
+                p.role_off[0] = A;
+                p.role_off[1] = up(p.role_off[0] + gu) + A;
+                p.role_off[2] = up(p.role_off[1] + gu) + A;
+                p.pin_slot_bytes = up(p.role_off[2] + dn) + A;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
                 // expert stream, which is what the chunk's MoE time is actually spent on.
                 size_t slot = p.ring_slot;
@@ -4579,7 +4697,7 @@ struct Engine::Impl {
                 p.ring_n = want;
                 for (int s = 0; s < p.ring_n; ++s) {
                     p.ring_v.push_back(cu::alloc(slot));
-                    p.pin_v.push_back(cu::host_alloc(slot));
+                    p.pin_v.push_back(cu::host_alloc(p.pin_slot_bytes));
                     p.ev_copy.push_back(cu::event_create());
                     p.ev_comp.push_back(cu::event_create());
                 }
@@ -4613,6 +4731,9 @@ struct Engine::Impl {
         std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
                      batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
                      (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
+        if (prefill_gpu_experts)
+            std::fprintf(stderr, "INFO minimax-prefill-expert-gemm=%s%s\n", prefill_expert_gemm.c_str(),
+                         prefill_expert_gemm == "auto" ? " (tensor cores from 16 rows per expert)" : "");
         if (ikq_experts)
             std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
                                  "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
@@ -4691,6 +4812,31 @@ struct Engine::Impl {
                 cu::dequant_to_f16(type, s, (int64_t)n * K, p.w16, nullptr);
                 cu::gemm_f16(X16, p.w16, Y + r0, T, n, K, N, 0.f, nullptr);
             }
+        }
+    }
+
+    // P10: the tensor-core expert path.  One expert's weight matrix is dequantized to fp16 once (in tiles of the
+    // weight scratch) and every token routed to that expert is a row of one cuBLAS HGEMM with FP32 accumulation.
+    // The mmvq path decodes the same weights into int8 dots per column; the dequantization is the same amount of
+    // work per weight either way, so the GEMM is free to be a tensor-core one.
+    bool tc_expert_type(int t) const {
+        if (t == 0 || t == 1 || t == 30) return true;   // F32 / F16 / BF16
+        // iq_supported covers the i-quants and the raw ggml block types dequant_f16 reads; the ported ik_llama
+        // formats are row-scaled and the flat dequantizer (deliberately) refuses them.
+        return strata::kernels::iq_supported(t) && !strata::kernels::ikq::is_iqk_type(t);
+    }
+
+    void gemm_expert_f16(int type, const void* src, size_t row_bytes, const uint16_t* X16, float* Y, int T, int N,
+                         int K, int ldy) {
+        PfBuf& p = P();
+        int64_t tile = p.w16_elems / K;
+        if (tile > N) tile = N;
+        if (tile < 1) fail("the batched-prefill weight scratch is smaller than one expert row");
+        for (int r0 = 0; r0 < N; r0 += (int)tile) {
+            const int n = (N - r0) < (int)tile ? (N - r0) : (int)tile;
+            const uint8_t* s = (const uint8_t*)src + (size_t)r0 * row_bytes;
+            cu::dequant_to_f16(type, s, (int64_t)n * K, p.w16, nullptr);
+            cu::gemm_f16(X16, p.w16, Y + r0, T, n, K, ldy, 0.f, nullptr);
         }
     }
 
@@ -5249,6 +5395,11 @@ struct Engine::Impl {
         const bool gu_iq = iq_expert_type(L.egate.type) && cfg.n_embd % 32 == 0;
         const bool d_iq = iq_expert_type(L.edown.type) && cfg.n_ff_exp % 32 == 0;
         const int gt = L.egate.type, dt = L.edown.type;
+        // P10: the tensor-core path needs a whole 256-value block per row (the flat dequantizer's contract) on both
+        // projections, and at least `tc_expert_min_rows` tokens in the group to pay for the weight dequantization.
+        const bool tc_gu_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(gt) && tc_expert_type(L.eup.type) &&
+                              (cfg.n_embd % 256) == 0;
+        const bool tc_d_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(dt) && (cfg.n_ff_exp % 256) == 0;
         bool zero = true;
         std::vector<int32_t> row_t((size_t)rows_cap);
         std::vector<float> row_w((size_t)rows_cap);
@@ -5284,7 +5435,7 @@ struct Engine::Impl {
             const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
                                      base ? base + gu : L.eup.host + (size_t)e * gu,
                                      base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
-            const size_t off[3] = {0, gu, 2 * gu};
+            const size_t off[3] = {p.role_off[0], p.role_off[1], p.role_off[2]};
             const size_t len[3] = {gu, gu, dn};
             // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
             // 4 per thread per matrix lands on ~60 KiB each at MiniMax's expert size.
@@ -5310,11 +5461,32 @@ struct Engine::Impl {
             const Grp& g = grps[(size_t)streamed[(size_t)si]];
             cu::event_sync(p.ev_comp[(size_t)slot]);
             uint8_t* pin = (uint8_t*)p.pin_v[(size_t)slot];
-            if (prefill_direct && !ssd_files.empty())
-                ssd_read_expert(L, g.e, pin);
-            else
+            const uint8_t* src[3] = {nullptr, nullptr, nullptr};
+            // P10: a RAM-tier expert is copied from the pinned arena; only a real miss is read unbuffered.  The old
+            // `if (prefill_direct)` branch read every streamed expert from the file, including the ones the tier had
+            // already pinned -- the SSD path replaced the faster RAM one for no reason.
+            const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)g.e] : -1;
+            if (rs >= 0) {
+                // The pinned tier already holds the bytes in kernel order: copy the three roles from there, no
+                // staging copy.
+                const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
+                src[0] = base;
+                src[1] = base + L.expert_gu;
+                src[2] = base + 2 * L.expert_gu;
+            } else if (prefill_direct && !ssd_files.empty()) {
+                std::string err;
+                if (!ssd_read_roles_direct(L, g.e, pin, src, err))
+                    fail("batched prefill: " + err);
+            } else {
                 read_expert(g.e, pin);
-            cu::copy_h2d_async(p.ring_v[(size_t)slot], pin, L.expert_bytes, p.copy_stream);
+                src[0] = pin + p.role_off[0];
+                src[1] = pin + p.role_off[1];
+                src[2] = pin + p.role_off[2];
+            }
+            uint8_t* dst = (uint8_t*)p.ring_v[(size_t)slot];
+            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+            for (int r = 0; r < 3; ++r) cu::copy_h2d_async(dst + off[r], src[r], len[r], p.copy_stream);
             cu::event_record(p.ev_copy[(size_t)slot], p.copy_stream);
         };
         int primed = 0;
@@ -5330,6 +5502,7 @@ struct Engine::Impl {
         if (ring_n > 1 && !streamed.empty()) pump(std::min<int>(ring_n - 1, (int)streamed.size()));
 
         size_t at = 0;
+        int n_vram = 0, n_ram = 0, n_disk = 0, n_tc = 0;
         while (at < pf_entries.size()) {
             const int e = pf_entries[at].expert;
             size_t end = at;
@@ -5338,6 +5511,9 @@ struct Engine::Impl {
             const uint8_t* su;
             const uint8_t* sd;
             const int slot = (L.vram_of.empty() ? -1 : L.vram_of[(size_t)e]);
+            if (slot >= 0) ++n_vram;
+            else if (!ram_inplace && L.ram_n > 0 && L.ram_of[(size_t)e] >= 0) ++n_ram;
+            else ++n_disk;
             int ring_slot = -1;
             if (slot >= 0) {
                 const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
@@ -5377,7 +5553,14 @@ struct Engine::Impl {
                 const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
                 const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
                 const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
-                if (gu_iq) {
+                const bool tc_gu = tc_gu_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
+                const bool tc_d = tc_d_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
+                if (tc_gu && a == at) ++n_tc;
+                if (tc_gu) {
+                    cu::gather_rows_f16(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                    gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
+                    gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
+                } else if (gu_iq) {
                     cu::gather_rows_f32(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
                     strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
                     strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
@@ -5394,7 +5577,10 @@ struct Engine::Impl {
                 if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
                 if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
                 cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
-                if (d_iq) {
+                if (tc_d) {
+                    cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
+                    gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
+                } else if (d_iq) {
                     strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
                     strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
                 } else if (prefill_dense_f32) {
@@ -5414,8 +5600,8 @@ struct Engine::Impl {
             at = end;
         }
         if (std::getenv("STRATA_MM_TIME"))
-            std::fprintf(stderr, "INFO batch-ring read=%.1f copywait=%.1f ms experts=%zu\n", t_read, t_copywait,
-                         streamed.size());
+            std::fprintf(stderr, "INFO batch-ring read=%.1f copywait=%.1f ms experts=%zu vram=%d ram=%d disk=%d tc=%d\n",
+                         t_read, t_copywait, streamed.size(), n_vram, n_ram, n_disk, n_tc);
         cu::sync();
         cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;
