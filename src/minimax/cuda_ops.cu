@@ -447,6 +447,8 @@ __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half
     float* s_sh = (float*)(sp + ms);                             // [H][C]
     float* run_m = s_sh + (size_t)H * C;                         // [H]
     float* run_l = run_m + H;                                    // [H]
+    float* sm_mn = run_l + H;                                    // [H] chunk max, set by one thread per head
+    float* sm_alpha = sm_mn + H;                                 // [H] rescale factor
     const long long t = (long long)blockIdx.x;
     const int kv = (int)blockIdx.y;
     const int q0 = kv * H;
@@ -489,6 +491,8 @@ __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half
             const __half2* k2 = (const __half2*)(k + ((long long)p * hkv + kv) * dim);
             for (int h = 0; h < H; ++h) {
                 const __half2* q2 = (const __half2*)(qs + h * dim);
+                // Two independent float2 chains over the head's dimensions (the parallelism is what makes the
+                // chunked score pass cheap; see the note in test_p5a.py about its summation order).
                 float2 a0 = make_float2(0.f, 0.f), a1 = make_float2(0.f, 0.f);
                 int d2 = 0;
                 for (; d2 + 1 < dim / 2; d2 += 2) {
@@ -511,7 +515,9 @@ __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half
             }
         }
         __syncthreads();
-        // ---- chunk max per head, then the running max and its rescale factor
+        // ---- chunk max per head, then the running max and its rescale factor.  Only one thread per head may
+        // touch run_m / run_l: with every thread doing the read-modify-write the running state (and therefore the
+        // output) depended on the warp interleaving, which made the chunked prefill non-deterministic.
         float rv[16];
         for (int h = 0; h < H; ++h) {
             float m = -INFINITY;
@@ -531,15 +537,17 @@ __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half
             red8[threadIdx.x][0] = x;
         }
         __syncthreads();
-        float alpha[16], mn[16];
-        for (int h = 0; h < H; ++h) {
-            mn[h] = fmaxf(run_m[h], red8[h][0]);
-            alpha[h] = (run_m[h] == -INFINITY) ? 0.f : __expf(run_m[h] - mn[h]);
-            run_m[h] = mn[h];
+        if ((int)threadIdx.x < H) {
+            const int h = (int)threadIdx.x;
+            const float mn = fmaxf(run_m[h], red8[h][0]);
+            sm_mn[h] = mn;
+            sm_alpha[h] = (run_m[h] == -INFINITY) ? 0.f : __expf(run_m[h] - mn);
+            run_m[h] = mn;
         }
         __syncthreads();
         if ((int)threadIdx.x < cn)
-            for (int h = 0; h < H; ++h) s_sh[h * C + (int)threadIdx.x] = __expf(s_sh[h * C + (int)threadIdx.x] - mn[h]);
+            for (int h = 0; h < H; ++h)
+                s_sh[h * C + (int)threadIdx.x] = __expf(s_sh[h * C + (int)threadIdx.x] - sm_mn[h]);
         __syncthreads();
         // ---- running denominator
         for (int h = 0; h < H; ++h) {
@@ -560,10 +568,11 @@ __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half
             red8[threadIdx.x][0] = x;
         }
         __syncthreads();
-        for (int h = 0; h < H; ++h) {
-            run_l[h] = run_l[h] * alpha[h] + red8[h][0];
-            acc[h] *= alpha[h];
+        if ((int)threadIdx.x < H) {
+            const int h = (int)threadIdx.x;
+            run_l[h] = run_l[h] * sm_alpha[h] + red8[h][0];
         }
+        for (int h = 0; h < H; ++h) acc[h] *= sm_alpha[h];
         // ---- P(chunk) x V(chunk), one thread per dimension; the V row is read once for the whole head group
         const int d = (int)threadIdx.x;
         if (d < dim) {
@@ -988,10 +997,11 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
     // selected positions in chunks of 128.  ~15 KB of shared memory instead of 43 KB.
     const int hkv_d = q_per_kv > 0 ? heads / q_per_kv : 0;
     const int idx_per_head = q_per_idx > 0 ? heads / q_per_idx : 0;
-    if (!dense_all && hkv_d > 0 && hkv_d == idx_per_head && q_per_kv >= 1 && q_per_kv <= 16 && dim >= 2 &&
+    static const bool msa_old = std::getenv("STRATA_MSA_OLD") != nullptr;
+    if (!msa_old && !dense_all && hkv_d > 0 && hkv_d == idx_per_head && q_per_kv >= 1 && q_per_kv <= 16 && dim >= 2 &&
         dim <= 128 && dim % 2 == 0) {
         const size_t shm = (size_t)q_per_kv * (size_t)dim * 2 + (size_t)max_blk * (size_t)blk_size * sizeof(int) +
-                           (size_t)q_per_kv * 128 * sizeof(float) + 2 * (size_t)q_per_kv * sizeof(float) + 64;
+                           (size_t)q_per_kv * 128 * sizeof(float) + 4 * (size_t)q_per_kv * sizeof(float) + 64;
         if (shm <= 48u * 1024u) {
             const dim3 grid((unsigned)n_tok, (unsigned)hkv_d);
             msa_attn_flash_kernel<<<grid, 128, shm, (cudaStream_t)stream>>>(
