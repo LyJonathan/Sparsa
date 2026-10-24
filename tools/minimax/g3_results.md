@@ -84,14 +84,14 @@ Timing: 2,089 s of engine time for the six prompts (6 model loads; 151-token pro
 
 ## Not measured
 
-* **long_code_stdlib (5,536 tok) and long_prose_austen (4,093 tok)** - skipped. With the
-  KV cache on the host the batched prefill runs `attend_host` once per token per layer,
-  which is O(T^2) and single-threaded: long_code_stdlib had 6,600 s of CPU and 100
+* **long_code_stdlib (5,536 tok) and long_prose_austen (4,093 tok)** - opt-in (`--long-prompts`) and
+  not scored here. With the KV cache on the host the batched prefill runs `attend_host` once per
+  token per layer, which is O(T^2) and single-threaded: long_code_stdlib had 6,600 s of CPU and 100
   minutes of wall on this build without finishing. The device-attention alternative
-  (`--minimax-kv vram|ram`) aborts with an access violation when the dense layers are on
-  the CPU (`--minimax-dense-layers-gpu 0`, both `vram` and `ram`, reproduced twice), and
-  with `--minimax-dense-layers-gpu -1` it exceeds 12 GB of VRAM per card and stalls. That
-  engine bug is being fixed separately; these two prompts are re-runnable as soon as it is.
+  (`--minimax-kv vram|ram`) aborts with an access violation when the dense layers are on the CPU
+  (`--minimax-dense-layers-gpu 0`, both `vram` and `ram`, reproduced twice), and with
+  `--minimax-dense-layers-gpu -1` it exceeds 12 GB of VRAM per card and stalls. That engine bug is
+  being fixed separately; these two prompts are re-runnable as soon as it is.
 * **Plain-text perplexity (2,048 ids)** - the pass was started and cut after ~2 minutes at
   the rig handover; it needs the same host-attention path (~30-60 min) and is not measured
   for this tier yet. The llama.cpp harness's D3 number is ppl 87.25 against the fp32
@@ -104,9 +104,12 @@ Timing: 2,089 s of engine time for the six prompts (6 model loads; 151-token pro
 python tools/minimax/test_g3_sparsa.py                  # alignment + reference self-check
 python tools/minimax/g3_sparsa.py --model <part1.gguf> --out _local/g3_sparsa/<run> \
     --tier MM-IQ2_XS-D3 --ref <ref>/logits --ids <ref>/ids \
-    --prompts chinese_local_llm,code_lru,math_bakery,multi_turn_threads,prose_moe,tool_weather \
     --memory-limit-mib 92000 --prefill-batch 512 --cpu-threads 16 --max-context 8192 \
     --vram-slots 0 --dense-layers-gpu 0 --kv host --gpus 0,1 --layer-split auto \
     --validate-with _local/g3_iq2xs/g3_results_d3.json
 python tools/minimax/g3_summary.py --root _local/g3_sparsa
 ```
+
+The default prompt set is the 6 short prompts. `--long-prompts` adds
+long_code_stdlib and long_prose_austen (about an hour each on the host-KV path), and
+`--prompts a,b` runs an explicit set.

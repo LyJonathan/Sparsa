@@ -1,11 +1,19 @@
 """G3 quality gate on the Strata engine: teacher-forced logits vs the fp32 reference.
 
-Same 8 prompts, same reference positions, same metrics as the llama.cpp harness
+Same prompts, same reference positions, same metrics as the llama.cpp harness
 (`Strata-MiniMax/_local/g3_iq2xs/tools/compare.py` + `run_g3_d3.py`), but the
 forward pass is `strata-minimax --minimax-eval`. The scoring math below is a copy
 of `compare.py` (KL64, full-vocab KL, top-1 agreement, NLL against the true next
 token) so the numbers are directly comparable; the ppl pass mirrors
 `run_g3_d3.py` + `score_d3.py` (ppl_text_hf.bin, the reference's exact ids).
+
+Prompt set: by default the **6 short prompts** - chinese_local_llm, code_lru,
+math_bakery, multi_turn_threads, prose_moe, tool_weather - are scored. The two
+long ones (long_code_stdlib at 5,536 tokens and long_prose_austen at 4,093) are
+opt-in with `--long-prompts`, because a teacher-forced pass over them costs about
+an hour each on the host-KV path: `forward_batch` calls `attend_host` once per
+token per layer, which is O(T^2) and single-threaded. `--prompts a,b` overrides
+the set entirely (and warns when it names a long prompt).
 
 Reference layout (produced on the A100, fp32 weights):
 
@@ -45,6 +53,9 @@ TOPK = 64
 VOCAB_EXPECTED = 200064
 PPL_IDS = "ppl_text_hf.bin"
 PPL_REF = 39.69292841776886  # _local/ref_out/ppl_a100_fp32.json
+# Scored by default. The two long prompts are opt-in (`--long-prompts`): a teacher-forced pass
+# over them is O(T^2) on the host-attention path and costs about an hour each.
+LONG_PROMPTS = ("long_code_stdlib", "long_prose_austen")
 
 
 # --------------------------------------------------------------------------- scoring (copy of compare.py)
@@ -229,6 +240,9 @@ def write_md(path, res):
     L.append(f"model: `{res['model']}`  \n")
     L.append(f"engine: `{res['engine']}`  \n")
     L.append(f"config: `{res['engine_flags']}`\n")
+    if res.get("prompt_set") == "short":
+        L.append("prompt set: the 6 short prompts (long_code_stdlib and long_prose_austen are opt-in with "
+                 "`--long-prompts`; each costs about an hour on the host-KV path)\n")
     if res.get("skipped"):
         L.append(f"**skipped (no dump): {', '.join(res['skipped'])}** - the aggregate below covers "
                  f"the {len(res['per_prompt'])} prompts that were scored.\n")
@@ -296,7 +310,13 @@ def main():
     ap.add_argument("--exe", default=None, help="strata-minimax.exe (default: <repo>/build/strata-minimax.exe)")
     ap.add_argument("--ref", default=None, help="reference logits dir (default <repo>/_local/ref_out/logits)")
     ap.add_argument("--ids", default=None, help="reference ids dir (default <repo>/_local/g3_iq2xs/ids)")
-    ap.add_argument("--prompts", default=None, help="comma-separated subset of prompts (smoke runs)")
+    ap.add_argument("--prompts", default=None,
+                    help="comma-separated subset of prompts (default: the 6 short prompts; --long-prompts adds "
+                         "long_code_stdlib and long_prose_austen)")
+    ap.add_argument("--long-prompts", action="store_true",
+                    help="also score long_code_stdlib (5,536 tok) and long_prose_austen (4,093 tok). Each "
+                         "costs about an hour of engine time on the host-KV path (O(T^2) host attention), "
+                         "so they are opt-in")
     ap.add_argument("--no-ppl", action="store_true", help="skip the 2,048-token ppl pass")
     ap.add_argument("--only-ppl", action="store_true", help="skip the 8 prompt passes")
     ap.add_argument("--rescore", action="store_true",
@@ -370,15 +390,24 @@ def main():
     flags += args.engine_arg
 
     names = sorted(d for d in os.listdir(ref) if os.path.isdir(os.path.join(ref, d)))
+    prompt_set = "short"
     if args.prompts:
         want = {s.strip() for s in args.prompts.split(",") if s.strip()}
         names = [n for n in names if n in want]
         missing = want - set(names)
         if missing:
             raise SystemExit(f"unknown prompts: {sorted(missing)}")
+        prompt_set = "custom"
+    elif not args.long_prompts:
+        names = [n for n in names if n not in LONG_PROMPTS]
+    else:
+        prompt_set = "all"
+    if args.prompts and (set(names) & set(LONG_PROMPTS)):
+        print("note: --prompts names a long prompt; each of those costs about an hour on the host-KV path",
+              flush=True)
 
     res = {"tier": tier, "model": os.path.abspath(args.model), "engine": exe,
-           "engine_flags": " ".join(flags), "prompts": names,
+           "engine_flags": " ".join(flags), "prompts": names, "prompt_set": prompt_set,
            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "per_prompt": [], "ppl": None,
            "skipped": []}
     if args.allow_partial:
