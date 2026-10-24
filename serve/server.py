@@ -3163,7 +3163,7 @@ def engine_args(cfg: dict) -> list[str]:
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
     # (only when the config has no reserve of its own).
-    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args and cfg["vision"].get("engine") is not True:
         args.append("--vision")
         note = "added --vision"
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
@@ -4819,7 +4819,7 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
+                why = "this server has no image encoder" if self.vision is None and self.engine_vision is None else None
                 if why is None:
                     src = item["source"]
                     try:
@@ -4830,8 +4830,11 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                            if self.engine_vision is not None:
+                                self.engine_vision.encode(src)
+                            else:
+                                self._vision_up()     # an elastic encoder is not running until a picture needs it
+                                self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
