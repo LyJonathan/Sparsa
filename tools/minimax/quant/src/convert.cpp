@@ -101,20 +101,10 @@ ggml_type parse_type(const std::string & s) {
     if (u == "NVFP4") return GGML_TYPE_NVFP4;
     // Ported from ik_llama.cpp; ids from include/strata/kernels/iqk_types.hpp. See THIRD_PARTY_NOTICES.md.
     if (u == "IQ2_KT") return (ggml_type) strata::kernels::ikq::kIQ2KT;
+    if (u == "IQ3_K") return (ggml_type) strata::kernels::ikq::kIQ3K;
+    if (u == "IQ4_KS") return (ggml_type) strata::kernels::ikq::kIQ4KS;
     if (u == "IQ3_KT") return (ggml_type) strata::kernels::ikq::kIQ3KT;
-    // Reserved ids with no quantizer yet: say so instead of failing later inside the packer.
-    static const struct { const char * name; int id; } kReserved[] = {
-        {"IQ3_K", strata::kernels::ikq::kIQ3K},
-        {"IQ4_KS", strata::kernels::ikq::kIQ4KS},
-        {"IQ2_KL", strata::kernels::ikq::kIQ2KL},
-    };
-    for (const auto & r : kReserved) {
-        if (u == r.name) {
-            die(std::string("the ") + r.name + " (type id " + std::to_string(r.id) +
-                ") is reserved for a format ported from ik_llama.cpp that this build has no quantizer for; "
-                "IQ2_KT and IQ3_KT are the ones it can write");
-        }
-    }
+    if (u == "IQ2_KL") return (ggml_type) strata::kernels::ikq::kIQ2KL;
     die("unknown quant type " + s);
 }
 
@@ -890,6 +880,7 @@ struct Item {
     std::string gguf;
     std::string hf;
     std::string wkey;
+    std::string imx;           ///< imatrix row name when the output layer is remapped (else = gguf)
     bool exact = false;
     bool side_scale = false;   ///< f32 [n_expert]: per-expert weight_global_scale for an NVFP4 expert tensor
     Role role = Role::Embd;
@@ -1077,6 +1068,9 @@ std::vector<Item> build_plan(const Hyp & h, const Recipe & r, const std::vector<
             auto add_ex = [&](const char * leaf, const char * wkey, Role role, ggml_type ty, int64_t n_in, int64_t n_out) {
                 Item it;
                 it.gguf = blk_name(blk, leaf);
+                // The calibration imatrix is keyed by the checkpoint's own layer names, so a remapped layer
+                // (`--layers 40,40` writes blk.0) still reads the importance of its source layer.
+                it.imx = blk_name(src, leaf);
                 it.hf = lb + ".block_sparse_moe.experts";
                 it.wkey = wkey;
                 it.role = role;
@@ -1589,7 +1583,7 @@ const float * importance_for(const Imp * imp, const Item & it, int64_t expert) {
         return nullptr;
     }
     const int64_t nmat = it.ne[2] > 0 ? it.ne[2] : 1;
-    return imp->at(it.gguf, it.ne[0], nmat, expert);
+    return imp->at(it.imx.empty() ? it.gguf : it.imx, it.ne[0], nmat, expert);
 }
 
 void require_importance(const Item & it, const float * im) {

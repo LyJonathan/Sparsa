@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -39,7 +40,10 @@ std::string shape_text(const std::vector<uint64_t>& s) {
 
 uint64_t product(const std::vector<uint64_t>& s) {
     uint64_t n = 1;
-    for (uint64_t d : s) n *= d;
+    for (uint64_t d : s) {
+        if (d == 0 || n > (std::numeric_limits<uint64_t>::max)() / d) return 0;   // 0 = overflow
+        n *= d;
+    }
     return n;
 }
 
@@ -156,6 +160,8 @@ Model load_model(const std::string& path, bool require_m3_1) {
         r.elements = product(t->shape);
         r.bytes = tensor_payload_bytes(*t);
         r.shard = shard;
+        if (r.elements == 0)
+            throw std::runtime_error(path + ": " + e.name + " has a shape whose element count overflows");
         if (r.bytes == 0) throw std::runtime_error(path + ": " + e.name + " has no payload size (type " +
                                                    std::to_string(t->type) + ")");
         m.tensors.push_back(std::move(r));
