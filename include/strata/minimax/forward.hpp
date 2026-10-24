@@ -103,6 +103,7 @@ struct EngineOptions {
     // ---- P7: the SSD tier's page-cache path.
     std::string ssd_zerocopy;       ///< "" / "on": an expert whose pages are already resident is computed from the
                                     ///< mapping with no read; "off": always issue the read (P6 behaviour)
+    int page_probe = 32;            ///< P9: pages probed per expert for a page-cache hit (0 = walk every page)
     std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
                                     ///< MoE, so they are in flight across that layer's attention
     // ---- P7b: the route nudge (Xolotl's selection bias toward resident experts).

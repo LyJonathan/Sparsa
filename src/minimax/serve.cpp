@@ -96,6 +96,7 @@ void usage() {
                  "                                    be read from the SSD; 0 (default) keeps every route\n"
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
+                 "  --minimax-page-probe N            pages sampled per expert for that check (default 32; 0 = all)\n"
                  "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n"
                  "  --minimax-route-bias on|off       rank the router's top-k on score + a residency bonus / file\n"
                  "                                    penalty (Xolotl); weights stay unbiased; default off\n"
@@ -545,6 +546,7 @@ int run(int argc, char** argv) {
     float expert_skip = 0.f;
     int ssd_chunks = 1, expert_skip_ssd = 0;
     std::string ssd_zerocopy;
+    int page_probe = 32;
     std::string ssd_prefetch;
     std::string ram_mode;
     std::string route_bias;
@@ -590,6 +592,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
         else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
+        else if (a == "--minimax-page-probe") page_probe = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
         else if (a == "--minimax-route-bias") route_bias = next();
         else if (a == "--minimax-route-bias-in") route_bias_in = (float)std::atof(next().c_str());
@@ -751,6 +754,7 @@ int run(int argc, char** argv) {
     opt.ssd_chunks = ssd_chunks;
     opt.expert_skip_ssd = expert_skip_ssd;
     opt.ssd_zerocopy = ssd_zerocopy;
+    opt.page_probe = page_probe;
     opt.ssd_prefetch = ssd_prefetch;
     opt.route_bias = route_bias;
     opt.route_bias_in = route_bias_in;

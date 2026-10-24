@@ -1154,3 +1154,110 @@ What is *not* measured: KL and top-1 for the nudge on the full model. The plan w
 pass (one model load an arm); the PC window ran out after the speed arms. The extrapolation from the meter -
 Xolotl's own table has 26.1 % swapped at 85.2 % API top-1 against 86.2 % exact, so 9.1 % should cost well under a
 point - is an extrapolation, not a measurement. **The default stays off** until that run exists.
+
+## P10: the shared expert beside the lane, the indexer on the card, and a prefill-aware slot count
+
+P8 named three phases to attack: the shared expert's three host round trips, the indexer's readback, and the
+page-cache walk inside `pick`. This round does those three, plus the automatic-slot OOM on a big card.
+
+### The shared expert runs beside the routed-expert CPU lane (bit-identical)
+
+The shared MLP is three dense GEMVs (Q8_0 here) and the old path ran them with three host round trips between the
+routed experts and the next layer. Nothing about it depends on routing: its input is the layer's MoE input and its
+result is added after the combine. `shared_begin` now enqueues the gate/up pair on its own stream **after routing**
+(so the router's GEMV is not delayed) and just before the CPU lane; `shared_finish` waits after the lane, runs the
+host `swigluoai` and the down GEMV, and returns. The tensors, the q8_1 activation, the native MMVQ kernels and the
+host swiglu are the same ones `mlp` used, so the result is bit-identical. Only the blocking cost is left in
+`shared=`, which is the wait plus swiglu plus the down GEMV.
+
+### The indexer and the attention output stay on the card (`--minimax-kv vram`)
+
+`idx_select` is the host's `select_slots` as a device kernel: one thread per indexer head, the same ranking
+(score desc, block index asc), the same forced local blocks, and the same ascending position order in the slot
+list. With the KV in VRAM the block scores and the slot lists no longer cross PCIe and there is no sync between the
+indexer and the MSA kernel. The attention output also stays on the card: `gemv_dev_in` feeds it to the output
+projection through the legacy default stream (native MMVQ needs a non-null handle but must stay ordered with the
+MSA kernel), so the D2H of `att` and the H2D back are gone. The pinned-RAM KV tier still selects on the host,
+because it needs the counts to know how many rows to copy.
+
+### `--minimax-page-probe N` (default 32; 0 = walk every page)
+
+P7b sampled eight spread pages, then walked all 4-8 K pages of a 17 MB expert when the sample passed. A sampled
+"yes" is only ever a page fault on the pages it did not see, never a wrong byte, so the default is now 32 sampled
+pages and no walk. `0` restores the full walk.
+
+### Automatic VRAM slots reserve the batched-prefill workspace
+
+The old rule was `slots = (free - reserve) / (layers * expert)` at sizing time. The batched-prefill workspace,
+the rows_cap scratch, the expert ring and the RAM tier's staged prompt K/V are allocated later (`init_prefill`), so
+on a card big enough for the slots to fill it - the 1 x RTX PRO 6000 96 GB, 153 GB model report - the prefill
+allocation died in `cudaMalloc` at startup. `prefill_device_bytes()` mirrors those allocations and the auto plan
+subtracts them before counting slots. The rule lives in `include/strata/minimax/vram_plan.hpp`, is header-only and
+is unit-tested with no GPU (`tests/minimax/vram_plan_test.cpp`, `tools/minimax/test_vram_plan.py`). An explicit
+`--minimax-vram-slots-per-layer` is unchanged: the prefill batch shrinks to the room that count left, as before.
+With `--minimax-prefill-batch 0` (this engine's default) the plan is byte-for-byte the old one.
+
+### Measured
+
+**Bit-identical gate.** Real-weight 15-layer slice `models/quant-d3/p5a-l0-14-iq2xs.gguf`, 96 real-text tokens,
+`--gpus 0 --minimax-dense-layers-gpu 15 --minimax-tiers --minimax-vram-slots-per-layer 0
+--minimax-ram-experts-per-layer 128 --minimax-kv vram --cpu-threads 12 --memory-limit-mib 40000`, merged base
+(`1390bdb8`) against this branch: **max abs 0.0, KL 0.0, top-1 1.000, identical**.
+
+**Full model, same run setup.** MiniMax-M3.1-Flash IQ2_XS-D3, 2 x RTX 5070 12 GB, `--gpus 0,1 --layer-split auto
+--minimax-profile mm3-d3.bin --memory-limit-mib 90000 --minimax-prefill-batch 0 --minimax-profile-time`, 64-token
+real-text prompt then 32 greedy tokens, one round, merged base against this branch:
+
+| phase | base ms/token | this branch | delta |
+| --- | ---: | ---: | ---: |
+| `attn` | 37.6 | **27.8** | -9.8 |
+| - `idx_sync` | 13.9 | **0.6** | -13.3 |
+| - `msa_sync` | 4.2 | **0.3** | -3.9 |
+| `shared` | 27.4 | **15.5** | -11.9 |
+| `pick` | 0.8 | **0.4** | -0.4 |
+| `cpu_ram` | 134.3 | 135.7 | +1.4 |
+| `ssd_wait` | 26.1 | 75.7 | +49.6 (drive) |
+| `admit` | 13.4 | 13.0 | -0.4 |
+| `total` | 271.3 | 300.4 | +29.1 |
+| **total - `ssd_wait`** | **245.2** | **224.7** | **-20.5 (-8.4 %)** |
+
+The CPU lane, the drive and the admissions are the same work in both arms; the raw wall time moved the wrong way
+because the second arm hit a slower drive window (26.1 -> 75.7 ms of wait for the same ~248 MB). **The compute-side
+cost of a token fell 20.5 ms (-8.4 %).** Raw decode was 3.44 tok/s (base) and 3.30 (this branch) in that pair; an
+isolated run of this branch on the same box measured **4.34 tok/s** (8 greedy tokens, 1.84 s) with the drive
+slower than either, which is why the raw number is reported as drive-bound rather than as a win.
+
+The box was not idle (the desktop agent, browser and Task Manager were running) and the NVMe fluctuated between
+0.12 and 2.1 GB/s over the session, so the raw tok/s is not comparable to the round-3 4.37 measured on an idle box.
+What is comparable is the per-phase table on the same pair of processes.
+
+### The route nudge: now measured, and it stays opt-in
+
+`tools/minimax/route_bias_quality.py` builds one teacher-forced stream from the six short G3 prompts and runs
+`--minimax-route-bias off` and `on` with the P7b defaults (0.25 / 0.15, protect 2, pool 12). 156 positions, full
+model, same placement as the speed run:
+
+| arm | KL64 mean | top-1 agreement |
+| --- | ---: | ---: |
+| `off` (reference) | 0 | 100 % |
+| `on` | **0.343** | **59.0 %** |
+
+The engine's meter says **9.97 % of picks swapped and 98.97 % of the router weight kept**, the same first-order
+numbers round 3 reported (9.1 % / 99.5 %). A two-identical-arms control is bit-identical (KL 0.0), and `on` with
+`--minimax-route-bias-in 0 --minimax-route-bias-out 0` is also bit-identical, so the code path itself is neutral
+and the loss comes from the nudge. **The decision rule (top-1 drop <= 1 point, KL64 increase <= 0.02) fails by a
+wide margin: the default stays off.** This is a different result from the P7b slice (KL 0.0348 at 35 % swaps): with
+112 of 128 experts resident, the nudge demotes the few file-resident experts that carry real weight, while the
+slice's 35 % were near-tied swaps.
+
+### The 96 GB auto plan
+
+`vram_plan_test` covers the big-card case directly (`reserve + prefill + slots * layers * expert <= free`), the
+12 GB case (the prefill reserve costs at most one slot), the no-prefill case (identical to the old rule) and the
+degenerate inputs. It passes with the host compiler. The 2 x 5070 auto plan is unchanged when prefill is off
+(this engine's default); when `--minimax-prefill-batch` is on, the workspace is taken out first, which is what PR
+#19 already did for its per-token part and this branch extends to the rows scratch, ring and staged K/V.
+
+**Tests.** `python -m pytest tools/minimax`: **68 passed**. The two setup errors in `test_g3_sparsa.py`
+(`ref_dir`, `name`, `logits`, `ids` are used as fixtures but are not defined) reproduce on the merged base
+`1390bdb8` in 0.19 s and are unrelated to this branch.
