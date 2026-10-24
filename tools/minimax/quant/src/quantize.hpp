@@ -7,7 +7,10 @@
 
 #include <ggml.h>
 
+#include "tqio.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -36,7 +39,7 @@ inline uint64_t tensor_nbytes(ggml_type type, const int64_t ne[4]) {
         throw std::runtime_error("non-positive tensor dimension");
     }
     const int64_t nrows = ne[1] * ne[2] * ne[3];
-    return static_cast<uint64_t>(ggml_row_size(type, ne[0])) * static_cast<uint64_t>(nrows);
+    return static_cast<uint64_t>(row_size(type, ne[0])) * static_cast<uint64_t>(nrows);
 }
 
 inline size_t quantize_rows(ggml_type type, const float * src, void * dst, int64_t nrows,
@@ -45,18 +48,69 @@ inline size_t quantize_rows(ggml_type type, const float * src, void * dst, int64
         throw std::runtime_error("quantize: empty tensor");
     }
     if (type_needs_imatrix(type) && !imatrix) {
-        throw std::runtime_error(std::string("quantize: ") + ggml_type_name(type) + " requires an imatrix");
+        throw std::runtime_error(std::string("quantize: ") + type_name(type) + " requires an imatrix");
     }
-    const size_t row_size = ggml_row_size(type, n_per_row);
+    const size_t row_size = mmq::row_size(type, n_per_row);
     if (type == GGML_TYPE_F32) {
         const size_t n = static_cast<size_t>(nrows) * static_cast<size_t>(n_per_row) * sizeof(float);
         std::memcpy(dst, src, n);
         return n;
     }
-    const int64_t blck = ggml_blck_size(type);
+    if (is_tq(type)) {
+        // The trellis encoder: one Viterbi search per 128-weight block, rows independent.
+        const int64_t blck = 128;
+        if ((n_per_row % blck) != 0) {
+            throw std::runtime_error(std::string("quantize: row length ") + std::to_string(n_per_row) +
+                                     " is not a multiple of 128 for " + type_name(type));
+        }
+        if (nthreads < 1) {
+            nthreads = 1;
+        }
+        if (static_cast<int64_t>(nthreads) > nrows) {
+            nthreads = static_cast<int>(nrows);
+        }
+        strata::kernels::cpu::TqEncodeParams p;
+        p.weighted = imatrix != nullptr;
+        auto one = [&](int64_t r0, int64_t r1) {
+            strata::kernels::cpu::tq_encode_row(static_cast<int>(type), src + r0 * n_per_row,
+                                                imatrix ? imatrix : nullptr, (r1 - r0) * n_per_row, p,
+                                                static_cast<uint8_t *>(dst) + r0 * row_size);
+        };
+        if (nthreads == 1) {
+            one(0, nrows);
+            return static_cast<size_t>(nrows) * row_size;
+        }
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> errors(static_cast<size_t>(nthreads));
+        const int64_t chunk = (nrows + nthreads - 1) / nthreads;
+        for (int t = 0; t < nthreads; ++t) {
+            const int64_t a = static_cast<int64_t>(t) * chunk;
+            if (a >= nrows) {
+                break;
+            }
+            const int64_t b = std::min(nrows, a + chunk);
+            workers.emplace_back([&, t, a, b]() {
+                try {
+                    one(a, b);
+                } catch (...) {
+                    errors[static_cast<size_t>(t)] = std::current_exception();
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        for (auto & e : errors) {
+            if (e) {
+                std::rethrow_exception(e);
+            }
+        }
+        return static_cast<size_t>(nrows) * row_size;
+    }
+    const int64_t blck = blck_size(type);
     if (blck <= 0 || (n_per_row % blck) != 0) {
         throw std::runtime_error(std::string("quantize: row length ") + std::to_string(n_per_row) +
-                                 " is not a multiple of block size for " + ggml_type_name(type));
+                                 " is not a multiple of block size for " + type_name(type));
     }
     ggml_quantize_init(type);
     if (nthreads < 1) {
@@ -73,7 +127,7 @@ inline size_t quantize_rows(ggml_type type, const float * src, void * dst, int64
             throw std::runtime_error("quantize: unexpected chunk size");
         }
         if (!ggml_validate_row_data(type, out, got)) {
-            throw std::runtime_error(std::string("quantize: row validation failed for ") + ggml_type_name(type));
+            throw std::runtime_error(std::string("quantize: row validation failed for ") + type_name(type));
         }
     };
 

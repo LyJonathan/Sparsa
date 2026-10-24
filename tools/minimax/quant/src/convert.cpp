@@ -14,6 +14,8 @@
 #include "json.hpp"
 #include "quantize.hpp"
 
+#include "strata/kernels/tq_encode_cuda.hpp"
+
 #include <ggml.h>
 #include <gguf.h>
 
@@ -99,6 +101,9 @@ ggml_type parse_type(const std::string & s) {
     if (u == "IQ3_S") return GGML_TYPE_IQ3_S;
     if (u == "IQ4_XS") return GGML_TYPE_IQ4_XS;
     if (u == "NVFP4") return GGML_TYPE_NVFP4;
+    if (u == "TQ2_T" || u == "TQ2T") return (ggml_type) 144;   // trellis, 2.125 bpw (third_party/ggml/ggml-common-tq.h)
+    if (u == "TQK6") return (ggml_type) 145;                   // trellis, 1.625 bpw
+    if (u == "TQK7") return (ggml_type) 146;                   // trellis, 1.875 bpw
     die("unknown quant type " + s);
 }
 
@@ -117,7 +122,7 @@ uint32_t ftype_of(ggml_type t) {
         case GGML_TYPE_IQ4_XS: return 30;
         case GGML_TYPE_IQ1_M: return 31;
         case GGML_TYPE_NVFP4: return 39;
-        default: return 0;
+        default: return 0;   // the trellis types (144-146) have no llama.cpp file_type; the recipe supplies one
     }
 }
 
@@ -125,9 +130,9 @@ uint64_t mat_bytes(ggml_type t, int64_t n_in, int64_t n_out, int64_t n_ex = 1) {
     if (n_in <= 0 || n_out <= 0 || n_ex <= 0) {
         die("bad mat shape");
     }
-    const size_t row = ggml_row_size(t, n_in);
+    const size_t row = row_size(t, n_in);
     if (row == 0) {
-        die(std::string("ggml_row_size returned 0 for ") + ggml_type_name(t));
+        die(std::string("row size is 0 for ") + type_name(t));
     }
     return static_cast<uint64_t>(row) * static_cast<uint64_t>(n_out) * static_cast<uint64_t>(n_ex);
 }
@@ -279,6 +284,9 @@ struct Recipe {
     ggml_type norms = GGML_TYPE_F32;
     ggml_type embd = GGML_TYPE_Q8_0;
     ggml_type output = GGML_TYPE_Q6_K;
+    /// 0 = experts are stored in the model's own basis; otherwise the block of the Hadamard rotation the encoder
+    /// applied (see tq_hadamard_rotate) and the engine must undo on the activation side.
+    int hadamard_block = 0;
 };
 
 ggml_type recipe_type(const Json & types, const char * key, ggml_type dflt) {
@@ -353,6 +361,15 @@ Recipe load_recipe(const Options & opt) {
     r.norms = recipe_type(t, "norms", r.norms);
     r.embd = recipe_type(t, "token_embd", r.embd);
     r.output = recipe_type(t, "output", r.output);
+    if (root.find("require_imatrix")) {
+        r.require_imatrix = root.at("require_imatrix").as_b();
+    }
+    if (const Json * hb = root.find("hadamard_block")) {
+        r.hadamard_block = static_cast<int>(hb->as_i());
+    }
+    if (r.hadamard_block != 0 && (r.hadamard_block < 2 || (r.hadamard_block & (r.hadamard_block - 1)))) {
+        die("hadamard_block must be a power of two >= 2");
+    }
     if (!opt.dense_type.empty()) {
         const ggml_type d = parse_type(opt.dense_type);
         r.attention = r.indexer = r.dense = r.shared = d;
@@ -396,17 +413,17 @@ std::string recipe_meta(const Recipe & r, const std::string & hot_mode) {
       << ",\"require_imatrix\":" << (r.require_imatrix ? "true" : "false")
       << ",\"dynamic_down\":" << (r.dynamic_down ? "true" : "false")
       << ",\"hot_expert_mode\":\"" << hot_mode << "\",\"types\":{"
-      << "\"experts\":\"" << ggml_type_name(r.experts) << "\","
-      << "\"ffn_down_exps\":\"" << ggml_type_name(r.ffn_down) << "\","
-      << "\"hot_experts\":\"" << ggml_type_name(r.hot) << "\","
-      << "\"attention\":\"" << ggml_type_name(r.attention) << "\","
-      << "\"indexer\":\"" << ggml_type_name(r.indexer) << "\","
-      << "\"dense_ffn\":\"" << ggml_type_name(r.dense) << "\","
-      << "\"shared_experts\":\"" << ggml_type_name(r.shared) << "\","
-      << "\"router\":\"" << ggml_type_name(r.router) << "\","
-      << "\"norms\":\"" << ggml_type_name(r.norms) << "\","
-      << "\"token_embd\":\"" << ggml_type_name(r.embd) << "\","
-      << "\"output\":\"" << ggml_type_name(r.output) << "\"}}";
+      << "\"experts\":\"" << type_name(r.experts) << "\","
+      << "\"ffn_down_exps\":\"" << type_name(r.ffn_down) << "\","
+      << "\"hot_experts\":\"" << type_name(r.hot) << "\","
+      << "\"attention\":\"" << type_name(r.attention) << "\","
+      << "\"indexer\":\"" << type_name(r.indexer) << "\","
+      << "\"dense_ffn\":\"" << type_name(r.dense) << "\","
+      << "\"shared_experts\":\"" << type_name(r.shared) << "\","
+      << "\"router\":\"" << type_name(r.router) << "\","
+      << "\"norms\":\"" << type_name(r.norms) << "\","
+      << "\"token_embd\":\"" << type_name(r.embd) << "\","
+      << "\"output\":\"" << type_name(r.output) << "\"}}";
     return o.str();
 }
 
@@ -1496,7 +1513,7 @@ const float * importance_for(const Imp * imp, const Item & it, int64_t expert) {
 
 void require_importance(const Item & it, const float * im) {
     if (type_needs_imatrix(it.type) && !im) {
-        die(std::string(ggml_type_name(it.type)) + " requires an imatrix entry for " + it.gguf);
+        die(std::string(type_name(it.type)) + " requires an imatrix entry for " + it.gguf);
     }
 }
 
@@ -1518,7 +1535,7 @@ void emit_constant(GgufWriter & w, ggml_type type, int64_t n_in, int64_t nrows, 
         return;
     }
     std::vector<float> row(static_cast<size_t>(n_in), value);
-    const size_t row_q = ggml_row_size(type, n_in);
+    const size_t row_q = row_size(type, n_in);
     std::vector<uint8_t> q(row_q);
     quantize_rows(type, row.data(), q.data(), 1, n_in, im, 1);
     const int64_t chunk = 128;
@@ -1535,8 +1552,8 @@ void emit_constant(GgufWriter & w, ggml_type type, int64_t n_in, int64_t nrows, 
 }
 
 void emit_weight(GgufWriter & w, const Weight & wt, ggml_type type, int64_t n_in, int64_t n_out,
-                 const float * im, int threads, float add) {
-    const size_t row_q = type == GGML_TYPE_F32 ? static_cast<size_t>(n_in) * 4 : ggml_row_size(type, n_in);
+                 const float * im, int threads, float add, int rot_block = 0, const float * rot = nullptr) {
+    const size_t row_q = type == GGML_TYPE_F32 ? static_cast<size_t>(n_in) * 4 : row_size(type, n_in);
     if (type == GGML_TYPE_F32 && wt.store == Weight::Store::F32 && add == 0.f) {
         const uint64_t n = static_cast<uint64_t>(n_in) * static_cast<uint64_t>(n_out) * 4;
         if (wt.val->nbytes < n) {
@@ -1575,10 +1592,25 @@ void emit_weight(GgufWriter & w, const Weight & wt, ggml_type type, int64_t n_in
     }
     std::vector<float> f32(static_cast<size_t>(batch) * static_cast<size_t>(n_in));
     std::vector<uint8_t> q(static_cast<size_t>(batch) * row_q);
+    std::vector<float> im_rot;
+    if (rot && im) {
+        // A block-Hadamard rotation makes the diagonal of the rotated Hessian the block mean of the original
+        // diagonal, so the per-column weight in the rotated basis is the block mean (tq_block_importance).
+        im_rot.resize(static_cast<size_t>(n_in));
+        strata::kernels::cpu::tq_block_importance(im, n_in, im_rot.data());
+    }
+    const float * im_q = rot && im ? im_rot.data() : im;
     for (int64_t r = 0; r < n_out; r += batch) {
         const int64_t n = std::min(batch, n_out - r);
         dequant_rows(wt, r, n, n_in, f32.data(), add, threads);
-        quantize_rows(type, f32.data(), q.data(), n, n_in, im, threads);
+        if (rot) {
+            // W' = W diag(signs) H_b^T for each row, b input columns per block (Hadamard-folded experts)
+            for (int64_t i = 0; i < n; ++i) {
+                strata::kernels::cpu::tq_hadamard_rotate(f32.data() + (size_t) i * (size_t) n_in, n_in,
+                                                         rot_block, rot);
+            }
+        }
+        quantize_rows(type, f32.data(), q.data(), n, n_in, im_q, threads);
         w.write_payload(q.data(), row_q * static_cast<size_t>(n));
     }
 }
@@ -1940,6 +1972,22 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
     if (write_kv) {
         vocab = load_vocab(opt.model, h.n_vocab);
     }
+    // Hadamard-folded experts: one +/-1 sign vector per folded input width, the block, and the roles per layer.
+    // These are the encoder's convention (emit_weight) and the engine applies y = H_b (signs * x) to the matching
+    // activation.  A fixed sign vector per width is enough: the rotation only needs to be orthonormal and dense.
+    std::vector<float> hsign_gu, hsign_dn;
+    std::vector<uint8_t> hadamard_layer((size_t) meta_blocks, 0);
+    if (r.hadamard_block > 0) {
+        hsign_gu = strata::kernels::cpu::tq_hadamard_signs((int) h.n_embd, 0x5a17u + (uint32_t) h.n_embd);
+        hsign_dn = strata::kernels::cpu::tq_hadamard_signs((int) h.n_ff_exp, 0x5a17u + (uint32_t) h.n_ff_exp);
+        for (const Item & it : items) {
+            if (it.role == Role::Eg || it.role == Role::Eu || it.role == Role::Ed) {
+                if (it.out_i >= 0 && (size_t) it.out_i < hadamard_layer.size()) {
+                    hadamard_layer[(size_t) it.out_i] = 1;
+                }
+            }
+        }
+    }
     struct PartialOut {
         fs::path path;
         bool armed = false;
@@ -1993,6 +2041,24 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
     w.add_f32(key("swiglu_limit"), h.swiglu_l);
     w.add_str("strata.recipe", recipe_meta(r, hot_mode));
     w.add_str("strata.tool", "strata-mm-quant");
+    if (r.hadamard_block > 0) {
+        auto signs_i32 = [](const std::vector<float> & s) {
+            std::vector<int32_t> v(s.size());
+            for (size_t i = 0; i < s.size(); ++i) v[i] = s[i] > 0.f ? 1 : -1;
+            return v;
+        };
+        w.add_u32("strata.hadamard.block", (uint32_t) r.hadamard_block);
+        w.add_i32_array("strata.hadamard.signs." + std::to_string(h.n_embd), signs_i32(hsign_gu));
+        w.add_i32_array("strata.hadamard.signs." + std::to_string(h.n_ff_exp), signs_i32(hsign_dn));
+        std::vector<int32_t> roles(hadamard_layer.begin(), hadamard_layer.end());
+        for (auto & v : roles) v = v ? 7 : 0;   // bit 0 gate, 1 up, 2 down
+        w.add_i32_array("strata.hadamard.roles", roles);
+        w.add_str("strata.hadamard.note",
+                  "The routed experts of a folded layer are stored as W' = W diag(signs) H_block^T per block of "
+                  "`block` input columns (H = normalized Sylvester-Walsh-Hadamard). An engine must apply "
+                  "y = H_block (signs * x) to the gate/up input and to the down input before the expert matmul, "
+                  "and must refuse a folded layer it cannot rotate. Not readable by llama.cpp or ik_llama.cpp.");
+    }
     w.add_str("strata.expert_mix",
               "GGUF stores one ggml type per tensor, so a per-expert mix is not representable. "
               "dynamic_down steps the whole ffn_down_exps tensor. promote-layer steps one layer's "
@@ -2071,7 +2137,9 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
                 }
                 const float * im = importance_for(imp, it, e);
                 require_importance(it, im);
-                emit_weight(w, wt, it.type, it.ne[0], it.ne[1], im, threads, 0.f);
+                const int rotb = std::getenv("MMQ_TQ_NOROT") ? 0 : r.hadamard_block;
+                const float * rot = rotb == 0 ? nullptr : (it.role == Role::Ed ? hsign_dn.data() : hsign_gu.data());
+                emit_weight(w, wt, it.type, it.ne[0], it.ne[1], im, threads, 0.f, rotb, rot);
             }
         } else {
             Weight wt = resolve_weight(cat, it.hf, it.exact);
@@ -2083,7 +2151,7 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
         w.end_tensor();
         written += it.nbytes;
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        logf("  %-32s %-8s %6.1fs  %s\n", it.gguf.c_str(), ggml_type_name(it.type), sec, human(it.nbytes).c_str());
+        logf("  %-32s %-8s %6.1fs  %s\n", it.gguf.c_str(), type_name(it.type), sec, human(it.nbytes).c_str());
     }
     w.close();
     partial.armed = false;
@@ -2144,10 +2212,10 @@ void bench(const Catalog & cat, const Hyp & h, const Recipe & r, const std::vect
         logf("WARNING: bench synthesized a uniform importance row. %s\n", kTestNote);
     }
     if (type_needs_imatrix(r.experts) && !im0) {
-        die("bench needs an imatrix for " + std::string(ggml_type_name(r.experts)));
+        die("bench needs an imatrix for " + std::string(type_name(r.experts)));
     }
     std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
-    const size_t row_q = ggml_row_size(r.experts, n_in);
+    const size_t row_q = row_size(r.experts, n_in);
     std::vector<uint8_t> q(row_q * static_cast<size_t>(n_out));
     int done = 0;
     uint64_t logical = 0;
@@ -2180,7 +2248,7 @@ void bench(const Catalog & cat, const Hyp & h, const Recipe & r, const std::vect
     }
     const double bps = static_cast<double>(logical) / sec;
     logf("bench layer %d -> blk.%d  %s  experts %d  logical f32 %s  %.2fs  %.3f GB/s\n",
-         layer, out_i, ggml_type_name(r.experts), done, human(logical).c_str(), sec, bps / 1e9);
+         layer, out_i, type_name(r.experts), done, human(logical).c_str(), sec, bps / 1e9);
     const double n_moe = static_cast<double>(h.n_layer - h.n_dense);
     const double expert_params = n_moe * h.n_expert * 3.0 * h.n_ff_exp * h.n_embd;
     const double expert_f32 = expert_params * 4.0;
@@ -2314,7 +2382,342 @@ int run_mmproj(const Options & opt) {
 }
 
 bool need_recipe(const Options & opt) {
-    return opt.dry_run || opt.bench || !opt.out.empty() || !opt.write_imatrix.empty();
+    return opt.dry_run || opt.bench || !opt.out.empty() || !opt.write_imatrix.empty() || opt.tq_eval_layer >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// --tq-eval: the format comparison on one real MoE layer of this checkpoint.
+//
+// Per expert it dequantizes gate/up/down to f32 (the shipped NVFP4/MXFP8 path), optionally folds them with the
+// Hadamard rotation of a recipe, then encodes, decodes and measures:
+//   * relative L2 of the reconstruction, plain and with the imatrix as a per-128-block weight,
+//   * the down projection's output error on the layer's real activations (the dumps' `hidden` rows are exactly
+//     what ffn_down_exps is applied to).
+// Formats: the placeholder TQ2_T encoder, the Viterbi TQ2_T/TQK6/TQK7 encoders, and IQ2_XS / IQ3_XXS through
+// ggml.  Encode time is measured per format, so the run doubles as the throughput benchmark.
+
+struct Npy {
+    std::vector<float> v;
+    int64_t rows = 0, cols = 0;
+    bool ok = false;
+};
+
+/// Minimal reader for the '<f4' little-endian, C-order arrays the reference dumper writes.
+Npy read_npy_f32(const fs::path & p) {
+    Npy a;
+    std::FILE * f = std::fopen(p.string().c_str(), "rb");
+    if (!f) return a;
+    char magic[8] = {};
+    if (std::fread(magic, 1, 8, f) != 8) { std::fclose(f); return a; }
+    unsigned short hlen = 0;
+    if (std::fread(&hlen, 2, 1, f) != 1) { std::fclose(f); return a; }
+    std::string hdr((size_t) hlen, '\0');
+    if (std::fread(hdr.data(), 1, hlen, f) != hlen) { std::fclose(f); return a; }
+    const auto sp = hdr.find("'shape': (");
+    const auto ep = hdr.find(')', sp == std::string::npos ? 0 : sp);
+    if (sp == std::string::npos || ep == std::string::npos || hdr.find("<f4") == std::string::npos) {
+        std::fclose(f);
+        return a;
+    }
+    std::string dims = hdr.substr(sp + 10, ep - sp - 10);
+    for (char & c : dims) {
+        if (c == ',') c = ' ';
+    }
+    std::istringstream ss(dims);
+    int64_t d0 = 1, d1 = 1;
+    ss >> d0;
+    if (!(ss >> d1)) d1 = 1;
+    a.rows = d0;
+    a.cols = d1;
+    a.v.resize((size_t) (d0 * d1));
+    a.ok = std::fread(a.v.data(), sizeof(float), a.v.size(), f) == a.v.size();
+    std::fclose(f);
+    return a;
+}
+
+double ss2(const float * a, const float * w, int64_t n, int64_t wlen = 0) {
+    double s = 0;
+    const int64_t m = wlen > 0 ? wlen : n;
+    for (int64_t i = 0; i < n; ++i) s += (w ? (double) w[i % m] : 1.0) * (double) a[i] * a[i];
+    return s;
+}
+
+double sse_w(const float * a, const float * b, const float * w, int64_t n, int64_t wlen = 0) {
+    double s = 0;
+    const int64_t m = wlen > 0 ? wlen : n;
+    for (int64_t i = 0; i < n; ++i) {
+        const double e = (double) a[i] - (double) b[i];
+        s += (w ? (double) w[i % m] : 1.0) * e * e;
+    }
+    return s;
+}
+
+/// Decodes a whole quantized tensor: the trellis types through the encoder module (the format's definition), every
+/// other type through ggml's to_float.
+void decode_any(ggml_type type, const uint8_t * q, int64_t n, float * y) {
+    if (is_tq(type)) {
+        strata::kernels::cpu::tq_decode_row(static_cast<int>(type), q, n, y);
+        return;
+    }
+    const ggml_type_traits * tr = ggml_get_type_traits(type);
+    if (!tr || !tr->to_float) die("no ggml to_float for the decode");
+    tr->to_float(q, y, n);
+}
+
+/// The upstream TQ2_T PLACEHOLDER encoder (agentionai/llama.cpp quantize_row_tq2_t_ref, MIT): greedy coordinate
+/// descent over the 32 path bytes, four sweeps, then a least-squares scale.  This is the encoder the fork ships;
+/// the comparison is "Viterbi vs what the format's own reference encoder produces".
+void placeholder_encode_row(const float * x, int64_t n, uint8_t * out) {
+    const float * lut = strata::kernels::cpu::tq_codebook();
+    auto val = [lut](uint32_t i) { return lut[i]; };
+    auto hyb = [](uint32_t e) {
+        const uint32_t x32 = ((e >> 1) & 0x7fffu) * 0x9e3779b1u;
+        return (e & 1) ? ((x32 >> 10) & 2047u) : (x32 >> 21);
+    };
+    auto step_err = [&](const float * y, int t, uint32_t a, uint32_t b) {
+        const uint32_t s = (a << 8) | b;
+        float err = 0.f;
+        for (int k = 0; k < 2; ++k) {
+            const uint32_t idx = hyb(2 * s + (uint32_t) k);
+            const float dx = y[4 * t + 2 * k + 0] - val(2 * idx + 0);
+            const float dy = y[4 * t + 2 * k + 1] - val(2 * idx + 1);
+            err += dx * dx + dy * dy;
+        }
+        return err;
+    };
+    for (int64_t blk = 0; blk < n / 128; ++blk) {
+        const float * xb = x + blk * 128;
+        uint8_t * qs = out + (size_t) blk * 34 + 2;
+        std::memset(out + (size_t) blk * 34, 0, 34);
+        float sumsq = 0.f;
+        for (int j = 0; j < 128; ++j) sumsq += xb[j] * xb[j];
+        if (!(sumsq > 0.f)) continue;
+        const float rms = std::sqrt(sumsq / 128.0f);
+        float yn[128];
+        for (int j = 0; j < 128; ++j) yn[j] = xb[j] / rms;
+        std::memset(qs, 0, 32);
+        for (int pass = 0; pass < 4; ++pass) {
+            for (int t = 0; t < 32; ++t) {
+                const uint32_t prev = qs[(t + 31) % 32];
+                const uint32_t next = qs[(t + 1) % 32];
+                float best = INFINITY;
+                uint32_t best_c = 0;
+                for (uint32_t c = 0; c < 256; ++c) {
+                    const float e = step_err(yn, t, prev, c) + step_err(yn, (t + 1) % 32, c, next);
+                    if (e < best) {
+                        best = e;
+                        best_c = c;
+                    }
+                }
+                qs[t] = (uint8_t) best_c;
+            }
+        }
+        float sxc = 0.f, scc = 0.f;
+        for (int t = 0; t < 32; ++t) {
+            const uint32_t s = ((uint32_t) qs[(t + 31) % 32] << 8) | qs[t];
+            for (int j = 0; j < 4; ++j) {
+                const float c = val(2 * hyb(2 * s + (uint32_t) (j >> 1)) + (uint32_t) (j & 1));
+                sxc += xb[4 * t + j] * c;
+                scc += c * c;
+            }
+        }
+        float d = scc > 0.f ? sxc / scc : rms;
+        uint16_t dh = 0;
+        ggml_fp32_to_fp16_row(&d, (ggml_fp16_t *) &dh, 1);
+        out[(size_t) blk * 34 + 0] = (uint8_t) (dh & 0xff);
+        out[(size_t) blk * 34 + 1] = (uint8_t) (dh >> 8);
+    }
+}
+
+void tq_eval(const Catalog & cat, const Hyp & h, const Recipe & r, const Imp * imp, const Options & opt,
+             int threads) {
+    const int layer = opt.tq_eval_layer;
+    if (layer < 0 || layer >= h.n_layer) die("--tq-eval needs a layer in the model");
+    if (!h.is_moe(layer)) die("--tq-eval needs a MoE layer");
+    const int nexp = opt.tq_eval_experts > 0 ? std::min(opt.tq_eval_experts, h.n_expert) : h.n_expert;
+    const int eval_expert = opt.tq_eval_expert >= 0 ? opt.tq_eval_expert : 0;
+    const int64_t n_in = h.n_embd, n_ff = h.n_ff_exp;
+    const int rotb = std::getenv("MMQ_TQ_NOROT") ? 0 : r.hadamard_block;
+    std::vector<float> sgu, sdn;
+    if (rotb > 0) {
+        sgu = strata::kernels::cpu::tq_hadamard_signs((int) n_in, 0x5a17u + (uint32_t) n_in);
+        sdn = strata::kernels::cpu::tq_hadamard_signs((int) n_ff, 0x5a17u + (uint32_t) n_ff);
+    }
+    logf("tq-eval layer %d, %d of %d experts, hadamard block %d, %d threads\n", layer, nexp, h.n_expert, rotb,
+         threads);
+
+    struct Fmt {
+        const char * name;
+        ggml_type type;
+        int enc;   // 0 = upstream TQ2_T placeholder, 1 = Viterbi (CPU), 3 = Viterbi (CUDA), 2 = ggml
+    };
+    const std::vector<Fmt> fmts = [] {
+        std::vector<Fmt> f = {
+            {"TQ2_T-greedy", (ggml_type) 144, 0},
+            {"TQ2_T-cpu", (ggml_type) 144, 1},
+            {"TQK6", (ggml_type) 145, 1},
+            {"TQK7", (ggml_type) 146, 1},
+            {"IQ2_XS", GGML_TYPE_IQ2_XS, 2},
+            {"IQ3_XXS", GGML_TYPE_IQ3_XXS, 2},
+        };
+        if (std::getenv("MMQ_TQ_EVAL_CUDA")) f.insert(f.begin() + 2, Fmt{"TQ2_T-cuda", (ggml_type) 144, 3});
+        return f;
+    }();
+    struct Acc {
+        double wnum = 0, wden = 0, num = 0, den = 0, out_num = 0, out_den = 0, sec = 0;
+        int64_t weights = 0;
+    };
+    std::vector<Acc> acc(fmts.size());
+
+    Npy hidden;
+    if (!opt.tq_eval_dumps.empty()) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "expert_%03d_hidden.npy", eval_expert);
+        const fs::path p = fs::path(opt.tq_eval_dumps) / buf;
+        hidden = read_npy_f32(p);
+        if (hidden.ok && hidden.cols == n_ff) {
+            logf("activations %s: %lld tokens x %lld (the down projection's real input)\n", p.string().c_str(),
+                 (long long) hidden.rows, (long long) hidden.cols);
+        } else {
+            if (hidden.ok) logf("WARNING: %s no %lld-column rows\n", p.string().c_str(), (long long) n_ff);
+            hidden.ok = false;
+        }
+    }
+
+    std::vector<float> w1((size_t) (n_ff * n_in)), w3(w1.size()), w2((size_t) (n_in * n_ff));
+    std::vector<float> wq1(w1.size()), wq3(w1.size()), wq2(w2.size());
+    std::vector<uint8_t> q1, q3, q2;
+
+
+    const int64_t rows_g = opt.tq_eval_rows > 0 ? std::min<int64_t>(opt.tq_eval_rows, n_ff) : n_ff;
+    const int64_t rows_d = opt.tq_eval_rows > 0 ? std::min<int64_t>(opt.tq_eval_rows, n_in) : n_in;
+    if (rows_g < n_ff) logf("only the first %lld rows of gate/up (%lld) and %lld of down (%lld)\n",
+                            (long long) rows_g, (long long) n_ff, (long long) rows_d, (long long) n_in);
+
+    for (int e = 0; e < nexp; ++e) {
+        const std::string base = layer_base(layer) + ".block_sparse_moe.experts." + std::to_string(e);
+        Weight g = resolve_weight(cat, base + ".w1", false);
+        Weight u = resolve_weight(cat, base + ".w3", false);
+        Weight d = resolve_weight(cat, base + ".w2", false);
+        if (!g.val || !u.val || !d.val) die("tq-eval: expert " + std::to_string(e) + " is missing a weight");
+        const bool trace = std::getenv("MMQ_TQ_EVAL_TRACE") != nullptr;
+        if (trace) logf("expert %d: dequant\n", e);
+        bind_shape(g, n_in, n_ff, base + ".w1");
+        bind_shape(u, n_in, n_ff, base + ".w3");
+        bind_shape(d, n_ff, n_in, base + ".w2");
+        dequant_rows(g, 0, n_ff, n_in, w1.data(), 0.f, threads);
+        dequant_rows(u, 0, n_ff, n_in, w3.data(), 0.f, threads);
+        dequant_rows(d, 0, n_in, n_ff, w2.data(), 0.f, threads);
+        if (rotb > 0) {
+            for (int64_t i = 0; i < n_ff; ++i) {
+                strata::kernels::cpu::tq_hadamard_rotate(w1.data() + i * n_in, n_in, rotb, sgu.data());
+                strata::kernels::cpu::tq_hadamard_rotate(w3.data() + i * n_in, n_in, rotb, sgu.data());
+            }
+            for (int64_t i = 0; i < n_in; ++i) {
+                strata::kernels::cpu::tq_hadamard_rotate(w2.data() + i * n_ff, n_ff, rotb, sdn.data());
+            }
+        }
+        const std::string gname = "blk." + std::to_string(layer) + ".ffn_gate_exps.weight";
+        const std::string dname = "blk." + std::to_string(layer) + ".ffn_down_exps.weight";
+        const float * img = imp ? imp->at(gname, n_in, h.n_expert, e) : nullptr;
+        const float * imd = imp ? imp->at(dname, n_ff, h.n_expert, e) : nullptr;
+        if (std::getenv("MMQ_TQ_EVAL_TRACE") && img && imd) {
+            float lo = img[0], hi = img[0];
+            double s = 0;
+            for (int64_t i = 0; i < n_in; ++i) {
+                lo = std::min(lo, img[i]);
+                hi = std::max(hi, img[i]);
+                s += img[i];
+            }
+            logf("imatrix gate: min %.6g max %.6g mean %.6g\n", lo, hi, s / n_in);
+        }
+
+        for (size_t fi = 0; fi < fmts.size(); ++fi) {
+            const Fmt & f = fmts[fi];
+            if (f.enc == 2 && (!img || !imd)) die("IQ2_XS / IQ3_XXS need --imatrix");
+            if (f.enc == 3 && !strata::kernels::tq_encode_cuda_supported(144)) continue;
+            if (trace) logf("  fmt %s encode (%lld x %lld, %lld x %lld)\n", f.name, (long long) rows_g,
+                            (long long) n_in, (long long) rows_d, (long long) n_ff);
+            q1.resize(row_size(f.type, n_in) * (size_t) rows_g);
+            q3.resize(q1.size());
+            q2.resize(row_size(f.type, n_ff) * (size_t) rows_d);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (f.enc == 0) {
+                placeholder_encode_row(w1.data(), rows_g * n_in, q1.data());
+                placeholder_encode_row(w3.data(), rows_g * n_in, q3.data());
+                placeholder_encode_row(w2.data(), rows_d * n_ff, q2.data());
+            } else if (f.enc == 1) {
+                quantize_rows(f.type, w1.data(), q1.data(), rows_g, n_in, img, threads);
+                quantize_rows(f.type, w3.data(), q3.data(), rows_g, n_in, img, threads);
+                quantize_rows(f.type, w2.data(), q2.data(), rows_d, n_ff, imd, threads);
+            } else if (f.enc == 3) {
+                if (!strata::kernels::tq_encode_rows_cuda(144, w1.data(), img, true, rows_g, n_in, 2, q1.data()) ||
+                    !strata::kernels::tq_encode_rows_cuda(144, w3.data(), img, true, rows_g, n_in, 2, q3.data()) ||
+                    !strata::kernels::tq_encode_rows_cuda(144, w2.data(), imd, true, rows_d, n_ff, 2, q2.data())) {
+                    die("the CUDA trellis encoder failed");
+                }
+            } else {
+                quantize_rows(f.type, w1.data(), q1.data(), rows_g, n_in, img, threads);
+                quantize_rows(f.type, w3.data(), q3.data(), rows_g, n_in, img, threads);
+                quantize_rows(f.type, w2.data(), q2.data(), rows_d, n_ff, imd, threads);
+            }
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (trace) logf("    %s done in %.2fs\n", f.name, sec);
+
+            decode_any(f.type, q1.data(), rows_g * n_in, wq1.data());
+            decode_any(f.type, q3.data(), rows_g * n_in, wq3.data());
+            decode_any(f.type, q2.data(), rows_d * n_ff, wq2.data());
+
+            Acc & a = acc[fi];
+            a.sec += sec;
+            a.weights += (int64_t) (rows_g * n_in * 2 + rows_d * n_ff);
+            a.wnum += sse_w(w1.data(), wq1.data(), img, rows_g * n_in, n_in) +
+                      sse_w(w3.data(), wq3.data(), img, rows_g * n_in, n_in) +
+                      sse_w(w2.data(), wq2.data(), imd, rows_d * n_ff, n_ff);
+            a.wden += ss2(w1.data(), img, rows_g * n_in, n_in) + ss2(w3.data(), img, rows_g * n_in, n_in) +
+                      ss2(w2.data(), imd, rows_d * n_ff, n_ff);
+            a.num += sse_w(w1.data(), wq1.data(), nullptr, rows_g * n_in) +
+                     sse_w(w3.data(), wq3.data(), nullptr, rows_g * n_in) +
+                     sse_w(w2.data(), wq2.data(), nullptr, rows_d * n_ff);
+            a.den += ss2(w1.data(), nullptr, rows_g * n_in) + ss2(w3.data(), nullptr, rows_g * n_in) +
+                     ss2(w2.data(), nullptr, rows_d * n_ff);
+
+            if (hidden.ok && e == eval_expert) {
+                std::vector<float> yref((size_t) (hidden.rows * n_in)), yq(yref.size());
+                std::vector<float> x((size_t) n_ff);
+                for (int64_t t = 0; t < hidden.rows; ++t) {
+                    std::memcpy(x.data(), hidden.v.data() + (size_t) (t * n_ff), (size_t) n_ff * sizeof(float));
+                    if (rotb > 0) strata::kernels::cpu::tq_hadamard_rotate(x.data(), n_ff, rotb, sdn.data());
+                    for (int64_t o = 0; o < rows_d; ++o) {
+                        double s0 = 0, s1 = 0;
+                        const float * r0 = w2.data() + o * n_ff;
+                        const float * r1 = wq2.data() + o * n_ff;
+                        for (int64_t k = 0; k < n_ff; ++k) {
+                            s0 += (double) r0[k] * x[(size_t) k];
+                            s1 += (double) r1[k] * x[(size_t) k];
+                        }
+                        yref[(size_t) (t * rows_d + o)] = (float) s0;
+                        yq[(size_t) (t * rows_d + o)] = (float) s1;
+                    }
+                }
+                a.out_num += sse_w(yref.data(), yq.data(), nullptr, (int64_t) yref.size());
+                a.out_den += ss2(yref.data(), nullptr, (int64_t) yref.size());
+            }
+        }
+        if ((e + 1) % 8 == 0 || e + 1 == nexp) logf("  expert %d/%d\n", e + 1, nexp);
+    }
+
+
+    std::printf("\n  format         bpw   relL2  relL2(im)  downOut  encode Mw/s\n");
+    for (size_t fi = 0; fi < fmts.size(); ++fi) {
+        const Acc & a = acc[fi];
+        const double bpw = 8.0 * (double) row_size(fmts[fi].type, 128) / 128.0;
+        std::printf("  %-12s %5.3f  %6.4f    %6.4f  %7.4f  %9.3f\n", fmts[fi].name, bpw,
+                    std::sqrt(a.num / (a.den > 0 ? a.den : 1)), std::sqrt(a.wnum / (a.wden > 0 ? a.wden : 1)),
+                    a.out_den > 0 ? std::sqrt(a.out_num / a.out_den) : 0.0,
+                    a.sec > 0 ? (double) a.weights / a.sec / 1e6 : 0.0);
+    }
+    std::printf("\n");
 }
 
 }  // namespace
@@ -2381,7 +2784,7 @@ int run(const Options & opt) {
                 die("this part has no tensors");
             }
             logf("recipe %s  experts %s  down %s  file_type %u  imatrix %s  layers %zu  tensors %zu\n",
-                 recipe.name.c_str(), ggml_type_name(recipe.experts), ggml_type_name(recipe.ffn_down),
+                 recipe.name.c_str(), type_name(recipe.experts), type_name(recipe.ffn_down),
                  recipe.file_type, recipe.require_imatrix ? "required" : "optional", sel.size(), items.size());
             if (opt.split_count >= 2) {
                 logf("split part %d/%d  globals %s  split.tensors.count %d\n", opt.split_part, opt.split_count,
@@ -2401,7 +2804,7 @@ int run(const Options & opt) {
             write_test_imatrix(opt.write_imatrix, items);
         }
 
-        const bool need_weights = opt.nvfp4_check || !opt.dump_name.empty() || opt.bench || !opt.out.empty();
+        const bool need_weights = opt.nvfp4_check || !opt.dump_name.empty() || opt.bench || !opt.out.empty() || opt.tq_eval_layer >= 0;
         Catalog cat;
         if (need_weights) {
             std::vector<std::string> needles;
@@ -2442,6 +2845,9 @@ int run(const Options & opt) {
         if (opt.bench) {
             bench(cat, h, recipe, sel, imp, opt, threads);
         }
+        if (opt.tq_eval_layer >= 0) {
+            tq_eval(cat, h, recipe, imp, opt, threads);
+        }
         if (!opt.out.empty()) {
             Options wopt = opt;
             wopt.split_tensors = split_tensors;
@@ -2452,8 +2858,8 @@ int run(const Options & opt) {
             rc = run_mmproj(opt);
         }
         if (!opt.dry_run && opt.out.empty() && opt.write_imatrix.empty() && opt.dump_name.empty() && !opt.bench &&
-            !opt.nvfp4_check && opt.mmproj_out.empty()) {
-            die("nothing to do: pass --out, --dry-run, --bench, --nvfp4-check, --dump-dequant, --write-test-imatrix, or --mmproj");
+            !opt.nvfp4_check && opt.mmproj_out.empty() && opt.tq_eval_layer < 0) {
+            die("nothing to do: pass --out, --dry-run, --bench, --nvfp4-check, --dump-dequant, --write-test-imatrix, --mmproj or --tq-eval");
         }
         return rc;
     } catch (const std::exception & e) {

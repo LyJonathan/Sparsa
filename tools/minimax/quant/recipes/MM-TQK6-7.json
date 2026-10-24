@@ -1,0 +1,20 @@
+{
+  "name": "MM-TQK6-7",
+  "file_type": 31,
+  "require_imatrix": true,
+  "hadamard_block": 128,
+  "dynamic_down": false,
+  "types": {
+    "experts": "TQK6",
+    "ffn_down_exps": "TQK7",
+    "hot_experts": "TQK7",
+    "attention": "Q6_K",
+    "indexer": "Q8_0",
+    "dense_ffn": "Q6_K",
+    "shared_experts": "Q6_K",
+    "router": "F32",
+    "norms": "F32",
+    "token_embd": "Q4_K",
+    "output": "Q6_K"
+  }
+}

@@ -48,6 +48,9 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
+#include "strata/kernels/cpu/tq_encode.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -122,6 +125,10 @@ struct Layer {
     std::vector<int32_t> ram_of;
     std::vector<int32_t> ram_expert_of;   // slot -> expert
     std::vector<uint64_t> ram_tick;
+    // APR trellis: this layer's routed experts are stored in a Hadamard-rotated basis (strata.hadamard.*), so the
+    // gate/up input and the down input must be rotated before the expert matmul.
+    bool gu_had = false;
+    bool down_had = false;
 };
 
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
@@ -272,10 +279,20 @@ size_t gpu_bytes(const Tensor& t) {
     return std::numeric_limits<size_t>::max();
 }
 
+// The trellis expert formats (TQ2_T 144, TQK6 145, TQK7 146).  Declared here because the decode and the row size
+// below need them, defined with the other type predicates.
+bool tq_expert_type(int t);
+size_t trellis_block_bytes(int t);
+size_t row_bytes_of(int t, int64_t n);
+
 void decode_f32(const Tensor& t, const uint8_t* src, float* dst, int64_t n) {
     // ggml leaves F32's to_float null; the bytes already are the floats.
     if (t.type == kF32) {
         std::memcpy(dst, src, (size_t)n * sizeof(float));
+        return;
+    }
+    if (tq_expert_type(t.type)) {
+        strata::kernels::cpu::tq_decode_row(t.type, src, n, dst);
         return;
     }
     if (!t.base || !t.base->to_float) fail(t.name + ": ggml has no to_float for type " + std::to_string(t.type));
@@ -339,6 +356,19 @@ bool finite_row(const float* x, int n) {
 
 bool raw_expert_type(int t) { return t == kF32 || t == kF16 || t == kBF16; }
 bool iq_expert_type(int t) { return t == 8 || strata::kernels::iq_supported(t); }
+
+// The trellis expert formats (TQ2_T 144, TQK6 145, TQK7 146, third_party/ggml/ggml-common-tq.h).  ggml has no
+// table entry for them, so the row size and every decode goes through the Strata trellis kernels.
+bool tq_expert_type(int t) { return t >= 144 && t <= 146; }
+
+size_t trellis_block_bytes(int t) { return (size_t) (2 + 4 * (t == 144 ? 8 : t == 145 ? 6 : 7)); }
+
+/// Bytes per row of `n` weights: ggml's table for a known type, the trellis layout for 144-146.
+size_t row_bytes_of(int t, int64_t n) {
+    if (!tq_expert_type(t)) return ggml_row_size((ggml_type) t, n);
+    if (n % 128 != 0) fail("a trellis expert row must be a multiple of 128 weights");
+    return (size_t) (n / 128) * trellis_block_bytes(t);
+}
 
 // Available physical memory, for the automatic pinned-tier budget.
 size_t host_available_bytes() {
@@ -487,6 +517,11 @@ struct Engine::Impl {
     std::mt19937_64 rng{0};
     Pool pool;
 
+    // ---- APR trellis (Hadamard-folded routed experts): strata.hadamard.block + a sign vector per folded width
+    int had_block = 0;
+    std::vector<float> had_gu, had_dn;        // sign vectors (host) for the gate/up width and the down width
+    std::vector<float> had_tmp, had_tmp2;     // activation scratch: rotated gate/up input, rotated down input
+
     // ---- P3 expert tiers
     bool tiers_on = false;
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
@@ -543,6 +578,7 @@ struct Engine::Impl {
         load_tensors();
         decide_norm();
         build_layers();
+        read_hadamard();
         read_eos();
 
         threads = opt.cpu_threads;
@@ -609,15 +645,17 @@ struct Engine::Impl {
         t.shard = shard;
         t.file_offset = model.shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
-        t.row_bytes = ggml_row_size((ggml_type)t.type, t.ne0);
+        t.row_bytes = row_bytes_of(t.type, t.ne0);
         if (t.row_bytes == 0 || t.row_bytes * (size_t)t.ne1 * (size_t)t.ne2 != t.bytes)
             fail(name + ": row size does not match the GGUF payload (type " + std::to_string(t.type) + ")");
-        t.base = ggml_get_type_traits((ggml_type)t.type);
-        t.cpu = ggml_get_type_traits_cpu((ggml_type)t.type);
-        if (!t.base) fail(name + ": ggml has no type traits for type " + std::to_string(t.type));
-        if (t.type != kF32 && !t.base->to_float)
-            fail(name + ": no ggml to_float for type " + std::to_string(t.type));
-        ggml_quantize_init((ggml_type)t.type);
+        if (!tq_expert_type(t.type)) {
+            t.base = ggml_get_type_traits((ggml_type)t.type);
+            t.cpu = ggml_get_type_traits_cpu((ggml_type)t.type);
+            if (!t.base) fail(name + ": ggml has no type traits for type " + std::to_string(t.type));
+            if (t.type != kF32 && !t.base->to_float)
+                fail(name + ": no ggml to_float for type " + std::to_string(t.type));
+            ggml_quantize_init((ggml_type)t.type);
+        }
         if (t.cpu && t.cpu->vec_dot_type != (ggml_type)t.type) ggml_quantize_init(t.cpu->vec_dot_type);
         return t;
     }
@@ -748,6 +786,40 @@ struct Engine::Impl {
             }
         }
         out_norm = norm_vec(must("output_norm.weight"));
+    }
+
+    /// strata.hadamard.*: the routed experts of these layers are stored as W' = W diag(signs) H_b^T per block of
+    /// `block` input columns, so the runtime must apply y = H_b (signs * x) to the gate/up input and to the down
+    /// input.  A file that says so and cannot be rotated must not run, hence the hard failure on a bad record.
+    void read_hadamard() {
+        const MetaValue* b = model.meta().get("strata.hadamard.block");
+        if (!b || !b->is_num()) return;
+        had_block = (int) b->num();
+        if (had_block < 2 || (had_block & (had_block - 1))) fail("strata.hadamard.block is not a power of two >= 2");
+        auto read_signs = [&](int width, std::vector<float>& out) {
+            const MetaValue* v = model.meta().get("strata.hadamard.signs." + std::to_string(width));
+            if (!v || v->type != MetaType::ARRAY) fail("a Hadamard-folded pack has no sign vector for width " + std::to_string(width));
+            if ((int64_t) v->items.size() != width) fail("strata.hadamard.signs." + std::to_string(width) + " has the wrong length");
+            if (width % had_block != 0) fail("a Hadamard sign width is not whole blocks");
+            out.resize((size_t) width);
+            for (int i = 0; i < width; ++i) out[(size_t) i] = v->items[(size_t) i].num() > 0 ? 1.f : -1.f;
+        };
+        read_signs((int) cfg.n_embd, had_gu);
+        if (cfg.n_ff_exp % 128 != 0) fail("a Hadamard-folded pack needs an expert width that is whole 128-blocks");
+        read_signs((int) cfg.n_ff_exp, had_dn);
+        const MetaValue* roles = model.meta().get("strata.hadamard.roles");
+        if (!roles || roles->type != MetaType::ARRAY) fail("a Hadamard-folded pack has no strata.hadamard.roles");
+        had_tmp.resize((size_t) bigger(cfg.n_embd, cfg.n_ff_exp));
+        had_tmp2.resize(had_tmp.size());
+        for (auto& L : layers) L.gu_had = L.down_had = false;
+        for (size_t i = 0; i < layers.size() && i < roles->items.size(); ++i) {
+            const int bits = (int) roles->items[i].num();
+            layers[i].gu_had = (bits & 3) == 3;
+            layers[i].down_had = (bits & 4) != 0;
+        }
+        int folded = 0;
+        for (const auto& L : layers) folded += L.gu_had ? 1 : 0;
+        std::fprintf(stderr, "INFO minimax: Hadamard-folded routed experts, block %d, %d layers\n", had_block, folded);
     }
 
     void read_eos() {
@@ -1191,14 +1263,19 @@ struct Engine::Impl {
         const int gt = L.egate.type, dt = L.edown.type;
         const bool iq = iq_expert_type(gt) && iq_expert_type(dt);
         const bool raw = raw_expert_type(gt) && raw_expert_type(dt);
+        const float* xin = rotate_gu(L, in);
         if (iq) {
             if (cfg.n_embd % 32 != 0 || cfg.n_ff_exp % 32 != 0)
                 fail("the GPU IQ expert path needs rounded 32-wide activations");
-            cu::copy_h2d(d_x.p, in, (size_t)n_embd * sizeof(float));
+            cu::copy_h2d(d_x.p, xin, (size_t)n_embd * sizeof(float));
             strata::kernels::quantize_q8_1_rows((const float*)d_x.p, 1, n_embd, d_ex_xq.p, nullptr);
             strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k,
                                             n_embd, n_ff, L.egate.row_bytes, d_ex_xq.p, (float*)d_ex_h.p, alpha, limit,
                                             nullptr);
+            if (L.down_had) {
+                strata::kernels::hadamard_rows((const float*)d_ex_h.p, (float*)d_ex_h.p, k, n_ff, had_block,
+                                               strata::kernels::hadamard_device_signs(had_dn.data(), n_ff), nullptr);
+            }
             strata::kernels::quantize_q8_1_rows((const float*)d_ex_h.p, k, n_ff, d_ex_hq.p, nullptr);
             strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
                                               L.edown.row_bytes, d_ex_hq.p, (float*)d_ex_out.p, nullptr);
@@ -1206,7 +1283,7 @@ struct Engine::Impl {
         } else if (raw) {
             if (gt != dt)
                 fail("the GPU F32/F16/BF16 expert path needs the same type for gate/up and down");
-            cu::copy_h2d(d_x.p, in, (size_t)n_embd * sizeof(float));
+            cu::copy_h2d(d_x.p, xin, (size_t)n_embd * sizeof(float));
             cu::moe_expert_f16(gt, (const void* const*)ptr, (const void* const*)(ptr + top),
                                (const void* const*)(ptr + 2 * top), k, n_embd, n_ff, L.egate.row_bytes,
                                L.edown.row_bytes, (const float*)d_x.p, (float*)d_ex_h.p, (float*)d_ex_out.p, alpha,
@@ -1315,6 +1392,7 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         std::vector<const CpuExpert*> cpu_of((size_t)cfg.n_expert, nullptr);
         for (const CpuExpert& c : cpu) cpu_of[(size_t)c.e] = &c;
+        const float* xin = rotate_gu(L, in);
         size_t gi = 0;
         for (int j = 0; j < top; ++j) {
             const int e = order[(size_t)j];
@@ -1325,7 +1403,8 @@ struct Engine::Impl {
             } else {
                 const CpuExpert* c = cpu_of[(size_t)e];
                 if (!c) fail("internal: routed expert has no source");
-                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, in, ye.data(), (int)cfg.n_ff_exp);
+                mlp_ptr(L.egate, c->gate, L.eup, c->up, L.edown, c->down, xin, ye.data(), (int)cfg.n_ff_exp,
+                        L.down_had);
             }
             const float WJ = w[(size_t)j];
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
@@ -1475,6 +1554,20 @@ struct Engine::Impl {
             });
             return;
         }
+        if (tq_expert_type(t.type)) {
+            // trellis experts: the shipped decode-and-dot kernel (tq_rows), one Q8_0 activation
+            const strata::kernels::cpu::TqIsa isa = strata::kernels::cpu::tq_isa();
+            std::vector<uint8_t> aq(ggml_row_size(GGML_TYPE_Q8_0, cols));
+            const ggml_type_traits_cpu* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+            if (!q8 || !q8->from_float) fail("no Q8_0 activation quantizer for the trellis path");
+            q8->from_float(xin, aq.data(), cols);
+            const void* a[1] = {aq.data()};
+            float* o[1] = {yout};
+            pool.run(rows_n, [&](int a0, int b0) {
+                strata::kernels::cpu::tq_rows(isa, t.type, base, t.row_bytes, (int)cols, a, 1, o, a0, b0);
+            });
+            return;
+        }
         if (!t.cpu || !t.cpu->vec_dot) fail(t.name + ": ggml-cpu has no vec_dot for type " + std::to_string(t.type));
         const ggml_type_traits_cpu* act = ggml_get_type_traits_cpu(t.cpu->vec_dot_type);
         if (!act || !act->from_float) fail(t.name + ": no from_float for the expert activation");
@@ -1505,21 +1598,47 @@ struct Engine::Impl {
     }
 
     void mlp(const Tensor& gate, const Tensor& up, const Tensor& down, int64_t expert, const float* in, float* yout,
-             int ff) {
+             int ff, bool rot_down = false) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         apply(gate, expert, in, ff_g.data(), ff, (int)gate.ne0);
         apply(up, expert, in, ff_u.data(), ff, (int)up.ne0);
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
+        if (rot_down) {
+            std::memcpy(had_tmp2.data(), ff_h.data(), (size_t)ff * sizeof(float));
+            strata::kernels::cpu::hadamard_rotate(had_tmp2.data(), ff, had_block, had_dn.data());
+            apply(down, expert, had_tmp2.data(), yout, (int)down.ne1, ff);
+            return;
+        }
         apply(down, expert, ff_h.data(), yout, (int)down.ne1, ff);
+    }
+
+    // APR trellis: the gate/up input of a folded layer, rotated (a scratch copy) or the caller's buffer.
+    const float* rotate_gu(const Layer& L, const float* in) {
+        if (!L.gu_had) return in;
+        std::memcpy(had_tmp.data(), in, (size_t)cfg.n_embd * sizeof(float));
+        strata::kernels::cpu::hadamard_rotate(had_tmp.data(), (int)cfg.n_embd, had_block, had_gu.data());
+        return had_tmp.data();
+    }
+    void rotate_down(const Layer& L, float* h, int rows) {
+        if (!L.down_had) return;
+        for (int r = 0; r < rows; ++r)
+            strata::kernels::cpu::hadamard_rotate(h + (size_t)r * cfg.n_ff_exp, (int)cfg.n_ff_exp, had_block,
+                                                  had_dn.data());
     }
 
     // The same MLP from three explicit byte slices (a RAM arena slot or an SSD staging buffer).
     void mlp_ptr(const Tensor& gate, const uint8_t* gb, const Tensor& up, const uint8_t* ub, const Tensor& down,
-                 const uint8_t* db, const float* in, float* yout, int ff) {
+                 const uint8_t* db, const float* in, float* yout, int ff, bool rot_down = false) {
         if ((int)ff_g.size() < ff) fail("MLP wider than the workspace");
         dot_rows_base(gate, gb, in, ff_g.data(), ff, (int)gate.ne0);
         dot_rows_base(up, ub, in, ff_u.data(), ff, (int)up.ne0);
         for (int i = 0; i < ff; ++i) ff_h[i] = swigluoai(ff_g[i], ff_u[i], alpha, limit);
+        if (rot_down) {
+            std::memcpy(had_tmp2.data(), ff_h.data(), (size_t)ff * sizeof(float));
+            strata::kernels::cpu::hadamard_rotate(had_tmp2.data(), ff, had_block, had_dn.data());
+            dot_rows_base(down, db, had_tmp2.data(), yout, (int)down.ne1, ff);
+            return;
+        }
         dot_rows_base(down, db, ff_h.data(), yout, (int)down.ne1, ff);
     }
 
@@ -1557,8 +1676,9 @@ struct Engine::Impl {
         std::fill(yout, yout + cfg.n_embd, 0.f);
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
+        const float* xin = rotate_gu(L, in);
         for (int j = 0; j < top; ++j) {
-            mlp(L.egate, L.eup, L.edown, order[(size_t)j], in, ye.data(), ff);
+            mlp(L.egate, L.eup, L.edown, order[(size_t)j], xin, ye.data(), ff, L.down_had);
             const float WJ = w[(size_t)j];
             for (int64_t i = 0; i < cfg.n_embd; ++i) yout[i] += WJ * ye[(size_t)i];
         }

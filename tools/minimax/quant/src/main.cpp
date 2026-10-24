@@ -56,6 +56,10 @@ void usage() {
         "  --bench                     time expert dequant+quant (no GGUF)\n"
         "  --bench-experts N           default 8\n"
         "  --nvfp4-check               report whether expert scales fold into GGML_TYPE_NVFP4\n"
+        "  --tq-eval LAYER             compare the trellis encoders with IQ2_XS / IQ3_XXS on one MoE layer\n"
+        "  --tq-eval-experts N         experts per format (default 8); --tq-eval-expert E is the activation one\n"
+        "  --tq-eval-dumps DIR         a dump-LNN directory of the reference dumper (down-projection output error)\n"
+        "  --tq-eval-rows N            use the first N rows of each matrix (0 = all)\n"
         "  --mmproj OUT.gguf           F16 vision projector via llama.cpp (skips if shards are absent)\n"
         "  --llama-cpp DIR             llama.cpp tree for --mmproj\n",
         stderr);
@@ -206,6 +210,16 @@ int main(int argc, char ** argv) {
                 opt.bench_experts = std::stoi(val);
             } else if (a == "--nvfp4-check") {
                 opt.nvfp4_check = true;
+            } else if (take(i, argc, argv, "--tq-eval", val)) {
+                opt.tq_eval_layer = std::stoi(val);
+            } else if (take(i, argc, argv, "--tq-eval-experts", val)) {
+                opt.tq_eval_experts = std::stoi(val);
+            } else if (take(i, argc, argv, "--tq-eval-expert", val)) {
+                opt.tq_eval_expert = std::stoi(val);
+            } else if (take(i, argc, argv, "--tq-eval-dumps", val)) {
+                opt.tq_eval_dumps = val;
+            } else if (take(i, argc, argv, "--tq-eval-rows", val)) {
+                opt.tq_eval_rows = std::stoi(val);
             } else if (take(i, argc, argv, "--mmproj", val)) {
                 opt.mmproj_out = val;
             } else if (take(i, argc, argv, "--llama-cpp", val)) {

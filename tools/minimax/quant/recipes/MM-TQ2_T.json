@@ -1,0 +1,20 @@
+{
+  "name": "MM-TQ2_T",
+  "file_type": 20,
+  "require_imatrix": true,
+  "hadamard_block": 128,
+  "dynamic_down": false,
+  "types": {
+    "experts": "TQ2_T",
+    "ffn_down_exps": "TQ2_T",
+    "hot_experts": "TQ2_T",
+    "attention": "Q6_K",
+    "indexer": "Q8_0",
+    "dense_ffn": "Q6_K",
+    "shared_experts": "Q6_K",
+    "router": "F32",
+    "norms": "F32",
+    "token_embd": "Q4_K",
+    "output": "Q6_K"
+  }
+}

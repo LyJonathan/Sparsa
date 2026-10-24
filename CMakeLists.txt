@@ -1627,7 +1627,8 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
+                                           src/kernels/cpu/tq_encode.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
@@ -2165,6 +2166,13 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME tq_cpu_parity COMMAND tq_cpu_parity)
     add_test(NAME tq_cpu_parity_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tq_cpu_parity>)
     set_tests_properties(tq_cpu_parity tq_cpu_parity_avx2 PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # the trellis ENCODER: round trip vs the upstream decoder, vs the shipped tq_rows kernel, vs the placeholder
+    # encoder, and the Hadamard folding convention of the runtime
+    add_executable(tq_encode_parity src/kernels/cpu/tq_encode_parity.cpp)
+    target_link_libraries(tq_encode_parity PRIVATE strata_kernels_cpu)
+    target_include_directories(tq_encode_parity PRIVATE third_party/ggml)
+    add_test(NAME tq_encode_parity COMMAND tq_encode_parity)
+    set_tests_properties(tq_encode_parity PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)

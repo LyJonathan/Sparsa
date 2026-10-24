@@ -41,12 +41,44 @@ if(NOT TARGET ggml-base)
     add_subdirectory("${STRATA_LLAMA_CPP_DIR}/ggml" "${CMAKE_BINARY_DIR}/mm-quant-ggml" EXCLUDE_FROM_ALL)
 endif()
 
+set(STRATA_MMQ_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+get_filename_component(STRATA_MMQ_REPO_ROOT "${STRATA_MMQ_REPO_ROOT}" ABSOLUTE)
+
 add_executable(strata-mm-quant
     src/main.cpp
-    src/convert.cpp)
-target_include_directories(strata-mm-quant PRIVATE src "${STRATA_LLAMA_CPP_DIR}/ggml/include")
+    src/convert.cpp
+    ${STRATA_MMQ_REPO_ROOT}/src/kernels/cpu/tq_encode.cpp)
+target_include_directories(strata-mm-quant PRIVATE
+    src
+    ${STRATA_MMQ_REPO_ROOT}/include
+    ${STRATA_MMQ_REPO_ROOT}/third_party/ggml
+    "${STRATA_LLAMA_CPP_DIR}/ggml/include")
 target_link_libraries(strata-mm-quant PRIVATE ggml-base)
 target_compile_features(strata-mm-quant PRIVATE cxx_std_20)
+
+# The GPU backend of the trellis encoder (TQ2_T): optional, so the tool still builds on a machine without CUDA.
+option(STRATA_MMQ_CUDA "Build the CUDA trellis encoder into strata-mm-quant (needs nvcc)" ON)
+if(STRATA_MMQ_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 17)
+        add_library(mm-tq-cuda STATIC ${STRATA_MMQ_REPO_ROOT}/src/kernels/cuda/tq_encode.cu)
+        target_include_directories(mm-tq-cuda PRIVATE ${STRATA_MMQ_REPO_ROOT}/include ${STRATA_MMQ_REPO_ROOT}/third_party/ggml)
+        if(NOT DEFINED STRATA_CUDA_ARCHS)
+            set(STRATA_CUDA_ARCHS "120" CACHE STRING "CUDA architectures for the trellis encoder")
+        endif()
+        set_target_properties(mm-tq-cuda PROPERTIES CUDA_ARCHITECTURES "${STRATA_CUDA_ARCHS}")
+        target_link_libraries(strata-mm-quant PRIVATE mm-tq-cuda)
+        message(STATUS "strata-mm-quant: CUDA trellis encoder ON (${STRATA_CUDA_ARCHS})")
+    else()
+        message(STATUS "strata-mm-quant: no nvcc, the CUDA trellis encoder is OFF")
+        target_sources(strata-mm-quant PRIVATE src/tq_cuda_stub.cpp)
+    endif()
+else()
+    target_sources(strata-mm-quant PRIVATE src/tq_cuda_stub.cpp)
+endif()
 if(MSVC)
     target_compile_definitions(strata-mm-quant PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()

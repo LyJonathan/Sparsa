@@ -45,6 +45,12 @@ struct Options {
     int bench_experts = 8;
     bool nvfp4_check = false;
     float placeholder_value = 0.02f;
+    // --tq-eval: the trellis format comparison on one real MoE layer
+    int tq_eval_layer = -1;
+    int tq_eval_experts = 8;
+    int tq_eval_expert = 0;
+    int tq_eval_rows = 0;   // 0 = every row of each matrix, else the first N rows (fast TQK6/TQK7 cells)
+    std::filesystem::path tq_eval_dumps;
     std::vector<std::pair<std::string, std::string>> overrides;
 };
 
