@@ -1,12 +1,19 @@
 # Third-party notices
 
-Strata itself is MIT (see `LICENSE`). This file lists the code and data the tree carries from other projects,
-with the notice each one requires. Everything below is MIT, so the notices travel with the copy.
+Sparsa is a fork of Strata and is MIT (see `LICENSE`). This file lists the code the tree carries from
+other projects, with the notice each one requires.
+
+The model files are not part of this repository. MiniMax-M3.1-Flash and its quantized GGUF copies are
+under the [MiniMax Community License](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/blob/main/LICENSE)
+(commercial use requires displaying "Built with MiniMax M3.1-Flash" and notifying api@minimax.io; the
+licence's prohibited uses apply). The GGUF copies on Hugging Face repeat that licence.
 
 ## ggml and llama.cpp
 
-`third_party/ggml/ggml-common.h`, `third_party/ggml/ggml-common-tq.h` and the ggml built from the pinned
-llama.cpp checkout (`third_party/ggml/VERSION.txt`) are from ggml/llama.cpp.
+`third_party/ggml/ggml-common.h`, `third_party/ggml/ggml-common-tq.h` and the ggml built from the
+pinned llama.cpp checkout (`third_party/ggml/VERSION.txt`) are from ggml/llama.cpp. The MiniMax
+engine's CUDA helpers (`src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`) use
+llama.cpp's CUDA MMVQ/MMQ kernels and dequantizers.
 
 ```
 MIT License
@@ -36,9 +43,30 @@ Copyright (c) 2023-2024 The llama.cpp authors
 Copyright (c) 2024-2025 The ik_llama.cpp authors
 ```
 
+## agentionai llama.cpp (trellis types, TQ2_T / TQK6 / TQK7)
+
+`third_party/ggml-tq/` holds the trellis headers of the agentionai ("Gyro") llama.cpp fork: `tq.cuh`
+(derived from the fork's `ggml/src/ggml-cuda/tq.cuh`) and `tq-mmq-tiles.cuh` (its
+`mmq-load-tiles.cuh` trellis loader, unchanged), which `cmake/strata_ggml_tq_overlay.cmake` adds to a
+build tree. The trellis codebooks and the Hadamard rotation used by the Gyro expert types are in
+`third_party/ggml/ggml-common-tq.h` and `src/kernels/cuda/tq_lut_i8.cuh`. The upstream directory had no
+licence file; the files' own headers name their origin, and the licence is MIT
+(`third_party/ggml-tq/README.md` carries the text).
+
+```
+MIT License
+
+Copyright (c) 2023-2024 The ggml authors
+Copyright (c) 2023-2024 The llama.cpp authors
+Copyright (c) 2026 Laurent Zuijdwijk
+Copyright (c) 2026 agentionai
+```
+
 ## Upstream Strata
 
-Strata is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).
+Sparsa is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata); everything outside
+`src/minimax/`, `include/strata/minimax/`, `tools/minimax/`, `serve/minimax*.py|jinja` and `sparsa.py`
+comes from it, including the Python server, the Terminal and the desktop app.
 
 ```
 MIT License
@@ -46,15 +74,8 @@ MIT License
 Copyright (c) 2026 Niko1221 and the Strata contributors
 ```
 
-## Gyro / agentionai llama.cpp (trellis types, TQ2_T / TQK6 / TQK7)
+## MiniMax chat template
 
-The trellis expert types, their block headers and the Hadamard rotation come from the agentionai ("Gyro")
-llama.cpp fork, through `feat/minimax-trellis`.
-
-```
-MIT License
-
-Copyright (c) 2023-2024 The ggml authors
-Copyright (c) 2023-2024 The llama.cpp authors
-Copyright (c) 2026 agentionai
-```
+`serve/minimax_chat_template.jinja` and `serve/chat_template.jinja` are the chat templates that ship
+with the models (MiniMax-M3.1-Flash and Qwen3.8-Flash-Next); they are model data under the models' own
+licences, included so the server renders prompts the way the model was trained to read them.
