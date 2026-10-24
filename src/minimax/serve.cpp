@@ -87,6 +87,9 @@ void usage() {
                  "                                    batched prompt pass (default auto, the long-context path)\n"
                  "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
                  "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
+                 "  --minimax-prefill-expert-gemm mmvq|tc|auto\n"
+                 "                                    routed experts: int8 iq_mmvq dots (default), dequantize-once +\n"
+                 "                                    FP16 tensor-core GEMM per expert, or auto (tc from 16 rows)\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
                  "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n"
                  "  --minimax-ssd-chunks N            pieces one SSD expert read is split into, in flight together\n"
@@ -541,7 +544,7 @@ int run(int argc, char** argv) {
     std::string layer_split, gpus, kv_space;
     std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
-    std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
+    std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
     int ssd_chunks = 1, expert_skip_ssd = 0;
@@ -584,6 +587,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-batch" || a == "--minimax-batch") prefill_batch = std::atoi(next().c_str());
         else if (a == "--minimax-prefill-experts") prefill_experts = next();
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
+        else if (a == "--minimax-prefill-expert-gemm") prefill_expert_gemm = next();
         else if (a == "--minimax-prefill-read") prefill_read = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
@@ -745,6 +749,7 @@ int run(int argc, char** argv) {
     opt.prefill_batch = prefill_batch;
     opt.prefill_experts = prefill_experts;
     opt.prefill_dense = prefill_dense;
+    opt.prefill_expert_gemm = prefill_expert_gemm;
     opt.prefill_read = prefill_read;
     opt.expert_prefetch = expert_prefetch;
     opt.dense_mmvq = dense_mmvq;
