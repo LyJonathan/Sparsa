@@ -652,6 +652,7 @@ struct Engine::Impl {
     struct PfBuf {
         uint16_t* x16 = nullptr;     // [T][embd] fp16 hidden state
         uint16_t* h16 = nullptr;     // [T][embd] fp16 normed input to the projections
+        uint16_t* a16 = nullptr;     // [T][maxN] fp16 attention output (wider than the hidden state)
         float* y32 = nullptr;        // [T][maxN] fp32 GEMM output (also the attention output)
         float* p32 = nullptr;        // [T][embd] fp32 projection / routed MoE output
         float* sh = nullptr;         // [T][embd] fp32 shared-expert output and the final MoE sum
@@ -2726,6 +2727,9 @@ struct Engine::Impl {
             const size_t embd = (size_t)cfg.n_embd;
             p.x16 = (uint16_t*)cu::alloc(T * embd * 2);
             p.h16 = (uint16_t*)cu::alloc(T * embd * 2);
+            // The attention output of a chunk is [T][n_head*head_dim], wider than the hidden state; the f16 path
+            // used to write it into p.h16 and run past the end of that buffer (non-finite logits on real weights).
+            p.a16 = (uint16_t*)cu::alloc(T * (size_t)max_dense_n * 2);
             p.y32 = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
             p.p32 = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
             p.sh = (float*)cu::alloc(T * (size_t)max_dense_n * 4);
@@ -2829,6 +2833,27 @@ struct Engine::Impl {
             }
         }
         cu::sync();
+    }
+
+    // One expert matrix (N rows of K) in tiles of the weight scratch, the same tiling gemm_gpu uses: the dequant
+    // buffer holds min(4096, max_dense_n) x n_embd values, which is smaller than a full 6144 x 6144 expert matrix.
+    void gemm_expert_gpu(int type, const void* src, size_t row_bytes, const uint16_t* X16, const float* X32, float* Y,
+                         int T, int N, int K) {
+        PfBuf& p = P();
+        int64_t tile = p.w16_elems / K;
+        if (tile > N) tile = N;
+        if (tile < 1) fail("the batched-prefill weight scratch is smaller than one expert row");
+        for (int r0 = 0; r0 < N; r0 += (int)tile) {
+            const int n = (N - r0) < (int)tile ? (N - r0) : (int)tile;
+            const uint8_t* s = (const uint8_t*)src + (size_t)r0 * row_bytes;
+            if (prefill_dense_f32) {
+                cu::dequant_to_f32(type, s, (int64_t)n * K, p.w32, nullptr);
+                cu::gemm_f32(X32, p.w32, Y + r0, T, n, K, N, 0.f, nullptr);
+            } else {
+                cu::dequant_to_f16(type, s, (int64_t)n * K, p.w16, nullptr);
+                cu::gemm_f16(X16, p.w16, Y + r0, T, n, K, N, 0.f, nullptr);
+            }
+        }
     }
 
     // The same projection on the CPU: every weight row is read once and dotted with all T activations.
@@ -3303,16 +3328,12 @@ struct Engine::Impl {
                     strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
                 } else if (prefill_dense_f32) {
                     cu::gather_rows_f32(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
-                    cu::dequant_to_f32(gt, sg, (int64_t)ff * embd, p.w32, nullptr);
-                    cu::gemm_f32(p.gx32, p.w32, p.gy, nt, ff, embd, ff, 0.f, nullptr);
-                    cu::dequant_to_f32(gt, su, (int64_t)ff * embd, p.w32, nullptr);
-                    cu::gemm_f32(p.gx32, p.w32, p.gu, nt, ff, embd, ff, 0.f, nullptr);
+                    gemm_expert_gpu(gt, sg, L.egate.row_bytes, nullptr, p.gx32, p.gy, nt, ff, embd);
+                    gemm_expert_gpu(gt, su, L.egate.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
                 } else {
                     cu::gather_rows_f16(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
-                    cu::dequant_to_f16(gt, sg, (int64_t)ff * embd, p.w16, nullptr);
-                    cu::gemm_f16(p.gx, p.w16, p.gy, nt, ff, embd, ff, 0.f, nullptr);
-                    cu::dequant_to_f16(gt, su, (int64_t)ff * embd, p.w16, nullptr);
-                    cu::gemm_f16(p.gx, p.w16, p.gu, nt, ff, embd, ff, 0.f, nullptr);
+                    gemm_expert_gpu(gt, sg, L.egate.row_bytes, p.gx, nullptr, p.gy, nt, ff, embd);
+                    gemm_expert_gpu(gt, su, L.egate.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
                 }
                 if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
                 if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
@@ -3321,12 +3342,10 @@ struct Engine::Impl {
                     strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
                     strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
                 } else if (prefill_dense_f32) {
-                    cu::dequant_to_f32(dt, sd, (int64_t)embd * ff, p.w32, nullptr);
-                    cu::gemm_f32(p.gh32, p.w32, p.gd, nt, embd, ff, embd, 0.f, nullptr);
+                    gemm_expert_gpu(dt, sd, L.edown.row_bytes, nullptr, p.gh32, p.gd, nt, embd, ff);
                 } else {
                     cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
-                    cu::dequant_to_f16(dt, sd, (int64_t)embd * ff, p.w16, nullptr);
-                    cu::gemm_f16(p.gh, p.w16, p.gd, nt, embd, ff, embd, 0.f, nullptr);
+                    gemm_expert_gpu(dt, sd, L.edown.row_bytes, p.gh, nullptr, p.gd, nt, embd, ff);
                 }
                 if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
                 cu::moe_combine_rows(p.gd, (const int32_t*)p.d_ent_row.p, (const float*)p.d_ent_w.p, nt, embd, p.sh,
@@ -3403,6 +3422,10 @@ struct Engine::Impl {
         auto ms = [](pfclock::time_point a) {
             return std::chrono::duration<double, std::milli>(pfclock::now() - a).count();
         };
+        double t_idx = 0, t_topk = 0, t_msa = 0, t_prep = 0, t_kvw = 0;
+        auto dur = [](pfclock::time_point a, pfclock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
             const bool gpu = !devs.empty() && L.want_gpu;
@@ -3412,9 +3435,11 @@ struct Engine::Impl {
             PfBuf p_dummy;
             PfBuf& p = pf.empty() ? p_dummy : P();
             // ---- attention block
+            const auto ta0 = pfclock::now();
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
+            const auto ta1 = pfclock::now();
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
@@ -3430,6 +3455,8 @@ struct Engine::Impl {
                 gemm_cpu(L.wk, hq, T, ne, pf_kv.data(), klen);
                 gemm_cpu(L.wv, hq, T, ne, vf.data(), klen);
             }
+            const auto ta2 = pfclock::now();
+            const auto tkv0 = pfclock::now();
             for (int t = 0; t < T; ++t) {
                 rms_heads(qf.data() + (size_t)t * qlen, H, D, L.q_norm.data(), eps);
                 rms_heads(pf_kv.data() + (size_t)t * klen, HKV, D, L.k_norm.data(), eps);
@@ -3453,6 +3480,7 @@ struct Engine::Impl {
             }
             if (L.indexer) {
                 const int ilen = HI * (int)cfg.idx_dim;
+                const auto tix0 = pfclock::now();
                 iqf.resize((size_t)T * ilen);
                 ikf.resize((size_t)T * cfg.idx_dim);
                 if (gpu) {
@@ -3489,16 +3517,19 @@ struct Engine::Impl {
                     for (int t = 0; t < T; ++t)
                         to_f16(iqf.data() + (size_t)t * ilen, iq16.data() + (size_t)t * ilen, ilen);
                 }
+                t_kvw += dur(tix0, pfclock::now());
             }
             if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
                 int nb = 0;
                 if (L.indexer) {
                     cu::copy_h2d(p.d_iq16.p, iq16.data(), iq16.size() * 2);
+                    const auto ti0 = pfclock::now();
                     nb = (int)((pos0 + T + BLK - 1) / BLK);
                     cu::idx_block_scores_batch(L.d_ik.p, (const uint16_t*)p.d_iq16.p, HI, (int)cfg.idx_dim, BLK, nb, T,
                                                pos0, (float*)p.d_bs.p, nullptr);
                     cu::sync();
+                    const auto ti1 = pfclock::now();
                     host_bs.resize((size_t)T * HI * (size_t)nb);
                     cu::copy_d2h(host_bs.data(), p.d_bs.p, host_bs.size() * sizeof(float));
                     for (int t = 0; t < T; ++t) {
@@ -3507,20 +3538,27 @@ struct Engine::Impl {
                                          pf_blk.data() + (size_t)t * HI * pf_max_blk, nblk);
                         for (int h = 0; h < HI; ++h) pf_nblk[(size_t)t * HI + h] = nblk;
                     }
+                    const auto ti2 = pfclock::now();
+                    t_idx += dur(ti0, ti1);
+                    t_topk += dur(ti1, ti2);
                     cu::copy_h2d(p.d_blk.p, pf_blk.data(), pf_blk.size() * sizeof(int32_t));
                     cu::copy_h2d(p.d_nblk.p, pf_nblk.data(), pf_nblk.size() * sizeof(int32_t));
                 }
                 cu::copy_h2d(p.y32, qf.data(), (size_t)T * qlen * sizeof(float));
                 cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
                 cu::sync();
+                const auto tm0 = pfclock::now();
                 cu::msa_attn_batch(L.d_k.p, L.d_v.p, (const uint16_t*)p.d_q16.p, (const int32_t*)p.d_blk.p,
                                    (const int32_t*)p.d_nblk.p, H, H / HKV, L.indexer ? H / HI : 1, D, BLK,
                                    L.indexer ? 0 : 1, pos0, T, pf_max_blk, p.p32, nullptr);
                 cu::sync();
-                if (!prefill_dense_f32) cu::f32_to_f16(p.p32, p.h16, (size_t)T * qlen, nullptr);
+                t_msa += dur(tm0, pfclock::now());
+                const auto tw0 = pfclock::now();
+                if (!prefill_dense_f32) cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
                 cu::sync();
-                gemm_gpu(L.wo, p.h16, p.p32, p.y32, T, ne);
+                gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
                 cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
+                t_prep += dur(tw0, pfclock::now());
             } else {
                 // Host attention: the same per-token math as the decode path, over the chunk's own rows.
                 for (int t = 0; t < T; ++t) {
@@ -3572,9 +3610,15 @@ struct Engine::Impl {
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
             if (time_on) {
                 const double f = ms(t_ffn);
-                std::fprintf(stderr, "INFO batch-time layer=%lld attn=%.1f ffn=%.1f moe=%d\n", (long long)li,
-                             ms(t_layer) - f, f, L.moe ? 1 : 0);
+                std::fprintf(stderr,
+                             "INFO batch-time layer=%lld attn=%.1f ffn=%.1f moe=%d norm=%.1f qkv=%.1f rest=%.1f\n",
+                             (long long)li, ms(t_layer) - f, f, L.moe ? 1 : 0, dur(ta0, ta1), dur(ta1, ta2),
+                             (ms(t_layer) - f) - dur(ta0, ta2));
             }
+        }
+        if (time_on) {
+            std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f\n", t_idx, t_topk,
+                         t_msa, t_prep, t_kvw);
         }
 
         // ---- final norm and output projection

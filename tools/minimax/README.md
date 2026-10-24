@@ -387,11 +387,66 @@ What the numbers say, honestly:
   MSA kernel is ~0.38 s/layer (about 60 % of the layer) against ~30 ms of cuBLAS projections and 150 ms of
   host-side norm/rope/fp16 work; a KV-head-tiled flash-style kernel is the next prefill item.
 
-## Not in this phase (P5b/P6)
+## Not in this phase (P6)
 
 CUDA graphs for the per-layer decode work (the engine still round-trips the host for the MSA top-k and the combine,
-so a graph would have to be split around those), overlapping the expert streaming copy with the previous expert's
-compute inside a chunk (the ring is one slot: copy, compute, repeat), a measured CPU/GPU cost model per chunk (the
-switch is `--minimax-prefill-experts`, not automatic yet), the AVX2 multi-row IQ2_XS CPU kernel, and an MSA kernel
-that tiles KV heads across more than four query heads.
+so a graph would have to be split around those), a measured CPU/GPU cost model per chunk (the switch is
+`--minimax-prefill-experts`, not automatic yet), the AVX2 multi-row IQ2_XS CPU kernel, and tensor cores in the MSA
+kernel (the P5b kernel is still scalar half math).
+
+## P5b: decode and prefill on the same file as llama.cpp
+
+Three changes, each measured on its own on the 15-layer real-weight IQ2_XS slice
+(`p5a-l0-14-iq2xs.gguf`, 12 MoE + 3 dense layers, 30.7 GB), one RTX 5070, 24 CPU threads, all experts on the CPU,
+box otherwise idle (103 GiB RAM free, both cards under 1.2 GiB used):
+
+| change | 512 prefill | 4096 prefill | decode |
+| --- | ---: | ---: | ---: |
+| P5a (start of this branch) | 62.4 tok/s | 117.8 tok/s | 4.3 tok/s |
+| + dense GEMV through packed CUDA MMVQ | 62.4 | 117.8 | **13.2** (241 → 76 ms/token) |
+| + multi-slot expert ring (overlapped reads) | **97.1** | **121.8** | 13.2 |
+| + flash-style MSA kernel | **111.2** | **194.3** | 15.2 |
+| llama.cpp `-ot exps=CPU -fa on` | 193.8 | 219.6 | 19.0 |
+
+Every number is the engine's own `PP`/`DONE` line (`tools/minimax/bench_p5b.py`); the llama.cpp column is
+`llama-bench -p 512,4096 -n 32 -t 16 -ngl 99 -fa on -ot exps=CPU -dev CUDA1` on the same file, same context, load
+printed before each run.
+
+### Dense projections: `--minimax-dense-mmvq` (default on)
+
+The token path dequantized each dense weight tile to fp32 in a scratch buffer and ran a fp32 GEMV on it: a Q8_0
+attention projection moved 8x its own bytes, and the Q6_K vocabulary head did that 49 times per token. It now calls
+`native_mmvq` (llama.cpp's CUDA MMVQ, already in the tree) on the packed blocks with a q8_1 activation. Attention
+went from 4.4 to 1.0 ms/layer and decode from 241 to 76 ms/token. It is also *closer* to the all-CPU logits than the
+path it replaced (KL 7.8e-3 vs 9.1e-2 on the real slice), because that path was handing Q8_0/Q6_K weights to the
+i-quant dequantizer, which only knows the i-quant formats. `--minimax-dense-mmvq off` keeps the old path.
+
+### Expert ring: four staging slots, overlapped
+
+The batched MoE stream ran read → copy → compute per expert through one slot, and the "parallel" read was one
+thread: 36 pieces is under `pool.run`'s four-pieces-per-thread inline threshold. The chunk's 2.1 GB/layer of expert
+bytes therefore moved at ~2.4 GB/s. The ring is now four slots with their own pinned staging buffer, an H2D event on
+a copy stream and a compute-done event on the main stream; the read is spread over the whole pool and the copy of
+expert *i+1* overlaps the GEMMs of expert *i*. Per-layer read at 4096 tokens: 690 ms → 490 ms; prefill 62 → 97 tok/s
+at 512.
+
+### MSA: `msa_attn_flash_kernel`
+
+The P5a kernel kept `4 x (top_k x block) = 43 KB` of per-position scores in shared memory (two blocks per SM) and
+streamed the selected positions three times. The new kernel is one block per (query token, KV head) covering every
+query head of that KV head (16 for M3.1), Q in shared memory, positions in chunks of 128 with an online softmax:
+21 KB of shared memory, one pass. Its output is **bit-identical** to the old kernel (max-abs 0.0 on 8 real-weight
+rows) and 3.7x faster: MSA 16.4 → 4.4 s over a 4096-token prompt (73 % → 21 % of prefill).
+
+### What is still slow
+
+- Host-side norm/rope/fp16 work is now 721 ms of a 804 ms attention block at 4096 tokens (~22 % of prefill): it
+  still round-trips q/k/v to the host. Moving `rms_heads` + `rope` to the device is the next prefill item.
+- Decode experts: 4.1 ms/layer for 65 MB = 16 GB/s from DDR4, against ~41 GB/s peak. The kernel is ggml's single-token
+  `vec_dot`; llama.cpp is at ~23 GB/s because its weights are committed RAM rather than our mmap, which pays a soft
+  page fault per 4 KiB. `--minimax-tiers --minimax-ram-experts-per-layer 128` does not help by itself (the arena is
+  filled on demand, i.e. re-reads the same bytes once more).
+- `--minimax-prefill-dense f16` is 7 % faster (209.7 tok/s at 4096) but still produces non-finite logits above 512
+  prompt tokens. It is not the default; the fp32 path is now correct after the dequantizer fix.
+
 
