@@ -107,4 +107,4 @@ out/
 *.obj
 
 # P7 measurement rows (bench_p6_ssd.py --json-out beside the worktree)
-/bench_p7_*.json
+/bench_p7*.json
