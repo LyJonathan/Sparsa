@@ -370,6 +370,8 @@ fast, and P6/P7 are additive.
   max-abs 0.24 (red circle, hard edges) and 0.015 (text card); end-to-end embedding cosine on the red circle is
   min 0.9846, mean 0.99973, and 0.99996 on the text card. The residual is the resize at one hard-edge token.
 - **CPU cost:** 64-80 s per 640x480 picture on 16 cores; 3.5 GB fp32 weights. The GPU path and video are not done.
+- **End to end** (IQ2_XS-D3, 2x RTX 5070, 2048 ctx, 601-token prompt with 391 image tokens): prefill 47.8 s,
+  9 decode tokens in 2.84 s; the 640x480 red circle on white answered `</mm:think>The object is a red circle.[e~[`.
 
 ### P4 measured (2026-10-24)
 
