@@ -102,3 +102,6 @@ node_modules/
 _pr_body.md
 # one-layer layer-40 sweep output (tools/minimax/test_ikq.py, out/sweep.ps1)
 out/
+
+# object files are build products (a stray root-level one was committed by PR #8)
+*.obj
