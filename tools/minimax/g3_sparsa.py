@@ -138,6 +138,25 @@ def write_ids_text(path, ids):
             f.write("\n")
 
 
+def dump_complete(path, rows, vocab=VOCAB_EXPECTED):
+    """A dump is reusable only when its header says exactly [rows, vocab] and the file holds every byte; a killed
+    run leaves either no file or a partial one."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+        if len(head) < 12 or head[:6] != b"\x93NUMPY":
+            return False
+        major = head[6]
+        hlen = int.from_bytes(head[8:10], "little") if major == 1 else int.from_bytes(head[8:12], "little")
+        lg = np.load(path, mmap_mode="r")
+        offset = 10 + hlen if major == 1 else 12 + hlen
+        return tuple(lg.shape) == (rows, vocab) and os.path.getsize(path) == offset + rows * vocab * 4
+    except Exception:
+        return False
+
+
 def run_engine_retry(args, logpath, retries=2):
     """A failed run writes no dump, so retrying is safe: one process's logits are never mixed with another's."""
     total = 0.0
@@ -152,7 +171,7 @@ def run_engine_retry(args, logpath, retries=2):
 
 
 def run_engine(args, logpath):
-    """Run one engine invocation; returns (returncode, seconds, tail). Never raises on a non-zero exit."""
+    """Run one engine invocation; returns (returncode, seconds, output). Never raises on a non-zero exit."""
     t = time.time()
     with open(logpath, "w", encoding="utf-8", errors="replace") as lf:
         p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -163,19 +182,6 @@ def run_engine(args, logpath):
     print(tail, flush=True)
     print(f"  rc={p.returncode} wall={dt:.1f}s", flush=True)
     return p.returncode, dt, p.stdout
-
-
-def run_engine_retry(args, logpath, retries=2):
-    """A failed run writes no dump, so retrying is safe: one process's logits are never mixed with another's."""
-    total = 0.0
-    for attempt in range(retries + 1):
-        path = logpath if attempt == 0 else logpath[:-4] + f".retry{attempt}.log"
-        rc, dt, out = run_engine(args, path)
-        total += dt
-        if rc == 0:
-            return total
-        print(f"  attempt {attempt + 1}/{retries + 1} failed rc={rc}", flush=True)
-    raise SystemExit(f"engine failed {retries + 1}x rc={rc}: {' '.join(args)} (log {logpath})")
 
 
 def ppl_from_logits(path, ids):
@@ -281,7 +287,10 @@ def main():
     ap.add_argument("--prompts", default=None, help="comma-separated subset of prompts (smoke runs)")
     ap.add_argument("--no-ppl", action="store_true", help="skip the 2,048-token ppl pass")
     ap.add_argument("--only-ppl", action="store_true", help="skip the 8 prompt passes")
-    ap.add_argument("--rescore", action="store_true", help="reuse existing dumps, only rescore")
+    ap.add_argument("--rescore", action="store_true",
+                    help="only rescore existing dumps (never start the engine)")
+    ap.add_argument("--force", action="store_true",
+                    help="rerun a prompt even when a complete dump from an earlier run exists")
     ap.add_argument("--keep-dumps", action="store_true", help="keep the logits npy files (2 GB for ppl)")
     ap.add_argument("--retries", type=int, default=2,
                     help="retry an engine run this many times on a non-zero exit (the batched CPU prefill "
@@ -367,7 +376,10 @@ def main():
             npy = os.path.join(dumps, name + ".npy")
             rows = int(np.load(os.path.join(ref, name, "logits_last128.npy"), mmap_mode="r").shape[0])
             dt = 0.0
-            if not (args.rescore and os.path.exists(npy)):
+            reusable = dump_complete(npy, rows)
+            if args.rescore and not reusable:
+                raise SystemExit(f"--rescore: no complete dump for {name} ({npy})")
+            if args.force or not reusable:
                 run = [exe, *flags, "--minimax-eval", ids_txt, "--minimax-dump-logits", npy,
                        "--minimax-last-k", str(rows)]
                 print(f"RUN {name}: {len(ids)} tokens, last {rows} dumped", flush=True)
@@ -375,6 +387,11 @@ def main():
                     os.remove(npy)  # never score a dump from an earlier run
                 dt = run_engine_retry(run, os.path.join(logs, name + ".log"), args.retries)
                 engine_s += dt
+                if not dump_complete(npy, rows):
+                    raise SystemExit(f"engine exited 0 but {npy} is not a complete [{rows}, "
+                                     f"{VOCAB_EXPECTED}] dump")
+            else:
+                print(f"REUSE {name}: complete dump already at {npy}", flush=True)
             q = np.load(npy, mmap_mode="r")[:rows]
             t = time.time()
             r = score_prompt(name, ref, q, ids)
@@ -396,13 +413,20 @@ def main():
         ids_txt = os.path.join(dumps, "ppl.ids.txt")
         write_ids_text(ids_txt, pids)
         npy = os.path.join(dumps, "ppl.npy")
-        if not (args.rescore and os.path.exists(npy)):
+        reusable = dump_complete(npy, len(pids))
+        if args.rescore and not reusable:
+            raise SystemExit(f"--rescore: no complete ppl dump ({npy})")
+        if args.force or not reusable:
             run = [exe, *flags, "--minimax-eval", ids_txt, "--minimax-dump-logits", npy,
                    "--minimax-last-k", str(len(pids))]
             print(f"RUN ppl: {len(pids)} tokens, all dumped", flush=True)
             if os.path.exists(npy):
                 os.remove(npy)
             engine_s += run_engine_retry(run, os.path.join(logs, "ppl.log"), args.retries)
+            if not dump_complete(npy, len(pids)):
+                raise SystemExit(f"engine exited 0 but {npy} is not a complete ppl dump")
+        else:
+            print("REUSE ppl: complete dump already present", flush=True)
         t = time.time()
         res["ppl"] = ppl_from_logits(npy, pids)
         score_s += time.time() - t
