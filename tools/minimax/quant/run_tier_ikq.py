@@ -279,9 +279,8 @@ def main():
 
         # 1. source shards: rig-3 streams and deletes, rig-2 has the checkpoint
         if c["fetch"]:
-            keep = []
-            for later in order[index + 1:]:
-                keep.append("%d-%d" % rows[later])
+            # keep only the next part's shards, so the disk holds at most two parts of checkpoint
+            keep = ["%d-%d" % rows[later] for later in order[index + 1:index + 2]]
             cmd = [sys.executable, os.path.join(c["quant_dir"], "fetch_shards.py"),
                    "--dest", c["model"], "--layers", "%d-%d" % (lo, hi), "--sidecars"]
             if run(cmd, log) != 0:
@@ -375,9 +374,9 @@ def main():
         else:
             log.write("VERIFIED %s sha256=%s bytes=%d\n" % (path, sha, size))
 
-        # 5. drop the source shards this part no longer needs (rig-3)
+        # 5. drop the source shards this part no longer needs (rig-3): only the next part's stay
         if c["fetch"]:
-            keep = [str(rows[later][0]) + "-" + str(rows[later][1]) for later in order[index + 1:]]
+            keep = ["%d-%d" % rows[later] for later in order[index + 1:index + 2]]
             cmd = [sys.executable, os.path.join(c["quant_dir"], "fetch_shards.py"),
                    "--dest", c["model"], "--layers", "%d-%d" % (lo, hi), "--delete"]
             if keep:
