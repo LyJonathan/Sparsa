@@ -22,6 +22,20 @@ Copyright (c) 2023-2024 The ggml authors
 Copyright (c) 2023-2024 The llama.cpp authors
 ```
 
+## stb_image (public domain)
+
+`src/minimax/third_party/stb_image.h` is stb_image v2.30 by Sean Barrett and contributors, taken from
+llama.cpp's `vendor/stb`. It decodes JPEG/PNG/BMP/GIF for `--minimax-vision`. Public domain, no conditions.
+
+## MiniMax vision graph
+
+`src/minimax/vision.cpp`, `include/strata/minimax/vision.hpp` and `tools/minimax/convert_mmproj.py` follow
+llama.cpp's `conversion/minimax.py` and `tools/mtmd/models/minimax-m3.cpp` (MIT, Copyright (c) 2023-2026 the
+llama.cpp authors) for the mmproj tensor layout, the q/k permutation and the vision graph; the arithmetic is
+transformers' `MiniMaxM3VLVisionModel` and `MiniMaxM3VLMultiModalProjector`. The engine's rotation differs from
+llama.cpp's current graph by axis: the reference is 3-D RoPE with the temporal axis at zero, so H is the
+(26+i, 39+i) pair and W is (52+i, 65+i).
+
 ## ik_llama.cpp (Iwan Kawrakow)
 
 `include/strata/kernels/iqk_types.hpp`, `include/strata/kernels/cpu/iqk_quants.hpp` and

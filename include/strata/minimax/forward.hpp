@@ -50,12 +50,17 @@ struct EngineOptions {
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
     bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 
+    // ---- P6: vision.  Empty `mmproj` keeps the text-only engine (no vision file opened).
+    std::string mmproj;             ///< llama.cpp clip mmproj (minimax_m3) for image inputs
+    int64_t image_token_id = 200025;///< the `<]image[>` token the image rows replace
+    int64_t image_max_tokens = 576; ///< refuse a picture above this many image tokens (0 = no limit)
+
     // ---- parity probes (P4).  Both are opt-in and add nothing to a normal run.
     std::string dump_dir;           ///< write per-layer activations as npy files here (empty: off)
     std::string dump_layers;        ///< "all" (default when dump_dir is set) or source layer ids "0,3,40"
     std::string seed_hidden;        ///< npy fp32 [seq, n_embd]: use row t as token t's input instead of the embedding
 
-    // ---- P4: more than one GPU, and where the KV cache lives.
+    /// P4: more than one GPU, and where the KV cache lives.
     std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
     std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
     std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
@@ -82,6 +87,11 @@ struct EngineOptions {
     std::string prefill_read;       ///< "" / "auto": the OS page cache, except when --memory-limit-mib is set (the
                                     ///< budget cannot bound the page cache, so streamed experts are read unbuffered);
                                     ///< "mmap": always the page cache; "direct": always unbuffered 16 MiB reads
+    std::string prefill_vram;       ///< "reserve" (default): the P10 rule, the batched-prompt workspace is subtracted
+                                    ///< from the automatic VRAM slot budget at startup and lives for the run.
+                                    ///< "swap": size the slots as if the workspace did not exist; at the start of a
+                                    ///< prompt free the slots it needs, and at the end free the workspace and
+                                    ///< re-allocate exactly the slots it took, so decode keeps the decode-only count.
     // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
@@ -108,8 +118,9 @@ struct EngineOptions {
     std::string ssd_zerocopy;       ///< "" / "on": an expert whose pages are already resident is computed from the
                                     ///< mapping with no read; "off": always issue the read (P6 behaviour)
     int page_probe = 32;            ///< P9: pages probed per expert for a page-cache hit (0 = walk every page)
-    std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
-                                    ///< MoE, so they are in flight across that layer's attention
+    std::string ssd_prefetch;       ///< "" / off: "on" queues a future layer's SSD misses while this layer computes,
+                                    ///< so they are in flight across whole layers instead of one attention block
+    int ssd_prefetch_depth = 1;     ///< --minimax-ssd-prefetch-depth: layers between the issue and the use (1-8)
     // ---- P7b: the route nudge (Xolotl's selection bias toward resident experts).
     std::string route_bias;         ///< "" / off: "on" ranks the router's top-k on the expert's score plus a
                                     ///< residency bonus / file penalty; the weights stay unbiased
@@ -165,7 +176,8 @@ public:
 
     GenerateResult generate(const std::vector<int32_t>& prompt, int max_new, const SampleParams& sp,
                             std::atomic<bool>& stop, const std::function<void(int32_t)>& on_token,
-                            const std::function<void(int, int, double)>& on_pp);
+                            const std::function<void(int, int, double)>& on_pp,
+                            const std::vector<std::string>& images = {});
 
 private:
     struct Impl;

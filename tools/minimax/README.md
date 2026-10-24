@@ -111,14 +111,53 @@ build\strata-minimax.exe --model model.gguf --serve --max-context 32768 --minima
 Prints `INFO engine=minimax-m3 ...`, an `INFO` line from the engine (`prefill=token`, how many dense layers
 landed on the GPU), and `READY <ctx> stop`. `GEN` streams `T <id>`, `PP <done> <total> <ms> <tok/s>`, and
 `DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> 0 0 <reused>`. `finish` is `stop`, `length`,
-`cancel`, or `nonfinite`. `STOP` during a request finishes it with `cancel`. `GENI` and `BGEN` return `ERR`
-and no `DONE`. Unknown options are ignored in `--serve` mode, because the server's config is shared with the
-Qwen families.
+`cancel`, or `nonfinite`. `STOP` during a request finishes it with `cancel`. `BGEN` returns `ERR` and no
+`DONE`. `GENI` is the same as `GEN` plus one `img=` key naming the pictures in prompt order (comma separated,
+no spaces): `GENI 64 temperature=0 img=C:\pics\a.png,C:\pics\b.png 1,2,...`. Unknown options are ignored in
+`--serve` mode, because the server's config is shared with the Qwen families.
 
 Sampling keys on `GEN`: `temperature` (0 is greedy argmax, ties take the lowest id), `top_k`, `top_p`,
 `min_p`, `penalty_last_n`, `penalty_repeat`, `penalty_freq`, `penalty_present`, `seed`.
 
 `--minimax-allow-nonstandard` serves a reduced test GGUF; `--serve` otherwise refuses it.
+
+## Vision (EXPERIMENTAL)
+
+MiniMax-M3.1-Flash's vision tower (32-layer ViT, width 1280; 1280->6144 projector; 2x2 patch merge) is in a
+separate `mmproj` GGUF that setup downloads next to the quants:
+
+```
+mmproj-MiniMax-M3.1-Flash-F16.gguf
+```
+
+It is the llama.cpp `clip` layout (`clip.projector_type = minimax_m3`), so llama.cpp's mtmd reads it too. Build it
+from the checkpoint with the repo's converter:
+
+```powershell
+python tools/minimax/convert_mmproj.py <checkpoint-dir> -o mmproj-MiniMax-M3.1-Flash-F16.gguf
+```
+
+The engine loads the file with `--mmproj`. A `GENI` request names one or more pictures; the engine decodes
+(JPEG/PNG/BMP/GIF via stb_image), resizes the short side into 28-pixel blocks with at most 672x672 pixels
+(`smart_resize`, as the checkpoint's `image_processor.py`), normalizes with the checkpoint's mean/std, runs the ViT
+and projectors on the CPU in fp32, and replaces the prompt's `]<]image[>[` tokens with the projected rows. One
+672x672 picture is 576 tokens; 640x480 is 391.
+
+```powershell
+build\strata-minimax.exe --model first-part.gguf --mmproj mmproj-MiniMax-M3.1-Flash-F16.gguf --serve
+# GENI 64 temperature=0 img=C:\pics\red_circle.png 1,2,...  (the server expands each picture's 391/576 tokens)
+```
+
+The server side (`serve/` on `main`) accepts OpenAI `image_url` (data: URL or http) and Anthropic `image` blocks
+(base64) and passes the files to the engine; it needs no `strata-vision` process for MiniMax.
+
+The ViT is CPU-only for now: about 64-80 s per 640x480 picture on 16 cores, 0.9-1.7 GB of RAM per encoder (3.5 GB
+of fp32 weights). A GPU path and video (the temporal axis) are not implemented. Parity against transformers
+5.20.2 fp32 on CPU is per-token cosine >= 0.99999 for the same `pixel_values`; see
+`tools/minimax/check_vision_parity.py` and `tools/minimax/ref_vision.py`.
+
+Only the vision tower and projectors are redistributed (about 0.87 B parameters, 1.73 GB); the MiniMax Community
+License applies, the same terms as the quants.
 
 ## Teacher-forced logits
 
@@ -748,11 +787,12 @@ fires and costs one query when it does not.
 
 **`--minimax-ssd-prefetch on|off` (default off): the next layer's reads, issued a layer early.** `prefetch_for`
 already applies layer *l+1*'s router to the residual to fill VRAM slots; it now also queues *l+1*'s SSD misses, so
-they are in flight across that layer's attention, router and shared expert. The residual at that point is only a
-*prediction* of the router's input (the next layer's attention moves it before the router runs), so the routes can
-differ. The staging ring is doubled, each route's slot is recorded, and `ssd_pf_hit` / `ssd_pf_waste` in the totals
-line say how good the prediction was -- which is the number that decides whether it is worth turning on, and it is
-why the default is off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
+they are in flight across that layer's attention, router and shared expert. It is scored from the layer that is
+running now: its post-attention FFN input fed to the future layer's router. `--minimax-ssd-prefetch-depth N`
+(1-8) chooses how many layers ahead. The staging pool has a region per layer slot, each route's slot is recorded,
+and `ssd_pf_hit` / `ssd_pf_waste` in the totals line say how good the prediction was -- which is the number that
+decides whether it is worth turning on. See the P11 section at the end for the three bugs that were fixed and why
+the default is still off. (Strata-DS measures next-layer copying at 52.2 -> 49.6 ms/token and Project Maya
 19.64 -> 20.22 tok/s, both with a much larger resident tier.)
 
 **CPU threads: the default is the physical core count, not the logical one.** Decode is bandwidth-bound -- the CPU
@@ -1323,3 +1363,124 @@ degenerate inputs. It passes with the host compiler. The 2 x 5070 auto plan is u
 **Tests.** `python -m pytest tools/minimax`: **68 passed**. The two setup errors in `test_g3_sparsa.py`
 (`ref_dir`, `name`, `logits`, `ids` are used as fixtures but are not defined) reproduce on the merged base
 `1390bdb8` in 0.19 s and are unrelated to this branch.
+
+## P11: the drive's slow windows, measured with `io_probe`
+
+The decode wait on the SSD tier swings between runs (20-76 ms/token, and a single token can spend seconds in
+`ssd_wait`), so this branch adds a drive-side probe instead of guessing: `tools/minimax/io_probe.cpp` issues the
+same 4 KiB-aligned unbuffered requests the tier issues, at a chosen queue depth, and reports GB/s. Build it with
+`tools/minimax/build_io_probe.bat`.
+
+Measured on the full D3 pack's shards, 5.2 MiB per request, 32-200 requests per configuration:
+
+| configuration | first ~1 GB after an idle box | immediately after, same offsets |
+| --- | ---: | ---: |
+| plain `NO_BUFFERING | OVERLAPPED` | 0.13-0.15 GB/s | 4.9-7.2 GB/s |
+| `+ FILE_FLAG_RANDOM_ACCESS` (what the engine sets) | 0.13-0.14 GB/s | 5.1-7.1 GB/s |
+| queue depth 1 / 2 / 8 / 32 | 0.13 / 0.13 / 0.13 / 0.15 | 4.9 / 7.0 / 7.2 / 7.2 |
+
+Three things follow. **The flag is not the cause** (the two arms are indistinguishable inside a window, and the
+mature `FileExpertSource` path in `src/core/expert_source.cpp` opens plain `NO_BUFFERING | OVERLAPPED` for the
+same reason); **queue depth is not the lever inside a slow window** (0.13 GB/s at depth 1 and at depth 32 means
+the device is not serving requests, not that it has too few); and **the drive has multi-second degraded windows**
+after sustained reads, which the token inherits as `ssd_wait`. The engine can only (a) have fewer bytes to read and
+(b) have them in flight before the layer needs them.
+
+### The one-layer-early prefetch, and the three bugs that made it wrong
+
+`--minimax-ssd-prefetch` was reported as producing no completed generation. Three separate faults were found:
+
+1. **It matched a prediction rank-for-rank.** A prediction that named the right experts in a different order was
+   counted as a miss and the bytes were read twice. It now matches the predicted *set* (`ssd_pf_exp` is searched).
+2. **It reused a staging region while a read into it was still in flight.** Regions are now per
+   `layer % (depth + 1)` and the region is drained before reuse.
+3. **It scored the predicted layer's router on the wrong CUDA device.** With `--gpus 0,1 --layer-split auto`,
+   layer `j`'s MoE predicted layer `j+2` and ran `j+2`'s router GEMV while device `j` was current; the first
+   token died with `cuda: gemv sync: an illegal memory access`. `use_layer_device(target)` fixes it. This was the
+   "no completed generation": the engine reports the error on **stdout** (`ERR minimax engine: ...`) and exits 0,
+   which a harness that only looks for `DONE` sees as silence.
+
+With those fixed, `gate_logits.py` on the 15-layer real-weight slice is **max abs 0.0 / KL 0.0 / top-1 1.000**
+(prefetch off against on), and the prediction is scored from the current layer's post-attention FFN input, which
+is what Project Maya's device uses.
+
+**It is still not a win on the full model.** The depth is a whole-layer drain (`ssd_wait_all` before reusing a
+region), because a per-region completion tag deadlocked after the full model's prefill when a prediction's
+completion was not reaped on its shard. On the slice, prefetch on reads 48 % more bytes and spends more time in
+`ssd_wait` (60 -> 124 ms); the default stays **off**, and the flag remains opt-in while a per-region drain that
+does not leak is written.
+
+## P12: the prompt workspace borrows the decode slots
+
+A batched prompt needs a device workspace (137 KiB/token/device plus the rows scratch, the expert ring and, with
+the KV in RAM, one layer's staged K/V). P10 made the auto slot count subtract that workspace up front so a big
+card could not fail in `cudaMalloc` at startup -- correct, but the workspace then sat in VRAM for the whole
+session while decode used the rest. With `--minimax-prefill-batch 4096` that is ~1.5 GiB per card; on a 12 GB card
+it was the difference between a usable slot pool and almost none.
+
+The workspace is only needed *while a prompt is being processed*, so the two no longer coexist:
+
+* `--minimax-prefill-vram swap`: the slots are sized as if there were no workspace. At the start of a prompt the
+  engine frees the slots it needs (round-robin over a device's MoE layers, so no layer is emptied), allocates the
+  workspace, and at the end of the prompt frees it and re-allocates exactly the slots it took
+  (`Impl::pf_acquire` / `pf_release`, `PrefillWs` in `Engine::generate` and `teacher_forced`). The slots come back
+  empty, which is the state a decode-only run starts in: the token path's compulsory admission fills them.
+* `--minimax-prefill-vram reserve` (**the default**): the P10 rule, unchanged -- the workspace is subtracted at
+  startup and lives for the run. It is the default because the swap measured slower on this box's full model (see
+  the table below); a placement with a slot pool worth having should turn it on.
+
+`include/strata/minimax/vram_plan.hpp` is untouched: swap mode passes `prefill_bytes = 0`, reserve passes the real
+figure. An explicit `--minimax-vram-slots-per-layer N` never swaps (the operator asked for N), so its workspace
+still comes out of the free VRAM as before.
+
+**The admission path reads the pinned tier now.** `vram_fill` used to copy a compulsory-admitted expert out of the
+file mapping even when the pinned RAM tier already held the same bytes, so every fill re-faulted 15 MB through the
+page cache (or the drive). It now copies from the arena when the expert is resident there -- same bytes, and the
+`pick` phase of a token stops paying for the drive.
+
+### Measured
+
+Bit-identical gates on the 15-layer real-weight slice (`models/quant-d3/p5a-l0-14-iq2xs.gguf`, 96 real-text
+tokens, `--gpus 0 --minimax-dense-layers-gpu 15 --minimax-tiers --minimax-kv vram --cpu-threads 12
+--memory-limit-mib 20000`), merged base `4658d3c3` against this branch:
+
+| arm | max abs | KL | top-1 |
+| --- | ---: | ---: | ---: |
+| `--minimax-vram-slots-per-layer 6 --minimax-prefill-batch 32` (the reserve path, this branch's default) | 0.0 | 0.0 | 1.000 |
+| `--minimax-vram-slots-per-layer -1 --minimax-prefill-batch 0` (the token path) | 0.0 | 0.0 | 1.000 |
+| the same with `--minimax-prefill-vram swap` (auto slots, 32 a layer, workspace borrowed) | 0.0 | 0.0 | 1.000 |
+
+The swap costs 21-23 ms per turn on that slice: two turns of 96 + 112 tokens, `--decode 8`, borrowed 34 then 38
+slots in 9 ms, workspace released and 32 slots a layer re-allocated in 12-14 ms, both turns `DONE`, and the second
+turn's decode is 69 ms/token against the first turn's 177 (the slots it filled are warm again).
+
+**Full model, the released server's flags.** MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB
+DDR4-3200, 512-token real-text prompt, 64 greedy tokens, 2 reps, all arms interleaved with a fresh process each
+rep: `--gpus 0,1 --max-context 32768 --minimax-kv vram --minimax-tiers --vram-reserve-mib 700
+--minimax-prefill-batch 4096 --minimax-prefill-expert-gemm mmvq --memory-limit-mib 90000 --minimax-stats
+--minimax-profile-time`, auto slots (`--minimax-vram-slots-per-layer -1`):
+
+| arm | slots/layer | decode tok/s | ms/token | ssd/token | ssd MB/token | ssd wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| P10 reserve (base) | 0 | **3.33** | 300.2 | 56.7 | 981 | 30.3 ms |
+| swap, after the admission fix | 2 | 3.15 | 317.1 | 57.4 | 994 | 35.1 ms |
+
+The per-token breakdown says exactly why: the two slots move work off the CPU lane (`cpu_ram` 184.4 -> 164.9 ms)
+but the compulsory admissions that fill them cost more than they save (`pick` 0.6 -> 12.7 ms, plus `gpu_begin`
+4.0, `gpu_stream` 3.4 and `gpu_finish` 1.3) -- net **-5.4 %** in this window. Before the admission fix (which
+copies a resident expert out of the pinned tier instead of re-faulting the file mapping) the same pair was 3.44
+against 2.95 tok/s on 32 decode tokens: the fix takes the loss from -14 % to -5 %.
+
+The reason is the placement, not the mechanism: at 32 K context with the KV in VRAM and 60 dense layers on the
+two 12 GB cards, the automatic slot pool is **2 experts a layer** (0 in the reserve arm -- the 1.5 GiB workspace
+ate the whole pool, which is the starvation this flag removes). Two of 128 experts cannot pay for their own
+fill-in inside a 64-token reply. `--minimax-vram-slots-per-layer 0` (what `sparsa.py` passes today) is unchanged
+by any of this: there is no slot pool to borrow from or reserve.
+
+**So the default stays `reserve`.** The flag exists, is bit-identical, and gives decode the decode-only slot count
+where a slot pool is worth having; on this box's full model it is a wash that costs 5 %, and the honest next step
+is not a bigger workspace but a cheaper admission: the compulsory fill is three synchronous H2D copies on the
+default stream, which wait behind the layer's queued GPU work, while `prefetch_for` already knows how to enqueue
+the same bytes on the side stream.
+
+
