@@ -859,6 +859,8 @@ void* stream_create_blocking() {
     return (void*)s;
 }
 
+void* stream_legacy() { return (void*)cudaStreamLegacy; }
+
 // P5c: CUDA graphs.  Capture is ThreadLocal so a launch from another thread (the pool) cannot be folded in by
 // accident, and the stream must be the dedicated blocking one: the legacy default stream cannot be captured.
 void* graph_capture_begin(void* stream) {
@@ -944,7 +946,7 @@ void idx_block_scores(const void* ik, int64_t ntok, const float* q, int heads, i
     check(cudaGetLastError(), "idx_scores launch");
 }
 
-// P9: the host's `select_slots` on the card.  One thread per indexer head: nb is at most a few thousand (256 K / 128),
+// P10: the host's `select_slots` on the card.  One thread per indexer head: nb is at most a few thousand (256 K / 128),
 // kk is top_k (<= 16), and the selection is a k-element insertion sort, which costs less than the round trip it
 // removes.  The ordering is the host's: score descending, block index ascending, the last `local` blocks of the query
 // forced in, and slots emitted in ascending block order (not rank order).

@@ -1,4 +1,4 @@
-"""P7b/P9: the route nudge's full-model quality, measured instead of extrapolated.
+"""P7b/P10: the route nudge's full-model quality, measured instead of extrapolated.
 
 Round 3 measured `--minimax-route-bias on` at 4.70 against 4.37 tok/s on the full model (+7.5%), but never measured
 what it costs in logits there.  This script builds one teacher-forced id stream from the six short G3 prompts, runs

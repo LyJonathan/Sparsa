@@ -746,7 +746,7 @@ struct Engine::Impl {
         void* side = nullptr;
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
         void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
-        // P9: the shared expert's own buffers and stream.  It is independent of routing, so it is launched on `shs`
+        // P10: the shared expert's own buffers and stream.  It is independent of routing, so it is launched on `shs`
         // at the top of the MoE and waited for after the CPU lane, where the card would otherwise be idle.
         DevPtr sh_x, sh_xq, sh_g, sh_u, sh_h, sh_hq, sh_y;
         void* shs = nullptr;
@@ -800,7 +800,7 @@ struct Engine::Impl {
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
-    bool sh_pending = false;       // P9: the shared expert's gate/up work is in flight on the shared stream
+    bool sh_pending = false;       // P10: the shared expert's gate/up work is in flight on the shared stream
     int sh_ff = 0;                 // its feed-forward width this layer
     bool gpu_norm_rope = true;     // fused device norm+rope (--minimax-gpu-normrope off)
     bool expert_resident = true;   // pin the RAM expert tier at startup (--minimax-expert-resident off)
@@ -1017,7 +1017,7 @@ struct Engine::Impl {
     int ssd_chunks = 1;
     int ssd_skip_rank = 0;
     bool ssd_zero_copy = true;
-    // P9: --minimax-page-probe N: pages probed per expert for a page-cache hit.  0 = walk every page.  32 spread
+    // P10: --minimax-page-probe N: pages probed per expert for a page-cache hit.  0 = walk every page.  32 spread
     // pages is the default: a cold expert fails the first few, a resident one passes all 32, and the full 4-8 K page
     // walk (1.5 ms an expert) was most of the token's `pick` phase.
     int page_probe = 32;
@@ -1745,7 +1745,7 @@ struct Engine::Impl {
                 }
             }
             w.side = cu::stream_create();
-            // P9: the shared expert runs on its own stream beside the routed-expert CPU lane.  The buffers are tiny
+            // P10: the shared expert runs on its own stream beside the routed-expert CPU lane.  The buffers are tiny
             // (the widest shared MLP is n_ff_exp * n_shared_experts), so they are allocated for every device.
             const int64_t shff = cfg.n_ff_exp * (cfg.n_shared_experts > 0 ? cfg.n_shared_experts : 0);
             if (shff > 0 && cfg.n_embd > 0) {
@@ -2210,40 +2210,29 @@ struct Engine::Impl {
             for (size_t d = 0; d < devs.size(); ++d) {
                 const cu::MemInfo mi = cu::mem_on(devs[d]);
                 dev_budget[d] = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
-                // P9: a batched prompt pass allocates its workspace on every card that owns a layer.  Sizing the
-                // VRAM expert slots first (the old order) is what clamped --minimax-prefill-batch to a few thousand
-                // tokens on this box: the automatic slot count spent all of the free VRAM on experts, so the
-                // workspace then fit only the remainder.  Reserve the workspace first, but only when the caller
-                // asked for a batch and did not name a slot count, so no existing plan changes.
-                if (opt.prefill_batch > 1 && opt.vram_slots_per_layer < 0) {
-                    const size_t ws = (size_t)prefill_bytes_per_token() *
-                                          (size_t)std::min<int64_t>(opt.prefill_batch, ctx) +
-                                      ((size_t)224 << 20);
-                    dev_budget[d] = dev_budget[d] > ws ? dev_budget[d] - ws : 0;
-                }
             }
-            if (opt.prefill_batch > 1 && opt.vram_slots_per_layer < 0)
-                std::fprintf(stderr,
-                             "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
-                             "workspace before sizing expert slots\n",
-                             (double)((size_t)prefill_bytes_per_token() *
-                                          (size_t)std::min<int64_t>(opt.prefill_batch, ctx) +
-                                      ((size_t)224 << 20)) /
-                                 1048576.0,
-                             (int)std::min<int64_t>(opt.prefill_batch, ctx));
         }
         int q = opt.vram_slots_per_layer;
         // `--minimax-expert-resident all` with the tiers off is a RAM-residency request, not a VRAM one: keep the
         // device for dense/KV unless the caller named a slot count explicitly.
         if (!opt.tiers && opt.expert_resident == "all" && opt.vram_slots_per_layer < 0) q = 0;
+        // P10: the batched prompt pass allocates its workspace on every card that owns a layer, after this
+        // sizing.  Auto slot sizing must leave it room or a card large enough for the slots to fill the card dies in
+        // cudaMalloc (the 96 GB / 153 GB-model startup OOM).  The rule is in vram_plan.hpp and unit-tested; it also
+        // covers the rows_cap scratch, the expert ring and the RAM tier's staged K/V, not just the per-token buffers.
         const size_t prefill_need = tiers_gpu_possible() ? prefill_device_bytes() : 0;
+        if (prefill_need > 0 && opt.vram_slots_per_layer < 0)
+            std::fprintf(stderr,
+                         "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
+                         "workspace before sizing expert slots\n",
+                         (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
                 if (dev_moe[d] <= 0) continue;
-                // dev_budget is already free - reserve.  The plan takes the batched-prefill workspace out before it
-                // counts slots: that allocation happens in init_prefill, after this sizing, and ignoring it is what
-                // made a 96 GB card run out of memory at startup.
+                // dev_budget is already free - reserve; the plan takes the batched-prefill workspace out before it
+                // counts slots.  The explicit-count path (`requested >= 0`) is unchanged: init_prefill shrinks the
+                // batch to whatever room that count left, as before.
                 const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_need, max_expert_bytes,
                                                         (int)dev_moe[d], (int)cfg.n_expert, -1);
                 if (pl.slots < q) q = pl.slots;
@@ -2262,14 +2251,13 @@ struct Engine::Impl {
                     const Layer& L = layers[(size_t)i];
                     if (L.moe && layer_dev[(size_t)i] == (int)d) need += (size_t)q * L.expert_bytes;
                 }
-                if (need > dev_budget[d] ||
-                    (opt.vram_slots_per_layer >= 0 && need + prefill_need > dev_budget[d])) {
+                if (need > dev_budget[d]) {
                     fail("the VRAM expert tier asked for " + std::to_string(q) + " slots per layer (" +
                          std::to_string(need / (1024 * 1024)) + " MiB on device " +
                          std::to_string(devs[d]) + ") but only " +
                          std::to_string(dev_budget[d] / (1024 * 1024)) +
                          " MiB is free after dense/KV/workspace, the " + std::to_string(opt.vram_reserve_mib) +
-                         " MiB reserve and the batched-prefill workspace. Lower --minimax-vram-slots-per-layer or "
+                         " MiB reserve, and the batched-prompt workspace. Lower --minimax-vram-slots-per-layer or "
                          "--vram-reserve-mib.");
                 }
             }
@@ -3072,7 +3060,7 @@ struct Engine::Impl {
         const uintptr_t a1 = ((uintptr_t)p + len + A - 1) & ~(A - 1);
         const size_t n = (a1 - a0) / A;
         if (n == 0 || n > ((size_t)1 << 21)) return false;
-        // P9: probe `page_probe` spread pages instead of the whole range.  The old code sampled 8 and then walked
+        // P10: probe `page_probe` spread pages instead of the whole range.  The old code sampled 8 and then walked
         // all 4-8 K pages when that sample passed, which at 1.5 ms an expert was most of the token's `pick` phase.
         // A sampled "yes" is only ever a page fault on the pages it did not see, never a wrong byte; a sampled "no"
         // is a missed opportunity (the read is issued, the expert is still correct).
@@ -3268,7 +3256,7 @@ struct Engine::Impl {
         float* out;
     };
 
-    // ---- P9: the shared expert, overlapped with the routed-expert CPU lane.
+    // ---- P10: the shared expert, overlapped with the routed-expert CPU lane.
     //
     // The shared MLP is three dense GEMVs, and the old path ran them with three host round trips between the routed
     // experts and the next layer.  Nothing about it depends on routing: its input is the layer's MoE input, and its
@@ -3322,8 +3310,7 @@ struct Engine::Impl {
         // from (VRAM / pinned RAM / SSD) and who computes it change.
         const bool pt = opt.profile_time;
         auto t_ph = std::chrono::steady_clock::now();
-        // P9: the shared expert's gate/up pair goes on its own stream now, and is joined after the CPU lane.
-        const bool shared_async = shared_begin(L, in);
+        bool shared_async = false;   // P10: set once routing is done, so the shared streams overlap only the lane
         const int nexp = (int)cfg.n_expert;
         const int top = (int)cfg.n_expert_used;
         std::vector<float> logits_r((size_t)nexp), prob((size_t)nexp);
@@ -3476,6 +3463,9 @@ struct Engine::Impl {
             prof.gpu_experts += (int64_t)gpu_e.size();
             t_ph = std::chrono::steady_clock::now();
         }
+        // P10: the shared expert's gate/up pair goes on its own stream here: routing is done, the GPU experts are
+        // already queued, and the 100+ ms CPU lane is about to run with the card otherwise idle.
+        shared_async = shared_begin(L, in);
         std::vector<std::vector<float>> cpu_ye((size_t)top);
         int64_t pass_experts = 0;
         auto run_cpu_experts = [&](bool want_ssd) {
@@ -3820,7 +3810,7 @@ struct Engine::Impl {
         });
     }
 
-    // P9: the same dense GEMV when the activation is already on the device (the attention output the MSA kernel just
+    // P10: the same dense GEMV when the activation is already on the device (the attention output the MSA kernel just
     // wrote there).  Byte-identical to gemv(): the same q8_1 quantizer and the same native MMVQ kernel, on a stream
     // that is ordered after the default-stream kernels, with no D2H of the activation and no H2D back.
     bool gemv_dev_in_ok(const Tensor& t, int cols) const {
@@ -3837,11 +3827,13 @@ struct Engine::Impl {
             return;
         }
         Work& w = W();
-        if (!w.dsb) w.dsb = cu::stream_create_blocking();
-        strata::kernels::quantize_q8_1_rows((const float*)din, 1, cols, w.xq.p, w.dsb);
-        strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, w.dsb);
-        cu::copy_d2h_async(yout, w.y.p, (size_t)rows * sizeof(float), w.dsb);
-        cu::stream_sync(w.dsb);
+        // The MSA kernel that wrote `din` is on the default stream, so this chain stays there too: the legacy
+        // default stream's handle keeps native MMVQ (which rejects nullptr) ordered with it, and the synchronous
+        // copy-out is the only wait.
+        void* st = cu::stream_legacy();
+        strata::kernels::quantize_q8_1_rows((const float*)din, 1, cols, w.xq.p, st);
+        strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, st);
+        cu::copy_d2h(yout, w.y.p, (size_t)rows * sizeof(float));
     }
 
     void dot_rows_base(const Tensor& t, const uint8_t* base, const float* xin, float* yout, int rows_n, int cols) {
@@ -4465,7 +4457,7 @@ struct Engine::Impl {
     // indexer keys; only the selected slots of each KV head are brought into the staging buffer (a device gather
     // when the KV lives in VRAM, one H2D copy from pinned host memory in the RAM tier).
     //
-    // P9: with the KV in VRAM the whole selection stays on the card (`idx_select`), so neither the block scores nor
+    // P10: with the KV in VRAM the whole selection stays on the card (`idx_select`), so neither the block scores nor
     // the slot lists cross PCIe and there is no device sync between the indexer and the MSA kernel.  `att_dev_out`
     // keeps the attention output on the card for the output projection, removing the D2H+H2D pair around it.
     void attend_dev(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
@@ -5235,7 +5227,7 @@ struct Engine::Impl {
             if (att_buf.size() < (size_t)cfg.n_head * (size_t)cfg.head_dim)
                 att_buf.assign((size_t)cfg.n_head * (size_t)cfg.head_dim, 0.f);
             float* att = att_buf.data();
-            // P9: keep the attention output on the card through the output projection.  Same kernels and the same
+            // P10: keep the attention output on the card through the output projection.  Same kernels and the same
             // arithmetic; the D2H of `att` and the H2D of the projection's activation are simply not needed.
             const bool keep_att_dev = !dbg && kv_mode != 0 && L.want_gpu && L.wo.gpu &&
                                       gemv_dev_in_ok(L.wo, (int)(cfg.n_head * cfg.head_dim)) && W().att.p;

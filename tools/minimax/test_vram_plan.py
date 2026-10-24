@@ -1,4 +1,4 @@
-"""P9: the automatic VRAM-slot sizing rule (header-only, no GPU, no model).
+"""P10: the automatic VRAM-slot sizing rule (header-only, no GPU, no model).
 
 The 96 GB / 153 GB-model startup OOM came from sizing the slots on `free - reserve` and never subtracting the
 batched-prefill workspace that is allocated later.  `include/strata/minimax/vram_plan.hpp` is the fixed rule and
