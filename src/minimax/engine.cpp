@@ -1102,6 +1102,9 @@ struct Engine::Impl {
             if (max_slot < (int32_t)cfg.idx_block) max_slot = (int32_t)cfg.idx_block;
             host_attn_fast = opt.host_attn != "legacy";
             if (opt.kv_quant == "q8_0" || opt.kv_quant == "q8") kv_q = 1;
+            if (kv_q && (cfg.head_dim % kQ8Block) != 0)
+                fail("--minimax-kv-quant q8_0 quantizes 32 values per block along head_dim; this file's head_dim is " +
+                     std::to_string(cfg.head_dim) + ", which is not a multiple of 32. Use f16.");
             print_kv_plan(0, opt.kv_space.empty() ? "auto" : "cpu-only");
         }
         alloc_cache();
@@ -1703,6 +1706,9 @@ struct Engine::Impl {
             else if (opt.kv_quant != "f16") fail("--minimax-kv-quant: unknown value '" + opt.kv_quant + "'");
         }
         if (kv_q == 0 && opt.kv_quant == "auto") kv_q = 0;   // decided below, once the placement is known
+        if (kv_q && (cfg.head_dim % kQ8Block) != 0)
+            fail("--minimax-kv-quant q8_0 quantizes 32 values per block along head_dim; this file's head_dim is " +
+                 std::to_string(cfg.head_dim) + ", which is not a multiple of 32. Use f16.");
         if (kv_q && !opt.kv_space.empty() && opt.kv_space != "auto" && opt.kv_space != "ram" &&
             opt.kv_space != "host")
             fail("--minimax-kv-quant q8_0 covers the host and pinned-RAM KV tiers. The VRAM tier's MSA kernels "
@@ -1838,7 +1844,7 @@ struct Engine::Impl {
         for (int64_t i = 0; i < cfg.n_layers; ++i) layers[(size_t)i].dev = layer_dev[(size_t)i];
 
         // The plan, in one line: this is what a long-context run has to be explainable by after the fact.
-        print_kv_plan(mode, opt.kv_space.empty() ? "auto" : "cpu-only-placeholder");
+        print_kv_plan(mode, opt.kv_space.empty() ? "auto" : opt.kv_space);
     }
 
     // One parseable line naming the KV decision.  `key=value` tokens, the same keys on every path.
@@ -3952,10 +3958,14 @@ struct Engine::Impl {
         prefill_kv_stage = kv_mode == 2 && !work.empty() && opt.prefill_kv != "off" &&
                            cfg.n_head_kv == cfg.idx_heads && cfg.idx_first_layer == 0;
         if (prefill_kv_stage && kv_q) {
+            // Correct, just not batched: the token path's device attention reads the q8 blocks directly.
             std::fprintf(stderr,
-                         "INFO minimax-prefill-kv: off, the device MSA kernels read fp16 rows and the cache is "
-                         "q8_0; the prompt pass keeps host attention\n");
+                         "INFO minimax-prefill-kv: the device MSA kernels read fp16 rows and the cache is q8_0; "
+                         "keeping the token path for the prompt (slower, same result). Use f16 K/V, or the vram "
+                         "tier, for a batched prompt at long context.\n");
             prefill_kv_stage = false;
+            batch_cap = 0;
+            return;
         }
         if (max_expert_bytes == 0)
             for (const Layer& L : layers)

@@ -217,6 +217,18 @@ def test_ram_tier_without_staging_names_the_refusal(gguf, tmp_path):
 
 # ---- the plan -----------------------------------------------------------------------------------------------
 
+def test_ram_tier_q8_falls_back_to_the_token_path(gguf, tmp_path):
+    """q8 + pinned RAM cannot use the staged device attention (fp16 rows), so it must fall back, not fail."""
+    if NDEV < 1:
+        pytest.skip('needs a CUDA device')
+    ids = _ids(64)
+    s = _run(gguf, ids, tmp_path / 'q8tok.npy',
+             ['--gpus', '0', '--minimax-dense-layers-gpu', '0', '--minimax-kv', 'ram',
+              '--minimax-kv-quant', 'q8_0', '--minimax-prefill-batch', '8'])
+    assert 'prefill=token' in s
+    assert 'keeping the token path for the prompt' in s
+
+
 def test_auto_plan_names_the_placement_and_the_quant(gguf, tmp_path):
     ids = _ids(16)
     s = _run(gguf, ids, tmp_path / 'plan.npy', ['--gpus', '0', '--minimax-dense-layers-gpu', '0'])
