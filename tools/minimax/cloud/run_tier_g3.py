@@ -136,6 +136,22 @@ def main():
     if p.returncode != 0:
         raise SystemExit("g3 failed for " + tier)
 
+    # The numbers are only half of G3: this tier also has to load, prefill and decode. Do it before the
+    # parts are deleted, because the engine wants every shard present to open the model.
+    smoke = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve_smoke.py"),
+             "--model", parts[0], "--ids", os.path.join(ref, "ids", "ppl_text_hf.bin"),
+             "--gpus", args.gpus, "--vram-slots", args.vram_slots,
+             "--cpu-threads", args.cpu_threads, "--memory-limit-mib", args.memory_limit_mib]
+    log("SMOKE " + " ".join(smoke))
+    s = subprocess.run(smoke, env=env, capture_output=True, text=True)
+    log(s.stdout)
+    if s.stderr:
+        log("---- smoke stderr ----\n" + s.stderr[-3000:])
+    open(os.path.join(out, "smoke.log"), "w", encoding="utf-8").write(s.stdout + "\n---- stderr ----\n" + s.stderr)
+    if s.returncode != 0:
+        # No cleanup on purpose: the parts stay so the failure can be reproduced.
+        raise SystemExit("smoke failed for %s (rc %d); parts kept in %s" % (tier, s.returncode, folder))
+
     if not args.keep:
         t0 = time.time()
         for path in parts:
