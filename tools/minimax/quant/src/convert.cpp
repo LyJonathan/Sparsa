@@ -101,10 +101,20 @@ ggml_type parse_type(const std::string & s) {
     if (u == "NVFP4") return GGML_TYPE_NVFP4;
     // Ported from ik_llama.cpp; ids from include/strata/kernels/iqk_types.hpp. See THIRD_PARTY_NOTICES.md.
     if (u == "IQ2_KT") return (ggml_type) strata::kernels::ikq::kIQ2KT;
-    if (u == "IQ3_K") return (ggml_type) strata::kernels::ikq::kIQ3K;
-    if (u == "IQ4_KS") return (ggml_type) strata::kernels::ikq::kIQ4KS;
     if (u == "IQ3_KT") return (ggml_type) strata::kernels::ikq::kIQ3KT;
-    if (u == "IQ2_KL") return (ggml_type) strata::kernels::ikq::kIQ2KL;
+    // Reserved ids with no quantizer yet: say so instead of failing later inside the packer.
+    static const struct { const char * name; int id; } kReserved[] = {
+        {"IQ3_K", strata::kernels::ikq::kIQ3K},
+        {"IQ4_KS", strata::kernels::ikq::kIQ4KS},
+        {"IQ2_KL", strata::kernels::ikq::kIQ2KL},
+    };
+    for (const auto & r : kReserved) {
+        if (u == r.name) {
+            die(std::string("the ") + r.name + " (type id " + std::to_string(r.id) +
+                ") is reserved for a format ported from ik_llama.cpp that this build has no quantizer for; "
+                "IQ2_KT and IQ3_KT are the ones it can write");
+        }
+    }
     die("unknown quant type " + s);
 }
 
