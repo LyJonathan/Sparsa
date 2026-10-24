@@ -899,3 +899,24 @@ the same warming effect and should be read as "the path fires on a warm box", no
 
 At 347 ms/token the drive is now ~4% of a token, the CPU expert lane and the GPU are the rest - which is why the
 route nudge (fewer, better-placed experts) and the lane shape are the next levers rather than more I/O work.
+
+### Real weights on the 15-layer slice
+
+`models/quant-d3/p5a-l0-14-iq2xs.gguf`, batched prompt pass, `--gpus 0 --minimax-dense-layers-gpu 15
+--minimax-prefill-batch 4096 --cpu-threads 12`, real-text token ids, last-K logits compared:
+
+| arm | context | prompt | wall | logits |
+|---|---|---|---|---|
+| `--minimax-kv host` (host attention, the P5a path) | 4096 | 4096 tok | 544 s | reference |
+| `--minimax-kv ram` (**staged**, new) | 4096 | 4096 tok | **32 s** | KL 6.1e-4 nats, top-1 4/4 |
+| `--minimax-kv vram` (device attention, pre-existing) | 4096 | 4096 tok | 42.7 s | KL 6.1e-4 nats, top-1 4/4 |
+| `--minimax-kv ram` (**staged**) | 32768 | 8192 tok | 67.7 s | reference |
+| `--minimax-kv vram` (device attention) | 32768 | 8192 tok | 64.5 s | `np.array_equal`, max abs 0.0 |
+
+17x on the 4K slice prompt, and the staged path is **bit-identical to the existing VRAM device-attention path**.
+The 6.1e-4-nat difference against host attention is the pre-existing device-kernel difference: the `vram` arm
+produces the same delta to four digits. 8192 tokens at a 32 K context is 64 blocks with top-16, so the indexer
+genuinely drops 48 blocks per query.
+
+q8_0 K/V on the same slice, 2048 tokens: 0.1318 -> 0.0769 GiB (0.583x), **mean KL 3.8e-5 nats, top-1 2/2**, and
+faster (136 s against 269 s) because that path is bandwidth-bound.
