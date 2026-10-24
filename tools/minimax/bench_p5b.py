@@ -103,7 +103,7 @@ def run_llama(bench: str, model: str, n_prompt: int, n_gen: int, reps: int, thre
     for r in rows:
         key = r.get('test')
         if key is None:
-            key = ('pp%d' % r['n_prompt']) if r.get('n_prompt') else ('tg%d' % r['n_gen'])
+            key = ('pp%d' % r['n_prompt']) if r.get('n_prompt') else 'tg'
         out[key] = r
     return out
 
@@ -148,7 +148,7 @@ def main() -> int:
             print(f'[{n}] load before llama.cpp: {load_line()}', flush=True)
             res = run_llama(a.llama_bench, a.model, n, a.decode, a.reps, a.llama_threads, a.llama_dev, llama_extra,
                             a.timeout)
-            pp, tg = res.get(f'pp{n}'), res.get(f'tg{n}')
+            pp, tg = res.get(f'pp{n}'), res.get('tg')
             if pp:
                 row.update(llama_prefill=pp['avg_ts'], llama_ttft_ms=n / pp['avg_ts'] * 1000.0)
             if tg:

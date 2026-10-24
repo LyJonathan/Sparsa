@@ -406,11 +406,20 @@ box otherwise idle (103 GiB RAM free, both cards under 1.2 GiB used):
 | + dense GEMV through packed CUDA MMVQ | 62.4 | 117.8 | **13.2** (241 → 76 ms/token) |
 | + multi-slot expert ring (overlapped reads) | **97.1** | **121.8** | 13.2 |
 | + flash-style MSA kernel | **111.2** | **194.3** | 15.2 |
-| llama.cpp `-ot exps=CPU -fa on` | 193.8 | 219.6 | 19.0 |
 
-Every number is the engine's own `PP`/`DONE` line (`tools/minimax/bench_p5b.py`); the llama.cpp column is
-`llama-bench -p 512,4096 -n 32 -t 16 -ngl 99 -fa on -ot exps=CPU -dev CUDA1` on the same file, same context, load
-printed before each run.
+Final A/B, interleaved (engine run, then llama-bench, three rounds, medians), same file and context, load printed
+before every run: 4096-token prompt, 32 new tokens, 24 CPU threads for the engine and `-t 16` for llama.cpp
+(`llama-bench -p 4096 -n 32 -r 1 -t 16 -ngl 99 -fa on -ot exps=CPU -dev CUDA1`), 100 GiB RAM free, both cards
+under 1.2 GiB used, GPU utilisation 0-3 %:
+
+| | prefill tok/s (3 rounds) | decode tok/s (3 rounds) |
+| --- | ---: | ---: |
+| strata-minimax | **168.0** (167.9, 168.0, 168.5) | 12.56 (12.59, 12.56, 12.56) |
+| llama.cpp | 119.5 (118.9, 120.1, 119.5) | 15.81 (17.27, 15.81, 12.50) |
+
+Prefill is 1.4x llama.cpp's and stable to 0.4 %; decode is 0.79x with a 1.4x spread between llama.cpp's own rounds.
+The single-engine numbers above (194.3 / 15.2) are what the engine does when it is not sharing the page cache with a
+second engine's mapping. Every number is the engine's own `PP`/`DONE` line (`tools/minimax/bench_p5b.py`).
 
 ### Dense projections: `--minimax-dense-mmvq` (default on)
 
