@@ -111,14 +111,53 @@ build\strata-minimax.exe --model model.gguf --serve --max-context 32768 --minima
 Prints `INFO engine=minimax-m3 ...`, an `INFO` line from the engine (`prefill=token`, how many dense layers
 landed on the GPU), and `READY <ctx> stop`. `GEN` streams `T <id>`, `PP <done> <total> <ms> <tok/s>`, and
 `DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> 0 0 <reused>`. `finish` is `stop`, `length`,
-`cancel`, or `nonfinite`. `STOP` during a request finishes it with `cancel`. `GENI` and `BGEN` return `ERR`
-and no `DONE`. Unknown options are ignored in `--serve` mode, because the server's config is shared with the
-Qwen families.
+`cancel`, or `nonfinite`. `STOP` during a request finishes it with `cancel`. `BGEN` returns `ERR` and no
+`DONE`. `GENI` is the same as `GEN` plus one `img=` key naming the pictures in prompt order (comma separated,
+no spaces): `GENI 64 temperature=0 img=C:\pics\a.png,C:\pics\b.png 1,2,...`. Unknown options are ignored in
+`--serve` mode, because the server's config is shared with the Qwen families.
 
 Sampling keys on `GEN`: `temperature` (0 is greedy argmax, ties take the lowest id), `top_k`, `top_p`,
 `min_p`, `penalty_last_n`, `penalty_repeat`, `penalty_freq`, `penalty_present`, `seed`.
 
 `--minimax-allow-nonstandard` serves a reduced test GGUF; `--serve` otherwise refuses it.
+
+## Vision (EXPERIMENTAL)
+
+MiniMax-M3.1-Flash's vision tower (32-layer ViT, width 1280; 1280->6144 projector; 2x2 patch merge) is in a
+separate `mmproj` GGUF that setup downloads next to the quants:
+
+```
+mmproj-MiniMax-M3.1-Flash-F16.gguf
+```
+
+It is the llama.cpp `clip` layout (`clip.projector_type = minimax_m3`), so llama.cpp's mtmd reads it too. Build it
+from the checkpoint with the repo's converter:
+
+```powershell
+python tools/minimax/convert_mmproj.py <checkpoint-dir> -o mmproj-MiniMax-M3.1-Flash-F16.gguf
+```
+
+The engine loads the file with `--mmproj`. A `GENI` request names one or more pictures; the engine decodes
+(JPEG/PNG/BMP/GIF via stb_image), resizes the short side into 28-pixel blocks with at most 672x672 pixels
+(`smart_resize`, as the checkpoint's `image_processor.py`), normalizes with the checkpoint's mean/std, runs the ViT
+and projectors on the CPU in fp32, and replaces the prompt's `]<]image[>[` tokens with the projected rows. One
+672x672 picture is 576 tokens; 640x480 is 391.
+
+```powershell
+build\strata-minimax.exe --model first-part.gguf --mmproj mmproj-MiniMax-M3.1-Flash-F16.gguf --serve
+# GENI 64 temperature=0 img=C:\pics\red_circle.png 1,2,...  (the server expands each picture's 391/576 tokens)
+```
+
+The server side (`serve/` on `main`) accepts OpenAI `image_url` (data: URL or http) and Anthropic `image` blocks
+(base64) and passes the files to the engine; it needs no `strata-vision` process for MiniMax.
+
+The ViT is CPU-only for now: about 64-80 s per 640x480 picture on 16 cores, 0.9-1.7 GB of RAM per encoder (3.5 GB
+of fp32 weights). A GPU path and video (the temporal axis) are not implemented. Parity against transformers
+5.20.2 fp32 on CPU is per-token cosine >= 0.99999 for the same `pixel_values`; see
+`tools/minimax/check_vision_parity.py` and `tools/minimax/ref_vision.py`.
+
+Only the vision tower and projectors are redistributed (about 0.87 B parameters, 1.73 GB); the MiniMax Community
+License applies, the same terms as the quants.
 
 ## Teacher-forced logits
 
