@@ -36,6 +36,12 @@ void host_free(void* p);
 /// bs[h*nb + b] = max over t in block b with t < ntok of dot(q_h, ik[t]).  `ik` is fp16 [ctx][dim].
 void idx_block_scores(const void* ik, int64_t ntok, const float* q, int heads, int dim, int blk, int nb, float* bs,
                       void* stream);
+/// P10: the indexer's top-k block selection on the device, from `bs` [heads][nb].  Writes the selected token positions
+/// of every head into `slots` [heads][maxslot] in ascending position order and their count into `counts` [heads].
+/// Same ranking as the host `select_slots` (score desc, block index asc); `local` blocks ending at the query block are
+/// forced in, exactly as the host path forces them to +inf.  No host round trip.
+void idx_select(const float* bs, int heads, int nb, int top_k, int blk, int64_t pos, int local, int maxslot,
+                int32_t* slots, int32_t* counts, void* stream);
 /// Gather the selected slots of every KV head from the device fp16 cache [ctx][hkv][dim] into a contiguous
 /// [hkv][maxslot][dim] staging buffer.  `slot_pos`/`counts` are device arrays [hkv][maxslot] / [hkv].
 void kv_gather(const void* k, const void* v, int hkv, int dim, const int32_t* slot_pos, const int32_t* counts,
@@ -56,6 +62,9 @@ void sync();
 void* stream_create();
 /// A blocking stream: ordered against the legacy default stream without events (the decode norm+rope chain).
 void* stream_create_blocking();
+/// The legacy default stream's non-null handle.  For a kernel API that rejects nullptr (native MMVQ) but must stay
+/// ordered with the default-stream kernels around it (`gemv_dev_in`: MSA wrote the activation on the default stream).
+void* stream_legacy();
 /// CUDA graph capture for the per-token GPU block.  Begin/end on a dedicated stream; `end` returns an
 /// instantiated graph executable (or null when capture is unsupported here).  Capture does NOT execute the work:
 /// the caller launches once after ending, then replays per token.
