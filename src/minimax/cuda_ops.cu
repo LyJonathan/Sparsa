@@ -224,6 +224,68 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ x, __half* __restric
     if (i < n) y[i] = __float2half(x[i]);
 }
 
+// P5c: one block per head row.  Per-head RMSNorm (gamma is head_dim long), then the NEOX partial rotation of
+// the first n_rot dimensions, then an optional fp32 and/or fp16 store.  One kernel replaces the host
+// rms_heads/rope/ggml_fp32_to_fp16 loop over every token and head, and for `q`/`k` it writes fp16 straight
+// into the KV cache (the caller points `o32`/`o16` at the cache row or at a projection buffer).
+//
+// `pos` is a DEVICE array of per-token positions (`heads_per_tok` rows share one token), for the same reason
+// rope.hpp gives: a CUDA graph bakes kernel arguments in, and a host scalar would replay token 0's position.
+__global__ void head_norm_rope_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
+                                      float* __restrict__ o32, __half* __restrict__ o16, int heads_per_tok, int dim,
+                                      int n_rot, const float* __restrict__ cos_tab,
+                                      const float* __restrict__ sin_tab, const int* __restrict__ pos, float eps) {
+    const long long r = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const float* xr = x + r * (long long)dim;
+
+    // THE SUM IS SEQUENTIAL, ON ONE THREAD, ON PURPOSE.  The host rms() adds in index order; a tree
+    // reduction here would differ in the last bits and then flip an fp16 rounding of K/V, which the router
+    // amplifies into a different top-4 expert.  dim is 128 for MiniMax, so 128 serial adds per head is
+    // cheaper than the divergence: the whole table then matches the host bit for bit.
+    __shared__ float inv_s;
+    if (tid == 0) {
+        float ss = 0.f;
+        // Explicit round-to-nearest intrinsics: nvcc contracts `a*b+c` into an FMA by default, and that alone is
+        // enough to differ from the host in the last bit.  Only non-fused mul/add/sub are bit-equal to it.
+        for (int i = 0; i < dim; ++i) ss = __fadd_rn(ss, __fmul_rn(xr[i], xr[i]));
+        inv_s = 1.f / sqrtf(__fadd_rn(ss / (float)dim, eps));
+    }
+    __syncthreads();
+    const float inv = inv_s;
+
+    const int p = pos[(int)(r / heads_per_tok)];
+    const int half = n_rot / 2;
+    const size_t toff = (size_t)p * (size_t)half;
+    // ONE THREAD OWNS BOTH HALVES OF A PAIR.  `o32` may be `x` (the norm is in-place), and the earlier
+    // one-thread-per-element form had thread i+half overwrite the partner thread i still had to read - the same
+    // race rope.cu's header warns about.  Pairing the writes removes the ordering question instead of
+    // synchronising it.
+    for (int j = tid; j < half; j += nt) {
+        const float c = cos_tab[toff + (size_t)j];
+        const float s = sin_tab[toff + (size_t)j];
+        const float a = __fmul_rn(__fmul_rn(xr[j], inv), gamma ? gamma[j] : 1.f);
+        const float b = __fmul_rn(__fmul_rn(xr[j + half], inv), gamma ? gamma[j + half] : 1.f);
+        // host: v[i] = a*c - b*s; v[i+half] = b*c + a*s.  Same operands, same order, no contraction.
+        const float oa = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+        const float ob = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+        if (o32) {
+            o32[r * (long long)dim + j] = oa;
+            o32[r * (long long)dim + j + half] = ob;
+        }
+        if (o16) {
+            o16[r * (long long)dim + j] = __float2half(oa);
+            o16[r * (long long)dim + j + half] = __float2half(ob);
+        }
+    }
+    for (int i = n_rot + tid; i < dim; i += nt) {
+        const float v = __fmul_rn(__fmul_rn(xr[i], inv), gamma ? gamma[i] : 1.f);
+        if (o32) o32[r * (long long)dim + i] = v;
+        if (o16) o16[r * (long long)dim + i] = __float2half(v);
+    }
+}
+
 __global__ void gather_rows_f16_kernel(const float* __restrict__ x, const int* __restrict__ rows, long long n_rows,
                                        int cols, __half* __restrict__ y) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -787,6 +849,16 @@ void* stream_create() {
     return (void*)s;
 }
 
+// P5c: a BLOCKING stream.  The legacy default stream orders itself against blocking streams but not against
+// non-blocking ones, so a kernel enqueued on this stream is safely bracketed by default-stream copies without an
+// explicit event: that is what lets the decode path's h2d -> q8_1 -> MMVQ -> norm/rope chain run with no
+// cudaStreamSynchronize at all.
+void* stream_create_blocking() {
+    cudaStream_t s = nullptr;
+    check(cudaStreamCreateWithFlags(&s, cudaStreamDefault), "stream create blocking");
+    return (void*)s;
+}
+
 void stream_destroy(void* stream) {
     if (stream) cudaStreamDestroy((cudaStream_t)stream);
 }
@@ -867,6 +939,15 @@ void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     const long long blocks = (n + 255) / 256;
     f32_to_f16_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>(x, (__half*)y, n);
     check(cudaGetLastError(), "f32_to_f16 launch");
+}
+
+void head_norm_rope(const float* x, const float* gamma, float* o32, uint16_t* o16, int64_t rows, int heads_per_tok,
+                    int dim, int n_rot, const float* cos_tab, const float* sin_tab, const int32_t* pos, float eps,
+                    void* stream) {
+    if (rows <= 0 || dim <= 0) return;
+    head_norm_rope_kernel<<<(unsigned)rows, 256, 0, (cudaStream_t)stream>>>(
+        x, gamma, o32, (__half*)o16, heads_per_tok, dim, n_rot, cos_tab, sin_tab, (const int*)pos, eps);
+    check(cudaGetLastError(), "head_norm_rope launch");
 }
 
 void gather_rows_f16(const float* x, const int32_t* rows, int64_t n_rows, int64_t cols, uint16_t* y, void* stream) {

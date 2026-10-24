@@ -458,4 +458,34 @@ rows) and 3.7x faster: MSA 16.4 → 4.4 s over a 4096-token prompt (73 % → 21 
 - `--minimax-prefill-dense f16` is 7 % faster (209.7 tok/s at 4096) but still produces non-finite logits above 512
   prompt tokens. It is not the default; the fp32 path is now correct after the dequantizer fix.
 
+## P5c: the norm+rope round trip is gone
+
+`--minimax-gpu-normrope` (default on) runs per-head RMSNorm + partial NEOX RoPE + the fp16 cache write on the
+device for both paths. P5b measured 721 ms of a 804 ms attention block at 4096 tokens as host work on q/k/v: the
+projections were copied back, normalized and rotated on one core, then converted to fp16 and copied in again.
+Now `cu::head_norm_rope` (one block per head row) reads the projection output in place and writes fp16 straight
+into the KV cache; the MSA query buffer and the indexer keys are produced by the same kernel, and the token path
+reads its query from the device buffer instead of uploading it.
+
+It is **bit-identical** to the host loop, which took two details. The RMS sum is sequential on one thread with
+`__fmul_rn`/`__fadd_rn` (nvcc contracts `a*b+c` into an FMA by default, and that last-bit difference was enough to
+flip an fp16 K/V rounding and - measured - the router's 4th expert at token 20). The cos/sin table is built from
+the same double-precision expression `rope()` evaluates per call (`pos / theta^(2i/n_rot)`), not from
+`build_rope_table`'s `pos * theta^(-2i/n_rot)` form. `test_p5c.py` holds both paths to `array_equal` on 200 tokens
+of the runnable model.
+
+The table is built once per device up to `min(ctx, 128 K)` positions (256 B per position); a longer context falls
+back to the host loop rather than reserving 256 MiB of VRAM on every card.
+
+Measured on the 15-layer real-weight IQ2_XS slice, one RTX 5070, KV in VRAM, 24 threads, box idle:
+
+| prompt | P5b | P5c | gain |
+| ---: | ---: | ---: | ---: |
+| 512 prefill | 82.2 tok/s | 90.8 | +10.5 % |
+| 4096 prefill | 168.2 tok/s | 222.6 | +32.3 % |
+| decode (32 new) | 12.63 tok/s | 13.03 | +3.2 % |
+
+`--minimax-gpu-normrope off` is the P5b path, byte for byte.
+
+
 

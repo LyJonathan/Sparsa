@@ -54,6 +54,8 @@ void sync();
 
 /// A non-blocking side stream for the adaptive VRAM swaps.
 void* stream_create();
+/// A blocking stream: ordered against the legacy default stream without events (the decode norm+rope chain).
+void* stream_create_blocking();
 void stream_destroy(void* stream);
 void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void stream_sync(void* stream);
@@ -79,6 +81,13 @@ void moe_expert_f16(int type, const void* const* gate, const void* const* up, co
 
 /// y[i] = (half) x[i], n values.  Device pointers.
 void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// P5c: per-head RMSNorm + NEOX partial RoPE + (optional) fp32/fp16 store, one block per row.
+/// `x` is [rows][dim]; `heads_per_tok` rows belong to one token and take `pos[token]`.  `o32` and/or `o16`
+/// may be null and may equal `x` (the rotation is in-place safe: a pair writes only its two inputs).
+/// `cos_tab`/`sin_tab` are [max_pos][n_rot/2] from `strata::kernels::build_rope_table`.
+void head_norm_rope(const float* x, const float* gamma, float* o32, uint16_t* o16, int64_t rows, int heads_per_tok,
+                    int dim, int n_rot, const float* cos_tab, const float* sin_tab, const int32_t* pos, float eps,
+                    void* stream);
 /// y[i] *= s, n values (the MM-NVFP4 per-expert global divisor on a batched expert result).
 void scale_rows(float* y, int64_t n, float s, void* stream);
 /// y[r][c] = (half) x[rows[r]][c], n_rows x cols, row-major.

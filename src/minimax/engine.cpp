@@ -55,6 +55,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
 
 namespace strata::minimax {
@@ -134,6 +135,8 @@ struct Layer {
     // P4: this layer's owning device (an index into Impl::devs) and the KV it keeps there.
     int dev = 0;
     DevPtr d_k, d_v, d_ik;          // when the KV lives in VRAM
+    // P5c: the per-head norm weights on the device, for the fused norm+rope kernel.
+    DevPtr d_qn, d_kn, d_iqn, d_ikn;
 };
 
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
@@ -609,12 +612,18 @@ struct Engine::Impl {
         DevPtr xq;                      // q8_1 image of a dense projection's activation (dense MMVQ)
         DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
         DevPtr qd, bs, slots, counts, kstage, vstage, att;
+        // P5c: the fused norm+rope step's device operands.  `qn`/`kn`/`vn` are the projection outputs of the
+        // token path (normed/rotated in place), `iqn`/`ikn` the indexer's; `pos1` is the one-token position array.
+        DevPtr qn, kn, vn, iqn, ikn, pos1;
+        DevPtr rope_cos, rope_sin;   // [rope_pos_cap][n_rot/2] fp32
+        int64_t rope_pos_cap = 0;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
         uint16_t* vstage_h = nullptr;
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
+        void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
     };
     std::vector<Work> work;          // one entry per device in `devs`
     Work& W() { return work[(size_t)cur]; }
@@ -649,6 +658,8 @@ struct Engine::Impl {
     bool prefill_dense_f32 = true;
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
+    bool gpu_norm_rope = true;     // fused device norm+rope (--minimax-gpu-normrope off)
+    bool expert_resident = true;   // pin the RAM expert tier at startup (--minimax-expert-resident off)
     struct PfBuf {
         uint16_t* x16 = nullptr;     // [T][embd] fp16 hidden state
         uint16_t* h16 = nullptr;     // [T][embd] fp16 normed input to the projections
@@ -681,6 +692,7 @@ struct Engine::Impl {
         DevPtr d_iq16, d_bs, d_blk, d_nblk, d_rows, d_ent_row, d_ent_w;
 
         DevPtr d_q16;                // fp16 attention queries for the batched MSA kernel
+        DevPtr d_pos;                // [T] token positions for the fused norm+rope kernel
         int64_t rows_cap = 0;
     };
     std::vector<PfBuf> pf;
@@ -704,6 +716,7 @@ struct Engine::Impl {
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
+    std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
     std::vector<float> pf_moe_h;     // [T][embd] the layer's FFN output on the host
     std::vector<float> pf_dense_h;   // [T][max_dense_n] host intermediate for the CPU dense MLP
@@ -759,6 +772,8 @@ struct Engine::Impl {
         scale_routed = (float)cfg.routed_scale;
         renorm = cfg.expert_weights_norm;
         dense_mmvq = opt.dense_mmvq != "off";
+        gpu_norm_rope = opt.gpu_normrope != "off";
+        expert_resident = opt.expert_resident != "off";
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
@@ -826,6 +841,10 @@ struct Engine::Impl {
         for (Work& w : work) {
             if (w.side) cu::stream_destroy(w.side);
             w.side = nullptr;
+            if (w.ds) cu::stream_destroy(w.ds);
+            w.ds = nullptr;
+            if (w.dsb) cu::stream_destroy(w.dsb);
+            w.dsb = nullptr;
             if (w.kstage_h) cu::host_free(w.kstage_h);
             if (w.vstage_h) cu::host_free(w.vstage_h);
             w.kstage_h = w.vstage_h = nullptr;
@@ -1211,6 +1230,37 @@ struct Engine::Impl {
             if (kv_mode != 0) {
                 w.qd = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
                 w.att = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
+                // P5c: fused norm+rope operands.  `qn` is the normed/rotated query the device attention reads
+                // directly; `kn`/`vn` are the projection outputs before they are written to the fp16 cache.
+                w.qn = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
+                w.kn = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * sizeof(float)));
+                w.vn = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * sizeof(float)));
+                w.iqn = DevPtr(cu::alloc((size_t)cfg.idx_heads * cfg.idx_dim * sizeof(float)));
+                w.ikn = DevPtr(cu::alloc((size_t)cfg.idx_dim * sizeof(float)));
+                w.pos1 = DevPtr(cu::alloc(sizeof(int32_t)));
+                // The cos/sin table the kernel indexes.  It is built once per device up to a cap: at 256 KiB of
+                // table per 1 K positions an uncapped 1 M context would cost 256 MiB on every card, so the table
+                // stops at 128 K and a longer context keeps the host rope (correct, just not this fast path).
+                int64_t rp = ctx < 131072 ? ctx : 131072;
+                if (rp < 1) rp = 1;
+                const int half = (int)cfg.n_rot / 2;
+                w.rope_pos_cap = rp;
+                std::vector<float> ct((size_t)rp * (size_t)half), st((size_t)rp * (size_t)half);
+                // The SAME double-precision expression the host `rope()` evaluates per call, tabulated.  Using
+                // build_rope_table's `p * theta^-x` form instead differs by ~1e-13 rad, which is enough to flip an
+                // fp16 K/V rounding and (measured) a router top-4 tie: the device path then stops being bit-equal
+                // to the host path it replaces.
+                for (int64_t pp = 0; pp < rp; ++pp)
+                    for (int i = 0; i < half; ++i) {
+                        const double freq =
+                            (double)pp / std::pow(cfg.rope_theta, (2.0 * (double)i) / (double)cfg.n_rot);
+                        ct[(size_t)pp * (size_t)half + (size_t)i] = (float)std::cos(freq);
+                        st[(size_t)pp * (size_t)half + (size_t)i] = (float)std::sin(freq);
+                    }
+                w.rope_cos = DevPtr(cu::alloc(ct.size() * sizeof(float)));
+                w.rope_sin = DevPtr(cu::alloc(st.size() * sizeof(float)));
+                cu::copy_h2d(w.rope_cos.p, ct.data(), ct.size() * sizeof(float));
+                cu::copy_h2d(w.rope_sin.p, st.data(), st.size() * sizeof(float));
                 const size_t nb_max = (size_t)((ctx + cfg.idx_block - 1) / cfg.idx_block);
                 w.bs = DevPtr(cu::alloc(nb_max * (size_t)cfg.idx_heads * sizeof(float)));
                 w.slots = DevPtr(cu::alloc((size_t)cfg.n_head_kv * (size_t)max_slot * sizeof(int32_t)));
@@ -1499,6 +1549,19 @@ struct Engine::Impl {
             up(L.router);
             up(L.iq);
             up(L.ik);
+            // P5c: the head-norm weights the fused device norm+rope kernel multiplies by.  Only when the KV (and
+            // therefore the fused path) lives on a device.
+            if (kv_mode != 0) {
+                auto upn = [&](DevPtr& d, const std::vector<float>& src) {
+                    if (src.empty()) return;
+                    d = DevPtr(cu::alloc(src.size() * sizeof(float)));
+                    cu::copy_h2d(d.p, src.data(), src.size() * sizeof(float));
+                };
+                upn(L.d_qn, L.q_norm);
+                upn(L.d_kn, L.k_norm);
+                upn(L.d_iqn, L.iq_norm);
+                upn(L.d_ikn, L.ik_norm);
+            }
         }
         // lm_head goes on the device that owns the last layer (upstream's "last card" rule), if it fits there.
         if (N > 0 && out_b != std::numeric_limits<size_t>::max()) {
@@ -2193,27 +2256,31 @@ struct Engine::Impl {
         ++profile_saves;
     }
 
-    void gemv(const Tensor& t, const float* xin, float* yout) {
+    void gemv(const Tensor& t, const float* xin, float* yout, void* dev_out = nullptr) {
         if (t.ne2 != 1) fail(t.name + ": internal gemv is for a matrix, not a stacked expert");
         const int rows = (int)t.ne1;
         const int cols = (int)t.ne0;
         if ((int64_t)cols > max_cols || (int64_t)rows > max_rows) fail(t.name + ": gemv exceeds the workspace");
         if (t.gpu) {
             Work& w = W();
-            // P5b: a packed projection through llama.cpp's CUDA MMVQ.  The blocks are read as they are - no
-            // fp32 dequantize buffer, so a Q6_K head reads 0.82 bytes per weight instead of 4, and there is no
-            // 128-row tile loop.  The activation is q8_1, the same contract the GPU expert tier already uses.
+            // P5c: with `dev_out` the result stays on the device (the fused norm+rope step consumes it there).
+            // The kernels then stay on the DEFAULT stream, so the norm+rope launch that follows is ordered
+            // after them without a host round trip.
             if (dense_mmvq && !t.dev_f32 && mmvq_dense_fits(t.type, cols) && w.xq.p) {
-                if (!w.ds) w.ds = cu::stream_create();
+                if (!dev_out && !w.ds) w.ds = cu::stream_create();
+                if (dev_out && !w.dsb) w.dsb = cu::stream_create_blocking();
+                void* ds = dev_out ? w.dsb : w.ds;
                 h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, w.ds);
-                strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, w.ds);
+                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, ds);
+                strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)(dev_out ? dev_out : w.y.p), cols, rows,
+                                             1, ds);
+                if (dev_out) return;
                 cu::copy_d2h_async(yout, w.y.p, (size_t)rows * sizeof(float), w.ds);
                 cu::stream_sync(w.ds);
                 return;
             }
             h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-            float* dy = (float*)w.y.p;
+            float* dy = (float*)(dev_out ? dev_out : w.y.p);
             if (t.dev_f32) {
                 cu::gemv((const float*)t.dev.p, (const float*)w.x.p, dy, rows, cols);
             } else {
@@ -2223,6 +2290,7 @@ struct Engine::Impl {
                     cu::gemv((const float*)w.scratch.p, (const float*)w.x.p, dy + r, n, cols);
                 }
             }
+            if (dev_out) return;
             cu::copy_d2h(yout, dy, (size_t)rows * sizeof(float));
             return;
         }
@@ -2582,7 +2650,8 @@ struct Engine::Impl {
     // P4: the same attention on the owning device.  The indexer scores are computed from the device copy of the
     // indexer keys; only the selected slots of each KV head are brought into the staging buffer (a device gather
     // when the KV lives in VRAM, one H2D copy from pinned host memory in the RAM tier).
-    void attend_dev(int layer, const Layer& L, int64_t pos, float* att) {
+    void attend_dev(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
+                    const float* iqdev = nullptr) {
         use_device_index(L.dev);
         Work& w = W();
         const int H = (int)cfg.n_head;
@@ -2594,9 +2663,13 @@ struct Engine::Impl {
         const int nb = (int)((Tk + BLK - 1) / BLK);
         std::vector<float> bs((size_t)HI * nb, -std::numeric_limits<float>::infinity());
         if (L.indexer) {
-            h2d(w, w.qd.p, iq.data(), (size_t)HI * (size_t)cfg.idx_dim * sizeof(float));
-            cu::idx_block_scores(L.d_ik.p, Tk, (const float*)w.qd.p, HI, (int)cfg.idx_dim, BLK, nb,
-                                 (float*)w.bs.p, nullptr);
+            if (iqdev) {
+                cu::idx_block_scores(L.d_ik.p, Tk, iqdev, HI, (int)cfg.idx_dim, BLK, nb, (float*)w.bs.p, nullptr);
+            } else {
+                h2d(w, w.qd.p, iq.data(), (size_t)HI * (size_t)cfg.idx_dim * sizeof(float));
+                cu::idx_block_scores(L.d_ik.p, Tk, (const float*)w.qd.p, HI, (int)cfg.idx_dim, BLK, nb,
+                                     (float*)w.bs.p, nullptr);
+            }
             cu::sync();
             cu::copy_d2h(bs.data(), w.bs.p, (size_t)HI * (size_t)nb * sizeof(float));
         }
@@ -2641,18 +2714,24 @@ struct Engine::Impl {
                 }
             }
         }
-        h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
-        cu::msa_attn(w.kstage.p, w.vstage.p, (const float*)w.qd.p, (float*)w.att.p, H, q_per_kv, (int)max_slot,
-                     (const int32_t*)w.counts.p, D, nullptr);
+        if (qdev) {
+            cu::msa_attn(w.kstage.p, w.vstage.p, qdev, (float*)w.att.p, H, q_per_kv, (int)max_slot,
+                         (const int32_t*)w.counts.p, D, nullptr);
+        } else {
+            h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
+            cu::msa_attn(w.kstage.p, w.vstage.p, (const float*)w.qd.p, (float*)w.att.p, H, q_per_kv, (int)max_slot,
+                         (const int32_t*)w.counts.p, D, nullptr);
+        }
         cu::sync();
         cu::copy_d2h(att, w.att.p, (size_t)H * (size_t)D * sizeof(float));
     }
 
-    void attend(int layer, const Layer& L, int64_t pos, float* att) {
+    void attend(int layer, const Layer& L, int64_t pos, float* att, const float* qdev = nullptr,
+                const float* iqdev = nullptr) {
         if (kv_mode == 0)
             attend_host(layer, L, pos, att);
         else
-            attend_dev(layer, L, pos, att);
+            attend_dev(layer, L, pos, att, qdev, iqdev);
     }
 
 
@@ -2757,6 +2836,7 @@ struct Engine::Impl {
             pf_max_blk = (int)cfg.idx_top_k;
             p.d_blk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)pf_max_blk * sizeof(int32_t) + 4096));
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
+            p.d_pos = DevPtr(cu::alloc((size_t)T * sizeof(int32_t) + 64));
             if (prefill_gpu_experts && max_expert_bytes > 0) {
                 p.ring_slot = max_expert_bytes;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
@@ -2803,6 +2883,9 @@ struct Engine::Impl {
     }
 
     PfBuf& P() { return pf[(size_t)cur]; }
+
+    // P5c: how many positions the device cos/sin table covers (all devices share the same cap).
+    int64_t p_rope_cap() const { return work.empty() ? 0 : work[0].rope_pos_cap; }
 
     // One projection for T rows: dequantize a tile of the weight rows to fp16, cuBLAS the tile, repeat.  The tile
     // size comes from the scratch buffer, so an `lm_head` of 200 K rows costs a few dozen launches, not 200 K.
@@ -2973,6 +3056,53 @@ struct Engine::Impl {
             if (dbg) dbuf_put(pfx + "/residual_in", x.data(), (int)cfg.n_embd);
             rms(x.data(), L.attn_norm.data(), h.data(), (int)cfg.n_embd, eps);
             if (dbg) dbuf_put(pfx + "/attn_input", h.data(), (int)cfg.n_embd);
+            // P5c: the token path's norm+rope on the device.  `dev_tok` keeps q/k/v on the card: the three
+            // projections write device buffers, the fused kernel norms/rotates them there and drops K/V straight
+            // into the cache, so the host sees one position update and no 16 K-float round trip per layer.
+            const bool dev_tok = kv_mode != 0 && L.want_gpu && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
+                                 pos < p_rope_cap();
+            const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
+            const size_t koff_dev = (size_t)pos * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
+            if (dev_tok) {
+                Work& w = W();
+                const int H = (int)cfg.n_head, HKV = (int)cfg.n_head_kv, D = (int)cfg.head_dim;
+                gemv(L.wq, h.data(), nullptr, w.qn.p);
+                gemv(L.wk, h.data(), nullptr, w.kn.p);
+                gemv(L.wv, h.data(), nullptr, w.vn.p);
+                const int32_t ppos = (int32_t)pos;
+                cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p, nullptr, H, H, D,
+                                   (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                   (const int32_t*)w.pos1.p, eps, nullptr);
+                if (kv_mode == 1) {
+                    cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p,
+                                       (uint16_t*)L.d_k.p + koff_dev, HKV, HKV, D, (int)cfg.n_rot,
+                                       (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                       (const int32_t*)w.pos1.p, eps, nullptr);
+                    cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)L.d_v.p + koff_dev, (int64_t)HKV * D, nullptr);
+                    if (dbg) {
+                        cu::sync();
+                        cu::copy_d2h(q.data(), w.qn.p, (size_t)H * D * sizeof(float));
+                        cu::copy_d2h(k.data(), w.kn.p, (size_t)HKV * D * sizeof(float));
+                        cu::copy_d2h(v.data(), w.vn.p, (size_t)HKV * D * sizeof(float));
+                        dbuf_put(pfx + "/q_after_rope", q.data(), (int)(cfg.n_head * cfg.head_dim));
+                        dbuf_put(pfx + "/k_after_rope", k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
+                    }
+                } else {
+                    // RAM tier: the rotated K/V are converted on the card and one small copy lands them in the
+                    // page-locked host cache.
+                    const int n = HKV * D;
+                    cu::head_norm_rope((const float*)w.kn.p, (const float*)L.d_kn.p, (float*)w.kn.p, nullptr, HKV,
+                                       HKV, D, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                       (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
+                    cu::f32_to_f16((const float*)w.kn.p, (uint16_t*)w.att.p, n, nullptr);
+                    cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
+                    std::memcpy(k_host + koff, kv_tmp.data(), (size_t)n * 2);
+                    cu::f32_to_f16((const float*)w.vn.p, (uint16_t*)w.att.p, n, nullptr);
+                    cu::copy_d2h(kv_tmp.data(), w.att.p, (size_t)n * 2);
+                    std::memcpy(v_host + koff, kv_tmp.data(), (size_t)n * 2);
+                }
+            } else {
             gemv(L.wq, h.data(), q.data());
             gemv(L.wk, h.data(), k.data());
             gemv(L.wv, h.data(), v.data());
@@ -2984,8 +3114,6 @@ struct Engine::Impl {
                 dbuf_put(pfx + "/q_after_rope", q.data(), (int)(cfg.n_head * cfg.head_dim));
                 dbuf_put(pfx + "/k_after_rope", k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
             }
-            const size_t koff = ((size_t)li * (size_t)ctx + (size_t)pos) * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
-            const size_t koff_dev = (size_t)pos * (size_t)cfg.n_head_kv * (size_t)cfg.head_dim;
             if (kv_mode == 0) {
                 store_f16(k_host, koff, k.data(), (int)(cfg.n_head_kv * cfg.head_dim));
                 store_f16(v_host, koff, v.data(), (int)(cfg.n_head_kv * cfg.head_dim));
@@ -3002,7 +3130,28 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_v.p + koff_dev, kv_tmp.data(), (size_t)n * 2);
                 }
             }
+            }
             if (L.indexer) {
+                if (dev_tok) {
+                    Work& w = W();
+                    const int HI = (int)cfg.idx_heads, ID = (int)cfg.idx_dim;
+                    gemv(L.iq, h.data(), nullptr, w.iqn.p);
+                    gemv(L.ik, h.data(), nullptr, w.ikn.p);
+                    cu::head_norm_rope((const float*)w.iqn.p, (const float*)L.d_iqn.p, (float*)w.iqn.p, nullptr,
+                                       (int64_t)HI, HI, ID, (int)cfg.n_rot, (const float*)w.rope_cos.p,
+                                       (const float*)w.rope_sin.p, (const int32_t*)w.pos1.p, eps, nullptr);
+                    cu::head_norm_rope((const float*)w.ikn.p, (const float*)L.d_ikn.p, (float*)w.ikn.p,
+                                       (uint16_t*)L.d_ik.p + (size_t)pos * (size_t)ID, (int64_t)1, 1, ID,
+                                       (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
+                                       (const int32_t*)w.pos1.p, eps, nullptr);
+                    if (dbg) {
+                        cu::sync();
+                        cu::copy_d2h(iq.data(), w.iqn.p, (size_t)HI * ID * sizeof(float));
+                        cu::copy_d2h(ik.data(), w.ikn.p, (size_t)ID * sizeof(float));
+                        dbuf_put(pfx + "/index_q_after_rope", iq.data(), (int)(cfg.idx_heads * cfg.idx_dim));
+                        dbuf_put(pfx + "/index_k_after_rope", ik.data(), (int)cfg.idx_dim);
+                    }
+                } else {
                 gemv(L.iq, h.data(), iq.data());
                 gemv(L.ik, h.data(), ik.data());
                 rms_heads(iq.data(), (int)cfg.idx_heads, (int)cfg.idx_dim, L.iq_norm.data(), eps);
@@ -3021,9 +3170,11 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_ik.p + (size_t)pos * (size_t)cfg.idx_dim, kv_tmp.data(),
                                  (size_t)cfg.idx_dim * 2);
                 }
+                }
             }
             std::vector<float> att((size_t)cfg.n_head * (size_t)cfg.head_dim);
-            attend((int)li, L, pos, att.data());
+            attend((int)li, L, pos, att.data(), dev_tok ? (const float*)W().qn.p : nullptr,
+                   dev_tok && L.indexer ? (const float*)W().iqn.p : nullptr);
             if (dbg) dbuf_put(pfx + "/attn_core_out", att.data(), (int)(cfg.n_head * cfg.head_dim));
             gemv(L.wo, att.data(), proj.data());
             if (dbg) dbuf_put(pfx + "/attn_out", proj.data(), (int)cfg.n_embd);
@@ -3440,16 +3591,55 @@ struct Engine::Impl {
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
             const auto ta1 = pfclock::now();
+            // P5c: with the fused device path the projections never come back to the host: norm+rope runs on
+            // the device and writes fp16 straight into the KV cache (and the MSA query buffer).
+            const bool dev_prep = dev_attn && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
+                                  (int64_t)pos0 + T <= p_rope_cap();
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
                 gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
-                cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
+                else {
+                    pf_pos.resize((size_t)T);
+                    for (int t = 0; t < T; ++t) pf_pos[(size_t)t] = (int32_t)(pos0 + t);
+                    cu::copy_h2d(p.d_pos.p, pf_pos.data(), (size_t)T * sizeof(int32_t));
+                    cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H, H,
+                                       D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                }
                 gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
-                cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
+                else {
+                    uint16_t* kdst = (uint16_t*)p.a16;
+                    cu::head_norm_rope(p.y32, (const float*)L.d_kn.p, nullptr, kdst, (int64_t)T * HKV, HKV, D,
+                                       (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    if (kv_mode == 1) {
+                        cu::copy_d2d((uint16_t*)L.d_k.p + (size_t)pos0 * klen, kdst, (size_t)T * klen * 2);
+                    } else {
+                        pf_k16.resize((size_t)T * klen);
+                        cu::copy_d2h(pf_k16.data(), kdst, (size_t)T * klen * 2);
+                        std::memcpy(k_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                    pf_k16.data(), (size_t)T * klen * sizeof(uint16_t));
+                    }
+                }
                 gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
-                cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
+                if (!dev_prep) cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
+                else {
+                    uint16_t* vdst = (uint16_t*)p.a16;
+                    cu::f32_to_f16(p.y32, vdst, (int64_t)T * klen, nullptr);
+                    if (kv_mode == 1) {
+                        cu::copy_d2d((uint16_t*)L.d_v.p + (size_t)pos0 * klen, vdst, (size_t)T * klen * 2);
+                    } else {
+                        pf_v16.resize((size_t)T * klen);
+                        cu::copy_d2h(pf_v16.data(), vdst, (size_t)T * klen * 2);
+                        std::memcpy(v_host + ((size_t)li * (size_t)ctx + (size_t)pos0) * (size_t)klen,
+                                    pf_v16.data(), (size_t)T * klen * sizeof(uint16_t));
+                    }
+                }
+                if (dev_prep) cu::sync();
             } else {
                 gemm_cpu(L.wq, hq, T, ne, qf.data(), qlen);
                 gemm_cpu(L.wk, hq, T, ne, pf_kv.data(), klen);
@@ -3457,6 +3647,7 @@ struct Engine::Impl {
             }
             const auto ta2 = pfclock::now();
             const auto tkv0 = pfclock::now();
+            if (!dev_prep)
             for (int t = 0; t < T; ++t) {
                 rms_heads(qf.data() + (size_t)t * qlen, H, D, L.q_norm.data(), eps);
                 rms_heads(pf_kv.data() + (size_t)t * klen, HKV, D, L.k_norm.data(), eps);
@@ -3468,7 +3659,7 @@ struct Engine::Impl {
                     store_f16(v_host, koff, vf.data() + (size_t)t * klen, klen);
                 }
             }
-            if (kv_mode == 1) {
+            if (kv_mode == 1 && !dev_prep) {
                 pf_k16.resize((size_t)T * klen);
                 pf_v16.resize((size_t)T * klen);
                 for (int t = 0; t < T; ++t) {
@@ -3485,13 +3676,24 @@ struct Engine::Impl {
                 ikf.resize((size_t)T * cfg.idx_dim);
                 if (gpu) {
                     gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
-                    cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
+                    if (!dev_prep) cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
+                    else
+                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, nullptr, (uint16_t*)p.d_iq16.p,
+                                           (int64_t)T * HI, HI, (int)cfg.idx_dim, (int)cfg.n_rot,
+                                           (const float*)W().rope_cos.p, (const float*)W().rope_sin.p,
+                                           (const int32_t*)p.d_pos.p, eps, nullptr);
                     gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
-                    cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
+                    if (!dev_prep) cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
+                    else
+                        cu::head_norm_rope(p.y32, (const float*)L.d_ikn.p, nullptr,
+                                           (uint16_t*)L.d_ik.p + (size_t)pos0 * cfg.idx_dim, (int64_t)T, 1,
+                                           (int)cfg.idx_dim, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
                 } else {
                     gemm_cpu(L.iq, hq, T, ne, iqf.data(), ilen);
                     gemm_cpu(L.ik, hq, T, ne, ikf.data(), (int)cfg.idx_dim);
                 }
+                if (!dev_prep)
                 for (int t = 0; t < T; ++t) {
                     rms_heads(iqf.data() + (size_t)t * ilen, HI, (int)cfg.idx_dim, L.iq_norm.data(), eps);
                     rms(ikf.data() + (size_t)t * cfg.idx_dim, L.ik_norm.data(), ikf.data() + (size_t)t * cfg.idx_dim,
@@ -3504,7 +3706,7 @@ struct Engine::Impl {
                     if (kv_mode == 0)
                         store_f16(ik_host, ioff, ikf.data() + (size_t)t * cfg.idx_dim, (int)cfg.idx_dim);
                 }
-                if (kv_mode != 0) {
+                if (kv_mode != 0 && !dev_prep) {
                     std::vector<uint16_t> ik16((size_t)T * cfg.idx_dim);
                     for (int t = 0; t < T; ++t)
                         to_f16(ikf.data() + (size_t)t * cfg.idx_dim, ik16.data() + (size_t)t * cfg.idx_dim,
@@ -3512,18 +3714,19 @@ struct Engine::Impl {
                     cu::copy_h2d((uint16_t*)L.d_ik.p + (size_t)pos0 * cfg.idx_dim, ik16.data(),
                                  (size_t)T * cfg.idx_dim * 2);
                 }
-                if (dev_attn) {
+                if (dev_attn && !dev_prep) {
                     iq16.resize((size_t)T * ilen);
                     for (int t = 0; t < T; ++t)
                         to_f16(iqf.data() + (size_t)t * ilen, iq16.data() + (size_t)t * ilen, ilen);
                 }
+                if (dev_prep) cu::sync();
                 t_kvw += dur(tix0, pfclock::now());
             }
             if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
                 int nb = 0;
                 if (L.indexer) {
-                    cu::copy_h2d(p.d_iq16.p, iq16.data(), iq16.size() * 2);
+                    if (!dev_prep) cu::copy_h2d(p.d_iq16.p, iq16.data(), iq16.size() * 2);
                     const auto ti0 = pfclock::now();
                     nb = (int)((pos0 + T + BLK - 1) / BLK);
                     cu::idx_block_scores_batch(L.d_ik.p, (const uint16_t*)p.d_iq16.p, HI, (int)cfg.idx_dim, BLK, nb, T,
@@ -3544,8 +3747,10 @@ struct Engine::Impl {
                     cu::copy_h2d(p.d_blk.p, pf_blk.data(), pf_blk.size() * sizeof(int32_t));
                     cu::copy_h2d(p.d_nblk.p, pf_nblk.data(), pf_nblk.size() * sizeof(int32_t));
                 }
-                cu::copy_h2d(p.y32, qf.data(), (size_t)T * qlen * sizeof(float));
-                cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
+                if (!dev_prep) {
+                    cu::copy_h2d(p.y32, qf.data(), (size_t)T * qlen * sizeof(float));
+                    cu::f32_to_f16(p.y32, (uint16_t*)p.d_q16.p, (size_t)T * qlen, nullptr);
+                }
                 cu::sync();
                 const auto tm0 = pfclock::now();
                 cu::msa_attn_batch(L.d_k.p, L.d_v.p, (const uint16_t*)p.d_q16.p, (const int32_t*)p.d_blk.p,
