@@ -43,12 +43,18 @@ void put_str(std::vector<uint8_t>& b, const std::string& s) {
 
 // A GGUF v3 file of F32[8] tensors named `names`, laid out 32 bytes apart from a 32-byte-aligned data start.
 // `header_only`: the file ends right after the tensor directory - no alignment padding, no data.
-std::filesystem::path write_gguf(const std::vector<std::string>& names, bool header_only = false) {
+std::filesystem::path write_gguf(const std::vector<std::string>& names, bool header_only = false,
+                                 uint64_t align_override = 0) {
     std::vector<uint8_t> b;
     put<uint32_t>(b, 0x46554747u);   // "GGUF"
     put<uint32_t>(b, 3);
     put<uint64_t>(b, names.size());  // n_tensors
-    put<uint64_t>(b, 0);             // n_kv
+    put<uint64_t>(b, align_override ? 1 : 0);   // n_kv
+    if (align_override) {
+        put_str(b, "general.alignment");
+        put<uint32_t>(b, 4);         // GGUF_METADATA_VALUE_TYPE_UINT32
+        put<uint32_t>(b, (uint32_t) align_override);
+    }
     for (size_t i = 0; i < names.size(); ++i) {
         put_str(b, names[i]);
         put<uint32_t>(b, 1);         // n_dims
@@ -58,6 +64,26 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names, bool hea
     }
     if (!header_only) b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
     const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
+    return path;
+}
+
+// One tensor of `type` with an untrusted shape, and a data section of `payload` zero bytes.  Used to check
+// that a crafted file is rejected by the arithmetic, never by an out-of-bounds read.
+std::filesystem::path write_shape_gguf(const std::string& name, const std::vector<uint64_t>& shape,
+                                       uint32_t type, uint64_t payload) {
+    std::vector<uint8_t> b;
+    put<uint32_t>(b, 0x46554747u);
+    put<uint32_t>(b, 3);
+    put<uint64_t>(b, 1);             // n_tensors
+    put<uint64_t>(b, 0);             // n_kv
+    put_str(b, name);
+    put<uint32_t>(b, (uint32_t) shape.size());
+    for (uint64_t d : shape) put<uint64_t>(b, d);
+    put<uint32_t>(b, type);
+    put<uint64_t>(b, 0);             // offset
+    b.resize((b.size() + 31) / 32 * 32 + payload, 0);
+    const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_shape_test.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     return path;
 }
@@ -123,6 +149,67 @@ int main() {
         std::filesystem::remove(path);
         check(err.find("data section starts past EOF") != std::string::npos,
               "one tensor, ends before the aligned data start: refused at open");
+    }
+    // Untrusted shapes: a GGUF is downloaded from the internet.  tensor_payload_bytes must return 0 (so
+    // in_bounds says no) rather than wrap to a small number that passes both the size and the bounds check.
+    {
+        const uint64_t huge = 1ull << 40;
+        const auto path = write_shape_gguf("blk.0.ffn_gate_exps.weight", {huge, huge}, 160 /* IQ2_KT */, 64);
+        std::string err;
+        bool ok = false;
+        try {
+            strata::GgufModel m({path.string()});
+            const auto* t = m.find("blk.0.ffn_gate_exps.weight");
+            ok = t && m.in_bounds(*t, 0);
+            if (t) std::printf("  (payload %llu bytes at %llu)\n", (unsigned long long) strata::tensor_payload_bytes(*t),
+                               (unsigned long long) t->offset);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.empty() && !ok, "IQ2_KT with 2^40 x 2^40 values: no payload size, in_bounds refuses it");
+    }
+    {
+        const uint64_t huge = 1ull << 40;
+        const auto path = write_shape_gguf("blk.0.attn_q.weight", {huge, huge}, 0 /* F32 */, 64);
+        std::string err;
+        bool ok = false;
+        try {
+            strata::GgufModel m({path.string()});
+            const auto* t = m.find("blk.0.attn_q.weight");
+            ok = t && m.in_bounds(*t, 0);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.empty() && !ok, "F32 with 2^40 x 2^40 values: the checked ggml path refuses it too");
+    }
+    {
+        // shape[0] wider than int64: the ikq row geometry must not be handed the truncated width.
+        const auto path = write_shape_gguf("blk.0.ffn_down_exps.weight", {0x8000000000000010ull, 2}, 163 /* IQ3_KT */, 64);
+        std::string err;
+        bool ok = false;
+        try {
+            strata::GgufModel m({path.string()});
+            const auto* t = m.find("blk.0.ffn_down_exps.weight");
+            ok = t && m.in_bounds(*t, 0);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.empty() && !ok, "IQ3_KT with a width above INT64_MAX: refused");
+    }
+    {
+        // an absurd general.alignment must not wrap the aligned data start
+        const auto path = write_gguf({"blk.0.attn_q.weight"}, true, 0xFFFFFFFFu);
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.find("general.alignment") != std::string::npos, "general.alignment = 2^32-1: refused at open");
     }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

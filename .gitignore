@@ -92,3 +92,6 @@ node_modules/
 .env
 .env.*
 *.token
+
+# one-layer layer-40 sweep output (tools/minimax/test_ikq.py, out/sweep.ps1)
+out/

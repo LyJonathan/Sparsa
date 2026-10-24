@@ -740,10 +740,19 @@ struct Engine::Impl {
         if (!info) return false;
         t.name = name;
         t.type = (int)info->type;
+        // The shape is untrusted: refuse a width/depth the engine's int64 offsets cannot hold before any
+        // multiplication, and refuse anything whose payload does not lie inside its shard (`in_bounds` does the
+        // offset+bytes check against the file size, without letting it wrap).
+        const uint64_t kMaxI64 = (uint64_t) (std::numeric_limits<int64_t>::max)();
+        if (info->shape.empty() || info->shape[0] == 0 || info->shape[0] > kMaxI64) fail(name + ": bad shape");
+        for (size_t d = 1; d < info->shape.size(); ++d)
+            if (info->shape[d] == 0 || info->shape[d] > kMaxI64) fail(name + ": bad shape");
         t.ne0 = (int64_t)info->shape[0];
         t.ne1 = info->shape.size() > 1 ? (int64_t)info->shape[1] : 1;
         t.ne2 = info->shape.size() > 2 ? (int64_t)info->shape[2] : 1;
         if (info->shape.size() > 3) fail(name + " has more than 3 dimensions");
+        if (!model.in_bounds(*info, shard))
+            fail(name + ": has an unknown type or lies past the end of its shard");
         t.host = model.shard(shard).tensor_data(*info);
         t.shard = shard;
         t.file_offset = model.shard(shard).data_start() + info->offset;
@@ -757,7 +766,11 @@ struct Engine::Impl {
         } else {
             t.row_bytes = ggml_row_size((ggml_type)t.type, t.ne0);
         }
-        if (t.row_bytes == 0 || t.row_bytes * (size_t)t.ne1 * (size_t)t.ne2 != t.bytes)
+        // row_bytes * ne1 * ne2, checked: with the checks above each factor fits an int64, but a crafted file can
+        // still make the (non-wrapping) product disagree with the payload, which is the rejection we want.
+        const uint64_t rows = (uint64_t)t.ne1 * (uint64_t)t.ne2;
+        if (t.row_bytes == 0 || t.bytes == 0 || (uint64_t)t.ne1 > (std::numeric_limits<uint64_t>::max)() / (uint64_t)t.ne2 ||
+            (uint64_t)t.row_bytes > (std::numeric_limits<uint64_t>::max)() / rows || t.bytes != (uint64_t)t.row_bytes * rows)
             fail(name + ": row size does not match the GGUF payload (type " + std::to_string(t.type) + ")");
         if (strata::kernels::ikq::is_iqk_type(t.type)) return true;
         t.base = ggml_get_type_traits((ggml_type)t.type);
