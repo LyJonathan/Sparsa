@@ -215,6 +215,12 @@ def ppl_from_logits(path, ids):
 
 # --------------------------------------------------------------------------- report
 def write_md(path, res):
+    if not res.get("overall"):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# G3 on the Strata engine - {res['tier']}\n\n"
+                    f"model: `{res['model']}`\n\nno prompt dumps were scored"
+                    + (f"; skipped: {', '.join(res['skipped'])}" if res.get("skipped") else "") + "\n")
+        return
     o = res["overall"]
     p = res["ppl"]
     v = res.get("validation")
@@ -223,7 +229,10 @@ def write_md(path, res):
     L.append(f"model: `{res['model']}`  \n")
     L.append(f"engine: `{res['engine']}`  \n")
     L.append(f"config: `{res['engine_flags']}`\n")
-    L.append("## Overall (935 scored positions, 8 reference prompts)\n")
+    if res.get("skipped"):
+        L.append(f"**skipped (no dump): {', '.join(res['skipped'])}** - the aggregate below covers "
+                 f"the {len(res['per_prompt'])} prompts that were scored.\n")
+    L.append(f"## Overall ({o['positions']} scored positions, {len(res['per_prompt'])} reference prompts)\n")
     L.append("| metric | value |")
     L.append("|---|---:|")
     L.append(f"| KL64 mean | {o['kl64_mean']:.4f} |")
@@ -256,6 +265,9 @@ def write_md(path, res):
     L.append("")
     if v:
         L.append("## Validation against the llama.cpp harness (same model, same positions)\n")
+        if v.get("matched_note"):
+            L.append(f"_{v['matched_note']}; the KL64 p99/max and full-vocab rows are the llama.cpp "
+                     f"file's all-prompt values and are not comparable when prompts are skipped._\n")
         L.append("| metric | llama.cpp | Sparsa | delta |")
         L.append("|---|---:|---:|---:|")
         for row in v["rows"]:
@@ -289,6 +301,10 @@ def main():
     ap.add_argument("--only-ppl", action="store_true", help="skip the 8 prompt passes")
     ap.add_argument("--rescore", action="store_true",
                     help="only rescore existing dumps (never start the engine)")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="skip a prompt that has no complete dump instead of running the engine for it; "
+                         "the results carry a `skipped` list. For the long prompts whose host-attention "
+                         "prefill is O(T^2) and would take an hour each")
     ap.add_argument("--force", action="store_true",
                     help="rerun a prompt even when a complete dump from an earlier run exists")
     ap.add_argument("--keep-dumps", action="store_true", help="keep the logits npy files (2 GB for ppl)")
@@ -363,7 +379,16 @@ def main():
 
     res = {"tier": tier, "model": os.path.abspath(args.model), "engine": exe,
            "engine_flags": " ".join(flags), "prompts": names,
-           "started": time.strftime("%Y-%m-%d %H:%M:%S"), "per_prompt": [], "ppl": None}
+           "started": time.strftime("%Y-%m-%d %H:%M:%S"), "per_prompt": [], "ppl": None,
+           "skipped": []}
+    if args.allow_partial:
+        have = [n for n in names
+                if dump_complete(os.path.join(dumps, n + ".npy"),
+                                 int(np.load(os.path.join(ref, n, "logits_last128.npy"), mmap_mode="r").shape[0]))]
+        res["skipped"] = [n for n in names if n not in have]
+        if res["skipped"]:
+            print("SKIP (no complete dump): " + ", ".join(res["skipped"]), flush=True)
+        names = have
 
     # ---- the 8 teacher-forced passes
     score_s = 0.0
@@ -450,14 +475,21 @@ def main():
             return {"metric": metric, "llamacpp": fmt.format(a), "sparsa": fmt.format(b),
                     "delta": ("+" if d >= 0 else "") + fmt.format(d)}
 
-        rows = [
-            row("KL64 mean (lower better)", ro["kl64_mean"], so["kl64_mean"]),
-            row("KL64 p99, all positions", ro["kl64_p99"], so["kl64_p99"]),
-            row("KL64 max", ro["kl64_max"], so["kl64_max"]),
-            row("full-vocab KL mean", ro["kl_vocab_mean"], so["kl_vocab_mean"]),
-            row("top-1 agreement %", 100 * ro["top1_agreement"], 100 * so["top1_agreement"], "{:.2f}"),
-            row("mean NLL vs true next", ro["nll_true_quant"], so["nll_true_quant"]),
-        ]
+        rows = []
+        for metric, key, fmt in (("KL64 mean (lower better)", "kl64_mean", "{:.4f}"),
+                                 ("KL64 p99, all positions", "kl64_p99", "{:.4f}"),
+                                 ("KL64 max", "kl64_max", "{:.4f}"),
+                                 ("full-vocab KL mean", "kl_vocab_mean", "{:.4f}"),
+                                 ("top-1 agreement %", "top1_agreement", "{:.2f}")):
+            if key not in ro or key not in so:
+                continue
+            a, b = ro[key], so[key]
+            if key == "top1_agreement":
+                a, b = 100 * a, 100 * b
+            rows.append(row(metric, a, b, fmt))
+        for key in ("nll_true_ref", "nll_true_quant"):
+            if key in ro and key in so:
+                rows.append(row("mean NLL " + key.replace("nll_true_", "vs true ("), ro[key], so[key]))
         if args.validate_ppl and res.get("ppl"):
             rp = json.load(open(args.validate_ppl, encoding="utf-8"))
             rows.append(row("ppl (2,048 tokens)", rp["ppl_quant"], res["ppl"]["ppl"], "{:.2f}"))
@@ -471,7 +503,33 @@ def main():
                 per.append({"prompt": r["prompt"], "kl64_llamacpp": o["kl64_mean"], "kl64_sparsa": r["kl64_mean"],
                             "delta": r["kl64_mean"] - o["kl64_mean"],
                             "top1_llamacpp": o["top1_agreement"], "top1_sparsa": r["top1_agreement"]})
+        # The reference file's `overall` block covers every prompt it scored (935 positions).  When this run
+        # covers a subset (skipped long prompts), an aggregate delta against that block would compare different
+        # position sets, so recompute the reference aggregate over the matched prompts only.
+        if per and len(per) < len(ref_res.get("per_prompt", [])):
+            n = sum(r["positions"] for r in res["per_prompt"])
+            ro = dict(ro)
+            ro["kl64_mean"] = sum(o["kl64_mean"] * r["positions"]
+                                  for o, r in zip([by_name[r["prompt"]] for r in res["per_prompt"]],
+                                                  res["per_prompt"])) / n
+            ro["top1_agreement"] = sum(o["top1_agreement"] * r["positions"]
+                                       for o, r in zip([by_name[r["prompt"]] for r in res["per_prompt"]],
+                                                       res["per_prompt"])) / n
+            for row_ in rows:
+                if row_["metric"].startswith("KL64 mean"):
+                    row_["llamacpp"] = "{:.4f}".format(ro["kl64_mean"])
+                    d = so["kl64_mean"] - ro["kl64_mean"]
+                    row_["delta"] = ("+" if d >= 0 else "") + "{:.4f}".format(d)
+                if row_["metric"].startswith("top-1 agreement"):
+                    row_["llamacpp"] = "{:.2f}".format(100 * ro["top1_agreement"])
+                    d = 100 * (so["top1_agreement"] - ro["top1_agreement"])
+                    row_["delta"] = ("+" if d >= 0 else "") + "{:.2f}".format(d)
         res["validation"] = {"llamacpp_results": args.validate_with, "rows": rows, "per_prompt": per}
+        if per and len(per) < len(ref_res.get("per_prompt", [])):
+            res["validation"]["matched_prompts"] = len(per)
+            res["validation"]["matched_note"] = (
+                f"llama.cpp aggregate recomputed over the same {len(per)} prompts "
+                f"({len(per)} of {len(ref_res.get('per_prompt', []))})")
     with open(os.path.join(out, "results.json"), "w", encoding="utf-8") as f:
         json.dump(res, f, indent=1)
     write_md(os.path.join(out, "results.md"), res)
