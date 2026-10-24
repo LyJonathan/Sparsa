@@ -751,12 +751,32 @@ struct Engine::Impl {
     uint64_t swaps = 0;
 
     struct TokenStats {
-        int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0;
+        int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0, skipped = 0;
     };
     TokenStats tok_stats;
     TokenStats total_stats;
     int64_t tokens_seen = 0;
     int64_t profile_saves = 0;
+
+    // P5c: --minimax-expert-skip.  Drop a routed expert whose RENORMALIZED weight is below `expert_skip` and
+    // renormalize what is left, so the routed sum keeps its scale.  Returns the number kept; a route whose every
+    // weight is below the threshold keeps everything rather than produce a zero vector.
+    float expert_skip = 0.f;
+    int apply_expert_skip_range(float* w, int n) {
+        if (expert_skip <= 0.f || n <= 0) return n;
+        int kept = 0;
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i)
+            if (w[i] >= expert_skip) {
+                ++kept;
+                sum += w[i];
+            }
+        if (kept == 0 || kept == n) return n;
+        for (int i = 0; i < n; ++i) w[i] = (w[i] >= expert_skip && sum > 0.f) ? w[i] / sum : 0.f;
+        tok_stats.skipped += n - kept;
+        return kept;
+    }
+    int apply_expert_skip(std::vector<float>& w) { return apply_expert_skip_range(w.data(), (int)w.size()); }
 
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
@@ -774,6 +794,10 @@ struct Engine::Impl {
         dense_mmvq = opt.dense_mmvq != "off";
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
+        expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
+        if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
+        if (expert_skip > 0.f)
+            std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
@@ -806,7 +830,7 @@ struct Engine::Impl {
         if (!cpu_only) alloc_workspace();
         place_weights();
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
-        if (opt.tiers) {
+        if (opt.tiers || opt.expert_resident == "all") {
             init_tiers();
         } else if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) {
             for (const Layer& L : layers)
@@ -1611,6 +1635,9 @@ struct Engine::Impl {
             }
         }
         int q = opt.vram_slots_per_layer;
+        // `--minimax-expert-resident all` with the tiers off is a RAM-residency request, not a VRAM one: keep the
+        // device for dense/KV unless the caller named a slot count explicitly.
+        if (!opt.tiers && opt.expert_resident == "all" && opt.vram_slots_per_layer < 0) q = 0;
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
@@ -1757,6 +1784,10 @@ struct Engine::Impl {
         const size_t cells = (size_t)cfg.n_layers * (size_t)cfg.n_expert;
         if (opt.adaptive) usage.assign(cells, 0.f);
         if (!opt.profile_save_path.empty() || !opt.routing_counts_path.empty()) route_counts.assign(cells, 0.0);
+
+        // P5c: every static RAM slot is filled here, once, in parallel, instead of on the first token that
+        // routes to it.
+        if (expert_resident && ram_per_layer > 0 && ram_arena && ram_arena->valid()) fill_ram_static();
     }
 
     bool tiers_gpu_possible() const { return opt.dense_layers_gpu != 0 || opt.tiers; }
@@ -1794,14 +1825,123 @@ struct Engine::Impl {
     void ram_fill(Layer& L, int slot, int expert) {
         if (!ram_arena || !ram_arena->valid()) fail("RAM tier is not allocated");
         uint8_t* p = ram_slot_ptr(L, slot);
-        std::memcpy(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        std::memcpy(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        std::memcpy(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        ram_copy(L, expert, p);
         for (int32_t& v : L.ram_of)
             if (v == slot) v = kNotResident;
         L.ram_of[(size_t)expert] = slot;
         L.ram_expert_of[(size_t)slot] = expert;
         L.ram_tick[(size_t)slot] = ++lru_tick;
+    }
+
+    // One expert's three role slices into `p`, spread over the pool.  The source is the mmap, so the cost is the
+    // soft page fault per 4 KiB: many threads is the difference between 8 and 20 GB/s on a cold mapping.
+    void ram_copy(const Layer& L, int expert, uint8_t* p) {
+        const size_t gu = L.expert_gu, dn = L.expert_down;
+        const uint8_t* src[3] = {L.egate.host + (size_t)expert * gu, L.eup.host + (size_t)expert * gu,
+                                 L.edown.host + (size_t)expert * dn};
+        const size_t off[3] = {0, gu, 2 * gu};
+        const size_t len[3] = {gu, gu, dn};
+        const int pieces = 8 * (threads > 0 ? threads : 4);
+        pool.run(pieces * 3, [&](int a, int b) {
+            for (int i = a; i < b; ++i) {
+                const int m = i / pieces, c = i % pieces;
+                const size_t p0 = len[m] * (size_t)c / (size_t)pieces;
+                const size_t p1 = len[m] * (size_t)(c + 1) / (size_t)pieces;
+                if (p1 > p0) std::memcpy(p + off[m] + p0, src[m] + p0, p1 - p0);
+            }
+        });
+    }
+
+    // P5c: fill every static RAM slot at startup instead of on first use.  The on-demand fill re-read the same
+    // bytes through the mmap once per expert (at 16 GB/s in the measured decode, i.e. exactly the fault cost the
+    // tier exists to avoid) and left the arena a cold, partly-empty cache for the first tokens.
+    void fill_ram_static() {
+        struct Job {
+            Layer* L;
+            int slot;
+            int expert;
+        };
+        std::vector<Job> jobs;
+        // Priority: the profile's rank order when there is one, then the lowest unused expert ids.
+        for (int64_t li = 0; li < cfg.n_layers; ++li) {
+            Layer& L = layers[(size_t)li];
+            if (!L.moe || L.ram_n <= 0) continue;
+            std::vector<char> used((size_t)cfg.n_expert, 0);
+            std::vector<int> rank((size_t)cfg.n_expert, -1);
+            if (!profile.empty()) {
+                const int ml = (int)(li - cfg.leading_dense);
+                for (size_t i = 0; i < profile.size(); ++i) {
+                    const auto [pl, pe] = profile[i];
+                    if (pl == ml && pe >= 0 && pe < (int)cfg.n_expert) rank[(size_t)pe] = (int)i;
+                }
+            }
+            std::vector<std::pair<int, int>> order;
+            for (int e = 0; e < (int)cfg.n_expert; ++e) order.push_back({rank[(size_t)e] < 0 ? INT32_MAX : rank[(size_t)e], e});
+            std::sort(order.begin(), order.end());
+            for (int s = 0; s < L.ram_n; ++s) {
+                if (L.ram_expert_of[(size_t)s] >= 0) {
+                    used[(size_t)L.ram_expert_of[(size_t)s]] = 1;
+                    continue;
+                }
+                int pick = -1;
+                for (const auto& [r, e] : order)
+                    if (!used[(size_t)e] && L.ram_of[(size_t)e] < 0) {
+                        pick = e;
+                        break;
+                    }
+                if (pick < 0) break;
+                used[(size_t)pick] = 1;
+                jobs.push_back({&L, s, pick});
+            }
+        }
+        if (jobs.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        // ONE pool.run OVER PIECES, NOT a pool.run per expert from our own thread band: Pool::run is not
+        // reentrant, and a band of threads each calling it deadlocked the tier fill (measured: 27 s of CPU and no
+        // progress).  ~1 MiB pieces are small enough that every core gets several and large enough that the
+        // syscall/memcpy overhead disappears.
+        struct Piece {
+            const uint8_t* src;
+            uint8_t* dst;
+            size_t len;
+        };
+        std::vector<Piece> pieces;
+        const size_t kPiece = (size_t)1 << 20;
+        for (const Job& j : jobs) {
+            const Layer& L = *j.L;
+            uint8_t* dst = ram_slot_ptr(*j.L, j.slot);
+            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+            const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,
+                                     L.eup.host + (size_t)j.expert * L.expert_gu,
+                                     L.edown.host + (size_t)j.expert * L.expert_down};
+            for (int r = 0; r < 3; ++r)
+                for (size_t at = 0; at < len[r]; at += kPiece)
+                    pieces.push_back({src[r] + at, dst + off[r] + at,
+                                      std::min(kPiece, len[r] - at)});
+        }
+        pool.run((int)pieces.size(), [&](int a, int b) {
+            for (int i = a; i < b; ++i) std::memcpy(pieces[(size_t)i].dst, pieces[(size_t)i].src, pieces[(size_t)i].len);
+        });
+        uint64_t bytes = 0;
+        for (const Job& j : jobs) {
+            j.L->ram_of[(size_t)j.expert] = j.slot;
+            j.L->ram_expert_of[(size_t)j.slot] = j.expert;
+            j.L->ram_tick[(size_t)j.slot] = ++lru_tick;
+            bytes += j.L->expert_bytes;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr,
+                     "INFO minimax-ram-tier experts=%zu gib=%.1f seconds=%.1f rate=%.1f GiB/s backing=%s\n",
+                     jobs.size(), (double)bytes / 1073741824.0, s,
+                     s > 0 ? (double)bytes / 1073741824.0 / s : 0.0,
+                     ram_arena ? (ram_arena->backing == strata::core::PageBacking::LargePages
+                                      ? "large-pages"
+                                      : ram_arena->backing == strata::core::PageBacking::PinnedByCuda ? "cuda-pinned"
+                                                                                                      : "locked")
+                               : "none");
+        if (ram_arena && ram_arena->backing != strata::core::PageBacking::LargePages)
+            std::fprintf(stderr, "INFO minimax-ram-tier note: %s\n", ram_arena->note.c_str());
     }
 
     // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
@@ -2002,6 +2142,7 @@ struct Engine::Impl {
         }
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
+        apply_expert_skip(w);
 
         const int64_t li = (int64_t)(&L - layers.data());
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
@@ -2025,6 +2166,7 @@ struct Engine::Impl {
         cpu.reserve((size_t)top);
         int ssd_n = 0;
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
             // Compulsory admission when no profile filled the slots: the first distinct experts a layer routes take
             // the free slots.  A profile-filled tier has no free slot and leaves this a pure lookup.
@@ -2077,6 +2219,7 @@ struct Engine::Impl {
         for (const CpuExpert& c : cpu) cpu_of[(size_t)c.e] = &c;
         std::vector<std::vector<float>> cpu_ye((size_t)top);
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;
             const int e = order[(size_t)j];
             if (L.vram_of[(size_t)e] >= 0) continue;
             const CpuExpert* c = cpu_of[(size_t)e];
@@ -2444,6 +2587,7 @@ struct Engine::Impl {
         }
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
+        apply_expert_skip(w);
         if (!route_counts.empty()) {
             const size_t b = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
             for (int j = 0; j < top; ++j) route_counts[b + (size_t)order[(size_t)j]] += 1.0;
@@ -2459,6 +2603,7 @@ struct Engine::Impl {
         std::vector<float> ye((size_t)cfg.n_embd);
         const int ff = (int)cfg.n_ff_exp;
         for (int j = 0; j < top; ++j) {
+            if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
             const float* sg = L.egate_scale.empty() ? nullptr : &L.egate_scale[(size_t)e];
             const float* su = L.eup_scale.empty() ? nullptr : &L.eup_scale[(size_t)e];
@@ -3215,6 +3360,7 @@ struct Engine::Impl {
             total_stats.ram += tok_stats.ram;
             total_stats.ssd += tok_stats.ssd;
             total_stats.ssd_bytes += tok_stats.ssd_bytes;
+            total_stats.skipped += tok_stats.skipped;
             ++tokens_seen;
             if (opt.adaptive && (++rebalance_tick % 16) == 0) rebalance();
             if (opt.stats)
@@ -3257,6 +3403,7 @@ struct Engine::Impl {
             }
             if (renorm && sum > 0.f)
                 for (int j = 0; j < top; ++j) wts[(size_t)t * top + j] /= sum;
+            apply_expert_skip_range(wts.data() + (size_t)t * top, top);
             if (!usage.empty())
                 for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
             if (!route_counts.empty())
@@ -3339,8 +3486,10 @@ struct Engine::Impl {
 
         pf_entries.clear();
         for (int t = 0; t < T; ++t)
-            for (int s = 0; s < top; ++s)
+            for (int s = 0; s < top; ++s) {
+                if (wts[(size_t)t * top + s] == 0.f) continue;   // --minimax-expert-skip
                 pf_entries.push_back({t, ids[(size_t)t * top + s], wts[(size_t)t * top + s], 0});
+            }
         std::stable_sort(pf_entries.begin(), pf_entries.end(),
                          [](const PfEntry& a, const PfEntry& b) { return a.expert < b.expert; });
 
@@ -3377,8 +3526,13 @@ struct Engine::Impl {
         // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
         auto read_expert = [&](int e, uint8_t* dst) {
             const size_t gu = L.expert_gu, dn = L.expert_down;
-            const uint8_t* src[3] = {L.egate.host + (size_t)e * gu, L.eup.host + (size_t)e * gu,
-                                     L.edown.host + (size_t)e * dn};
+            // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
+            // to ignore the tier and re-fault every page of every expert once per chunk.
+            const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
+            const uint8_t* base = rs >= 0 ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
+            const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
+                                     base ? base + gu : L.eup.host + (size_t)e * gu,
+                                     base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
             const size_t off[3] = {0, gu, 2 * gu};
             const size_t len[3] = {gu, gu, dn};
             // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
@@ -3860,6 +4014,7 @@ struct Engine::Impl {
             total_stats.ram += tok_stats.ram;
             total_stats.ssd += tok_stats.ssd;
             total_stats.ssd_bytes += tok_stats.ssd_bytes;
+            total_stats.skipped += tok_stats.skipped;
         }
     }
 
@@ -4010,12 +4165,13 @@ std::string Engine::describe() const {
 }
 
 std::string Engine::stats() const {
-    if (!impl_->tiers_on) return std::string();
+    if (!impl_->tiers_on && impl_->total_stats.skipped == 0) return std::string();
     std::ostringstream o;
     o << "tiers=on vram_slots_per_layer=" << impl_->vram_per_layer << " ram_experts_per_layer="
       << impl_->ram_per_layer << " tokens=" << impl_->tokens_seen << " vram_hits=" << impl_->total_stats.vram
       << " ram_hits=" << impl_->total_stats.ram << " ssd_reads=" << impl_->total_stats.ssd
-      << " ssd_bytes=" << impl_->total_stats.ssd_bytes << " swaps=" << impl_->swaps;
+      << " ssd_bytes=" << impl_->total_stats.ssd_bytes << " swaps=" << impl_->swaps
+      << " skipped=" << impl_->total_stats.skipped;
     return o.str();
 }
 

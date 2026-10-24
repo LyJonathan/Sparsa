@@ -487,5 +487,69 @@ Measured on the 15-layer real-weight IQ2_XS slice, one RTX 5070, KV in VRAM, 24 
 
 `--minimax-gpu-normrope off` is the P5b path, byte for byte.
 
+### Resident experts: `--minimax-expert-resident off|auto|all`
+
+The P3 RAM tier was filled on demand: the first token that routed to an expert copied it out of the mmap into the
+pinned arena, so that token paid the fault *and* the copy, and the arena was a cold, partly-empty cache for the
+first tokens of every run. `auto` (the default, and only when a RAM tier exists) and `all` (which creates the tier
+even with the tiers off, using the device only for dense/KV) now fill every static slot at startup with a parallel
+reader (1 MiB pieces over the whole pool), print the achieved rate and the arena backing, and the batched prefill
+reads a resident expert from the arena instead of re-faulting it once per chunk.
+
+Large pages are tried first and refused on this box (`VirtualAlloc` error 1314: `SeLockMemoryPrivilege` is not
+assigned to a normal account), so the arena is 4 KB pages, `cudaHostRegister`ed and working-set locked. That is
+the documented fallback, not an error.
+
+15-layer IQ2_XS slice, RTX 5070, kv=vram, 24 threads, 4096-token prompt, 32 new tokens, page cache **cold**
+(45 GiB of anonymous memory written first to evict the mapping):
+
+| arm | prefill tok/s | decode tok/s | ms/token |
+| --- | ---: | ---: | ---: |
+| `off` (mmap, tier filled on demand) | 131.2 | 6.39 | 156.5 |
+| `all` (pinned arena, eager fill) | 104.4 | **12.07** | 82.9 |
+
+With the page cache **warm** (the model's 28.6 GB fit beside the arena) the decode difference disappears:
+16.9-17.1 tok/s both arms, and the fill buys prefill at 512 tokens instead (107-126 -> 138-151 tok/s, medians of
+three interleaved rounds). The honest reading: pinning does not make DDR4 faster - it stops the *page faults and
+SSD reads* when the system cannot keep the whole model cached. On a 128 GB box with a 146 GB model that is the
+normal case, not the exception.
+
+Effective CPU expert bandwidth (785 MB of routed experts per token at 512 context, from `STRATA_MM_TIME`): the
+expert FFN is 39.2 ms/token = **~20 GB/s**, against 16 GB/s in P5b and 39.5 GB/s for a raw 24-thread stream of the
+same RAM. The remaining gap is the single-token IQ2_XS dot kernel, not the memory system: `iq_avx2_parity --bench`
+puts Strata's own AVX2 IQ row kernel within 5 % of ggml's `vec_dot` at one token (its win is multi-token), so there
+is no cheap port left here.
+
+### Expert skipping: `--minimax-expert-skip <threshold>` (default off)
+
+A routed expert whose renormalized weight is below the threshold is dropped and the survivors are renormalized; a
+route whose every weight is below it keeps everything rather than produce a zero vector. The skip applies to the
+token path, the tiered path (so a skipped expert is never fetched from VRAM/RAM/SSD) and the batched prefill.
+
+Speed, 512-token prompt, 32 new tokens on the slice (decode):
+
+| threshold | decode tok/s | gain | skipped routes |
+| ---: | ---: | ---: | ---: |
+| 0 (off) | 18.04 | - | 0 |
+| 0.05 | 18.17 | +0.7 % | - |
+| 0.10 | 18.62 | +3.2 % | - |
+| 0.15 | 19.11 | +5.9 % | - |
+| 0.20 | 21.14 | +17.2 % | - |
+
+Quality against the engine's own no-skip logits, the short G3 reference prompts (97-114 tokens), same file and
+placement (`tools/minimax/skip_quality.py`):
+
+| threshold | mean KL | mean top-1 | worst median abs |
+| ---: | ---: | ---: | ---: |
+| 0.05 | 9.3e-4 | 0.958 | 1.7e-1 |
+| 0.10 | 1.7e-3 | 0.955 | 2.8e-1 |
+| 0.15 | 1.2e-2 | 0.894 | 7.1e-1 |
+| 0.20 | 4.9e-2 | 0.769 | 1.6 |
+
+0.10 is the only setting whose KL stays under the IQ2_XS quant noise floor this project measured on the real
+checkpoint (0.012), for +3 % decode; 0.15 is at the floor with a visible top-1 cost. The default stays **off**: a
+3 % win does not justify changing answers, and the slice's 15 layers understate what a deep-layer skip costs.
+
+
 
 
