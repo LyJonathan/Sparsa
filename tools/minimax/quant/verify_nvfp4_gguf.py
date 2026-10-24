@@ -10,8 +10,12 @@ max |diff| == 0.
         --gguf E:/mm-nvfp4/MM-NVFP4-L0-3.gguf \
         --model E:/.../models/MiniMax-M3.1-Flash
 
-Layer mapping comes from `strata.source_layers` in the GGUF. Every routed expert
-matrix of every expert tensor in the file is checked (gate, up, down).
+Layer mapping comes from `strata.source_layers` in the GGUF. Only the first part of a
+split writes that key (the split metadata decides what a later part carries), so for a
+later part the block number is the source layer - a split is a contiguous layer range and
+blk.N keeps the global layer index. `--layers LO-HI` is then only a check that the file
+holds exactly that range. Every routed expert matrix of every expert tensor in the file is
+checked (gate, up, down).
 """
 from __future__ import annotations
 
@@ -173,19 +177,27 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, type=Path)
     ap.add_argument("--model", required=True, type=Path)
+    ap.add_argument("--layers", default="", help="LO-HI source layers this part holds; checked against the file")
     ap.add_argument("--max-experts", type=int, default=0, help="0: every expert")
     args = ap.parse_args()
 
     r = Reader(args.gguf)
-    src_layers = r.meta.get("strata.source_layers")
-    if src_layers is None:
-        raise SystemExit("GGUF has no strata.source_layers")
     st = Safetensors(args.model)
 
     roles = {"ffn_gate_exps": "w1", "ffn_up_exps": "w3", "ffn_down_exps": "w2"}
     blks = sorted({int(n.split(".")[1]) for n in r.tensors if n.endswith("_exps.weight")})
+    src_layers = r.meta.get("strata.source_layers")
+    if src_layers is None:
+        # not part 0: the block index is the source layer (see the module docstring)
+        src_layers = {b: b for b in blks}
+    if args.layers:
+        lo, hi = (int(x) for x in args.layers.split("-"))
+        lead = int(r.meta.get("minimax-m3.leading_dense_block_count", 3))
+        want = [b for b in range(lo, hi + 1) if b >= lead]
+        if blks != want:
+            raise SystemExit(f"expert blocks {blks}, expected {want} for layers {args.layers}")
     print(f"gguf {args.gguf.name}: {len(r.tensors)} tensors, block_count {r.meta.get('minimax-m3.block_count')}, "
-          f"source layers {src_layers}, expert blocks {blks}")
+          f"source layers {[src_layers[b] for b in blks]}, expert blocks {blks}")
 
     checked = 0
     total_elems = 0

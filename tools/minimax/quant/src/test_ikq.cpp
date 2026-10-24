@@ -22,8 +22,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <process.h>
 #include <cstring>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -283,8 +288,7 @@ int main(int argc, char** argv) {
                                          (c.imatrix ? "w" : "n") + ".bin");
         const fs::path ref_f32 = work / ("ref-" + std::to_string(c.type) + "-" + std::to_string(c.cols) +
                                          (c.imatrix ? "w" : "n") + ".f32");
-        // _spawnv: no shell, so no quoting to get wrong.  The strings outlive the call: the temporary
-        // `p.string()` results would be freed before the child runs.
+        // _spawnv on Windows, posix_spawn on Linux: no shell either way, so no quoting to get wrong.
         const std::string type_s = std::to_string(ik_id(c.type));
         const std::string rows_s = std::to_string(c.rows);
         const std::string cols_s = std::to_string(c.cols);
@@ -299,7 +303,23 @@ int main(int argc, char** argv) {
         const char* args[] = {argv0_s.c_str(),    type_s.c_str(), rows_s.c_str(), cols_s.c_str(),
                               in_s.c_str(),       imx_s.c_str(),  bin_s.c_str(),  f32_s.c_str(),
                               nullptr};
+#ifdef _WIN32
         const intptr_t rc = _spawnv(_P_WAIT, exe_s.c_str(), args);
+#else
+        std::vector<char*> pargs;
+        for (const char* a : args) {
+            if (!a) break;
+            pargs.push_back(const_cast<char*>(a));
+        }
+        pargs.push_back(nullptr);
+        pid_t pid = 0;
+        extern char** environ;
+        intptr_t rc = posix_spawn(&pid, exe_s.c_str(), nullptr, nullptr, pargs.data(), environ);
+        if (rc == 0) {
+            int status = 0;
+            rc = (waitpid(pid, &status, 0) < 0) ? -1 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
+#endif
         if (rc != 0) {
             fail("the ik reference binary failed (" + std::to_string((long long) rc) + ")");
             continue;
