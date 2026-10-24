@@ -325,7 +325,10 @@ Per chunk and layer:
   tokens that route to it (the int8 `iq_mmvq` kernel for IQ2_XS/Q8_0/Q2_0/IQ4_NL/NVFP4, or dequantize-to-fp32 +
   cuBLAS for F32/F16/BF16 and the mixed IQ2_XS-gate/F32-down files). MM-NVFP4's per-expert `blk.N.ffn_*_exps.scale`
   divisors are applied to the gate/up rows before `swigluoai` and to the down output, exactly as the token path.
-  `--minimax-prefill-experts cpu` runs the same grouping through the ggml CPU dot products.
+  `--minimax-prefill-experts cpu` runs the same grouping through the ggml CPU dot products. The default
+  `auto` uses the device when it can and keeps a model of the ported ik_llama formats (IQ2_KL, IQ2_KT, IQ3_K,
+  IQ4_KS, IQ3_KT) on that CPU path, because the device dequant kernel has no type for them; an explicit `gpu`
+  still asks for the device and fails with `iq_mmvq: type ... is not supported`.
 - The gate, up and down of the shared expert, the dense MLP layers and `lm_head` use the same batched projection
   helper; `lm_head` is tiled by output rows (4096 at a time) so the 200 K vocabulary never needs a full device buffer.
 - `--minimax-prefill-batch` also shrinks itself to what each card's free VRAM can hold after dense weights, KV and
