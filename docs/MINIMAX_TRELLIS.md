@@ -146,7 +146,10 @@ Gaussian is 0.28-0.33 in the published QTIP/ik_llama tables too; the *real* weig
 * Engine (`src/minimax/engine.cpp`): row size and decode for 144-146 (`row_bytes_of`, `decode_f32`), the CPU expert
   path via `tq_rows` (`dot_rows_base`), the hadamard record (`read_hadamard`) and its application on both the CPU and
   the GPU expert paths. `Fmt<144/145/146>` were already in `src/kernels/cuda/iq_kernels.cu` (`STRATA_GU_FMTS` has
-  144/145, `STRATA_D_FMTS` has 144/146, and `minimax_moe_gu` / `minimax_moe_down` route through them).
+  144/145, `STRATA_D_FMTS` has 144/146, and `minimax_moe_gu` / `minimax_moe_down` route through them). A TQK7
+  gate/up or a TQK6 down is in neither list: `minimax_moe_gu` then launches no kernel at all rather than failing, so
+  those combinations must not be produced (the two recipes use 145 for gate/up and 146 for down, i.e. the listed
+  ones). Adding them is two macro entries plus a rebuild of `iq_kernels.cu`; it is listed under "what is left".
 * Build check: `build-engine-mapped.cmd` configures with `-DSTRATA_ENABLE_CUDA=ON -DSTRATA_MMQ_TQ_OVERLAY=OFF` and
   builds `strata_minimax` + `strata-minimax.exe` clean (CUDA 13.3, sm_120). The mapped drive is required: nvcc breaks
   on the apostrophe in `Jon's Projects`, and the trellis MMQ overlay's `configure_file` of `ggml.h` makes ninja
@@ -248,6 +251,8 @@ above should be quoted.
    add layer 40 (`dump-L40` exists). Then decide between TQ21 and IQ2_XS for the default tier.
 5. **The engine parity test on the GPU** (`minimax_moe_gu` / `minimax_moe_down` with type 144 against `tq_rows` on a
    synthetic expert) - the CPU half is covered by `tq_cpu_parity` and `tq_encode_parity`; the GPU half needs the
-   CUDA build and a small `src/kernels/minimax_tq_parity.cpp`.
+   CUDA build and a small `src/kernels/minimax_tq_parity.cpp`. Also add 146 to `STRATA_GU_FMTS` and 145 to
+   `STRATA_D_FMTS`, and make `minimax_moe_gu` / `minimax_moe_down` **fail** on an unlisted type instead of launching
+   nothing.
 6. **Full-model wiring**: `run_tier.py` splits by layer range; a TQ tier needs the hadamard keys repeated in part 0
    only (done) and `STRATA_TQ_OVERLAY_OK` (already in the tree) for the prompt path.
