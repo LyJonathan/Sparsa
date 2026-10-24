@@ -100,7 +100,10 @@ void usage() {
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
                  "  --minimax-page-probe N            pages sampled per expert for that check (default 32; 0 = all)\n"
-                 "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n"
+                 "  --minimax-ssd-prefetch on|off     queue a future layer's SSD misses while this one computes\n"
+                 "                                    (default off; pair with --minimax-ssd-prefetch-depth)\n"
+                 "  --minimax-ssd-prefetch-depth N    layers between issuing a predicted read and using it\n"
+                 "                                    (default 1, 1-8); the read overwinters depth layers of compute\n"
                  "  --minimax-route-bias on|off       rank the router's top-k on score + a residency bonus / file\n"
                  "                                    penalty (Xolotl); weights stay unbiased; default off\n"
                  "  --minimax-route-bias-in A         bonus for a resident expert (default 0.25)\n"
@@ -551,6 +554,7 @@ int run(int argc, char** argv) {
     std::string ssd_zerocopy;
     int page_probe = 32;
     std::string ssd_prefetch;
+    int ssd_prefetch_depth = 1;
     std::string ram_mode;
     std::string route_bias;
     float route_bias_in = 0.25f, route_bias_out = 0.15f, route_margin = 0.f;
@@ -598,6 +602,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
         else if (a == "--minimax-page-probe") page_probe = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
+        else if (a == "--minimax-ssd-prefetch-depth") ssd_prefetch_depth = std::atoi(next().c_str());
         else if (a == "--minimax-route-bias") route_bias = next();
         else if (a == "--minimax-route-bias-in") route_bias_in = (float)std::atof(next().c_str());
         else if (a == "--minimax-route-bias-out") route_bias_out = (float)std::atof(next().c_str());
@@ -761,6 +766,7 @@ int run(int argc, char** argv) {
     opt.ssd_zerocopy = ssd_zerocopy;
     opt.page_probe = page_probe;
     opt.ssd_prefetch = ssd_prefetch;
+    opt.ssd_prefetch_depth = ssd_prefetch_depth;
     opt.route_bias = route_bias;
     opt.route_bias_in = route_bias_in;
     opt.route_bias_out = route_bias_out;
