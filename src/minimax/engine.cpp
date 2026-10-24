@@ -54,6 +54,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/direct_file.hpp"
 
 namespace strata::minimax {
@@ -355,6 +356,28 @@ bool finite_row(const float* x, int n) {
 bool raw_expert_type(int t) { return t == kF32 || t == kF16 || t == kBF16; }
 bool iq_expert_type(int t) { return t == 8 || strata::kernels::iq_supported(t); }
 
+// The packed types `native_mmvq` reads directly (llama.cpp's CUDA MMVQ, `native_mmvq.cu`).  Types 11-14, 23 and the
+// i-quants are 256-value blocks; Q4_0/Q5_0/Q8_0/IQ4_NL/Q2_0 are 32/64-value ones.
+bool mmvq_dense_type(int t) {
+    switch (t) {
+        case 2: case 6: case 8: case 20:              // Q4_0, Q5_0, Q8_0, IQ4_NL
+        case 11: case 12: case 13: case 14: case 23:  // Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS
+        case 42:                                      // Q2_0
+            return true;
+        default:
+            return strata::kernels::iq_supported(t);
+    }
+}
+// A dense projection with `cols` values per row can take the packed path only on a whole number of blocks.
+bool mmvq_dense_fits(int t, int64_t cols) {
+    if (!mmvq_dense_type(t)) return false;
+    switch (t) {
+        case 2: case 6: case 8: case 20: return cols % 32 == 0;
+        case 42: return cols % 64 == 0;
+        default: return cols % 256 == 0;
+    }
+}
+
 // ---- parity probes.  A minimal .npy codec: little-endian fp32 / int64, C order, no pickle.
 bool read_npy_f32(const std::string& path, std::vector<float>& out, int64_t& rows, int64_t& cols) {
     std::ifstream f(path, std::ios::binary);
@@ -583,6 +606,7 @@ struct Engine::Impl {
     int32_t max_slot = 0;            // selected positions one KV head can have
     struct Work {
         DevPtr x, y, scratch, ex_ptr, ex_xq, ex_hq, ex_h, ex_out;
+        DevPtr xq;                      // q8_1 image of a dense projection's activation (dense MMVQ)
         DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
         DevPtr qd, bs, slots, counts, kstage, vstage, att;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
@@ -590,6 +614,7 @@ struct Engine::Impl {
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
+        void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
     };
     std::vector<Work> work;          // one entry per device in `devs`
     Work& W() { return work[(size_t)cur]; }
@@ -623,6 +648,7 @@ struct Engine::Impl {
     bool prefill_gpu_experts = true;
     bool prefill_dense_f32 = true;
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
+    bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
     struct PfBuf {
         uint16_t* x16 = nullptr;     // [T][embd] fp16 hidden state
         uint16_t* h16 = nullptr;     // [T][embd] fp16 normed input to the projections
@@ -724,6 +750,7 @@ struct Engine::Impl {
         limit = (float)cfg.swiglu_limit;
         scale_routed = (float)cfg.routed_scale;
         renorm = cfg.expert_weights_norm;
+        dense_mmvq = opt.dense_mmvq != "off";
         ctx = cfg.context;
         if (opt.max_context > 0 && opt.max_context < ctx) ctx = opt.max_context;
         if (ctx < 1) fail("context length is 0");
@@ -1171,6 +1198,8 @@ struct Engine::Impl {
             w.x = DevPtr(cu::alloc((size_t)max_cols * sizeof(float)));
             w.y = DevPtr(cu::alloc((size_t)max_rows * sizeof(float)));
             w.scratch = DevPtr(cu::alloc((size_t)kTile * (size_t)max_cols * sizeof(float)));
+            // q8_1 image of a dense projection's activation (P5b dense MMVQ): 36 bytes per 32 values.
+            w.xq = DevPtr(cu::alloc(((size_t)max_cols / 32) * 36 + 64));
             if (kv_mode != 0) {
                 w.qd = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
                 w.att = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * sizeof(float)));
@@ -2163,6 +2192,18 @@ struct Engine::Impl {
         if ((int64_t)cols > max_cols || (int64_t)rows > max_rows) fail(t.name + ": gemv exceeds the workspace");
         if (t.gpu) {
             Work& w = W();
+            // P5b: a packed projection through llama.cpp's CUDA MMVQ.  The blocks are read as they are - no
+            // fp32 dequantize buffer, so a Q6_K head reads 0.82 bytes per weight instead of 4, and there is no
+            // 128-row tile loop.  The activation is q8_1, the same contract the GPU expert tier already uses.
+            if (dense_mmvq && !t.dev_f32 && mmvq_dense_fits(t.type, cols) && w.xq.p) {
+                if (!w.ds) w.ds = cu::stream_create();
+                h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
+                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, w.ds);
+                strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, w.ds);
+                cu::copy_d2h_async(yout, w.y.p, (size_t)rows * sizeof(float), w.ds);
+                cu::stream_sync(w.ds);
+                return;
+            }
             h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
             float* dy = (float*)w.y.p;
             if (t.dev_f32) {
@@ -2868,9 +2909,15 @@ struct Engine::Impl {
             decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
         }
 
+        const bool time_on = std::getenv("STRATA_MM_TIME") != nullptr;
+        using tokclock = std::chrono::steady_clock;
+        auto ms = [](tokclock::time_point a) {
+            return std::chrono::duration<double, std::milli>(tokclock::now() - a).count();
+        };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
             if (kv_mode != 0 || L.want_gpu) use_layer_device(li);
+            const auto t_layer = tokclock::now();
             const bool dbg = dumping(li);
             const std::string pfx = "L" + std::to_string(src_layer[(size_t)li]);
             if (dbg) dbuf_put(pfx + "/residual_in", x.data(), (int)cfg.n_embd);
@@ -2933,6 +2980,7 @@ struct Engine::Impl {
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
 
             rms(x.data(), L.ffn_norm.data(), h.data(), (int)cfg.n_embd, eps);
+            const auto t_ffn = tokclock::now();
             if (!L.moe) {
                 mlp(L.gate, L.up, L.down, 0, h.data(), proj.data(), (int)cfg.n_ff_dense);
                 if (dbg) {
@@ -2950,6 +2998,11 @@ struct Engine::Impl {
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
             if (prefetch_slots > 0 && li + 1 < cfg.n_layers) prefetch_for(li + 1);
             if (dbg) dbuf_put(pfx + "/layer_out", x.data(), (int)cfg.n_embd);
+            if (time_on) {
+                const double f = ms(t_ffn);
+                std::fprintf(stderr, "INFO token-time layer=%lld attn=%.2f ffn=%.2f moe=%d\n", (long long)li,
+                             ms(t_layer) - f, f, L.moe ? 1 : 0);
+            }
         }
 
         rms(x.data(), out_norm.data(), h.data(), (int)cfg.n_embd, eps);

@@ -595,6 +595,11 @@ void copy_d2h(void* dst, const void* src, size_t bytes) {
     if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
 }
 
+void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream),
+                     "cudaMemcpyAsync D2H");
+}
+
 void copy_d2d(void* dst, const void* src, size_t bytes) {
     if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy D2D");
 }
