@@ -65,6 +65,8 @@ struct EngineOptions {
                                     ///< "direct" (unbuffered 16 MiB reads, for a set larger than RAM)
     // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
+    std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
+                                    ///< "off": the fp32 dequantize + SGEMM path, bit-closer to the CPU dots
 };
 
 struct SampleParams {

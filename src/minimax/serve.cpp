@@ -437,7 +437,7 @@ int run(int argc, char** argv) {
     std::string dump_dir, dump_layers, seed_hidden;
     std::string layer_split, gpus, kv_space;
     int prefill_batch = 0, expert_prefetch = 0;
-    std::string prefill_experts, prefill_dense, prefill_read;
+    std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -468,6 +468,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
         else if (a == "--minimax-prefill-read") prefill_read = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
+        else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
         else if (a == "--minimax-profile-save") profile_save = next();
@@ -593,6 +594,7 @@ int run(int argc, char** argv) {
     opt.prefill_dense = prefill_dense;
     opt.prefill_read = prefill_read;
     opt.expert_prefetch = expert_prefetch;
+    opt.dense_mmvq = dense_mmvq;
 
     Engine* engine = nullptr;
     try {
