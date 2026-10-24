@@ -50,9 +50,10 @@
 #include <unistd.h>
 #endif
 
-namespace strata {
-
+// The formats ported from ik_llama.cpp (ids 160..164) need their own row geometry, which ggml does not have.
 #include "strata/kernels/iqk_types.hpp"
+
+namespace strata {
 
 // ---- ggml type ids we care about. 42 = Q2_0, the PrismML ternary 2-bit encoding this engine targets.
 inline const char* ggml_type_name(uint32_t t) {
