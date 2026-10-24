@@ -74,6 +74,19 @@ MIT License
 Copyright (c) 2026 Niko1221 and the Strata contributors
 ```
 
+## Ideas and measurements (no code copied)
+
+The MiniMax engine's later work compares itself against two sibling engines and follows their ideas:
+the CPU pool's spin window and the RAM tier's size-from-the-box rule from
+[Project Maya](https://github.com/mw00/project-maya) (Peasant Smith and contributors, MIT), and the
+selection bias toward resident experts from [Xolotl](https://github.com/Indras-Mirror/Xolotl) (MIT).
+The comments in `src/minimax/engine.cpp` name the measured rows each came from. No source file from
+either project is copied into this tree; they are MIT, so a copy would be compatible, but the credit
+is to the idea and the number.
+
+The DeepSeek server front end's tokenizer handling (Strata-DS, Jackwwg83, MIT) is the model for
+`serve/minimax.py`'s; the dynamic quant mix of the low tiers follows Unsloth's UD quants.
+
 ## MiniMax chat template
 
 `serve/minimax_chat_template.jinja` and `serve/chat_template.jinja` are the chat templates that ship

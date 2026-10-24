@@ -94,6 +94,31 @@ Useful flags: `--context 8192` (default 32768; long context is work in progress)
 settings without starting, `--engine PATH`. `python sparsa.py inspect --model FILE` lists what the
 engine reads from a GGUF.
 
+### Share it on your network
+
+By default the server listens on `127.0.0.1` only: this computer. To let another machine on your
+network use it, say so, and Sparsa makes an API key and binds every address:
+
+```sh
+python sparsa.py serve --model D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3 --access lan
+# sparsa: LAN address http://192.168.1.50:8080/v1   (API key: sk-strata-...)
+# sparsa: Windows may ask whether to allow Strata (python.exe) on your network: choose Allow...
+```
+
+Then from the other machine, the same request with the key:
+
+```sh
+curl http://192.168.1.50:8080/v1/chat/completions \
+  -H "Content-Type: application/json" -H "Authorization: Bearer sk-strata-..." -d '{
+  "model": "minimax-m3.1-flash", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 200 }'
+```
+
+Anthropic clients send the key as `x-api-key` instead. The key is kept in the run settings file
+(`sparsa-minimax.json`, which `.gitignore` covers); `--show-key` prints it again, and
+`--no-api-key` serves without one, with a warning: anyone who can reach the port could then use the
+model and spend your electricity. Keep the server on your own network; there is no user account, just
+the one key.
+
 The server is the Qwen families' server too. `strata` (the Terminal) still manages those;
 `python sparsa.py` is the MiniMax path.
 
@@ -131,20 +156,21 @@ fetches the pinned llama.cpp commit (network needed). Details and every engine f
 
 ## Measured, not estimated
 
-Full `MM-IQ2_XS-D3` (146.1 GB), 2x RTX 5070 12 GB, Ryzen 9 5900X, 128 GB DDR4, Windows, NVMe, the
-engine at this branch point, uniform-random token ids (the worst case for expert residency, so the
-numbers are not flattered by the model guessing its own text):
+Full `MM-IQ2_XS-D3` (146.1 GB), 2x RTX 5070 12 GB, Ryzen 9 5900X, 128 GB DDR4, Windows, NVMe, this
+branch. Real 512-token text from the quality set, 32 greedy tokens, `--gpus 0,1 --layer-split auto`,
+the box idle for the first two arms:
 
-| context | request | prefill tok/s | TTFT | decode tok/s |
-| ---: | ---: | ---: | ---: | ---: |
-| 512 | 1 | 17.7 | 28.9 s | 2.40 |
-| 512 | 2 | 16.5 | 31.1 s | 2.90 |
-| 4096 | 1 | 37.4 | 109.6 s | 2.40 |
-| 4096 | 2 | 48.8 | 84.0 s | 2.43 |
+| arm | decode tok/s | ms/token | experts read from the SSD per token |
+| --- | ---: | ---: | ---: |
+| earlier build (uniform RAM tier) | 2.64 | 379.5 | 10.4 |
+| **this build** (RAM tier sized per layer) | **2.88** | 347.4 | 7.8 |
+| this build, the old uniform tier | 2.58 | 386.9 | 8.9 |
 
-79-97 % of the 228 expert routes per token came from the pinned RAM tier, the rest off the NVMe. GPU
-utilisation during decode was 10 % / 2 %: the token waits on the CPU and the SSD. Decode work
-(PR #11) is in progress and not in these numbers.
+**About 2.9 tokens a second.** That is experimental and slow: speed work is ongoing, and the arms ran
+one after another, so part of the difference is the file's pages being warm in the second arm (the
+load-independent rows, 7.8 against 10.4 experts and 135 against 180 MB per token, are what the change
+itself buys). Prefill on the earlier build was 16.5-17.7 tok/s for a 512-token prompt, so the first
+token takes about half a minute before decode starts.
 
 Quality, `MM-IQ2_XS-D3` against an fp32 reference of the checkpoint's own weights, six prompts,
 679 positions, teacher-forced:
@@ -195,6 +221,10 @@ its prohibited uses apply. They are not part of this repository.
   IQ4_KS / IQ2_KL formats the expert tiers port.
 - [agentionai/llama.cpp](https://github.com/agentionai/llama.cpp) ("Gyro") - the trellis expert types.
 - [Strata-DS](https://github.com/Jackwwg83/Strata-DS) (Jackwwg83) - the DeepSeek server front end the
-  MiniMax tokenizer and parser are modelled on.
+  MiniMax tokenizer and parser are modelled on, and the RAM-tier measurements this engine compares to.
+- [Project Maya](https://github.com/mw00/project-maya) (Peasant Smith and contributors, MIT) - the
+  DeepSeek engine whose pool spin, RAM-tier headroom and in-place reads were measured against here.
+- [Xolotl](https://github.com/Indras-Mirror/Xolotl) (MIT) - the resident-expert routing bias this
+  engine's opt-in route nudge follows.
 - Unsloth - the dynamic quant-mix idea the low tiers borrow.
 - MiniMax - the model and its chat template.
