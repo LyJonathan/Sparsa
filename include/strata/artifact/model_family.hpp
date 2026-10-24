@@ -2,8 +2,10 @@
 //
 // Strata was written for one model (Qwen3.8-Flash-Next, `qwen4exp`).  Qwen3.6-35B-A3B (`qwen35moe`) is a close
 // cousin (same tokenizer, the same Gated-DeltaNet + gated-attention 3:1 layer pattern, the same head dims), so the
-// reader, the geometry and the layout tables know both.  The ENGINE runs only the families `model_family_runs`
-// names; a recognised family it does not run yet is refused with `model_family_not_supported`, not mis-run.
+// reader, the geometry and the layout tables know both.  MiniMax-M3.1-Flash (`minimax-m3`) has an engine path of
+// its own (src/minimax), reached through the same family switch as Qwen3.6.  The MAIN engine runs only the families
+// `model_family_runs` names; a recognised family it does not run yet is refused with
+// `model_family_not_supported`, not mis-run.
 //
 // No dependencies: the GGUF reader (the architecture guard) and the core geometry both include this.
 #pragma once
@@ -16,11 +18,13 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    MinimaxM3,   ///< MiniMax-M3.1-Flash: MSA sparse attention, sigmoid router, swigluoai experts (src/minimax)
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
+    if (arch == "minimax-m3") return ModelFamily::MinimaxM3;
     return ModelFamily::Unknown;
 }
 
@@ -31,6 +35,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen4exp";
     case ModelFamily::Qwen35Moe:
         return "qwen35moe";
+    case ModelFamily::MinimaxM3:
+        return "minimax-m3";
     default:
         return "";
     }
@@ -43,14 +49,16 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
         return "Qwen3.6-35B-A3B";
+    case ModelFamily::MinimaxM3:
+        return "MiniMax-M3.1-Flash";
     default:
         return "an unknown model";
     }
 }
 
-/// Whether Flash-Next's engine path runs the family.  Qwen3.6 has an engine path of its own (src/qwen35), which the
-/// CUDA and HIP builds of `strata` switch to at the top of main(); the Intel Arc (SYCL) build has none yet, so there
-/// (and on Flash-Next's path) the family is refused with `model_family_not_supported`.
+/// Whether Flash-Next's engine path runs the family.  Qwen3.6 (src/qwen35) and MiniMax-M3.1 (src/minimax) have engine
+/// paths of their own, which the CUDA and HIP builds of `strata` switch to at the top of main(); the Intel Arc (SYCL)
+/// build has none yet, so there (and on Flash-Next's path) the family is refused with `model_family_not_supported`.
 inline bool model_family_runs(ModelFamily f) { return f == ModelFamily::Qwen4Exp; }
 
 /// The refusal for a recognised family the engine does not run (empty when it runs it).

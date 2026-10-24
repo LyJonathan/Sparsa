@@ -207,6 +207,10 @@ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thin
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# MiniMax-M3.1 closes its thinking with </mm:think>; the same two continuations in its spelling (format "minimax_m3")
+MINIMAX_THINK_END = "</mm:think>"
+MINIMAX_REASONING_CLOSE = "\n</mm:think>\n\n"
+MINIMAX_REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</mm:think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -3788,7 +3792,11 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True):
+                 fit_max_tokens: bool = True, format: str = "qwen"):
+        if format not in ("qwen", "minimax_m3"):
+            raise ValueError(f"unknown model format {format!r}")
+        self.format = format
+        self.minimax = format == "minimax_m3"
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
@@ -3887,8 +3895,13 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = ({tokenizer.eos_id} if self.minimax else
+                         set(tokenizer.encode(IM_END, parse_special=True) +
+                             tokenizer.encode("<|endoftext|>", parse_special=True)))
+        # The reasoning tag the parser and the budget/retry paths close with (MiniMax: </mm:think>)
+        self.think_end = MINIMAX_THINK_END if self.minimax else THINK_END
+        self.reasoning_close = MINIMAX_REASONING_CLOSE if self.minimax else REASONING_CLOSE
+        self.reasoning_wrap_up = MINIMAX_REASONING_WRAP_UP if self.minimax else REASONING_WRAP_UP
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
@@ -5027,8 +5040,13 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                              declared_only=declared_only)
+        if self.minimax:
+            from serve.minimax import MiniMaxOutputParser
+            parser = MiniMaxOutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                                         recover=self.tool_call_recovery, declared_only=declared_only)
+        else:
+            parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -5204,7 +5222,7 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
-                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                    if force and parser.state == "reasoning" and parser.buf == self.think_end:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
                                     finish = "stop"
@@ -5336,12 +5354,12 @@ class Service:
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
+                                and parser.buf != self.think_end         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(self.reasoning_close, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -5365,7 +5383,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = self.reasoning_wrap_up + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -7951,7 +7969,8 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
+                      "minimax-m3": "minimax-m3.1-flash"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -7964,6 +7983,10 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # MiniMax-M3.1-Flash: generation_config.json carries one set (temperature 1.0, top_p 0.95); the card does not
+    # split thinking from answering, so both states use it
+    "minimax_m3": {"thinking": {"temperature": 1.0, "top_p": 0.95},
+                   "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
 
 
@@ -8147,6 +8170,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
+    # The run config's "format" selects the Python front end (tokenizer, chat template, output parser).  The engine
+    # is selected by the GGUF's architecture, so the two are orthogonal: "arch" is C++, "format" is here.
+    model_format = cfg.get("format", "qwen")
+    if model_format not in ("qwen", "minimax_m3"):
+        ap.error(f"unknown model format {model_format!r} (expected \"qwen\" or \"minimax_m3\")")
+    minimax = model_format == "minimax_m3"
+    if minimax and cfg.get("vision"):
+        ap.error("MiniMax-M3.1 vision is not implemented in this server yet")
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:
@@ -8214,17 +8245,24 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
-        import strata_tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
-        tokens = [None] * len(vocab)
-        for t, i in vocab.items():
-            tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+    if minimax:
+        from serve.minimax import MiniMaxTokenizer
+        try:
+            tok = MiniMaxTokenizer(tpath)
+        except ValueError as e:
+            ap.error(f"the MiniMax tokenizer could not be loaded from {tpath}: {e}")
+    else:
+        if a.engine == "strata" and not (tpath / "vocab.json").exists():
+            ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        if (tpath / "vocab.json").exists():
+            import strata_tokenizer as ST
+            vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+            tokens = [None] * len(vocab)
+            for t, i in vocab.items():
+                tokens[i] = t
+            merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+            types = json.loads((tpath / "token_type.json").read_text())
+            tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
@@ -8328,9 +8366,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    if minimax:
+        from serve.minimax import MiniMaxTemplate
+        template = MiniMaxTemplate(tpl if tpl.exists() else None)
+    else:
+        template = ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+    svc = Service(engine, tok, template,
                   model_name=default_model_name(cfg), vision=vision,
-                  sampling_defaults=sampling_defaults,
+                  sampling_defaults=sampling_defaults, format=model_format,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline

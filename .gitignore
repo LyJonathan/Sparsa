@@ -85,3 +85,30 @@ node_modules/
 # screenshots and checkpoints from the Mac rebuild live outside git (StrataSplit\evidence-archive)
 /apps/host/docs/evidence/
 /apps/host/docs/checkpoints/
+# MiniMax work: local llama.cpp baseline build, reference venv, dumps (never committed)
+/_baseline/
+/_local/
+/_ref/
+# sparsa.py's generated run settings and engine log
+/sparsa-*.json
+/sparsa-*.log
+# secrets must never be committed
+.env
+.env.*
+*.token
+
+# P6 measurement scratch (bench_p6_ssd.py writes these beside the worktree)
+/bench_p6_engine.err
+/bench_p6_*.json
+/p6_ids.txt
+/p6_out/
+/build-err.log
+_pr_body.md
+# one-layer layer-40 sweep output (tools/minimax/test_ikq.py, out/sweep.ps1)
+out/
+
+# object files are build products (a stray root-level one was committed by PR #8)
+*.obj
+
+# P7 measurement rows (bench_p6_ssd.py --json-out beside the worktree)
+/bench_p7*.json

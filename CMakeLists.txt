@@ -794,6 +794,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # MiniMax-M3.1-Flash (GGUF architecture minimax-m3): src/minimax, a library that `strata` switches to at the top
+  # of its main, and strata-minimax wraps on its own.  P2b is one GPU plus ggml-cpu for routed experts (swigluoai,
+  # not the Qwen SiLU pool).  Excluded on gfx906: the dense GEMV is a 32-lane kernel.  Also skipped when
+  # STRATA_NATIVE_EXPERTS is OFF, so a Qwen-only configuration still configures.  main() guards the switch with
+  # STRATA_HAVE_MINIMAX, so those builds link and run the Qwen families, and `strata --families` says so.
+  if(NOT STRATA_HIP_GFX906 AND STRATA_NATIVE_EXPERTS)
+  add_library(strata_minimax STATIC
+    src/minimax/config.cpp
+    src/minimax/gguf.cpp
+    src/minimax/serve.cpp
+    src/minimax/engine.cpp
+    src/minimax/cuda_ops.cu)
+  target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                             PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_minimax PUBLIC strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+                        PRIVATE strata_warnings ${_strata_gpu_blas_target})
+  add_executable(strata-minimax src/minimax/minimax_main.cpp)
+  strata_utf8_manifest(strata-minimax)
+  target_link_libraries(strata-minimax PRIVATE strata_minimax ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_minimax)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAX=1)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
@@ -998,6 +1021,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(dequant_wide_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(dequant_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME dequant_wide_parity COMMAND dequant_wide_parity)
+    # the ported ik_llama.cpp formats: the GPU dequantizers (dq_iq2_kt and friends) bitwise against the CPU
+    # codec, and the grouped expert dot against the CPU dot (GPU, synthetic, no model)
+    add_executable(ikq_cuda_parity src/kernels/ikq_cuda_parity.cpp)
+    target_include_directories(ikq_cuda_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(ikq_cuda_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    if(MSVC)
+      target_compile_options(ikq_cuda_parity PRIVATE /EHsc)
+    endif()
+    add_test(NAME ikq_cuda_parity COMMAND ikq_cuda_parity)
   endif()
   # programmatic dependent launch (pdl.hpp) in a captured verify-shaped chain: bitwise vs ordinary launches over
   # replays with poisoned buffers, and only kernel-to-kernel programmatic edges (GPU, synthetic, no model; the edges
@@ -1604,7 +1636,8 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
+                                           src/kernels/cpu/iqk_quants.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
@@ -1614,6 +1647,8 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    # the formats ported from ik_llama.cpp: AVX2 trellis search, like ik's own quantizer
+    set_source_files_properties(src/kernels/cpu/iqk_quants.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     # the router lookahead's AVX1 dot (older CPUs; called behind cpu_avx1_ok): no FMA, no 256-bit integer ops
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
     # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): 128-bit integer lanes,
@@ -2264,4 +2299,10 @@ endif()
 if(STRATA_HIP_GFX906)
   add_executable(gfx906_qsa_query_swizzle_probe bench/gfx906_qsa_query_swizzle_probe.cpp)
   target_link_libraries(gfx906_qsa_query_swizzle_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+endif()
+
+# MiniMax GGUF quantizer. Default OFF so a normal strata configure is unchanged.
+option(STRATA_BUILD_MM_QUANT "Build strata-mm-quant (tools/minimax/quant). Does not change other targets." OFF)
+if(STRATA_BUILD_MM_QUANT)
+  add_subdirectory(tools/minimax/quant)
 endif()
