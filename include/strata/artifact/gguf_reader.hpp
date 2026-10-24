@@ -52,6 +52,8 @@
 
 namespace strata {
 
+#include "strata/kernels/iqk_types.hpp"
+
 // ---- ggml type ids we care about. 42 = Q2_0, the PrismML ternary 2-bit encoding this engine targets.
 inline const char* ggml_type_name(uint32_t t) {
     switch (t) {
@@ -124,6 +126,16 @@ inline const char* ggml_type_name(uint32_t t) {
         return "TQK6";
     case 146:
         return "TQK7";
+    case 160:
+        return "IQ2_KT";
+    case 161:
+        return "IQ3_K";
+    case 162:
+        return "IQ4_KS";
+    case 163:
+        return "IQ3_KT";
+    case 164:
+        return "IQ2_KL";
     default:
         return "?";
     }
@@ -256,6 +268,8 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 128;
         bytes = 30;
         return true;
+    // The formats ported from ik_llama.cpp (160..164) have a per-row scale in front of their blocks, so
+    // they are sized by ikq::row_bytes in tensor_payload_bytes below rather than by this table.
     default:
         return false;
     }
@@ -524,8 +538,16 @@ private:
 // Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
 // blocks, or the count overflows.
 inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
+    if (t.shape.empty()) return 0;
+    if (strata::kernels::ikq::is_iqk_type((int) t.type)) {
+        const size_t row = strata::kernels::ikq::row_bytes((int) t.type, (int64_t) t.shape[0]);
+        if (row == 0) return 0;
+        uint64_t rows = 1;
+        for (size_t i = 1; i < t.shape.size(); ++i) rows *= t.shape[i];
+        return (uint64_t) row * rows;
+    }
     int be = 0, bb = 0;
-    if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
+    if (!block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
     uint64_t elements = 1;
     for (uint64_t d : t.shape) {
         if (d == 0 || elements > (std::numeric_limits<uint64_t>::max)() / d) return 0;

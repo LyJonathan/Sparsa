@@ -1,0 +1,19 @@
+{
+  "name": "MM-IQ4_KS",
+  "file_type": 137,
+  "require_imatrix": true,
+  "dynamic_down": false,
+  "types": {
+    "experts": "IQ4_KS",
+    "ffn_down_exps": "IQ4_KS",
+    "hot_experts": "IQ4_KS",
+    "attention": "Q8_0",
+    "indexer": "Q8_0",
+    "dense_ffn": "Q8_0",
+    "shared_experts": "Q8_0",
+    "router": "F32",
+    "norms": "F32",
+    "token_embd": "Q8_0",
+    "output": "Q6_K"
+  }
+}

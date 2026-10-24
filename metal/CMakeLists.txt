@@ -98,7 +98,9 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/prefill/prefill.cpp
   ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
   ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
-  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)   # Gyro: the Hadamard rotation, the scalar trellis rows
+  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp
+${S}/kernels/cpu/iqk_quants.cpp)   # Gyro: the Hadamard rotation, the scalar trellis rows; iqk_quants: the
+# ik_llama.cpp IQ2_KT/IQ3_KT codec the CPU expert path of src/minimax/engine.cpp calls
 set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu PROPERTIES LANGUAGE CXX)
 
 # The kernel library: Metal implementations (src/engine/*.cpp) and, for every entry point not ported yet, a stub

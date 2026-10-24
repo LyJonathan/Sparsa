@@ -99,6 +99,12 @@ ggml_type parse_type(const std::string & s) {
     if (u == "IQ3_S") return GGML_TYPE_IQ3_S;
     if (u == "IQ4_XS") return GGML_TYPE_IQ4_XS;
     if (u == "NVFP4") return GGML_TYPE_NVFP4;
+    // Ported from ik_llama.cpp; ids from include/strata/kernels/iqk_types.hpp. See THIRD_PARTY_NOTICES.md.
+    if (u == "IQ2_KT") return (ggml_type) strata::kernels::ikq::kIQ2KT;
+    if (u == "IQ3_K") return (ggml_type) strata::kernels::ikq::kIQ3K;
+    if (u == "IQ4_KS") return (ggml_type) strata::kernels::ikq::kIQ4KS;
+    if (u == "IQ3_KT") return (ggml_type) strata::kernels::ikq::kIQ3KT;
+    if (u == "IQ2_KL") return (ggml_type) strata::kernels::ikq::kIQ2KL;
     die("unknown quant type " + s);
 }
 
@@ -117,6 +123,12 @@ uint32_t ftype_of(ggml_type t) {
         case GGML_TYPE_IQ4_XS: return 30;
         case GGML_TYPE_IQ1_M: return 31;
         case GGML_TYPE_NVFP4: return 39;
+        // ik_llama.cpp's GGML_FTYPE_MOSTLY_* numbers, so general.file_type reads the same in both tools
+        case (ggml_type) 160: return 142;   // IQ2_KT
+        case (ggml_type) 161: return 131;   // IQ3_K
+        case (ggml_type) 162: return 137;   // IQ4_KS
+        case (ggml_type) 163: return 143;   // IQ3_KT
+        case (ggml_type) 164: return 146;   // IQ2_KL
         default: return 0;
     }
 }
@@ -125,9 +137,9 @@ uint64_t mat_bytes(ggml_type t, int64_t n_in, int64_t n_out, int64_t n_ex = 1) {
     if (n_in <= 0 || n_out <= 0 || n_ex <= 0) {
         die("bad mat shape");
     }
-    const size_t row = ggml_row_size(t, n_in);
+    const size_t row = row_size(t, n_in);
     if (row == 0) {
-        die(std::string("ggml_row_size returned 0 for ") + ggml_type_name(t));
+        die(std::string("no row size for ") + type_name(t) + " at " + std::to_string(n_in) + " values");
     }
     return static_cast<uint64_t>(row) * static_cast<uint64_t>(n_out) * static_cast<uint64_t>(n_ex);
 }
@@ -396,17 +408,17 @@ std::string recipe_meta(const Recipe & r, const std::string & hot_mode) {
       << ",\"require_imatrix\":" << (r.require_imatrix ? "true" : "false")
       << ",\"dynamic_down\":" << (r.dynamic_down ? "true" : "false")
       << ",\"hot_expert_mode\":\"" << hot_mode << "\",\"types\":{"
-      << "\"experts\":\"" << ggml_type_name(r.experts) << "\","
-      << "\"ffn_down_exps\":\"" << ggml_type_name(r.ffn_down) << "\","
-      << "\"hot_experts\":\"" << ggml_type_name(r.hot) << "\","
-      << "\"attention\":\"" << ggml_type_name(r.attention) << "\","
-      << "\"indexer\":\"" << ggml_type_name(r.indexer) << "\","
-      << "\"dense_ffn\":\"" << ggml_type_name(r.dense) << "\","
-      << "\"shared_experts\":\"" << ggml_type_name(r.shared) << "\","
-      << "\"router\":\"" << ggml_type_name(r.router) << "\","
-      << "\"norms\":\"" << ggml_type_name(r.norms) << "\","
-      << "\"token_embd\":\"" << ggml_type_name(r.embd) << "\","
-      << "\"output\":\"" << ggml_type_name(r.output) << "\"}}";
+      << "\"experts\":\"" << type_name(r.experts) << "\","
+      << "\"ffn_down_exps\":\"" << type_name(r.ffn_down) << "\","
+      << "\"hot_experts\":\"" << type_name(r.hot) << "\","
+      << "\"attention\":\"" << type_name(r.attention) << "\","
+      << "\"indexer\":\"" << type_name(r.indexer) << "\","
+      << "\"dense_ffn\":\"" << type_name(r.dense) << "\","
+      << "\"shared_experts\":\"" << type_name(r.shared) << "\","
+      << "\"router\":\"" << type_name(r.router) << "\","
+      << "\"norms\":\"" << type_name(r.norms) << "\","
+      << "\"token_embd\":\"" << type_name(r.embd) << "\","
+      << "\"output\":\"" << type_name(r.output) << "\"}}";
     return o.str();
 }
 
@@ -1572,7 +1584,7 @@ const float * importance_for(const Imp * imp, const Item & it, int64_t expert) {
 
 void require_importance(const Item & it, const float * im) {
     if (type_needs_imatrix(it.type) && !im) {
-        die(std::string(ggml_type_name(it.type)) + " requires an imatrix entry for " + it.gguf);
+        die(std::string(type_name(it.type)) + " requires an imatrix entry for " + it.gguf);
     }
 }
 
@@ -1594,7 +1606,7 @@ void emit_constant(GgufWriter & w, ggml_type type, int64_t n_in, int64_t nrows, 
         return;
     }
     std::vector<float> row(static_cast<size_t>(n_in), value);
-    const size_t row_q = ggml_row_size(type, n_in);
+    const size_t row_q = row_size(type, n_in);
     std::vector<uint8_t> q(row_q);
     quantize_rows(type, row.data(), q.data(), 1, n_in, im, 1);
     const int64_t chunk = 128;
@@ -1612,7 +1624,7 @@ void emit_constant(GgufWriter & w, ggml_type type, int64_t n_in, int64_t nrows, 
 
 void emit_weight(GgufWriter & w, const Weight & wt, ggml_type type, int64_t n_in, int64_t n_out,
                  const float * im, int threads, float add) {
-    const size_t row_q = type == GGML_TYPE_F32 ? static_cast<size_t>(n_in) * 4 : ggml_row_size(type, n_in);
+    const size_t row_q = type == GGML_TYPE_F32 ? static_cast<size_t>(n_in) * 4 : row_size(type, n_in);
     if (type == GGML_TYPE_F32 && wt.store == Weight::Store::F32 && add == 0.f) {
         const uint64_t n = static_cast<uint64_t>(n_in) * static_cast<uint64_t>(n_out) * 4;
         if (wt.val->nbytes < n) {
@@ -2178,7 +2190,7 @@ void write_model(const Options & opt, const Hyp & h, const Recipe & r, const Pro
         w.end_tensor();
         written += it.nbytes;
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        logf("  %-32s %-8s %6.1fs  %s\n", it.gguf.c_str(), ggml_type_name(it.type), sec, human(it.nbytes).c_str());
+        logf("  %-32s %-8s %6.1fs  %s\n", it.gguf.c_str(), type_name(it.type), sec, human(it.nbytes).c_str());
     }
     w.close();
     partial.armed = false;
@@ -2239,10 +2251,10 @@ void bench(const Catalog & cat, const Hyp & h, const Recipe & r, const std::vect
         logf("WARNING: bench synthesized a uniform importance row. %s\n", kTestNote);
     }
     if (type_needs_imatrix(r.experts) && !im0) {
-        die("bench needs an imatrix for " + std::string(ggml_type_name(r.experts)));
+        die("bench needs an imatrix for " + std::string(type_name(r.experts)));
     }
     std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
-    const size_t row_q = ggml_row_size(r.experts, n_in);
+    const size_t row_q = row_size(r.experts, n_in);
     std::vector<uint8_t> q(row_q * static_cast<size_t>(n_out));
     int done = 0;
     uint64_t logical = 0;
@@ -2275,7 +2287,7 @@ void bench(const Catalog & cat, const Hyp & h, const Recipe & r, const std::vect
     }
     const double bps = static_cast<double>(logical) / sec;
     logf("bench layer %d -> blk.%d  %s  experts %d  logical f32 %s  %.2fs  %.3f GB/s\n",
-         layer, out_i, ggml_type_name(r.experts), done, human(logical).c_str(), sec, bps / 1e9);
+         layer, out_i, type_name(r.experts), done, human(logical).c_str(), sec, bps / 1e9);
     const double n_moe = static_cast<double>(h.n_layer - h.n_dense);
     const double expert_params = n_moe * h.n_expert * 3.0 * h.n_ff_exp * h.n_embd;
     const double expert_f32 = expert_params * 4.0;
@@ -2532,10 +2544,17 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         res.tensor = blk_name(opt.exp_layer, leaves[k]);
         const int64_t n_in = k == 2 ? h.n_ff_exp : h.n_embd;
         const int64_t n_out = k == 2 ? h.n_embd : h.n_ff_exp;
-        const size_t row_q = ggml_row_size(type, n_in);
-        const ggml_type_traits * traits = ggml_get_type_traits(type);
-        if (!traits || !traits->to_float) {
-            die("no dequantizer for " + std::string(ggml_type_name(type)));
+        const size_t row_q = row_size(type, n_in);
+        const ggml_type_traits * traits = is_ikq(type) ? nullptr : ggml_get_type_traits(type);
+        const auto dequant_row = [type, traits](const void * src, float * dst, int64_t n) {
+            if (is_ikq(type)) {
+                strata::kernels::ikq::dequantize_row((int) type, src, dst, n);
+            } else if (traits && traits->to_float) {
+                traits->to_float(src, dst, n);
+            }
+        };
+        if (!is_ikq(type) && (!traits || !traits->to_float)) {
+            die("no dequantizer for " + std::string(type_name(type)));
         }
         std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
         std::vector<float> dq(f32.size());
@@ -2552,7 +2571,7 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
             const float * im = imp ? imp->at(res.tensor, n_in, h.n_expert, e) : nullptr;
             if (!im) {
                 if (type_needs_imatrix(type)) {
-                    die(std::string("experiment: ") + ggml_type_name(type) + " needs an imatrix");
+                    die(std::string("experiment: ") + type_name(type) + " needs an imatrix");
                 }
                 uniform_row.assign(static_cast<size_t>(n_in), 1.f);
                 im = uniform_row.data();
@@ -2562,7 +2581,7 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
             quantize_rows(type, f32.data(), q.data(), n_out, n_in, im, threads);
             res.quant_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
             for (int64_t row = 0; row < n_out; ++row) {
-                traits->to_float(q.data() + static_cast<size_t>(row) * row_q, dq.data() + row * n_in, n_in);
+                dequant_row(q.data() + static_cast<size_t>(row) * row_q, dq.data() + row * n_in, n_in);
             }
             double pnum = 0.0, pden = 0.0, wnum = 0.0, wden = 0.0, wrow = 0.0;
             int64_t wrow_n = 0;
@@ -2650,7 +2669,7 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         const double outc = res.out_den > 0 ? std::sqrt(res.out_num / res.out_den) : 0.0;
         std::snprintf(line, sizeof(line),
                       "exp %-4s %-8s experts %d  plain %.6f  plain_mean %.6f  weighted %.6f  weighted_global %.6f  output %.6f  tokens %lld  outEX %d  outNum %.6g  outDen %.6g  quant %.1fs\n",
-                      res.name.c_str(), ggml_type_name(type), static_cast<int>(res.experts), plain,
+                      res.name.c_str(), type_name(type), static_cast<int>(res.experts), plain,
                       res.plain_mean / std::max<int64_t>(1, res.experts),
                       res.weighted_mean / std::max<int64_t>(1, res.experts), wglobal, outc,
                       static_cast<long long>(res.out_tokens), static_cast<int>(res.out_experts),
@@ -2678,7 +2697,7 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         char num[2048];
         o << "{\n";
         o << "  \"layer\": " << opt.exp_layer << ",\n";
-        o << "  \"type\": \"" << ggml_type_name(type) << "\",\n";
+        o << "  \"type\": \"" << type_name(type) << "\",\n";
         o << "  \"experts\": " << nexp << ",\n";
         o << "  \"imatrix\": \"" << js(opt.imatrix.string()) << "\",\n";
         o << "  \"imatrix_test_only\": " << (imp && imp->test_only ? "true" : "false") << ",\n";
@@ -2887,7 +2906,7 @@ int run(const Options & opt) {
                 die("this part has no tensors");
             }
             logf("recipe %s  experts %s  down %s  file_type %u  imatrix %s  layers %zu  tensors %zu\n",
-                 recipe.name.c_str(), ggml_type_name(recipe.experts), ggml_type_name(recipe.ffn_down),
+                 recipe.name.c_str(), type_name(recipe.experts), type_name(recipe.ffn_down),
                  recipe.file_type, recipe.require_imatrix ? "required" : "optional", sel.size(), items.size());
             if (opt.split_count >= 2) {
                 logf("split part %d/%d  globals %s  split.tensors.count %d\n", opt.split_part, opt.split_count,
