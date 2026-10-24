@@ -808,7 +808,90 @@ instead of dereferencing a null host pointer (it used to take an access violatio
   long-context prompt is still slow. The RAM tier at long context wants fp16 for prefill and q8 for capacity: those
   two do not yet coexist.
 * Prefill is still CPU-expert-bound on the full model; the expert bytes per chunk, not the attention, are the
-  ceiling. See §3.3 of the analysis.
+  ceiling. See ï¿½3.3 of the analysis.
+## P9: the budget has to cover the page cache, and the chunk the caller asked for
+
+Round 1's 32 K run held **112.8 GB of working set with 0.3 GB of RAM available** while the pinned expert tier was
+inside its 74 GiB `--memory-limit-mib` budget. The budget bounded the arena; nothing bounded the 146 GB model being
+streamed through the OS page cache by `--minimax-prefill-read mmap` (the default), and memcpy-ing the tier out of
+that mapping left the same bytes cached a second time.
+
+### `--minimax-prefill-read auto|mmap|direct` (default auto)
+
+`auto` means: **direct when `--memory-limit-mib` is set**, mmap otherwise. `direct` reads every streamed expert
+unbuffered (`DirectFile`) into the pinned staging buffer, so it costs no page cache; `mmap` is unchanged and is
+still the faster choice when the whole expert set is meant to be cached. The bytes are identical, so the logits are
+identical -- `tools/minimax/test_p9_direct_read.py` asserts `np.array_equal` against the mmap path on the synthetic
+runnable model (CPU only, no CUDA), and the plan line says which path ran:
+
+```
+INFO minimax-prefill-read=direct (implied by --memory-limit-mib; --minimax-prefill-read mmap keeps the page cache)
+```
+
+The three places that read the model now honour it: the profile/static RAM-tier fill (`ram_copy`), the batched CPU
+MoE (`moe_batch_cpu`, which also reads a resident expert from the pinned arena instead of the mapping), and the
+batched device MoE ring (unchanged `direct` path). On Windows the process working set is also trimmed
+(`EmptyWorkingSet`, after the fill and every 8 layers) so the clean mapped pages the upload faulted in go back to
+the standby list instead of sitting next to the pinned arena.
+
+### The batched workspace is 137 KiB/token, and the expert slots no longer take its VRAM
+
+Two separate space bugs kept `--minimax-prefill-batch 32768` from being honoured:
+
+* The per-token workspace was sized at `max_dense_n` (12288) for three fp32 buffers and one fp16 buffer that
+  nothing read -- 188 KiB/token. Only the dense MLP's `rows_cap` tile needs that width; the T-wide buffers need the
+  attention width (8192) and the hidden size (6144). It is now 137 KiB/token, and the sizes are printed:
+  `INFO minimax-prefill-workspace dev=1 free=... MiB reserve=... per_token=137.3 KiB fit=... tokens`.
+* `init_tiers` sized the automatic VRAM expert slots *before* the prompt workspace existed, so the slot count spent
+  all of the free VRAM and `init_prefill` then clamped the chunk to the leftovers. With `--minimax-prefill-batch`
+  set (and no explicit `--minimax-vram-slots-per-layer`) the workspace is now reserved first:
+  `INFO minimax-vram-slots reserving N MiB/device for the 32768-token batched prompt workspace`.
+  A run that does not ask for a batch sizes exactly as before.
+
+`--minimax-prefill-read` and the workspace layout change nothing about the numbers a chunk produces: the same
+kernels read the same bytes. `--minimax-vram-slots-per-layer 0` still forces the old "no VRAM slots" behaviour.
+
+### Measuring it
+
+`tools/minimax/bench_longctx.py` runs a real-text prompt (tokenized with the model's `tokenizer.json`, not random
+ids) through the serve protocol and reports the engine's own prefill/decode numbers plus **peak working set** and
+**minimum available RAM**, sampled every 2 s, and kills the run at `--cap-s` with the per-chunk `PP` lines intact:
+
+```powershell
+python tools/minimax/bench_longctx.py --model m.gguf --text docs/DETAILS.md --length 32768 --decode 64 `
+  --ctx 33280 --cap-s 1500 -- --gpus 0,1 --minimax-tiers --minimax-profile mm3-d3.bin --minimax-kv ram `
+  --minimax-prefill-batch 32768 --minimax-vram-slots-per-layer 0 --memory-limit-mib 66000
+```
+
+### Measured: 32 K of real text on the full model
+
+MiniMax-M3.1-Flash IQ2_XS-D3 (146 GB), 2x RTX 5070 12 GB, 128 GB DDR4-3200, Ryzen 5900X, prompt = 32 768 tokens of
+this repository's `docs/DETAILS.md`. Flags as above plus `--cpu-threads 12`; RAM tier 64.5 GiB pinned (3 815
+slots), KV f16 4.28 GiB in pinned RAM.
+
+| | value |
+|---|---|
+| chunk achieved | **22 473 tokens** (binding card GPU1, 3 938 MiB free; workspace 2 879 MiB/device) |
+| chunks | 2 (22 473 + 10 295) |
+| prefill | **866.7 s, 37.8 tok/s** |
+| decode, 64 tokens | **34.9 s, 1.83 tok/s** (546 ms/token) |
+| peak working set | **83.4 GiB** |
+| minimum available RAM | **39.8 GiB** |
+| startup (weights, pin, fill, workspace) | 76 s |
+
+Round 1 stopped this prompt at 20 min with 25 of 60 layers done and 0.3 GB of RAM left. The per-chunk split (an
+earlier run, same flags, `--ctx 32768`) was 22 991 tokens in **554.3 s (41.5 tok/s)** and 9 777 tokens in
+**310.4 s (31.5 tok/s)** â€” the second chunk pays more per token because the indexer and MSA grow with position while
+the expert bytes per chunk do not.
+
+The read paths agree on real weights: the 15-layer slice (`p5a-l0-14-iq2xs.gguf`), 4 096 real tokens, is
+`np.array_equal` between `--minimax-prefill-read mmap` and `direct` (4 096 x 200 064 logits, max abs 0.0, top-1
+4 096/4 096).
+
+128 K fits in RAM (16.9 GiB of KV + a 55 GiB tier leaves ~35 GiB available) but not in a 25-min run: at 37.8 tok/s it
+is ~57 min, and the per-token cost grows with position, so nearer 1.5-2 h. It was not run. The next lever there is
+the expert GEMM (an MMVQ at 1 024 rows/expert), not the chunk size.
+
 ## P7b: the route nudge, the lane's spin window, and page-cache-in-place
 
 **`--minimax-route-bias on` (default off): rank the router's top-k on the expert's score plus a residency
