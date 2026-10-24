@@ -98,7 +98,7 @@ def cfg(machine):
     }
     if machine == "rig-2":
         # the full checkpoint, never deleted
-        c["model"] = "/home/adminl/models/MiniMax-M3.1-Flash"
+        c["model"] = os.environ.get("MINIMAX_CHECKPOINT", os.path.join(home, "models", "MiniMax-M3.1-Flash"))
         c["fetch"] = False
     elif machine == "rig-3":
         c["model"] = os.path.join(base, "shards")
