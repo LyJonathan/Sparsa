@@ -3750,9 +3750,14 @@ struct Engine::Impl {
         pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
         pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
         pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        pf_gate_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
-        pf_up_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
-        pf_hid_h.assign((size_t)rows_cap * (size_t)cfg.n_ff_exp, 0.f);
+        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
+        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
+        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
+        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
+        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
+        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
         pf_dense_h.assign((size_t)batch_cap * (size_t)max_dense_n, 0.f);
         pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
         pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
