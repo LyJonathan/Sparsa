@@ -72,6 +72,7 @@ void usage() {
                  "  --minimax-profile-save PATH       record routing and write an STRP profile on exit\n"
                  "  --minimax-routing-counts PATH     also write a text 'layer expert count' table\n"
                  "  --minimax-stats [--minimax-stats-per-layer]   tier counters on stderr\n"
+                 "  --minimax-profile-time            one line per decode token: the wall time of every phase\n"
                  "  --no-minimax-adaptive             disable decayed VRAM swaps and the RAM-tier LRU\n"
                  "  --minimax-dump-dir DIR            write per-layer activations as npy (parity probes)\n"
                  "  --minimax-dump-layers LIST|all    which source layers to dump (default all)\n"
@@ -79,8 +80,16 @@ void usage() {
                  "  --gpus 0,1                       CUDA devices to use (default: 0)\n"
                  "  --layer-split auto|K[,K2]         layer K is the first one on the next GPU (auto: by free VRAM)\n"
                  "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n"
+                 "  --minimax-kv-quant f16|q8_0|auto  fp16 (default) or q8_0 blocks for the host/pinned K/V;\n"
+                 "                                    auto picks q8_0 only when f16 does not fit\n"
+                 "  --minimax-host-attn fast|legacy   multithreaded host attention (default fast; same arithmetic)\n"
+                 "  --minimax-prefill-kv auto|off     with the KV in RAM, stage one layer's K/V on the card for the\n"
+                 "                                    batched prompt pass (default auto, the long-context path)\n"
                  "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
                  "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
+                 "  --minimax-prefill-expert-gemm mmvq|tc|auto\n"
+                 "                                    routed experts: int8 iq_mmvq dots (default), dequantize-once +\n"
+                 "                                    FP16 tensor-core GEMM per expert, or auto (tc from 16 rows)\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
                  "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n"
                  "  --minimax-ssd-chunks N            pieces one SSD expert read is split into, in flight together\n"
@@ -90,6 +99,7 @@ void usage() {
                  "                                    be read from the SSD; 0 (default) keeps every route\n"
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
+                 "  --minimax-page-probe N            pages sampled per expert for that check (default 32; 0 = all)\n"
                  "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n"
                  "  --minimax-route-bias on|off       rank the router's top-k on score + a residency bonus / file\n"
                  "                                    penalty (Xolotl); weights stay unbiased; default off\n"
@@ -526,18 +536,20 @@ int run(int argc, char** argv) {
     std::string profile, profile_save, routing_counts;
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
     int pool_spin_us = 0;
-    bool stats = false, stats_per_layer = false, adaptive = true;
+    bool stats = false, stats_per_layer = false, profile_time = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
     std::string dump_dir, dump_layers, seed_hidden;
     std::string layer_split, gpus, kv_space;
+    std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
-    std::string prefill_experts, prefill_dense, prefill_read, dense_mmvq;
+    std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
     int ssd_chunks = 1, expert_skip_ssd = 0;
     std::string ssd_zerocopy;
+    int page_probe = 32;
     std::string ssd_prefetch;
     std::string ram_mode;
     std::string route_bias;
@@ -569,9 +581,13 @@ int run(int argc, char** argv) {
         else if (a == "--layer-split") layer_split = next();
         else if (a == "--gpus" || a == "--gpu") gpus = next();
         else if (a == "--minimax-kv" || a == "--kv-space") kv_space = next();
+        else if (a == "--minimax-kv-quant" || a == "--kv-quant") kv_quant = next();
+        else if (a == "--minimax-host-attn" || a == "--host-attn") host_attn = next();
+        else if (a == "--minimax-prefill-kv") prefill_kv = next();
         else if (a == "--minimax-prefill-batch" || a == "--minimax-batch") prefill_batch = std::atoi(next().c_str());
         else if (a == "--minimax-prefill-experts") prefill_experts = next();
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
+        else if (a == "--minimax-prefill-expert-gemm") prefill_expert_gemm = next();
         else if (a == "--minimax-prefill-read") prefill_read = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
@@ -580,6 +596,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
         else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
+        else if (a == "--minimax-page-probe") page_probe = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
         else if (a == "--minimax-route-bias") route_bias = next();
         else if (a == "--minimax-route-bias-in") route_bias_in = (float)std::atof(next().c_str());
@@ -602,6 +619,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ram-mode") ram_mode = next();
         else if (a == "--minimax-stats") stats = true;
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
+        else if (a == "--minimax-profile-time") profile_time = true;
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
         else if (a == "--minimax-pack-quant" || a == "--minimax-pack-iq2xs") {
             pack = true;
@@ -718,15 +736,20 @@ int run(int argc, char** argv) {
     opt.adaptive = adaptive;
     opt.stats = stats;
     opt.stats_per_layer = stats_per_layer;
+    opt.profile_time = profile_time;
     opt.dump_dir = dump_dir;
     opt.dump_layers = dump_layers;
     opt.seed_hidden = seed_hidden;
     opt.layer_split = layer_split;
     opt.gpus = gpus;
     opt.kv_space = kv_space;
+    opt.kv_quant = kv_quant;
+    opt.host_attn = host_attn;
+    opt.prefill_kv = prefill_kv;
     opt.prefill_batch = prefill_batch;
     opt.prefill_experts = prefill_experts;
     opt.prefill_dense = prefill_dense;
+    opt.prefill_expert_gemm = prefill_expert_gemm;
     opt.prefill_read = prefill_read;
     opt.expert_prefetch = expert_prefetch;
     opt.dense_mmvq = dense_mmvq;
@@ -736,6 +759,7 @@ int run(int argc, char** argv) {
     opt.ssd_chunks = ssd_chunks;
     opt.expert_skip_ssd = expert_skip_ssd;
     opt.ssd_zerocopy = ssd_zerocopy;
+    opt.page_probe = page_probe;
     opt.ssd_prefetch = ssd_prefetch;
     opt.route_bias = route_bias;
     opt.route_bias_in = route_bias_in;
@@ -853,7 +877,7 @@ int run(int argc, char** argv) {
     while (lines.pop(line)) {
         if (line == "QUIT") break;
         if (starts_with(line, "GEN ")) {
-            handle_gen(*engine, line, gate, greedy, stats);
+            handle_gen(*engine, line, gate, greedy, stats || profile_time);
             continue;
         }
         if (starts_with(line, "GENI ") || starts_with(line, "GENI")) {

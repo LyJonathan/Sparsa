@@ -48,6 +48,7 @@ struct EngineOptions {
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
+    bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 
     // ---- parity probes (P4).  Both are opt-in and add nothing to a normal run.
     std::string dump_dir;           ///< write per-layer activations as npy files here (empty: off)
@@ -58,6 +59,15 @@ struct EngineOptions {
     std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
     std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
     std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
+    // ---- P8: long context.  `kv_quant` halves the host/pinned KV (q8_0 blocks, 34 B / 32 values); the indexer
+    // keys stay fp16 because they only rank blocks and a flipped rank changes the output discretely.
+    std::string kv_quant;           ///< "" / "f16" (default, byte-identical) | "q8_0" | "auto" (q8 only when f16
+                                    ///< does not fit)
+    std::string host_attn;          ///< "" / "fast": the multithreaded, allocation-free host attention (same
+                                    ///< arithmetic order, bit-identical); "legacy": the P2 loop
+    std::string prefill_kv;         ///< "" / "auto": with the KV in pinned RAM, stage one layer's K/V on the card
+                                    ///< for the batched prompt pass instead of running attention on the host;
+                                    ///< "off": keep the host attention in prefill (P7 behaviour)
 
     // ---- P5a: batched prefill.  0 keeps the token path (byte-identical to P4); a positive value is the maximum
     // prompt tokens processed per layer in one batched pass.  The prompt is then walked in chunks of that size.
@@ -65,8 +75,13 @@ struct EngineOptions {
     std::string prefill_experts;    ///< "auto" (chunk size decides), "cpu" or "gpu": where a batched chunk's routed
                                     ///< experts are computed
     std::string prefill_dense;      ///< "f32" (default: fp32 cuBLAS, matches the per-token GPU GEMV) or "f16"
-    std::string prefill_read;       ///< "mmap" (default: the OS page cache, best when the expert set fits in RAM) or
-                                    ///< "direct" (unbuffered 16 MiB reads, for a set larger than RAM)
+    std::string prefill_expert_gemm;///< "mmvq" (default: the int8 iq_mmvq expert dots) or "tc": dequantize each
+                                    ///< routed expert once per chunk and run the rows through the FP16 tensor-core
+                                    ///< GEMM (cuBLAS), grouped over the tokens routed to that expert. "auto"
+                                    ///< picks "tc" for a group of at least 16 rows.
+    std::string prefill_read;       ///< "" / "auto": the OS page cache, except when --memory-limit-mib is set (the
+                                    ///< budget cannot bound the page cache, so streamed experts are read unbuffered);
+                                    ///< "mmap": always the page cache; "direct": always unbuffered 16 MiB reads
     // ---- P5b: decode.  Copy the next layer's routed experts into free VRAM slots while this layer computes.
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
@@ -92,6 +107,7 @@ struct EngineOptions {
     // ---- P7: the SSD tier's page-cache path.
     std::string ssd_zerocopy;       ///< "" / "on": an expert whose pages are already resident is computed from the
                                     ///< mapping with no read; "off": always issue the read (P6 behaviour)
+    int page_probe = 32;            ///< P9: pages probed per expert for a page-cache hit (0 = walk every page)
     std::string ssd_prefetch;       ///< "" / off: "on" queues the next layer's SSD misses right after this layer's
                                     ///< MoE, so they are in flight across that layer's attention
     // ---- P7b: the route nudge (Xolotl's selection bias toward resident experts).
