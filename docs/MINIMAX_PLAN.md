@@ -357,6 +357,22 @@ G0-G2 always stay with Claude.
 Text-only chat through the API is usable after P2+P5. P3/P4 are what make it
 fast, and P6/P7 are additive.
 
+### P6 measured (2026-10-24)
+
+- **mmproj:** `mmproj-MiniMax-M3.1-Flash-F16.gguf`, 524 tensors, 1.73 GB. The repo's converter
+  (`tools/minimax/convert_mmproj.py`) produces byte-identical tensors to llama.cpp's
+  `convert_hf_to_gguf.py --mmproj` for this checkpoint.
+- **ViT + projector parity, fp32 CPU against transformers 5.20.2**, on the processor's own `pixel_values` (so
+  preprocessing is excluded): per-token cosine min 0.9999998 / 0.9999934 / 0.9999977 (mean 1.00000000) for a red
+  circle on white (391 tokens), a photograph (391) and a text card (450). Max-abs 0.13 / 0.096 / 0.29 on values up
+  to 727 / 1494 / 543.
+- **Preprocessing:** the engine's `smart_resize` + bicubic + mean/std matches the processor's `pixel_values` to
+  max-abs 0.24 (red circle, hard edges) and 0.015 (text card); end-to-end embedding cosine on the red circle is
+  min 0.9846, mean 0.99973, and 0.99996 on the text card. The residual is the resize at one hard-edge token.
+- **CPU cost:** 64-80 s per 640x480 picture on 16 cores; 3.5 GB fp32 weights. The GPU path and video are not done.
+- **End to end** (IQ2_XS-D3, 2x RTX 5070, 2048 ctx, 601-token prompt with 391 image tokens): prefill 47.8 s,
+  9 decode tokens in 2.84 s; the 640x480 red circle on white answered `</mm:think>The object is a red circle.[e~[`.
+
 ### P4 measured (2026-10-24)
 
 - **G1 on real weights** (Q8_0 dense and experts, F32 norms/router, truncated GGUFs from the real checkpoint,

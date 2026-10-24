@@ -10,6 +10,7 @@
 #include "strata/kernels/iqk_types.hpp"
 
 #include "cuda_ops.hpp"
+#include "strata/minimax/vision.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -785,6 +786,12 @@ struct Engine::Impl {
     std::vector<char> ah_sel;
     std::vector<int64_t> ah_ids;
     std::vector<int32_t> held;
+    // ---- P6: images for the current request.  `img_row[pos]` is the embedding row that replaces the token
+    // embedding at that prompt position, or -1.  Cleared by reset().
+    std::unique_ptr<Vision> vision;
+    std::vector<float> img_data;   // [rows, n_embd]
+    std::vector<int> img_row;      // per prompt position
+    int64_t img_rows = 0;
     int64_t n_past = 0;
     int64_t cur_pos = 0;
     bool have_logits = false;
@@ -1262,6 +1269,16 @@ struct Engine::Impl {
         kv_tmp.assign((size_t)bigger(klen, cfg.idx_dim) * 2, 0);
         logits.assign((size_t)cfg.n_vocab, 0.f);
         last_logits.assign((size_t)cfg.n_vocab, 0.f);
+
+        if (!opt.mmproj.empty()) {
+            const auto tv0 = std::chrono::steady_clock::now();
+            vision = std::make_unique<Vision>(opt.mmproj, opt.cpu_threads);
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count();
+            std::fprintf(stderr,
+                         "INFO minimax-vision mmproj=%s layers=%lld hidden=%lld merge=%lld loaded_in=%.1fs\n",
+                         opt.mmproj.c_str(), (long long)vision->config().layers,
+                         (long long)vision->config().hidden, (long long)vision->config().merge, sec);
+        }
     }
 
     ~Impl() {
@@ -5264,6 +5281,12 @@ struct Engine::Impl {
         } else {
             decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
         }
+        if ((size_t)pos < img_row.size()) {
+            const int row = img_row[(size_t)pos];
+            if (row >= 0)
+                std::memcpy(x.data(), img_data.data() + (size_t)row * (size_t)cfg.n_embd,
+                            (size_t)cfg.n_embd * sizeof(float));
+        }
         if (pt) prof.embed = pms(t_tok);
 
         const bool time_on = std::getenv("STRATA_MM_TIME") != nullptr;
@@ -5962,6 +5985,12 @@ struct Engine::Impl {
                 decode_f32(embd_t, embd_t.host + (size_t)toks[t] * embd_t.row_bytes, pf_h.data() + (size_t)t * ne,
                            ne);
             }
+            if ((size_t)(pos0 + t) < img_row.size()) {
+                const int row = img_row[(size_t)(pos0 + t)];
+                if (row >= 0)
+                    std::memcpy(pf_h.data() + (size_t)t * ne,
+                                img_data.data() + (size_t)row * (size_t)ne, (size_t)ne * sizeof(float));
+            }
         }
         std::vector<float> att((size_t)qlen);          // one row's attention output (host path)
         std::vector<float> qf((size_t)T * qlen);       // attention queries, fp32 (host path and the q8 upload)
@@ -6494,7 +6523,8 @@ void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std:
 
 GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new, const SampleParams& sp,
                                 std::atomic<bool>& stop, const std::function<void(int32_t)>& on_token,
-                                const std::function<void(int, int, double)>& on_pp) {
+                                const std::function<void(int, int, double)>& on_pp,
+                                const std::vector<std::string>& images) {
     GenerateResult gr;
     if (prompt.empty()) fail("prompt is empty");
     if ((int64_t)prompt.size() > impl_->ctx) fail("prompt is longer than the context");
@@ -6503,6 +6533,43 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
     else {
         std::random_device rd;
         impl_->rng.seed(((uint64_t)rd() << 32) ^ rd());
+    }
+
+    // P6: encode every picture, then line its rows up with the `<]image[>` placeholders in prompt order.
+    // The server expands one placeholder per token; a caller that leaves a single token per picture is refused
+    // rather than silently reading the wrong rows.
+    impl_->img_row.clear();
+    impl_->img_data.clear();
+    impl_->img_rows = 0;
+    if (!images.empty()) {
+        if (!impl_->vision) fail("an image was sent but no vision encoder is loaded (pass --mmproj)");
+        std::vector<int64_t> per;
+        int64_t total = 0;
+        for (const std::string& path : images) {
+            ImageEmbeddings e = impl_->vision->encode_file(path, impl_->opt.image_max_tokens);
+            if (e.dim != impl_->cfg.n_embd)
+                fail("the mmproj projects to " + std::to_string(e.dim) + " but the model needs " +
+                     std::to_string(impl_->cfg.n_embd));
+            per.push_back(e.tokens);
+            total += e.tokens;
+            impl_->img_data.insert(impl_->img_data.end(), e.data.begin(), e.data.end());
+        }
+        impl_->img_rows = total;
+        impl_->img_row.assign(prompt.size(), -1);
+        int64_t row = 0;
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            if (prompt[i] == impl_->opt.image_token_id) {
+                if (row >= total) fail("the prompt has more image tokens than the pictures supply");
+                impl_->img_row[i] = (int)row++;
+            }
+        }
+        if (row != total)
+            fail("the prompt has " + std::to_string(row) + " image tokens but " + std::to_string(images.size()) +
+                 " picture(s) produce " + std::to_string(total) + " (each picture is expanded to its own tokens)");
+        // A picture's rows are request data, not cache: always prefill this prompt again.
+        impl_->n_past = 0;
+        impl_->held.clear();
+        impl_->have_logits = false;
     }
 
     // n_past is the cache. The last sampled token sits in `held` but is not forwarded until the next

@@ -50,12 +50,17 @@ struct EngineOptions {
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
     bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 
+    // ---- P6: vision.  Empty `mmproj` keeps the text-only engine (no vision file opened).
+    std::string mmproj;             ///< llama.cpp clip mmproj (minimax_m3) for image inputs
+    int64_t image_token_id = 200025;///< the `<]image[>` token the image rows replace
+    int64_t image_max_tokens = 576; ///< refuse a picture above this many image tokens (0 = no limit)
+
     // ---- parity probes (P4).  Both are opt-in and add nothing to a normal run.
     std::string dump_dir;           ///< write per-layer activations as npy files here (empty: off)
     std::string dump_layers;        ///< "all" (default when dump_dir is set) or source layer ids "0,3,40"
     std::string seed_hidden;        ///< npy fp32 [seq, n_embd]: use row t as token t's input instead of the embedding
 
-    // ---- P4: more than one GPU, and where the KV cache lives.
+    /// P4: more than one GPU, and where the KV cache lives.
     std::string gpus;               ///< CUDA ordinals to use, comma separated ("0,1"); empty: device 0
     std::string layer_split;        ///< "auto" or K[,K2]: layer K is the first one on the next GPU
     std::string kv_space;           ///< "host" (CPU attention, the P2 default) | "vram" | "ram" | "auto"
@@ -166,7 +171,8 @@ public:
 
     GenerateResult generate(const std::vector<int32_t>& prompt, int max_new, const SampleParams& sp,
                             std::atomic<bool>& stop, const std::function<void(int32_t)>& on_token,
-                            const std::function<void(int, int, double)>& on_pp);
+                            const std::function<void(int, int, double)>& on_pp,
+                            const std::vector<std::string>& images = {});
 
 private:
     struct Impl;
