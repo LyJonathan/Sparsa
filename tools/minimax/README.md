@@ -1945,7 +1945,17 @@ moved by 4096 bytes** and requires the comparison to fail. On the cropped logs u
 `base: 5/6, 1 differ` / `selftest PASS (a moved offset was caught)`, i.e. the checker can distinguish a wrong byte
 from a right one.
 
-Cropped-run result (28 tensors across the packs, chosen to cover shards 0, 1 and 13 and the alternate pack): the base
-arm is **6/6 identical** and the `--expert-source` arm **8/8 identical** to a donor. The full 1188-tensor N/N on both
-all-SSD arms is the first thing the next engine turn runs - it needs the two `--verify-exit` arms regenerated with
-this build.
+**Full N/N, both all-SSD arms, all 1188 tensors** (regenerated with this build, `--memory-limit-mib 600` so every
+expert goes through the drive, `--vram-slots 0`):
+
+```
+      base: 1188/1188 tensors identical to a donor
+       alt: resolution against the first log: 0 tensors only here, 15 resolved differently
+       alt: 1188/1188 tensors identical to a donor
+PROOF PASS - SHA-256 of every tensor, streamed in 64 MiB reads, and every log resolving every tensor the same way
+```
+
+The 15 are exactly the block: layers 3-7 x {gate, up, down}. `verify_pack.py` now takes `--same-config` (require
+identical resolution, for a `--serve` against a `--minimax-eval` log) and `--expect-moved N` (require exactly N
+tensors to move), because a base arm and an `--expert-source` arm are *supposed* to differ - comparing them as if they
+were the same configuration was the last false failure.

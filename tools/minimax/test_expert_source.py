@@ -67,7 +67,10 @@ def main() -> int:
     # every tensor must hash to one of the two donors, and the block must name the donor's file
     verify = [sys.executable, str(ROOT / 'tools' / 'minimax' / 'verify_pack.py'),
               '--pack', str(D3), '--engine-log', str(TMP / 'base.log'), '--engine-log', str(TMP / 'alt.log'),
-              '--label', 'base', '--label', 'alt', '--donor', str(D3), '--donor', str(IQ1)]
+              '--label', 'base', '--label', 'alt', '--donor', str(D3), '--donor', str(IQ1),
+              # the block is BLOCK[0]..BLOCK[1] layers x 3 expert matrices: exactly that many tensors must resolve
+              # to a different file, and every one of them must still hash to a donor
+              '--expect-moved', str((BLOCK[1] - BLOCK[0] + 1) * 3)]
     r = subprocess.run(verify, capture_output=True, text=True, encoding='utf-8', errors='replace')
     print(r.stdout[-2000:])
     if r.returncode != 0:

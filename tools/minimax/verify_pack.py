@@ -114,6 +114,13 @@ def main(argv=None) -> int:
     ap.add_argument('--donor', action='append', required=True, help='first shard of a donor pack (repeatable)')
     ap.add_argument('--label', action='append', default=[])
     ap.add_argument('--quiet', action='store_true', help='only the totals and mismatches')
+    ap.add_argument('--same-config', action='store_true',
+                    help='the logs are the SAME configuration (e.g. --serve against --minimax-eval): require every '
+                         'tensor to resolve identically.  Off by default, because a base arm and an '
+                         '--expert-source arm are supposed to differ.')
+    ap.add_argument('--expect-moved', type=int, default=None,
+                    help='require exactly this many tensors to resolve differently between the first and each later '
+                         'log (an --expert-source block of N layers moves 3N expert tensors)')
     ap.add_argument('--selftest', action='store_true',
                     help="prove the checker can fail: rerun with one tensor's offset moved, and require DIFFERS")
     a = ap.parse_args(argv)
@@ -159,8 +166,14 @@ def main(argv=None) -> int:
             moved = {n: (prev[n], offs[n]) for n in set(offs) & set(prev) if prev[n] != offs[n]}
             print(f'{label:>10}: resolution against the first log: {len(only_here)} tensors only here, '
                   f'{len(moved)} resolved differently' + ('' if not moved else f' (e.g. {list(moved)[:3]})'))
-            if only_here or moved:
+            if only_here:
                 ok_all = False
+            if a.same_config and moved:
+                ok_all = False
+            if a.expect_moved is not None:
+                if len(moved) != a.expect_moved or only_here:
+                    print(f'{label:>10}: expected exactly {a.expect_moved} tensors to move, saw {len(moved)}')
+                    ok_all = False
         prev = offs
         for name, (shard, offset, nbytes, qtype, leaf) in got.items():
             # The engine's shard index is an index into ONE flat file list: the base pack's shards and then each
