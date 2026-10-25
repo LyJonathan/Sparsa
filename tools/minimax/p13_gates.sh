@@ -22,9 +22,11 @@ EXE=./build/strata-minimax.exe
 OWNER=${PC_OWNER:-dspark}
 LAUNCH=tools/minimax/pc_launch.py
 SHIM=$(mktemp -d)/eng-dspark.sh
+# EST_RAM_GB overrides the estimate; by default the launcher reads the engine's own flags (--memory-limit-mib etc.)
+if [ -n "${EST_RAM_GB:-}" ]; then EST="--est-ram-gb $EST_RAM_GB"; else EST=""; fi
 cat > "$SHIM" <<SH
 #!/bin/bash
-exec python "$LAUNCH" --owner "$OWNER" --est-ram-gb "\${EST_RAM_GB:-40}" -- "$EXE" "\$@"
+exec python "$LAUNCH" --owner "$OWNER" $EST -- "$EXE" "\$@"
 SH
 chmod +x "$SHIM"
 if [ ! -f "$LAUNCH" ]; then echo "pc_launch.py is missing: run nothing on the shared PC without it" >&2; exit 1; fi
