@@ -60,7 +60,8 @@ def run(cmd: list[str], tag: str, est_gb: float, timeout: float, deadline: float
     return p.returncode
 
 
-def gate(model: Path, out: Path, prompts: str | None, timeout: float, deadline: float) -> dict | None:
+def gate(model: Path, out: Path, prompts: str | None, timeout: float, deadline: float,
+         pre_locked: bool = False) -> dict | None:
     cmd = [sys.executable, str(ROOT / 'tools' / 'minimax' / 'g3_sparsa.py'), '--model', str(model), '--out', str(out),
            '--tier', 'MIX', '--ref', r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\ref_out\logits",
            '--ids', r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\g3_iq2xs\ids",
@@ -68,7 +69,23 @@ def gate(model: Path, out: Path, prompts: str | None, timeout: float, deadline: 
            '--memory-limit-mib', '80000', '--layer-split', 'auto', '--cpu-threads', '12']
     if prompts:
         cmd += ['--prompts', prompts]
-    if run(cmd, out.name, 30, timeout, deadline) != 0:
+    if pre_locked:
+        # the caller already holds the lock for this whole turn (pc_launch around the driver), so the gate runs
+        # directly: one lock acquisition per two or three blocks, not one per gate
+        log = open(TMP / f'sweep_{out.name}.log', 'w')
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, text=True,
+                             encoding='utf-8', errors='replace')
+        try:
+            p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            print(f'{out.name}: TIMEOUT', flush=True)
+        log.close()
+        print(f'{out.name}: rc {p.returncode}', flush=True)
+        if p.returncode != 0:
+            return None
+    elif run(cmd, out.name, 30, timeout, deadline) != 0:
         return None
     f = out / 'results.json'
     if not f.exists():
@@ -102,6 +119,9 @@ def main(argv=None) -> int:
     ap.add_argument('--est-gb-per-layer', type=float, default=0.688,
                     help='GB saved per layer moved to the cold donor (D3 2.322 -> IQ1_M 1.680 GB a layer)')
     ap.add_argument('--minutes', type=float, default=120.0, help='give up waiting for the lock after this long')
+    ap.add_argument('--already-locked', action='store_true',
+                    help='the caller holds the lock for the whole turn; the gates run directly')
+    ap.add_argument('--baseline', help='gate this pack (the D3 default) with the same flags and write its KL/top-1')
     a = ap.parse_args(argv)
     out_dir = Path(a.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +129,18 @@ def main(argv=None) -> int:
     pack.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + a.minutes * 60
     rows = []
+    if a.baseline:
+        # the baseline is measured with EXACTLY the blocks' flags - same prompt sets, same --memory-limit-mib, same
+        # --vram-slots 0 - because the ranking is a KL64 delta against it.
+        base = {}
+        for tag, prompts, timeout in (('subset', a.prompts, 780), ('full', a.full_prompts or a.prompts, 1150)):
+            o = gate(Path(a.baseline), out_dir / f'baseline_{tag}', prompts, timeout, deadline, a.already_locked)
+            if o:
+                base[tag] = {'top1': round(100.0 * o['top1_agreement'], 2), 'kl64': round(o['kl64_mean'], 4),
+                             'positions': o['positions']}
+        (out_dir / 'baseline.json').write_text(json.dumps(base, indent=1))
+        print('baseline ' + json.dumps(base), flush=True)
+        return 0
     full_blocks = {b for b in a.full_blocks.split(';') if b}
     for spec in a.blocks.split(';'):
         if '-' in spec:
@@ -124,16 +156,25 @@ def main(argv=None) -> int:
             print('  build failed', flush=True)
             continue
         row = {'block': spec, 'layers': layers, 'gb_saved': round(saved, 2)}
-        o = gate(pack, out_dir / f'block_{spec}', a.prompts, 780, deadline)
+        o = gate(pack, out_dir / f'block_{spec}', a.prompts, 780, deadline, a.already_locked)
         if o:
             row['subset_top1'] = round(100.0 * o['top1_agreement'], 2)
             row['subset_kl64'] = round(o['kl64_mean'], 3)
             row['subset_positions'] = o['positions']
         if spec in full_blocks and a.full_prompts:
-            o2 = gate(pack, out_dir / f'block_{spec}_full', a.full_prompts, 1150, deadline)
+            o2 = gate(pack, out_dir / f'block_{spec}_full', a.full_prompts, 1150, deadline, a.already_locked)
             if o2:
                 row['full_top1'] = round(100.0 * o2['top1_agreement'], 2)
                 row['full_kl64'] = round(o2['kl64_mean'], 3)
+        bfile = out_dir / 'baseline.json'
+        if bfile.exists():
+            b = json.loads(bfile.read_text())
+            if 'subset_top1' in row and 'subset' in b:
+                row['subset_kl64_delta'] = round(row['subset_kl64'] - b['subset']['kl64'], 4)
+                row['subset_top1_delta'] = round(row['subset_top1'] - b['subset']['top1'], 2)
+            if 'full_top1' in row and 'full' in b:
+                row['full_kl64_delta'] = round(row['full_kl64'] - b['full']['kl64'], 4)
+                row['full_top1_delta'] = round(row['full_top1'] - b['full']['top1'], 2)
         rows.append(row)
         (out_dir / 'sweep.json').write_text(json.dumps(rows, indent=1))
         # an aborted gate can still hold the file open; the next block's build overwrites it anyway

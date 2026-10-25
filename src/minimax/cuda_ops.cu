@@ -802,6 +802,32 @@ void dealloc(void* p) {
     if (p) cudaFree(p);
 }
 
+void* host_register_mapped(void* host, size_t bytes) {
+    if (host == nullptr || bytes == 0) return nullptr;
+    // `cudaHostRegisterMapped` makes the range readable by kernels through the device view returned below.  On WDDM
+    // the mapped address is what a kernel must use; on Linux it is the same pointer, but asking is portable.
+    const cudaError_t rc = cudaHostRegister(host, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (rc != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    if (cudaSetDeviceFlags(cudaDeviceMapHost) != cudaSuccess && cudaGetLastError() != cudaSuccess) cudaGetLastError();
+    void* dev = nullptr;
+    if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
+        cudaGetLastError();
+        cudaHostUnregister(host);
+        return nullptr;
+    }
+    return dev;
+}
+
+void host_unregister_mapped(void* host) {
+    if (host != nullptr) {
+        cudaHostUnregister(host);
+        cudaGetLastError();
+    }
+}
+
 void copy_h2d(void* dst, const void* src, size_t bytes) {
     if (!bytes) return;
     const cudaError_t e = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);

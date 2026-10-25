@@ -924,6 +924,12 @@ struct Engine::Impl {
     bool tiers_on = false;
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
     bool verify_tensors = false;    // --minimax-verify-tensors: one digest line per tensor the engine resolved
+    // P15 (A3, Maya #476): the zero-copy PCIe lane.  `ram_dev_base` is the device view of the pinned RAM tier after
+    // `cudaHostRegisterMapped`; when it exists, a share of each layer's RAM-tier experts is computed by the GPU
+    // reading them in place.  0 share = off, and a failed registration leaves it off with a line saying so.
+    float pcie_share = 0.f;
+    void* ram_dev_base = nullptr;
+    int64_t tok_pcie = 0;
     int verify_mod = 1, verify_rem = 0;
     bool verify_exit = false;
     int vram_per_layer = 0;
@@ -961,6 +967,7 @@ struct Engine::Impl {
 
     struct TokenStats {
         int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0, skipped = 0, ssd_mapped = 0;
+        int64_t pcie = 0;   // P15: experts the GPU read in place out of the pinned RAM tier this token
     };
     TokenStats tok_stats;
     TokenStats total_stats;
@@ -1153,6 +1160,7 @@ struct Engine::Impl {
         renorm = cfg.expert_weights_norm;
         dense_mmvq = opt.dense_mmvq != "off";
         verify_tensors = opt.verify_tensors;
+        pcie_share = std::max(0.f, std::min(1.f, opt.pcie_share));
         verify_mod = opt.verify_mod > 0 ? opt.verify_mod : 1;
         verify_rem = opt.verify_rem;
         verify_exit = opt.verify_exit;
@@ -2872,6 +2880,19 @@ struct Engine::Impl {
             }
         }
 
+        // P15: the RAM tier's device view, for the zero-copy PCIe lane.  A 100 GB range does not always register;
+        // when it does not, the lane stays off and says so rather than failing the run.
+        if (pcie_share > 0.f && !ram_inplace && ram_arena && ram_arena->valid() && ram_bytes > 0) {
+            ram_dev_base = cu::host_register_mapped(ram_arena->data(), (size_t)ram_bytes);
+            if (ram_dev_base == nullptr)
+                std::fprintf(stderr, "INFO minimax-pcie-lane off: the driver refused to map the %.1f GiB RAM tier "
+                                     "(cudaHostRegister failed)%c", (double)ram_bytes / 1073741824.0, 10);
+            else
+                std::fprintf(stderr, "INFO minimax-pcie-lane on: %.1f GiB of the RAM tier is device-mapped, share "
+                                     "%.2f of each layer's RAM experts%c", (double)ram_bytes / 1073741824.0,
+                             (double)pcie_share, 10);
+        }
+
         // ---- SSD staging buffers for the token path (the files and ssd_tmp were opened above, before the fill).
         ssd_stage = (uint8_t*)strata::platform::DirectFile::alloc_aligned(ssd_stage_bytes);
         if (!ssd_stage) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned staging buffer");
@@ -3643,7 +3664,11 @@ struct Engine::Impl {
 
     // ---- P5b: the routed experts of one layer, GPU part.  The int8 kernels run on the side stream so the CPU
     // experts of the same token are computed while the GPU works; `finish` joins the stream and copies the rows back.
-    bool gpu_experts_begin(const Layer& L, const std::vector<int>& exps, const float* in) {
+    // `alt` (optional, same length as `exps`): the DEVICE address to read expert i from instead of its VRAM slot.
+    // That is the zero-copy PCIe lane - the entry is the device view of the pinned RAM tier, so the kernel reads the
+    // expert where it already lives and nothing is staged.  nullptr entries keep the VRAM slot.
+    bool gpu_experts_begin(const Layer& L, const std::vector<int>& exps, const float* in,
+                           const std::vector<const void*>* alt = nullptr) {
         const int k = (int)exps.size();
         if (k == 0) return false;
         use_device_index(L.dev);
@@ -3652,8 +3677,12 @@ struct Engine::Impl {
         for (int i = 0; i < k; ++i) {
             const int e = exps[(size_t)i];
             const int slot = L.vram_of[(size_t)e];
-            if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
-            const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+            const uint8_t* base = nullptr;
+            if (alt != nullptr && (*alt)[(size_t)i] != nullptr) base = (const uint8_t*)(*alt)[(size_t)i];
+            else {
+                if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
+                base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+            }
             gp[(size_t)i] = base;
             up[(size_t)i] = base + L.expert_gu;
             dp[(size_t)i] = base + 2 * L.expert_gu;
@@ -3984,11 +4013,39 @@ struct Engine::Impl {
             prof.pick += pms(t_ph);
             t_ph = std::chrono::steady_clock::now();
         }
+        // P15: the zero-copy PCIe lane.  `pcie_share` of this layer's RAM-tier experts join the GPU list, each with
+        // the device address of its pinned bytes as its base - so the kernel reads it over PCIe in place, with no
+        // staging copy, while the CPU lane computes the rest.  The share is a measured knob (both lanes should finish
+        // together).  `alt` stays aligned with `gpu_e`: nullptr keeps a VRAM slot, anything else is an in-place read.
+        std::vector<const void*> alt;
+        if (pcie_share > 0.f && ram_dev_base != nullptr) {
+            const int want = (int)std::lround((double)pcie_share * (double)top);
+            int taken = 0;
+            alt.assign(gpu_e.size(), nullptr);          // the VRAM-resident ones classified before this point
+            for (int j = 0; j < top && taken < want; ++j) {
+                if (w[(size_t)j] == 0.f) continue;
+                const int e = order[(size_t)j];
+                if (L.vram_of[(size_t)e] >= 0) continue;
+                const int rs = L.ram_of[(size_t)e];
+                if (rs < 0 || rs >= L.ram_n) continue;   // not in the RAM tier: the SSD path keeps it
+                for (auto& c : cpu)
+                    if (c.e == e && !c.ssd) {
+                        c.ssd = true;                    // taken off the CPU pass (the flag only routes the pass)
+                        alt.push_back((const void*)((const uint8_t*)ram_dev_base + L.ram_off +
+                                                    (uint64_t)rs * L.expert_bytes));
+                        gpu_e.push_back(e);
+                        ++taken;
+                        ++tok_pcie;
+                        break;
+                    }
+            }
+            if ((size_t)taken == 0) alt.clear();
+        }
         std::vector<float> gpu_out;
         bool gpu_async = false;
         if (!gpu_e.empty()) {
             use_device_index(L.dev);
-            gpu_async = gpu_experts_begin(L, gpu_e, in);
+            gpu_async = gpu_experts_begin(L, gpu_e, in, alt.size() == gpu_e.size() ? &alt : nullptr);
         }
         if (pt) {
             prof.gpu_begin += pms(t_ph);
@@ -5854,6 +5911,7 @@ struct Engine::Impl {
         const int64_t pos = n_past;
         cur_pos = pos;
         tok_stats = TokenStats{};
+        tok_pcie = 0;
         ssd_wait_ms = 0.0;
         decay_usage();
         const bool pt = opt.profile_time;

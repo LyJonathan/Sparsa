@@ -1781,3 +1781,20 @@ stopped two gates) and to the lock going to the other task; they are the first t
 
 `--memory-limit-mib 80000` is now the sweep's budget (77 GB free before the run, per the launcher's own line), and
 the download is paused rather than run beside a gate.
+
+### Round 8: the zero-copy PCIe lane (written, not yet measured)
+
+Maya #476's design, ported: `--minimax-pcie-share f` takes `f` of each layer's RAM-tier experts and hands them to the
+GPU expert path with the **device address of their pinned bytes** as the base, instead of a VRAM slot.
+
+* `cu::host_register_mapped` registers the `PinnedArena` range with `cudaHostRegisterMapped | Portable` and returns
+  `cudaHostGetDevicePointer`'s device view (`cuda_ops.cu`). A 100 GB range does not always register; a refusal leaves
+  the lane off with `INFO minimax-pcie-lane off: the driver refused to map the … RAM tier`.
+* `gpu_experts_begin` takes an optional `alt` vector aligned with `exps`: nullptr keeps the VRAM slot, anything else
+  is read in place. The blob layout is already `[gate | up | down]` in the arena, the same as a VRAM slot, so no
+  repacking.
+* The token path marks the chosen routes out of the CPU pass and appends them to the GPU list, so the combine and the
+  ordering are unchanged; `INFO minimax-stats … pcie=N` counts them per token.
+
+Not measured yet: the share has to be set from the two links' measured rates (the startup `INFO minimax-link` line
+gives them), and the whole-token A/B that keeps the lane only when it is >3% faster is still to be written.

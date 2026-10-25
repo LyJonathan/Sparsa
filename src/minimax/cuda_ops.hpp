@@ -16,6 +16,11 @@ MemInfo mem();
 void* alloc(size_t bytes);
 void dealloc(void* p);
 void copy_h2d(void* dst, const void* src, size_t bytes);
+/// Register `bytes` of host memory as a mapped (zero-copy) range and return the device address that reads it, or
+/// nullptr when the driver refuses (a range that large may not register).  Project Maya's PCIe lane (#476): the GPU
+/// expert kernels then read a pinned RAM-tier expert *in place*, crossing PCIe once and using no CPU cores.
+void* host_register_mapped(void* host, size_t bytes);
+void host_unregister_mapped(void* host);
 void copy_d2h(void* dst, const void* src, size_t bytes);
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
 void copy_d2d(void* dst, const void* src, size_t bytes);
