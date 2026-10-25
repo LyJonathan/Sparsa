@@ -871,6 +871,49 @@ double host_to_device_gbs(int dev, size_t bytes, int rounds) {
     return out;
 }
 
+double device_to_host_gbs(int dev, size_t bytes, int rounds) {
+    if (rounds < 1) rounds = 5;
+    if (bytes < (size_t{64} << 20)) bytes = size_t{256} << 20;
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) return 0.0;
+    if (cudaSetDevice(dev) != cudaSuccess) { cudaGetLastError(); return 0.0; }
+    void* host = nullptr;
+    void* src = nullptr;
+    cudaStream_t st = nullptr;
+    double out = 0.0;
+    if (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError(); cudaSetDevice(prev); return 0.0;
+    }
+    if (cudaMalloc(&src, bytes) != cudaSuccess || cudaStreamCreate(&st) != cudaSuccess) {
+        cudaGetLastError();
+        if (src) cudaFree(src);
+        if (st) cudaStreamDestroy(st);
+        cudaFreeHost(host); cudaSetDevice(prev); return 0.0;
+    }
+    cudaMemset(src, 1, bytes);
+    std::vector<double> gbs;
+    for (int r = 0; r < rounds; ++r) {
+        cudaEvent_t a = nullptr, b = nullptr;
+        if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess) break;
+        cudaEventRecord(a, st);
+        if (cudaMemcpyAsync(host, src, bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
+            cudaGetLastError(); cudaEventDestroy(a); cudaEventDestroy(b); break;
+        }
+        cudaEventRecord(b, st);
+        if (cudaEventSynchronize(b) != cudaSuccess) {
+            cudaGetLastError(); cudaEventDestroy(a); cudaEventDestroy(b); break;
+        }
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        if (ms > 0.f) gbs.push_back((double)bytes / (ms * 1.0e6));
+        cudaEventDestroy(a); cudaEventDestroy(b);
+    }
+    if (!gbs.empty()) { std::sort(gbs.begin(), gbs.end()); out = gbs[gbs.size() / 2]; }
+    cudaStreamDestroy(st); cudaFree(src); cudaFreeHost(host);
+    cudaSetDevice(prev);
+    return out;
+}
+
 void* host_register_mapped(void* host, size_t bytes) {
     if (host == nullptr || bytes == 0) return nullptr;
     // `cudaHostRegisterMapped` makes the range readable by kernels through the device view returned below.  On WDDM

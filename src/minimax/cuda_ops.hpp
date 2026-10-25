@@ -23,6 +23,9 @@ void copy_h2d(void* dst, const void* src, size_t bytes);
 /// own, `rounds` times, and the MEDIAN reported.  Pinned source matters - a pageable copy measures the driver's
 /// staging buffer (~3.3 GB/s on both cards here, whichever slot they are in) rather than the link.
 double host_to_device_gbs(int dev, size_t bytes, int rounds);
+/// The same for device->host (pinned destination).  Both directions matter: an expert lane streams *up* while an
+/// attention readback streams *down*, and a slot can report a different rate each way.
+double device_to_host_gbs(int dev, size_t bytes, int rounds);
 void* host_register_mapped(void* host, size_t bytes);
 void host_unregister_mapped(void* host);
 void copy_d2h(void* dst, const void* src, size_t bytes);

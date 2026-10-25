@@ -1834,3 +1834,27 @@ NVML reports device 0 at **gen3 x4** - matching the ~3.5 GB/s ceiling the round-
 gen4 x16, but *both* measure ~3.3 GB/s, so the probe is not separating them: a 32 MiB pageable copy per call is
 probably limited by the copy engine's staging rather than by the link. The probe needs pinned source memory and a
 larger transfer before its number is used to split work between the lanes.
+
+### Round 10: the SSD tier is source-aware; the link probe is two-directional and sampled under load
+
+**Every tier now opens the tensor's own file.** `--expert-source` folds each alternate pack's shards into ONE flat
+`ssd_files` list (the base pack's shards, then each alternate's), and `try_must` maps a tensor's shard into that list
+at resolution time. The SSD read, the prefetch and the pin-time fill therefore open the file the bytes actually live
+in, with no per-tier knowledge of where a tensor came from. The bug that made the first attempt die with
+*"minimax SSD read: short read"* was exactly this, and a second one (**an out-of-bounds read of the shard-base vector,
+which is now filled at open time rather than by the later SSD block - an access violation right after `decide_norm`**)
+came with it.
+
+`tools/minimax/test_expert_source.py` forces layers 3-7 onto the SSD tier with a tiny `--memory-limit-mib`, runs the
+base arm and the `--expert-source` arm, and checks (a) both arms run, (b) every tensor in both arms hashes to a donor,
+(c) the block's expert tensors resolve to the donor's file.
+
+**The link probe is two-directional and samples NVML from a second thread during the transfer.** An idle card drops
+its link generation, so a reading taken between transfers describes the idle state: `INFO minimax-link` now prints
+`h2d`, `d2h`, `pcie_idle` and `pcie_load` per card, where `pcie_load` is the highest generation/width the driver
+reported while the 256 MiB pinned copies were running.
+
+**Correction, in this doc as well as the code:** the 6.4 GB/s figure the split probe reported for device 0 was a
+measurement error. Device 0's real rate is **3.3 GB/s**, which matches NVML's **gen3 x4** - and the earlier probe
+(pageable source, default stream) read ~3.3 GB/s on *both* cards, which is the driver's staging rate and cannot tell
+the two slots apart. Only the pinned 256 MiB probe's two directions are used from now on.

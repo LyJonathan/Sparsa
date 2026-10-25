@@ -1494,6 +1494,15 @@ struct Engine::Impl {
         }
         for (const AltPack& a : alt_packs) alt_pack_leaf.push_back(base_leaf_name(a.path));
         base_leaf = base_leaf_name(opt_model_path);
+        // The flat file list is the base pack's shards and then each alternate pack's, in this order.  This has to be
+        // known HERE, because try_must maps a tensor's shard into that list from the first tensor it resolves - an
+        // empty or late-filled vector was an out-of-bounds read (an access violation right after decide_norm).
+        alt_shard_base.clear();
+        size_t at = model.size();
+        for (const AltPack& a : alt_packs) {
+            alt_shard_base.push_back(at);
+            at += a.model->size();
+        }
     }
 
     static std::string base_leaf_name(const std::string& path) {
@@ -2265,19 +2274,44 @@ struct Engine::Impl {
             nv.width = (int (*)(void*, unsigned*))resolve_symbol(nv.lib, "nvmlDeviceGetCurrPcieLinkWidth");
             nv.ok = nv.init && nv.byIndex && nv.gen && nv.width && nv.init() == 0;
         }
+        const auto link_now = [&](int dev, unsigned* g, unsigned* w) {
+            *g = 0;
+            *w = 0;
+            if (!nv.ok) return;
+            void* h = nullptr;
+            if (nv.byIndex((unsigned)dev, &h) != 0) return;
+            if (nv.gen(h, g) != 0) *g = 0;
+            if (nv.width(h, w) != 0) *w = 0;
+        };
         for (size_t d = 0; d < devs.size(); ++d) {
-            unsigned gen = 0, width = 0;
-            if (nv.ok) {
-                void* h = nullptr;
-                if (nv.byIndex((unsigned)devs[d], &h) == 0) {
-                    if (nv.gen(h, &gen) != 0) gen = 0;
-                    if (nv.width(h, &width) != 0) width = 0;
+            const int dev = (int)devs[d];
+            unsigned idle_g = 0, idle_w = 0;
+            link_now(dev, &idle_g, &idle_w);
+            // Sample the driver's CURRENT link from a second thread WHILE the transfers run: an idle card drops its
+            // link generation, so a reading taken between transfers describes the idle state, not the slot.
+            std::atomic<bool> stop{false};
+            std::atomic<unsigned> load_g{0}, load_w{0};
+            std::thread sampler([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    unsigned g = 0, w = 0;
+                    link_now(dev, &g, &w);
+                    if (g > load_g.load(std::memory_order_relaxed)) load_g.store(g, std::memory_order_relaxed);
+                    if (w > load_w.load(std::memory_order_relaxed)) load_w.store(w, std::memory_order_relaxed);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-            }
-            const double gbs = h2d_gbs((int)devs[d]);
-            std::fprintf(stderr, "INFO minimax-link dev=%d h2d=%.2f GB/s pcie=%s%c", (int)devs[d], gbs,
-                         gen ? (std::string("gen") + std::to_string(gen) + " x" + std::to_string(width)).c_str()
-                             : "unknown",
+            });
+            const double up = h2d_gbs(dev);
+            const double down = cu::device_to_host_gbs(dev, size_t{256} << 20, 5);
+            stop.store(true);
+            sampler.join();
+            std::fprintf(stderr,
+                         "INFO minimax-link dev=%d h2d=%.2f GB/s d2h=%.2f GB/s pcie_idle=%s pcie_load=%s%c", dev, up,
+                         down,
+                         idle_g ? (std::string("gen") + std::to_string(idle_g) + " x" + std::to_string(idle_w)).c_str()
+                                : "unknown",
+                         load_g.load() ? (std::string("gen") + std::to_string(load_g.load()) + " x" +
+                                          std::to_string(load_w.load())).c_str()
+                                       : "unknown",
                          10);
         }
 #if defined(_WIN32)
@@ -2906,8 +2940,6 @@ struct Engine::Impl {
         // read, the prefetch, the PIN-time fill through these files - therefore reads the *tensor's own* file with
         // no per-tier knowledge of where it came from.
         ssd_files.clear();
-        alt_shard_base.clear();
-        for (const AltPack& a : alt_packs) alt_shard_base.push_back(ssd_files.size() + a.model->size() * 0);
         ssd_files.resize(model.size());
         for (size_t s = 0; s < model.size(); ++s) {
             ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
@@ -2917,7 +2949,8 @@ struct Engine::Impl {
         }
         for (size_t ai = 0; ai < alt_packs.size(); ++ai) {
             const GgufModel& am = *alt_packs[ai].model;
-            alt_shard_base[ai] = ssd_files.size();
+            if (alt_shard_base[ai] != ssd_files.size())
+                fail("internal: the alternate pack's shard base does not match the file list order");
             for (size_t s = 0; s < am.size(); ++s) {
                 auto f = std::make_unique<strata::platform::DirectFile>();
                 std::string err;
