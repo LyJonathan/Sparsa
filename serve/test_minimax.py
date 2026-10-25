@@ -38,7 +38,8 @@ def _write_tokenizer(directory):
     for word in ("hello", " world", "hi"):
         add(word)
 
-    added = ["]~b]", "[e~[", "]~!b[", "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>", NS]
+    added = ["]~b]", "[e~[", "]~!b[", "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>", NS,
+             ']<]image[>[', ']<]start of image[>[', ']<]end of image[>[']
     added = [(text, next_id + i) for i, text in enumerate(added)]
     data = {
         "version": "1.0",

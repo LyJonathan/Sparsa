@@ -85,6 +85,8 @@ The process refuses to start a GGUF when free space on the output drive is below
 | --- | --- | --- | --- | --- |
 | MM-IQ1_S | IQ1_S | IQ1_M | IQ2_XXS | yes |
 | MM-IQ1_M | IQ1_M | IQ2_XXS | IQ2_XS | yes |
+| MM-IQ1_S-MIX | IQ1_S | IQ1_M | IQ2_XXS | yes |
+| MM-IQ1_M-MIX | IQ1_M | IQ2_XXS | IQ2_XS | yes |
 | MM-IQ2_XXS | IQ2_XXS | IQ2_XS | IQ2_S | yes |
 | MM-IQ2_XS | IQ2_XS | IQ2_XS | IQ2_S | yes |
 | MM-IQ2_XS-D3 | IQ2_XS | IQ3_XXS | IQ2_S | yes |
@@ -103,6 +105,8 @@ Router gate and `exp_probs_b` stay F32. Norms stay F32. `token_embd` is Q8_0. `o
 
 IQ1_S, IQ1_M, and IQ2_XXS step the whole `ffn_down_exps` tensor up one type. A GGUF tensor has one ggml type, so mixed types inside one stacked expert tensor are not possible. MM-IQ2_XS keeps IQ2_XS on gate, up, and down. MM-IQ2_XS-D3 keeps IQ2_XS on `ffn_gate_exps` and `ffn_up_exps` and sets `ffn_down_exps` to IQ3_XXS; everything else is byte-for-byte the MM-IQ2_XS recipe.
 
+`-MIX` is the small-tier variant of the same idea: identical expert types, but attention, indexer, dense MLP, shared experts and `token_embd` drop from Q8_0 to Q6_K. Those tensors are about a tenth of the file, and the 1-bit tiers cannot afford Q8_0 there. `output.weight` stays Q6_K everywhere.
+
 An expert-usage file looks like `{"mode":"record","layers":{"3":[12,40]}}`. `record` stores the ids and does not change types. `promote-layer` sets that source layer's whole `ffn_gate_exps` and `ffn_up_exps` to `hot_experts`. `--hot-expert-mode` overrides the file.
 
 The resolved types are stored in the GGUF key `strata.recipe`.
@@ -113,6 +117,8 @@ Full 60-layer tensor bytes from `ggml_row_size`, decimal GB, with the default Q8
 | --- | --- | --- |
 | MM-IQ1_S | 97.632 | 90.927 |
 | MM-IQ1_M | 109.467 | 101.949 |
+| MM-IQ1_S-MIX | 94.777 | 88.268 |
+| MM-IQ1_M-MIX | 106.611 | 99.290 |
 | MM-IQ2_XXS | 124.528 | 115.976 |
 | MM-IQ2_XS | 133.135 | 123.992 |
 | MM-IQ2_XS-D3 | 146.045 | 136.015 |
@@ -203,6 +209,28 @@ the q8_1-versus-Q8_K activation difference, as on the synthetic model.
 Quantize speed for these one-layer files (5900X, 8 threads, shared machine; each expert tensor is 9.7 GB of f32
 values): IQ3_K 21 s, IQ4_KS 34 s, IQ2_KL 73 s, IQ2_KT 202 s, IQ3_KT 1094 s. For reference the mainline
 baselines on the same machine: IQ2_XS 246 s, IQ3_XXS 131 s, IQ4_XS 86 s.
+
+### Small tiers, layer 40
+
+`--exp-layer 40` on all 128 experts of the layer-40 routed tensors, real imatrix, replayed from the reference
+dump's routed tokens (456 routed instances, 75 experts; `--exp-x`/`--exp-dumps`). `out` is
+`||Wx - Qx|| / ||Wx||` per matrix; the mix rows take gate and up from the first type and down from the second.
+
+| tier | gate/up | down | out gate | out up | out down | mean |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| IQ1_S-MIX | IQ1_S | IQ1_M | 0.3520 | 0.4916 | 0.4298 | 0.4245 |
+| IQ1_M-MIX | IQ1_M | IQ2_XXS | 0.3251 | 0.4525 | 0.3212 | 0.3663 |
+| IQ2_XXS | IQ2_XXS | IQ2_XS | 0.2442 | 0.3405 | 0.2820 | 0.2889 |
+| MM-IQ2_KT | IQ2_KT | IQ2_KT | 0.2146 | 0.2981 | 0.2885 | 0.2670 |
+| MM-IQ2_XS, for scale | IQ2_XS | IQ2_XS | 0.2135 | 0.2974 | 0.2820 | 0.2643 |
+
+Uniform-type means on the same run are 0.4402 (IQ1_S), 0.4025 (IQ1_M) and 0.3020 (IQ2_XXS), so one step up on
+`ffn_down_exps` buys 3.6%, 9.0% and 4.3%. IQ2_KT comes out 1% *worse* than IQ2_XS on all 128 experts here,
+against slightly better on the 32-expert subset in `IQK_EXPERIMENT.md`: the difference is inside the noise of
+one layer, and IQ2_KT is still 9 GB smaller. These are weight/output errors on one layer, not perplexity.
+
+Measurements on rig-3 (Ryzen 7 5700G, 16 threads, 2026-10-24). Reports: `mmwork/exp40/report-*.json`
+outside the repository.
 
 ## NVFP4
 

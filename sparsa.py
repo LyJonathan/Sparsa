@@ -9,14 +9,19 @@ Anthropic ``/v1/messages``, streaming, tool calls, the web page).
     python sparsa.py serve --model model.gguf --context 8192 --gpu 0
     python sparsa.py plan  --model model.gguf          # print the settings, start nothing
     python sparsa.py download iq2-xs-d3 --dir D:\\models
+    python sparsa.py download mmproj --dir D:\\models\\MiniMax-M3.1-Flash-IQ2_XS-D3
     python sparsa.py inspect --model model.gguf        # what the engine reads from the file
 
 The model argument is the folder the GGUF parts were downloaded into, or the first part.  The
 tokenizer is needed too (``tokenizer.json`` from the checkpoint, ~10 MB); ``download tokenizer``
 fetches it, and ``serve`` says where it looked when it cannot find it.
 
+Vision is one more file: ``download mmproj`` puts a ~1.7 GB ``mmproj-*.gguf`` beside the parts, and
+``serve`` finds it there (``--mmproj PATH`` names another one, ``--no-vision`` ignores it).  Without
+it the server is text only.
+
 EXPERIMENTAL.  Decode is slow (a few tokens a second on two consumer cards), long context is work
-in progress, and vision is not implemented.
+in progress, and pictures go through a CPU fp32 encoder: 64-80 s each.
 """
 from __future__ import annotations
 
@@ -37,13 +42,18 @@ GGUF_PART = "-00001-of-"
 # LyJonathan/MiniMax-M3.1-Flash-GGUF: folder name -> what it is.  Kept here so `download` can name
 # the exact `hf` command without a network call.
 QUANTS = {
+    "iq1-s": ("MiniMax-M3.1-Flash-IQ1_S", "IQ1_S experts; 94.8 GB; Sparsa only; quality not measured"),
+    "iq1-m": ("MiniMax-M3.1-Flash-IQ1_M", "IQ1_M experts; 106.6 GB; top-1 47.1 %"),
+    "iq2-xxs": ("MiniMax-M3.1-Flash-IQ2_XXS", "IQ2_XXS experts; 124.5 GB; quality not measured"),
+    "iq2-kt": ("MiniMax-M3.1-Flash-IQ2_KT", "IQ2_KT experts (ik_llama.cpp's type); 123.8 GB; Sparsa only"),
     "iq2-xs": ("MiniMax-M3.1-Flash-IQ2_XS", "IQ2_XS experts; 133.1 GB; loads in llama.cpp (patched) and Sparsa"),
     "iq2-xs-d3": ("MiniMax-M3.1-Flash-IQ2_XS-D3", "IQ2_XS gate/up + IQ3_XXS down; 146.1 GB; measured quality"),
+    "iq2-kl": ("MiniMax-M3.1-Flash-IQ2_KL", "IQ2_KL experts; 152.7 GB; Sparsa only"),
     "iq3-k": ("MiniMax-M3.1-Flash-IQ3_K", "IQ3_K experts; 191.2 GB; Sparsa only"),
     "iq4-ks": ("MiniMax-M3.1-Flash-IQ4_KS", "IQ4_KS experts; 233.6 GB; Sparsa only"),
-    "iq2-kl": ("MiniMax-M3.1-Flash-IQ2_KL", "IQ2_KL experts; 152.7 GB; Sparsa only"),
     "nvfp4": ("MiniMax-M3.1-Flash-NVFP4", "the checkpoint's NVFP4 expert values, lossless; 246.1 GB; Sparsa only"),
 }
+MMPROJ = "mmproj-MiniMax-M3.1-Flash-F16.gguf"
 HF_REPO = "LyJonathan/MiniMax-M3.1-Flash-GGUF"
 CHECKPOINT = "MiniMaxAI/MiniMax-M3.1-Flash"
 
@@ -146,6 +156,17 @@ def prefill_batch_value(text: str) -> int:
     return n
 
 
+def find_mmproj(model: Path, explicit: str | None) -> Path | None:
+    """The vision file: --mmproj, else the one mmproj-*.gguf beside the model.  None keeps the engine text-only."""
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"sparsa: --mmproj {p} is not a file")
+        return p
+    found = sorted(model.parent.glob("mmproj-*.gguf"))
+    return found[0] if found else None
+
+
 def build_config(args) -> dict:
     if not args.model:
         raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
@@ -193,6 +214,9 @@ def build_config(args) -> dict:
         cfg_args += ["--cpu-threads", str(args.threads)]
     if args.allow_nonstandard:
         cfg_args += ["--minimax-allow-nonstandard"]
+    mmproj = None if getattr(args, "no_vision", False) else find_mmproj(first, args.mmproj)
+    if mmproj is not None:
+        cfg_args += ["--mmproj", str(mmproj)]
     cfg_args += list(args.engine_arg or [])
 
     log = Path(args.log).expanduser() if args.log else Path(args.config).with_suffix(".log")
@@ -214,6 +238,9 @@ def build_config(args) -> dict:
         cfg["gpu"] = gpus if len(gpus) > 1 else gpus[0]
         if len(gpus) > 1:
             cfg["layer_split"] = "auto"
+    if mmproj is not None:
+        # The engine owns the ViT: the server writes the picture and counts its tokens, the engine projects it.
+        cfg["vision"] = {"engine": True, "mmproj": str(mmproj), "max_tokens": 576}
     return cfg
 
 
@@ -267,6 +294,10 @@ def cmd_serve(args) -> int:
     say(f"sparsa: run settings written to {config_path}")
     say(f"sparsa: engine {cfg['exe']}")
     say(f"sparsa: tokenizer {cfg['tokenizer']}")
+    if cfg.get("vision"):
+        say(f"sparsa: vision {cfg['vision']['mmproj']} (CPU encoder, ~1 min a picture)")
+    elif not args.no_vision:
+        say("sparsa: no mmproj beside the model: text only (`python sparsa.py download mmproj` adds pictures)")
     if args.access != "local":
         for ip in access_mod.lan_ips()[:2]:
             say(f"sparsa: LAN address http://{ip}:{cfg['port']}/v1"
@@ -304,6 +335,12 @@ def cmd_download(args) -> int:
         target.mkdir(parents=True, exist_ok=True)
         command = ["hf", "download", CHECKPOINT, "tokenizer.json", "tokenizer_config.json",
                    "chat_template.jinja", "--local-dir", str(target)]
+    elif args.what == "mmproj":
+        # One vision file for every tier, at the repository's root.  Point --dir at the model folder so the
+        # file sits beside the parts: `serve` looks there (find_mmproj).
+        target = Path(args.dir).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        command = ["hf", "download", HF_REPO, MMPROJ, "--local-dir", str(target)]
     else:
         folder, _what = QUANTS[args.what]
         target = Path(args.dir).expanduser()
@@ -348,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--allow-nonstandard", action="store_true",
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
+        p.add_argument("--mmproj", help="vision mmproj GGUF (default: the mmproj-*.gguf beside the model)")
+        p.add_argument("--no-vision", action="store_true", help="ignore the mmproj and serve text only")
         p.add_argument("--port", type=int, default=8080)
         p.add_argument("--host", help="the address to listen on (default: 127.0.0.1, or 0.0.0.0 for --access lan)")
         p.add_argument("--access", choices=("local", "lan"), default="local",
@@ -367,8 +406,8 @@ def main(argv: list[str] | None = None) -> int:
     ins.add_argument("--model", required=True)
     ins.add_argument("--engine")
 
-    dl = sp.add_parser("download", help="download one quant folder, or the tokenizer files")
-    dl.add_argument("what", choices=[*QUANTS, "tokenizer"])
+    dl = sp.add_parser("download", help="download one quant folder, the tokenizer files, or the mmproj")
+    dl.add_argument("what", choices=[*QUANTS, "tokenizer", "mmproj"])
     dl.add_argument("--dir", required=True, help="where the files go")
     dl.add_argument("--print-only", action="store_true", help="only print the command")
 

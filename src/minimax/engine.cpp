@@ -10,6 +10,7 @@
 #include "strata/kernels/iqk_types.hpp"
 
 #include "cuda_ops.hpp"
+#include "strata/minimax/vision.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -785,6 +786,12 @@ struct Engine::Impl {
     std::vector<char> ah_sel;
     std::vector<int64_t> ah_ids;
     std::vector<int32_t> held;
+    // ---- P6: images for the current request.  `img_row[pos]` is the embedding row that replaces the token
+    // embedding at that prompt position, or -1.  Cleared by reset().
+    std::unique_ptr<Vision> vision;
+    std::vector<float> img_data;   // [rows, n_embd]
+    std::vector<int> img_row;      // per prompt position
+    int64_t img_rows = 0;
     int64_t n_past = 0;
     int64_t cur_pos = 0;
     bool have_logits = false;
@@ -795,6 +802,14 @@ struct Engine::Impl {
     // device that owns the layer being computed (one set per device).  Off unless --minimax-prefill-batch > 1.
     bool batch_on = false;
     int batch_cap = 0;
+    // P12: the batched-prompt workspace and the VRAM expert slots share the card.  `prefill_ws_swap` says the
+    // prompt pass must free slots to make room (and put them back afterwards); `prefill_ws_bytes` is the workspace's
+    // over-estimated size per device; `ws_taken[layer]` counts the slots currently freed on that layer, so the
+    // restore re-allocates exactly what came out.
+    bool prefill_ws_swap = false;
+    size_t prefill_ws_bytes = 0;
+    bool ws_live = false;            // the device side of the workspace is allocated right now
+    std::vector<int> ws_taken;       // per layer: slots freed for the prompt
     bool prefill_gpu_experts = true;
     bool prefill_dense_f32 = true;
     // P10: the routed experts' batched projection.  "mmvq" keeps the int8 iq_mmvq dots; "tc" dequantizes each
@@ -917,10 +932,12 @@ struct Engine::Impl {
     // is queued at once so the drive and the CPU experts work at the same time.
     uint8_t* ssd_slots = nullptr;
     size_t ssd_slot_bytes = 0;
-    size_t ssd_slot_cap = 0;       // routes that can be in flight at once (P7: doubled when prefetching)
+    size_t ssd_slot_cap = 0;       // slots: one route per slot, 2 x top per prefetch region
     size_t ssd_gu_cap = 0;
     size_t ssd_dn_cap = 0;
-    std::vector<int> ssd_pending;   // queued, not yet completed, per shard
+    std::vector<int> ssd_pending;   // queued, not yet completed, per shard (the layer's own misses, tag 0)
+    std::vector<int> ssd_pf_out;    // queued, not yet completed, per prefetched layer (tag = layer + 1)
+    std::vector<int> ssd_pf_out_shard;   // the same split per shard, so a layer wait blocks only where it reads
     double ssd_wait_ms = 0.0;       // the last token's total time spent waiting for the SSD
 
     std::vector<float> usage;       // decayed routing counts, [n_layers * n_expert]
@@ -1140,6 +1157,10 @@ struct Engine::Impl {
         ssd_zero_copy = opt.ssd_zerocopy != "off";
         page_probe = opt.page_probe;
         ssd_prefetch = opt.ssd_prefetch != "off" && !opt.ssd_prefetch.empty();
+        ssd_prefetch_depth = std::clamp(opt.ssd_prefetch_depth, 1, 8);
+        if (ssd_prefetch)
+            std::fprintf(stderr, "INFO minimax-ssd-prefetch depth=%d slots=%zu\n", ssd_prefetch_depth,
+                         (size_t)cfg.n_expert_used * 2 * (size_t)(ssd_prefetch_depth + 1));
         route_bias = opt.route_bias == "on";
         ram_inplace = opt.ram_mode == "inplace";
         if (ram_inplace && opt.memory_limit_mib > 0)
@@ -1256,6 +1277,16 @@ struct Engine::Impl {
         kv_tmp.assign((size_t)bigger(klen, cfg.idx_dim) * 2, 0);
         logits.assign((size_t)cfg.n_vocab, 0.f);
         last_logits.assign((size_t)cfg.n_vocab, 0.f);
+
+        if (!opt.mmproj.empty()) {
+            const auto tv0 = std::chrono::steady_clock::now();
+            vision = std::make_unique<Vision>(opt.mmproj, opt.cpu_threads);
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count();
+            std::fprintf(stderr,
+                         "INFO minimax-vision mmproj=%s layers=%lld hidden=%lld merge=%lld loaded_in=%.1fs\n",
+                         opt.mmproj.c_str(), (long long)vision->config().layers,
+                         (long long)vision->config().hidden, (long long)vision->config().merge, sec);
+        }
     }
 
     ~Impl() {
@@ -1278,12 +1309,7 @@ struct Engine::Impl {
             w.kstage_h = w.vstage_h = nullptr;
         }
         if (kv_arena) cu::host_free(kv_arena);
-        for (PfBuf& p : pf) {
-            if (p.ring) cu::dealloc(p.ring);
-            p.ring = nullptr;
-            if (p.pin) cu::host_free(p.pin);
-            p.pin = nullptr;
-        }
+        pf_free();   // P12: the prompt workspace is allocated only while a prompt runs; free it if the run ended mid-prompt
         if (ssd_stage) strata::platform::DirectFile::free_aligned(ssd_stage);
         if (ssd_tmp) strata::platform::DirectFile::free_aligned(ssd_tmp);
         if (ssd_slots) strata::platform::DirectFile::free_aligned(ssd_slots);
@@ -2151,9 +2177,10 @@ struct Engine::Impl {
     // buffers for the requested batch (the prompt cap is also ctx); the 224 MiB fixed headroom is the same one
     // init_prefill keeps for itself.  This is an over-estimate when the batch is later reduced to fit, which is the
     // safe direction: it can only cost a slot, never a failed allocation.
-    size_t prefill_device_bytes() const {
+    size_t prefill_device_bytes(int t_override = 0) const {
         if (opt.prefill_batch <= 1 || dump_on) return 0;
-        const int64_t T = std::min<int64_t>(opt.prefill_batch, ctx);
+        const int64_t T = t_override > 0 ? std::min<int64_t>(t_override, ctx)
+                                         : std::min<int64_t>(opt.prefill_batch, ctx);
         if (T < 2) return 0;
         const size_t t = (size_t)T;
         const size_t rc = t < 1024 ? t : 1024;
@@ -2229,21 +2256,40 @@ struct Engine::Impl {
         // sizing.  Auto slot sizing must leave it room or a card large enough for the slots to fill the card dies in
         // cudaMalloc (the 96 GB / 153 GB-model startup OOM).  The rule is in vram_plan.hpp and unit-tested; it also
         // covers the rows_cap scratch, the expert ring and the RAM tier's staged K/V, not just the per-token buffers.
+        //
+        // P12: the workspace never coexists with the *decode* slots -- it is only needed while a prompt is being
+        // processed.  `--minimax-prefill-vram swap` therefore sizes the slots as if the workspace did not exist and
+        // lets the prompt pass free the slots it displaces (`pf_acquire`), re-allocating them when the prompt
+        // finishes, so a batched prompt leaves decode the decode-only slot count.  The default ("reserve") keeps the
+        // P10 rule: measured a wash on a 2 x RTX 5070 12 GB box whose slot pool is 2 experts a layer either way (see
+        // tools/minimax/README.md), so the swap stays opt-in until a placement with a real slot pool is measured.
         const size_t prefill_need = tiers_gpu_possible() ? prefill_device_bytes() : 0;
-        if (prefill_need > 0 && opt.vram_slots_per_layer < 0)
-            std::fprintf(stderr,
-                         "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
-                         "workspace before sizing expert slots\n",
-                         (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
+        prefill_ws_bytes = prefill_need;
+        const bool prefill_swap = prefill_need > 0 && opt.vram_slots_per_layer < 0 && opt.prefill_vram == "swap";
+        prefill_ws_swap = prefill_swap;
+        if (prefill_need > 0 && opt.vram_slots_per_layer < 0) {
+            if (prefill_swap)
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots the %d-token batched prompt workspace (%.0f MiB/device) "
+                             "borrows the expert slots for the prompt and returns them after it; decode keeps the "
+                             "full slot count\n",
+                             (int)std::min<int64_t>(opt.prefill_batch, ctx), (double)prefill_need / 1048576.0);
+            else
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots reserving %.0f MiB/device for the %d-token batched prompt "
+                             "workspace before sizing expert slots\n",
+                             (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
+        }
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
                 if (dev_moe[d] <= 0) continue;
                 // dev_budget is already free - reserve; the plan takes the batched-prefill workspace out before it
-                // counts slots.  The explicit-count path (`requested >= 0`) is unchanged: init_prefill shrinks the
-                // batch to whatever room that count left, as before.
-                const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_need, max_expert_bytes,
-                                                        (int)dev_moe[d], (int)cfg.n_expert, -1);
+                // counts slots -- except in the swap mode, where the prompt pass takes the slots back for the
+                // duration of the prompt instead.  The explicit-count path (`requested >= 0`) is unchanged:
+                // init_prefill shrinks the batch to whatever room that count left, as before.
+                const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_swap ? 0 : prefill_need,
+                                                        max_expert_bytes, (int)dev_moe[d], (int)cfg.n_expert, -1);
                 if (pl.slots < q) q = pl.slots;
             }
             if (q < 0) q = 0;
@@ -2557,12 +2603,17 @@ struct Engine::Impl {
             ssd_slot_bytes = up(2 * ssd_gu_cap + ssd_dn_cap);
             // P7 --minimax-ssd-prefetch guesses the next layer's routes from the residual, which is only a
             // prediction (the next layer's attention moves the residual before its router runs), so a layer can
-            // need a slot for a route nobody predicted.  Doubling the slots keeps both sets alive; the wasted
-            // reads are counted as ssd_pf_waste.
-            ssd_slot_cap = (size_t)cfg.n_expert_used * (ssd_prefetch ? 2 : 1);
+            // need slots for routes nobody predicted.  Each of the `depth` prefetch regions holds 2 x top slots:
+            // the predicted routes first, then room for the layer's own unpredicted misses.  A region is reused
+            // only after `ssd_wait_layer` has drained the reads that were in it, so an in-flight read can never
+            // be overwritten by the next prediction.
+            const size_t per_region = (size_t)cfg.n_expert_used * 2;
+            ssd_slot_cap = per_region * (size_t)(ssd_prefetch ? ssd_prefetch_depth + 1 : 1);
             ssd_slots = (uint8_t*)strata::platform::DirectFile::alloc_aligned(ssd_slot_cap * ssd_slot_bytes);
             if (!ssd_slots) fail("minimax SSD tier: cannot allocate the 4 KiB-aligned expert staging slots");
             ssd_pending.assign(ssd_files.size(), 0);
+            ssd_pf_out.assign((size_t)cfg.n_layers, 0);
+            ssd_pf_out_shard.assign((size_t)cfg.n_layers * ssd_files.size(), 0);
             ssd_pf_exp.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert_used, -1);
             ssd_pf_slot.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert_used, -1);
             ssd_pf_n.assign((size_t)cfg.n_layers, 0);
@@ -2587,9 +2638,24 @@ struct Engine::Impl {
         Layer::VramSlot& s = L.vram[(size_t)slot];
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         uint8_t* p = (uint8_t*)s.mem.p;
-        cu::copy_h2d(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        cu::copy_h2d(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu);
-        cu::copy_h2d(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down);
+        // P12: if the expert is already in the pinned RAM tier, copy it from there.  It used to be read out of the
+        // file mapping even when the arena held the same bytes, so every compulsory admission re-faulted 15 MB of
+        // the model through the page cache (or the drive) instead of a 20 GB/s memcpy from RAM.  Same bytes.
+        const uint8_t* g = L.egate.host + (size_t)expert * L.expert_gu;
+        const uint8_t* u = L.eup.host + (size_t)expert * L.expert_gu;
+        const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
+        if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
+            const int rs = L.ram_of[(size_t)expert];
+            if (rs >= 0 && rs < L.ram_n) {
+                const uint8_t* base = ram_arena->data() + L.ram_off + (uint64_t)rs * L.expert_bytes;
+                g = base;
+                u = base + L.expert_gu;
+                d = base + 2 * L.expert_gu;
+            }
+        }
+        cu::copy_h2d(p, g, L.expert_gu);
+        cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
+        cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
     }
@@ -3095,8 +3161,20 @@ struct Engine::Impl {
         return b + (role == 0 ? 0 : role == 1 ? ssd_gu_cap : 2 * ssd_gu_cap);
     }
 
+    // A layer's staging region: `2 * top` slots, the first `top` for the routes prefetched for it and the rest for
+    // misses the prediction did not name.  With depth 1 the region is the whole pool, as before.
+    size_t ssd_region_slots() const { return (size_t)cfg.n_expert_used * 2; }
+    // depth + 1 regions: while layer `li` computes in region `li % (depth+1)`, the prediction for `li + depth`
+    // lands in the region vacated by `li - 1`, which is finished.  Neither can touch the other's slots.
+    size_t ssd_region_base(int64_t li) const {
+        if (!ssd_prefetch || ssd_prefetch_depth < 1) return 0;
+        return (size_t)(li % (int64_t)(ssd_prefetch_depth + 1)) * ssd_region_slots();
+    }
+
     // Queue one role's bytes so they land in their final place; returns the pointer the dot kernels read.
-    uint8_t* ssd_submit_role(const Tensor& t, int64_t expert, uint8_t* base) {
+    // `tag` is 0 for the layer's own miss and `layer + 1` for a read queued a layer (or more) early; the tag is
+    // what lets a prefetch region be drained without waiting for the current layer's reads.
+    uint8_t* ssd_submit_role(const Tensor& t, int64_t expert, uint8_t* base, uint64_t tag = 0) {
         const size_t len = t.bytes / (size_t)t.ne2;
         const uint64_t off = t.file_offset + (uint64_t)expert * (uint64_t)len;
         constexpr uint64_t A = strata::platform::DirectFile::alignment();
@@ -3115,35 +3193,72 @@ struct Engine::Impl {
             const uint32_t o = (uint32_t)c * step;
             if (o >= alen) break;
             const uint32_t l = alen - o < step ? alen - o : step;
-            if (!file.submit(aoff + o, base + o, l, 0, err)) fail("minimax SSD read: " + err);
-            ++ssd_pending[t.shard];
+            if (!file.submit(aoff + o, base + o, l, tag, err)) fail("minimax SSD read: " + err);
+            if (tag == 0) {
+                ++ssd_pending[t.shard];
+            } else {
+                ++ssd_pf_out[(size_t)(tag - 1)];
+                ++ssd_pf_out_shard[(size_t)(tag - 1) * ssd_files.size() + t.shard];
+            }
         }
         return base + (size_t)(off - aoff);
+    }
+
+    // Collect up to 64 completions from one shard and account them by tag.  Returns the number the port
+    // delivered (0 when `timeout_ms` is 0 and nothing was ready).  A completion is the only place a prefetch
+    // read stops being outstanding, whichever layer's wait happens to reap it.
+    int ssd_pump(int f, int max, int timeout_ms) {
+        strata::platform::Completion buf[64];
+        const int want = max < 64 ? max : 64;
+        const int n = ssd_files[(size_t)f]->wait(buf, want, timeout_ms);
+        if (n <= 0) return 0;
+        for (int i = 0; i < n; ++i) {
+            if (buf[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+            if (!buf[i].ok) fail("minimax SSD read: I/O failed");
+            if (buf[i].tag == 0) {
+                --ssd_pending[(size_t)f];
+            } else {
+                const size_t li = (size_t)(buf[i].tag - 1);
+                if (li >= ssd_pf_out.size() || ssd_pf_out[li] <= 0)
+                    fail("minimax SSD read: completion for a prefetch layer that is not in flight");
+                --ssd_pf_out[li];
+                int& by_shard = ssd_pf_out_shard[li * ssd_files.size() + (size_t)f];
+                if (by_shard > 0) --by_shard;
+            }
+        }
+        return n;
     }
 
     void ssd_wait_all() {
         if (ssd_pending.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
-        strata::platform::Completion buf[64];
         for (size_t f = 0; f < ssd_pending.size(); ++f) {
-            int left = ssd_pending[f];
-            if (left <= 0) continue;
-            strata::platform::DirectFile& file = *ssd_files[f];
-            while (left > 0) {
-                // Drain a batch, not one completion at a time: a layer of a 57-layer model queues a few hundred
-                // reads, and one completion-port call each was measurable host time of its own.
-                const int want = left < 64 ? left : 64;
-                const int n = file.wait(buf, want, -1);
-                if (n <= 0) continue;
-                for (int i = 0; i < n; ++i) {
-                    if (buf[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
-                    if (!buf[i].ok) fail("minimax SSD read: I/O failed");
-                    --left;
-                }
+            // Drain a batch, not one completion at a time: a layer of a 57-layer model queues a few hundred
+            // reads, and one completion-port call each was measurable host time of its own.  Prefetch
+            // completions that arrive here are simply accounted and dropped; the data is already in its slot.
+            while (ssd_pending[f] > 0) {
+                if (ssd_pump((int)f, 64, -1) == 0) continue;
             }
-            ssd_pending[f] = 0;
         }
         ssd_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Wait until every read queued for layer `li` a few layers ago has completed, so its staging region can be
+    // reused.  This is deliberately per layer: the current layer's own misses are `ssd_wait_all`, and blocking on
+    // the deeper predictions there would throw away the lookahead.
+    void ssd_wait_layer(int li) {
+        if (ssd_pf_out.empty() || li < 0 || li >= (int)ssd_pf_out.size()) return;
+        while (ssd_pf_out[(size_t)li] > 0) {
+            int progressed = 0;
+            int block_on = -1;
+            for (size_t f = 0; f < ssd_files.size() && ssd_pf_out[(size_t)li] > 0; ++f) {
+                if (ssd_pf_out_shard[(size_t)li * ssd_files.size() + f] <= 0) continue;
+                if (block_on < 0) block_on = (int)f;
+                progressed += ssd_pump((int)f, 64, 0);
+            }
+            // Nothing was ready: sleep on a shard this layer actually reads from, never on shard 0 by assumption.
+            if (progressed == 0 && block_on >= 0 && ssd_pf_out[(size_t)li] > 0) ssd_pump(block_on, 64, -1);
+        }
     }
 
     // P7: is every page covering [p, p + len) in this process's working set?  If so, reading the expert's bytes
@@ -3205,10 +3320,10 @@ struct Engine::Impl {
 
     // Queue one expert's three roles into `slot`; fills the three data pointers.
     void ssd_submit_expert(const Layer& L, int64_t expert, int slot, const uint8_t*& g, const uint8_t*& u,
-                           const uint8_t*& d) {
-        g = ssd_submit_role(L.egate, expert, ssd_slot_role(slot, 0));
-        u = ssd_submit_role(L.eup, expert, ssd_slot_role(slot, 1));
-        d = ssd_submit_role(L.edown, expert, ssd_slot_role(slot, 2));
+                           const uint8_t*& d, uint64_t tag = 0) {
+        g = ssd_submit_role(L.egate, expert, ssd_slot_role(slot, 0), tag);
+        u = ssd_submit_role(L.eup, expert, ssd_slot_role(slot, 1), tag);
+        d = ssd_submit_role(L.edown, expert, ssd_slot_role(slot, 2), tag);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
     }
@@ -3435,6 +3550,9 @@ struct Engine::Impl {
             t_ph = std::chrono::steady_clock::now();
         }
         const int64_t li = (int64_t)(&L - layers.data());
+        // Start the prediction for a later layer now, while this layer's experts compute.  `in` is this layer's
+        // post-attention FFN input, the predictor Maya's device uses; the target layer's own router scores it.
+        if (ssd_prefetch && li + ssd_prefetch_depth < cfg.n_layers) ssd_prefetch_for(li + ssd_prefetch_depth, in);
         const size_t base_idx = (size_t)li * (size_t)cfg.n_expert;
         if (!usage.empty()) {
             for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
@@ -3458,7 +3576,9 @@ struct Engine::Impl {
         cpu.reserve((size_t)top);
         int ssd_n = 0;
         int pf_hits = 0;
-        ssd_slot_next = (int)li < (int)ssd_pf_n.size() ? ssd_pf_n[(size_t)li] : 0;
+        const size_t slot_base = ssd_region_base(li);
+        const int slot_end = (int)(slot_base + ssd_region_slots());
+        ssd_slot_next = (int)(slot_base + ((int)li < (int)ssd_pf_n.size() ? ssd_pf_n[(size_t)li] : 0));
         for (int j = 0; j < top; ++j) {
             if (w[(size_t)j] == 0.f) continue;   // --minimax-expert-skip
             const int e = order[(size_t)j];
@@ -3527,10 +3647,15 @@ struct Engine::Impl {
                     continue;
                 }
             }
-            // P7 --minimax-ssd-prefetch: the read for this route was queued right after the previous layer, so it
-            // has had that layer's attention and router to complete.  Take its slot; do not issue it twice.
-            const size_t pfat = (size_t)li * (size_t)top + (size_t)j;
-            if (!ssd_pf_exp.empty() && ssd_pf_exp[pfat] == e) {
+            // P7 --minimax-ssd-prefetch: the read for this route was queued a few layers ago.  Match the route
+            // against the predicted *set*, not rank-for-rank: a prediction that names the right experts in a
+            // slightly different order is still a hit and its slot is still the one holding its bytes.
+            int pf_at = -1;
+            const size_t pfat_base = (size_t)li * (size_t)top;
+            for (int j2 = 0; j2 < top && !ssd_pf_exp.empty(); ++j2)
+                if (ssd_pf_exp[pfat_base + (size_t)j2] == e) { pf_at = j2; break; }
+            if (pf_at >= 0) {
+                const size_t pfat = pfat_base + (size_t)pf_at;
                 const int slot = ssd_pf_slot[pfat];
                 ssd_pf_exp[pfat] = -1;
                 g = ssd_role_ptr(L.egate, e, ssd_slot_role(slot, 0));
@@ -3539,7 +3664,7 @@ struct Engine::Impl {
                 ++ssd_n;
                 ++pf_hits;
             } else {
-                if (ssd_slot_next >= (int)ssd_slot_cap)
+                if (ssd_slot_next >= slot_end)
                     fail("internal: the SSD staging slots are exhausted (more misses than slots in one layer)");
                 ssd_submit_expert(L, e, ssd_slot_next++, g, u, d);
                 ++ssd_n;
@@ -3604,7 +3729,9 @@ struct Engine::Impl {
             t_ph = std::chrono::steady_clock::now();
         }
         if (ssd_n > 0) {
-            // The drive has had the GPU stream and this pass's RAM experts to hide behind.
+            // The drive has had the GPU stream and this pass's RAM experts to hide behind.  A prefetched read
+            // carries the same tag as a miss, so this drains it too: a route that used a predicted slot is never
+            // read before its bytes are there.
             ssd_wait_all();
             if (pt) {
                 prof.ssd_wait += pms(t_ph);
@@ -3687,24 +3814,24 @@ struct Engine::Impl {
     // route that the layer then skips (`--minimax-expert-skip`) never mis-maps another route's bytes.
     int prefetch_wait = -1;
     bool ssd_prefetch = false;
+    int ssd_prefetch_depth = 1;     // layers between the issue and the use of a predicted read
     std::vector<int> ssd_pf_exp;    // [n_layers * top]: expert whose read is already in flight, or -1
     std::vector<int> ssd_pf_slot;   // [n_layers * top]: the staging slot it landed in
     std::vector<int> ssd_pf_n;      // [n_layers]: slots this layer's prefetch took
     int ssd_slot_next = 0;          // staging slot cursor inside one layer
-    int64_t ssd_prefetched = 0;     // reads issued a layer early (counters, not bytes: bytes count once)
+    int64_t ssd_prefetched = 0;     // reads issued early (counters, not bytes: bytes count once)
     int64_t ssd_pf_hit = 0;         // predicted routes that the layer then really used
     int64_t ssd_pf_waste = 0;       // predicted routes the layer did not use (bytes read for nothing)
 
+    // The VRAM half of the lookahead: one layer ahead, exact router, fill the card's empty slots.
     void prefetch_for(int64_t li) {
         const bool want_vram = prefetch_slots > 0 && tiers_gpu && li >= 0 && li < cfg.n_layers;
-        if (!want_vram && !ssd_prefetch) return;
+        if (!want_vram) return;
         if (li < 0 || li >= cfg.n_layers) return;
         Layer& L = layers[(size_t)li];
         if (!L.moe || !L.router.host) return;
         const bool vram_part = want_vram && !L.vram.empty();
-        const bool ssd_part = ssd_prefetch && ssd_slots &&
-                              (int)ssd_pf_exp.size() >= (int)cfg.n_layers * (int)cfg.n_expert_used;
-        if (!vram_part && !ssd_part) return;
+        if (!vram_part) return;
         Work* wv = nullptr;
         if (vram_part) {
             use_layer_device(li);
@@ -3740,8 +3867,38 @@ struct Engine::Impl {
             ++started;
         }
         if (started) prefetch_wait = (int)li;
-        if (!ssd_part) return;
-        // The SSD part: queue this layer's misses now, so the drive works through the next layer's attention.
+    }
+
+    // The SSD half: apply layer `li`'s router to the *post-attention, post-norm input* of the layer that is about
+    // to run (`hnorm`), which is what Project Maya's device does ("the device guesses the next layer's picks from
+    // the current layer's FFN input", ds4_model.cu:1173-1190).  It is called from inside layer `j`'s MoE for
+    // `li = j + depth`, so the bytes are in flight across `depth` layers of expert compute and attention instead of
+    // one attention block.  The router input is a prediction: the real layer `li` sees a different attention
+    // output.  It only ever decides *which bytes to read early*; a route the prediction missed is read
+    // synchronously exactly as it was with prefetch off, so the result cannot change.
+    void ssd_prefetch_for(int64_t li, const float* hnorm) {
+        if (!ssd_prefetch || !ssd_slots || !hnorm) return;
+        if (li < 0 || li >= cfg.n_layers) return;
+        if ((int)ssd_pf_exp.size() < (int)cfg.n_layers * (int)cfg.n_expert_used) return;
+        Layer& L = layers[(size_t)li];
+        if (!L.moe || !L.router.host) return;
+        // This layer's router may be on the other card (--layer-split): the prediction is scored on the target
+        // layer's device, not on the device of the layer whose MoE is running.  Without this, a 2-GPU split faults
+        // with "gemv sync: an illegal memory access" on the first token.
+        use_layer_device(li);
+        // Drain every read before writing into the region.  A region can hold a read that no route ever consumed,
+        // and reusing those bytes while the old read is in flight is a data race.  Draining here is a whole-layer
+        // barrier, so the effective lookahead is one layer, but it is unconditional, cannot deadlock on a tag
+        // that a shard never reports, and keeps the prediction safe.  (A per-region drain was tried: it deadlocked
+        // after the full model's prefill when a prediction's completion was never reaped on its shard.)
+        ssd_wait_all();
+        const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
+        std::vector<float> logits((size_t)nexp), prob((size_t)nexp);
+        gemv(L.router, hnorm, logits.data());
+        for (int i = 0; i < nexp; ++i) prob[(size_t)i] = sigmoid(logits[(size_t)i]);
+        std::vector<int> order;
+        select_routes(L, prob, order, top, false);
+        const size_t region = ssd_region_base(li);
         const size_t at = (size_t)li * (size_t)top;
         for (int j = 0; j < top; ++j) ssd_pf_exp[at + (size_t)j] = -1;
         int k = 0;
@@ -3752,13 +3909,14 @@ struct Engine::Impl {
             if (rs >= 0) continue;
             if (ssd_skip_rank > 0 && j >= ssd_skip_rank) continue;
             if (k >= top) break;
-            const int slot = k++;
+            const int slot = (int)region + k;
             const uint8_t* g = nullptr;
             const uint8_t* u = nullptr;
             const uint8_t* d = nullptr;
             ssd_submit_expert(L, e, slot, g, u, d);
             ssd_pf_exp[at + (size_t)j] = e;
             ssd_pf_slot[at + (size_t)j] = slot;
+            ++k;
             ++ssd_prefetched;
         }
         ssd_pf_n[(size_t)li] = k;
@@ -4762,7 +4920,11 @@ struct Engine::Impl {
         for (size_t d = 0; d < devs.size(); ++d) {
             const cu::MemInfo mi = cu::mem_on(devs[d]);
             const size_t reserve = ((size_t)std::max(opt.vram_reserve_mib, 256) << 20) + fixed;
-            if (mi.free_bytes <= reserve) {
+            // P12: in the swap mode the prompt pass may take the expert slots back for its workspace, so what the
+            // batch may use is the free VRAM plus every slot on this card.
+            const size_t reclaim = prefill_ws_swap ? slotted_bytes_on((int)d) : 0;
+            const size_t budget = mi.free_bytes + reclaim;
+            if (budget <= reserve) {
                 std::fprintf(stderr,
                              "strata-minimax: batched prefill needs workspace on device %d but only %zu MiB is free. "
                              "Lower --minimax-prefill-batch or --minimax-dense-layers-gpu.\n",
@@ -4770,11 +4932,12 @@ struct Engine::Impl {
                 batch_cap = 0;
                 return;
             }
-            const size_t fit = (mi.free_bytes - reserve) / per_tok;
+            const size_t fit = (budget - reserve) / per_tok;
             std::fprintf(stderr,
-                         "INFO minimax-prefill-workspace dev=%d free=%zu MiB reserve=%zu MiB per_token=%.1f KiB "
+                         "INFO minimax-prefill-workspace dev=%d free=%zu MiB%s reserve=%zu MiB per_token=%.1f KiB "
                          "fit=%zu tokens\n",
-                         devs[d], mi.free_bytes >> 20, reserve >> 20, (double)per_tok / 1024.0, fit);
+                         devs[d], mi.free_bytes >> 20, reclaim ? (" +slots=" + std::to_string(reclaim >> 20) + " MiB").c_str() : "",
+                         reserve >> 20, (double)per_tok / 1024.0, fit);
             if ((size_t)batch_cap > fit) batch_cap = (int)fit;
         }
         if (batch_cap < 2) {
@@ -4796,6 +4959,148 @@ struct Engine::Impl {
             ssd_tmp_bytes = (size_t)max_expert_bytes + 4096;
         }
         pf.resize(devs.size());
+        ws_taken.assign(layers.size(), 0);
+        // P12: `pf_max_blk` is read by the host buffers below and by the device allocation later, so it is settled
+        // here with the rest of the batch geometry.  It used to be set inside the allocation loop, which now runs at
+        // the first prompt.
+        pf_max_blk = (int)cfg.idx_top_k;
+        // P12: the pinned expert-slot layout is host arithmetic that both the prompt ring and the decode path's
+        // direct reads use, so it is computed here once, not with the (per-prompt) device buffers.
+        if (prefill_gpu_experts && max_expert_bytes > 0) {
+            size_t gu = 0, dn = 0;
+            for (const Layer& L : layers)
+                if (L.moe) {
+                    if (L.expert_gu > gu) gu = L.expert_gu;
+                    if (L.expert_down > dn) dn = L.expert_down;
+                }
+            const size_t A = strata::platform::DirectFile::alignment();
+            auto up = [&](size_t x) { return (x + A - 1) & ~(A - 1); };
+            for (PfBuf& p : pf) {
+                p.ring_slot = max_expert_bytes;
+                p.role_off[0] = A;
+                p.role_off[1] = up(p.role_off[0] + gu) + A;
+                p.role_off[2] = up(p.role_off[1] + gu) + A;
+                p.pin_slot_bytes = up(p.role_off[2] + dn) + A;
+            }
+        }
+        // The workspace's size on one device, from the settled batch: with the tiers off there are no slots to
+        // borrow from and the allocation is just the free VRAM.
+        prefill_ws_bytes = prefill_device_bytes(batch_cap);
+        batch_on = true;
+        pf_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
+        pf_q.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
+        pf_kv.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0.f);
+        pf_router.assign((size_t)batch_cap * (size_t)cfg.n_expert, 0.f);
+        pf_blk.assign((size_t)batch_cap * (size_t)cfg.idx_heads * (size_t)pf_max_blk, 0);
+        pf_nblk.assign((size_t)batch_cap * (size_t)cfg.idx_heads, 0);
+        pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
+        pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
+        pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
+        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
+        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
+        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
+        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
+        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
+        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
+        pf_dense_h.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
+        pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
+        pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
+        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
+                     batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
+                     (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
+        if (prefill_gpu_experts)
+            std::fprintf(stderr, "INFO minimax-prefill-expert-gemm=%s%s\n", prefill_expert_gemm.c_str(),
+                         prefill_expert_gemm == "auto" ? " (tensor cores from 16 rows per expert)" : "");
+        if (ikq_experts)
+            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
+                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
+    }
+
+        PfBuf& P() { return pf[(size_t)cur]; }
+
+    // =========================================================== P12: the prompt workspace and the slots share VRAM
+    //
+    // The batched prompt workspace is only needed while a prompt is being processed; the decode expert slots are
+    // only needed after it.  Before P12 both were reserved at startup, so a server that always passes
+    // `--minimax-prefill-batch 4096` gave the workspace ~700 MiB of every card out of the decode slot pool for the
+    // whole session.  Now the workspace is allocated at the start of a prompt (freeing the slots it displaces) and
+    // released when the prompt ends, and the slots are re-allocated, so decode runs with the decode-only count.
+    // The kernels and their arguments are untouched: only the residency of the slots changes, exactly as the
+    // adaptive swaps already change it during a run.
+
+    /// Every VRAM expert slot on device `d`, in bytes: what the prompt workspace may take back.
+    size_t slotted_bytes_on(int d) const {
+        size_t b = 0;
+        for (const Layer& L : layers)
+            if (L.moe && L.dev == d) b += (size_t)L.vram.size() * L.expert_bytes;
+        return b;
+    }
+
+    /// Release the device side of the batched-prompt workspace.  Idempotent.  The pinned slot *layout*
+    /// (`role_off`, `pin_slot_bytes`, `ring_slot`) is host-side arithmetic that the decode path's direct reads also
+    /// use, so it is computed once in init_prefill and survives this: only the buffers go away.
+    void pf_free() {
+        if (!ws_live) return;
+        for (size_t d = 0; d < pf.size(); ++d) {
+            PfBuf& p = pf[d];
+            use_device_index((int)d);
+            cu::dealloc(p.h16);          p.h16 = nullptr;
+            cu::dealloc(p.a16);          p.a16 = nullptr;
+            cu::dealloc(p.y32);          p.y32 = nullptr;
+            cu::dealloc(p.p32);          p.p32 = nullptr;
+            cu::dealloc(p.sh);           p.sh = nullptr;
+            cu::dealloc(p.w16);          p.w16 = nullptr;
+            cu::dealloc(p.w32);          p.w32 = nullptr;
+            cu::dealloc(p.gx);           p.gx = nullptr;
+            cu::dealloc(p.gx32);         p.gx32 = nullptr;
+            cu::dealloc(p.gy);           p.gy = nullptr;
+            cu::dealloc(p.gu);           p.gu = nullptr;
+            cu::dealloc(p.gh);           p.gh = nullptr;
+            cu::dealloc(p.gh32);         p.gh32 = nullptr;
+            cu::dealloc(p.gd);           p.gd = nullptr;
+            cu::dealloc(p.xq);           p.xq = nullptr;
+            cu::dealloc(p.hq);           p.hq = nullptr;
+            cu::dealloc(p.d_rows.p);     p.d_rows.p = nullptr;
+            cu::dealloc(p.d_ent_row.p);  p.d_ent_row.p = nullptr;
+            cu::dealloc(p.d_ent_w.p);    p.d_ent_w.p = nullptr;
+            cu::dealloc(p.d_iq16.p);     p.d_iq16.p = nullptr;
+            cu::dealloc(p.d_q16.p);      p.d_q16.p = nullptr;
+            cu::dealloc(p.d_bs.p);       p.d_bs.p = nullptr;
+            cu::dealloc(p.d_blk.p);      p.d_blk.p = nullptr;
+            cu::dealloc(p.d_nblk.p);     p.d_nblk.p = nullptr;
+            cu::dealloc(p.d_pos.p);      p.d_pos.p = nullptr;
+            cu::dealloc(p.kv_k.p);       p.kv_k.p = nullptr;
+            cu::dealloc(p.kv_v.p);       p.kv_v.p = nullptr;
+            for (void* r : p.ring_v) cu::dealloc(r);
+            for (void* h : p.pin_v) cu::host_free(h);
+            for (void* e : p.ev_copy) cu::event_destroy(e);
+            for (void* e : p.ev_comp) cu::event_destroy(e);
+            p.ring_v.clear();
+            p.pin_v.clear();
+            p.ev_copy.clear();
+            p.ev_comp.clear();
+            p.ring = nullptr;
+            p.pin = nullptr;
+            p.ring_n = 0;
+            p.x16 = nullptr;
+            p.y32_elems = p.p32_elems = p.sh_elems = 0;
+            p.w16_elems = 0;
+            p.rows_cap = 0;
+        }
+        use_device_index(0);
+        ws_live = false;
+    }
+
+    /// Allocate the device side of the batched-prompt workspace for `batch_cap` tokens.  The caller has already made
+    /// room (`pf_acquire`).  A cudaMalloc that still does not fit throws, which is the honest failure: the plan
+    /// above counted these bytes.
+    void pf_alloc() {
+        if (ws_live) return;
+        // Mark it live first: a cudaMalloc that throws part-way leaves a half-filled PfBuf that pf_free() must be
+        // able to release (every pointer starts null and is set one at a time).
+        ws_live = true;
         for (size_t d = 0; d < devs.size(); ++d) {
             use_device_index((int)d);
             PfBuf& p = pf[d];
@@ -4838,7 +5143,6 @@ struct Engine::Impl {
             p.d_q16 = DevPtr(cu::alloc(T * (size_t)(cfg.n_head * cfg.head_dim) * 2 + 4096));
             const int64_t nbmax = (ctx + cfg.idx_block - 1) / cfg.idx_block;
             p.d_bs = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)nbmax * sizeof(float) + 4096));
-            pf_max_blk = (int)cfg.idx_top_k;
             p.d_blk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * (size_t)pf_max_blk * sizeof(int32_t) + 4096));
             p.d_nblk = DevPtr(cu::alloc(T * (size_t)cfg.idx_heads * sizeof(int32_t) + 4096));
             p.d_pos = DevPtr(cu::alloc((size_t)T * sizeof(int32_t) + 64));
@@ -4862,21 +5166,8 @@ struct Engine::Impl {
                 }
             }
             if (prefill_gpu_experts && max_expert_bytes > 0) {
-                p.ring_slot = max_expert_bytes;
                 // P10: the pinned slot's role layout (see PfBuf::role_off): gate, up and down each at a 4 KiB
                 // boundary with 4 KiB of headroom, so an unbuffered read of the aligned superset can land there.
-                size_t gu = 0, dn = 0;
-                for (const Layer& L : layers)
-                    if (L.moe) {
-                        if (L.expert_gu > gu) gu = L.expert_gu;
-                        if (L.expert_down > dn) dn = L.expert_down;
-                    }
-                const size_t A = strata::platform::DirectFile::alignment();
-                auto up = [&](size_t x) { return (x + A - 1) & ~(A - 1); };
-                p.role_off[0] = A;
-                p.role_off[1] = up(p.role_off[0] + gu) + A;
-                p.role_off[2] = up(p.role_off[1] + gu) + A;
-                p.pin_slot_bytes = up(p.role_off[2] + dn) + A;
                 // Four slots unless the card cannot spare them: 64 MiB of ring buys copy/compute overlap on the
                 // expert stream, which is what the chunk's MoE time is actually spent on.
                 size_t slot = p.ring_slot;
@@ -4900,39 +5191,146 @@ struct Engine::Impl {
             }
         }
         use_device_index(0);
-        batch_on = true;
-        pf_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
-        pf_q.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
-        pf_kv.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0.f);
-        pf_router.assign((size_t)batch_cap * (size_t)cfg.n_expert, 0.f);
-        pf_blk.assign((size_t)batch_cap * (size_t)cfg.idx_heads * (size_t)pf_max_blk, 0);
-        pf_nblk.assign((size_t)batch_cap * (size_t)cfg.idx_heads, 0);
-        pf_entries.reserve((size_t)batch_cap * (size_t)cfg.n_expert_used);
-        pf_k16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        pf_v16.assign((size_t)batch_cap * (size_t)(cfg.n_head_kv * cfg.head_dim), 0);
-        // The dense MLP layers are wider than the routed experts (12288 vs 3072 on M3.1).  These three buffers
-        // are used by BOTH the dense-layer CPU MLP and the shared expert, so size them for the wider of the two:
-        // with rows_cap * n_ff_exp only, one 512-row chunk of layer 0 wrote 4x past the end of the buffer
-        // (G3 on IQ2_XS-D3 crashed with an access violation in gemm_cpu_base's row loop).
-        const size_t pf_ff = (size_t)bigger(cfg.n_ff_exp, cfg.n_ff_dense);
-        pf_gate_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_up_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_hid_h.assign((size_t)rows_cap * pf_ff, 0.f);
-        pf_dense_h.assign((size_t)batch_cap * (size_t)(cfg.n_head * cfg.head_dim), 0.f);
-        pf_moe_h.assign((size_t)batch_cap * (size_t)cfg.n_embd, 0.f);
-        pf_out_tile.assign((size_t)batch_cap * (size_t)std::min<int64_t>(4096, cfg.n_vocab), 0.f);
-        std::fprintf(stderr, "INFO minimax-prefill batch=%d experts=%s workspace=%.1f MiB/device reads=%s\n",
-                     batch_cap, prefill_gpu_experts ? "gpu" : "cpu",
-                     (double)per_tok * (double)batch_cap / 1048576.0, prefill_direct ? "direct" : "mmap");
-        if (prefill_gpu_experts)
-            std::fprintf(stderr, "INFO minimax-prefill-expert-gemm=%s%s\n", prefill_expert_gemm.c_str(),
-                         prefill_expert_gemm == "auto" ? " (tensor cores from 16 rows per expert)" : "");
-        if (ikq_experts)
-            std::fprintf(stderr, "INFO minimax-prefill the expert format has no device prefill path; experts run "
-                                 "on the CPU (--minimax-prefill-experts gpu to ask for the device anyway)\n");
+        ws_live = true;
     }
 
-    PfBuf& P() { return pf[(size_t)cur]; }
+    // `--minimax-prefill-vram swap`'s two halves.  `pf_acquire` frees expert slots until every card has room for
+    // the workspace and then allocates it; `pf_release` frees the workspace and re-allocates exactly the slots it
+    // took.  Slots come back empty (the experts they held are marked non-resident), which is the same state a
+    // decode-only run starts in; the pinning tier and the retier loop refill them on the next tokens.
+    void pf_release() {
+        if (!ws_live) return;
+        const auto ws_t0 = std::chrono::steady_clock::now();
+        cu::sync();
+        for (size_t d = 0; d < work.size(); ++d) {
+            if (!work[d].side) continue;
+            use_device_index((int)d);
+            cu::stream_sync(work[d].side);
+        }
+        use_device_index(0);
+        pf_free();
+        int restored = 0;
+        for (size_t li = 0; li < layers.size(); ++li) {
+            Layer& L = layers[li];
+            if (ws_taken[li] <= 0) continue;
+            use_device_index(L.dev);
+            for (int s = 0; s < ws_taken[li]; ++s) {
+                Layer::VramSlot slot;
+                slot.mem = DevPtr(cu::alloc(L.expert_bytes));
+                L.vram.push_back(std::move(slot));
+                ++restored;
+            }
+            ws_taken[li] = 0;
+        }
+        use_device_index(0);
+        cu::sync();
+        if (restored > 0) {
+            int lo = std::numeric_limits<int>::max(), hi = 0;
+            for (const Layer& L : layers)
+                if (L.moe && !L.vram.empty()) {
+                    lo = std::min(lo, (int)L.vram.size());
+                    hi = std::max(hi, (int)L.vram.size());
+                }
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-vram workspace released, %d expert slots re-allocated (%d..%d per "
+                         "layer) in %.0f ms\n",
+                         restored, lo, hi,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ws_t0).count());
+        }
+    }
+
+    /// Make room for the workspace by taking slots away (swap mode only), then allocate it.  Returns false when the
+    /// allocation still does not fit (the caller then keeps the token path).  `--minimax-prefill-vram reserve` and an
+    /// explicit `--minimax-vram-slots-per-layer` never take a slot away: their workspace comes out of whatever
+    /// free VRAM init_prefill sized the batch against, exactly as before P12.
+    bool pf_acquire() {
+        if (ws_live) return true;
+        // cudaFree is a device-wide sync: do it before the prompt, never inside one.  The expert side streams get
+        // an explicit sync too, because the adaptive retier and the lookahead copy into slots asynchronously and a
+        // slot must not be freed while a copy into it is still in flight.
+        cu::sync();
+        for (size_t d = 0; d < work.size(); ++d) {
+            if (!work[d].side) continue;
+            use_device_index((int)d);
+            cu::stream_sync(work[d].side);
+        }
+        use_device_index(0);
+        const auto ws_t0 = std::chrono::steady_clock::now();
+        const size_t margin = (size_t)std::max(opt.vram_reserve_mib, 256) << 20;
+        const size_t need = prefill_ws_bytes + margin;
+        int freed = 0;
+        if (prefill_ws_swap) {
+            for (size_t d = 0; d < devs.size(); ++d) {
+                // Round-robin over this device's MoE layers so no single layer loses its whole pool.
+                std::vector<size_t> moe_on_d;
+                for (size_t li = 0; li < layers.size(); ++li)
+                    if (layers[li].moe && layers[li].dev == (int)d) moe_on_d.push_back(li);
+                size_t turn = 0;
+                bool any = true;
+                while (any && cu::mem_on(devs[d]).free_bytes < need) {
+                    any = false;
+                    for (size_t k = 0; k < moe_on_d.size(); ++k) {
+                        const size_t li = moe_on_d[(turn + k) % moe_on_d.size()];
+                        Layer& L = layers[li];
+                        if (L.vram.empty()) continue;
+                        use_device_index(L.dev);
+                        Layer::VramSlot& s = L.vram.back();
+                        if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
+                        // `VramSlot::mem` is an RAII DevPtr: free it here and null it, or pop_back's destructor
+                        // frees the same pointer again (a double free that surfaces later as a bogus launch error).
+                        cu::dealloc(s.mem.p);
+                        s.mem.p = nullptr;
+                        L.vram.pop_back();
+                        ++ws_taken[li];
+                        ++freed;
+                        any = true;
+                        break;   // re-check the free bytes before taking another
+                    }
+                    ++turn;
+                }
+                if (cu::mem_on(devs[d]).free_bytes < need) {
+                    use_device_index(0);
+                    std::fprintf(stderr,
+                                 "WARN minimax-prefill-vram device %d still has only %zu MiB free after taking %d "
+                                 "slots; the batched prompt may not fit\n",
+                                 devs[d], cu::mem_on(devs[d]).free_bytes >> 20, freed);
+                }
+            }
+        }
+        use_device_index(0);
+        if (freed > 0)
+            std::fprintf(stderr,
+                         "INFO minimax-prefill-vram borrowed %d expert slots for the prompt workspace in %.0f ms\n",
+                         freed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ws_t0).count());
+        try {
+            pf_alloc();
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                         "WARN minimax-prefill-vram the %.0f MiB/device prompt workspace did not fit (%s); keeping "
+                         "the token path for this run\n",
+                         (double)prefill_ws_bytes / 1048576.0, ex.what());
+            pf_release();
+            batch_on = false;
+            batch_cap = 0;
+            return false;
+        }
+        return ws_live;
+    }
+
+    /// RAII: the prompt workspace exists for exactly the duration of a prompt.  Every path that runs
+    /// `forward_batch` opens one; the destructor gives the slots back even when a run is cancelled.
+    struct PrefillWs {
+        Impl* im = nullptr;
+        bool on = false;
+        explicit PrefillWs(Impl* i) : im(i) {
+            if (i->batch_on) on = i->pf_acquire();
+        }
+        ~PrefillWs() {
+            if (on) im->pf_release();
+        }
+        PrefillWs(const PrefillWs&) = delete;
+        PrefillWs& operator=(const PrefillWs&) = delete;
+    };
 
     // P9: the batched prompt workspace, bytes per token per device.  Kept in one place because the tier sizing
     // (which must leave room for it) and the allocator below both need it.
@@ -5162,6 +5560,12 @@ struct Engine::Impl {
             std::memcpy(x.data(), seed_h.data() + (size_t)pos * (size_t)cfg.n_embd, (size_t)cfg.n_embd * sizeof(float));
         } else {
             decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, x.data(), cfg.n_embd);
+        }
+        if ((size_t)pos < img_row.size()) {
+            const int row = img_row[(size_t)pos];
+            if (row >= 0)
+                std::memcpy(x.data(), img_data.data() + (size_t)row * (size_t)cfg.n_embd,
+                            (size_t)cfg.n_embd * sizeof(float));
         }
         if (pt) prof.embed = pms(t_tok);
 
@@ -5405,7 +5809,9 @@ struct Engine::Impl {
                 moe(L, h.data(), proj.data());
             }
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
-            if ((prefetch_slots > 0 || ssd_prefetch) && li + 1 < cfg.n_layers) {
+            if (prefetch_slots > 0 && li + 1 < cfg.n_layers) {
+                // The SSD lookahead is issued from inside moe() (it needs this layer's FFN input); only the VRAM
+                // fill is left here, and it keeps its one-layer distance and its exact router input.
                 const auto t_pf = std::chrono::steady_clock::now();
                 prefetch_for(li + 1);
                 if (pt) prof.prefetch += pms(t_pf);
@@ -5858,6 +6264,12 @@ struct Engine::Impl {
             } else {
                 decode_f32(embd_t, embd_t.host + (size_t)toks[t] * embd_t.row_bytes, pf_h.data() + (size_t)t * ne,
                            ne);
+            }
+            if ((size_t)(pos0 + t) < img_row.size()) {
+                const int row = img_row[(size_t)(pos0 + t)];
+                if (row >= 0)
+                    std::memcpy(pf_h.data() + (size_t)t * ne,
+                                img_data.data() + (size_t)row * (size_t)ne, (size_t)ne * sizeof(float));
             }
         }
         std::vector<float> att((size_t)qlen);          // one row's attention output (host path)
@@ -6366,6 +6778,8 @@ void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std:
     if ((int64_t)n > impl_->ctx) fail("teacher-forced sequence is longer than the context");
     impl_->dump_seq = n;
     std::vector<float> all((size_t)n * vocab);
+    // P12: the batched workspace (and the slots it borrows) lives for the teacher-forced pass only.
+    Impl::PrefillWs ws(impl_);
     const int batch = impl_->batch_on ? impl_->batch_cap : 1;
     for (int i = 0; i < n;) {
         const int k = std::min(batch, n - i);
@@ -6391,7 +6805,8 @@ void Engine::teacher_forced(const std::vector<int32_t>& tokens, int last_k, std:
 
 GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new, const SampleParams& sp,
                                 std::atomic<bool>& stop, const std::function<void(int32_t)>& on_token,
-                                const std::function<void(int, int, double)>& on_pp) {
+                                const std::function<void(int, int, double)>& on_pp,
+                                const std::vector<std::string>& images) {
     GenerateResult gr;
     if (prompt.empty()) fail("prompt is empty");
     if ((int64_t)prompt.size() > impl_->ctx) fail("prompt is longer than the context");
@@ -6400,6 +6815,43 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
     else {
         std::random_device rd;
         impl_->rng.seed(((uint64_t)rd() << 32) ^ rd());
+    }
+
+    // P6: encode every picture, then line its rows up with the `<]image[>` placeholders in prompt order.
+    // The server expands one placeholder per token; a caller that leaves a single token per picture is refused
+    // rather than silently reading the wrong rows.
+    impl_->img_row.clear();
+    impl_->img_data.clear();
+    impl_->img_rows = 0;
+    if (!images.empty()) {
+        if (!impl_->vision) fail("an image was sent but no vision encoder is loaded (pass --mmproj)");
+        std::vector<int64_t> per;
+        int64_t total = 0;
+        for (const std::string& path : images) {
+            ImageEmbeddings e = impl_->vision->encode_file(path, impl_->opt.image_max_tokens);
+            if (e.dim != impl_->cfg.n_embd)
+                fail("the mmproj projects to " + std::to_string(e.dim) + " but the model needs " +
+                     std::to_string(impl_->cfg.n_embd));
+            per.push_back(e.tokens);
+            total += e.tokens;
+            impl_->img_data.insert(impl_->img_data.end(), e.data.begin(), e.data.end());
+        }
+        impl_->img_rows = total;
+        impl_->img_row.assign(prompt.size(), -1);
+        int64_t row = 0;
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            if (prompt[i] == impl_->opt.image_token_id) {
+                if (row >= total) fail("the prompt has more image tokens than the pictures supply");
+                impl_->img_row[i] = (int)row++;
+            }
+        }
+        if (row != total)
+            fail("the prompt has " + std::to_string(row) + " image tokens but " + std::to_string(images.size()) +
+                 " picture(s) produce " + std::to_string(total) + " (each picture is expanded to its own tokens)");
+        // A picture's rows are request data, not cache: always prefill this prompt again.
+        impl_->n_past = 0;
+        impl_->held.clear();
+        impl_->have_logits = false;
     }
 
     // n_past is the cache. The last sampled token sits in `held` but is not forwarded until the next
@@ -6431,39 +6883,44 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
         return std::chrono::duration<double, std::milli>(clock::now() - a).count();
     };
     const int chunk = impl_->opt.chunk > 0 ? impl_->opt.chunk : 16;
-    const int batch = impl_->batch_on ? impl_->batch_cap : 1;
-    for (int i = (int)begin; i < (int)prompt.size();) {
-        if (stop.load(std::memory_order_relaxed)) {
-            gr.finish = "cancel";
-            gr.prompt_ms = ms_since(t0);
-            return gr;
+    // P12: the batched-prompt workspace borrows the decode expert slots for the prompt and returns them when it
+    // ends, so decode starts with the decode-only slot count.  The scope is the prompt: the brace closes before the
+    // decode loop, and the guard releases on every early return.
+    {
+        Impl::PrefillWs ws(impl_);
+        const int batch = impl_->batch_on ? impl_->batch_cap : 1;
+        for (int i = (int)begin; i < (int)prompt.size();) {
+            if (stop.load(std::memory_order_relaxed)) {
+                gr.finish = "cancel";
+                gr.prompt_ms = ms_since(t0);
+                return gr;
+            }
+            if (reforward && i == (int)begin) impl_->n_past = begin;
+            const int k = std::min(batch, (int)prompt.size() - i);
+            if (k > 1) {
+                impl_->forward_batch(prompt.data() + i, k, impl_->last_logits.data(), 1);
+                for (int j = 0; j < k; ++j) impl_->held.push_back(prompt[(size_t)(i + j)]);
+                i += k;
+            } else {
+                impl_->forward_token(prompt[(size_t)i], impl_->last_logits.data());
+                impl_->held.push_back(prompt[(size_t)i]);
+                ++i;
+            }
+            impl_->have_logits = true;
+            const int done = i;
+            if (on_pp && (done == (int)prompt.size() || done % chunk == 0 || done > (int)prompt.size() - batch))
+                on_pp(done, (int)prompt.size(), ms_since(t0));
+            if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
+                gr.finish = "nonfinite";
+                gr.prompt_ms = ms_since(t0);
+                return gr;
+            }
         }
-        if (reforward && i == (int)begin) impl_->n_past = begin;
-        const int k = std::min(batch, (int)prompt.size() - i);
-        if (k > 1) {
-            impl_->forward_batch(prompt.data() + i, k, impl_->last_logits.data(), 1);
-            for (int j = 0; j < k; ++j) impl_->held.push_back(prompt[(size_t)(i + j)]);
-            i += k;
-        } else {
-            impl_->forward_token(prompt[(size_t)i], impl_->last_logits.data());
-            impl_->held.push_back(prompt[(size_t)i]);
-            ++i;
-        }
-        impl_->have_logits = true;
-        const int done = i;
-        if (on_pp && (done == (int)prompt.size() || done % chunk == 0 || done > (int)prompt.size() - batch))
-            on_pp(done, (int)prompt.size(), ms_since(t0));
-        if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
-            gr.finish = "nonfinite";
-            gr.prompt_ms = ms_since(t0);
-            return gr;
-        }
-    }
+    }   // the prompt workspace's scope
     gr.prompt_ms = ms_since(t0);
     if (!impl_->have_logits) {
         gr.finish = "length";
-        return gr;
-    }
+        return gr;    }
 
     const auto t1 = clock::now();
     std::vector<int32_t> hist = impl_->held;

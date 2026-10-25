@@ -77,6 +77,7 @@ void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void stream_sync(void* stream);
 /// CUDA events for the staged expert ring (copy stream -> compute stream ordering).
 void* event_create();
+void event_destroy(void* event);
 void event_record(void* event, void* stream);
 void event_sync(void* event);
 bool event_ready(void* event);

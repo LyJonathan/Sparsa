@@ -914,6 +914,10 @@ void event_record(void* event, void* stream) {
     if (event) check(cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream), "event record");
 }
 
+void event_destroy(void* event) {
+    if (event) cudaEventDestroy((cudaEvent_t)event);
+}
+
 void event_sync(void* event) {
     if (event) check(cudaEventSynchronize((cudaEvent_t)event), "event sync");
 }

@@ -1,8 +1,9 @@
 // src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
 //
 // Inspect never constructs the engine (no CUDA). Serve and eval load the GGUF, refuse a non-M3.1 file unless
-// --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE. GENI and BGEN
-// answer with ERR and no DONE. Unknown --flags are ignored only in --serve, matching the shared server config.
+// --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE; GENI is GEN with
+// `img=` pictures the mmproj reads (an image without --mmproj is refused), and BGEN answers with ERR and no DONE.
+// Unknown --flags are ignored only in --serve, matching the shared server config.
 // An unasked context is min(model, 32768); only --max-context raises it.
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -42,6 +43,7 @@
 #include "strata/minimax/engine.hpp"
 #include "strata/minimax/forward.hpp"
 #include "strata/minimax/gguf.hpp"
+#include "strata/minimax/vision.hpp"
 
 #ifndef STRATA_VERSION
 #define STRATA_VERSION "dev"
@@ -91,6 +93,10 @@ void usage() {
                  "                                    routed experts: int8 iq_mmvq dots (default), dequantize-once +\n"
                  "                                    FP16 tensor-core GEMM per expert, or auto (tc from 16 rows)\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
+                 "  --minimax-prefill-vram reserve|swap  reserve (default): the prompt workspace is subtracted from the\n"
+                 "                                    VRAM expert slots at startup and lives for the run (P10); swap:\n"
+                 "                                    the prompt workspace borrows the slots for the prompt and returns\n"
+                 "                                    them after it, so decode keeps the decode-only slot count\n"
                  "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n"
                  "  --minimax-ssd-chunks N            pieces one SSD expert read is split into, in flight together\n"
                  "                                    (default 1, 1-16); try 4-8 for a drive that prefers\n"
@@ -100,7 +106,10 @@ void usage() {
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
                  "  --minimax-page-probe N            pages sampled per expert for that check (default 32; 0 = all)\n"
-                 "  --minimax-ssd-prefetch on|off     queue the next layer's SSD misses one layer early (default off)\n"
+                 "  --minimax-ssd-prefetch on|off     queue a future layer's SSD misses while this one computes\n"
+                 "                                    (default off; pair with --minimax-ssd-prefetch-depth)\n"
+                 "  --minimax-ssd-prefetch-depth N    layers between issuing a predicted read and using it\n"
+                 "                                    (default 1, 1-8); the read overwinters depth layers of compute\n"
                  "  --minimax-route-bias on|off       rank the router's top-k on score + a residency bonus / file\n"
                  "                                    penalty (Xolotl); weights stay unbiased; default off\n"
                  "  --minimax-route-bias-in A         bonus for a resident expert (default 0.25)\n"
@@ -108,10 +117,47 @@ void usage() {
                  "  --minimax-route-protect P         the exact top-P experts are never displaced (default 2)\n"
                  "  --minimax-route-pool M            a pick must stay inside the exact top-M (default 12)\n"
                  "  --minimax-route-margin D          nudge only experts within D of the cutoff (default 0 = all)\n"
-                 "  --minimax-pool-spin-us N          CPU pool workers spin N us before sleeping (default 0)\n");
+                 "  --minimax-pool-spin-us N          CPU pool workers spin N us before sleeping (default 0)\n"
+                 "  --mmproj PATH                     vision encoder (llama.cpp clip mmproj, minimax_m3)\n"
+                 "  --minimax-vision IMAGE            encode IMAGE and write --minimax-vision-out (no LM loaded)\n"
+                 "  --minimax-vision-pixels PV.npy    encode preprocessed pixel_values [n,1176] instead of a picture\n"
+                 "  --minimax-vision-size WxH         the resized size that goes with --minimax-vision-pixels\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
+
+/// A float32 .npy with a 2-D shape (the parity harness's pixel_values).  Header-only subset of the format.
+bool read_npy_2d(const std::string& path, std::vector<float>& out, int64_t& rows, int64_t& cols) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[6] = {};
+    f.read(magic, 6);
+    if (!f || std::memcmp(magic, "\x93NUMPY", 6) != 0) return false;
+    char ver[2] = {};
+    f.read(ver, 2);
+    uint32_t hlen = 0;
+    if ((unsigned char)ver[0] == 1) {
+        uint16_t h = 0;
+        f.read(reinterpret_cast<char*>(&h), 2);
+        hlen = h;
+    } else {
+        f.read(reinterpret_cast<char*>(&hlen), 4);
+    }
+    std::string header((size_t)hlen, '\0');
+    f.read(header.data(), (std::streamsize)hlen);
+    const auto lp = header.find("(");
+    const auto rp = header.find(")", lp == std::string::npos ? 0 : lp);
+    if (lp == std::string::npos || rp == std::string::npos) return false;
+    std::string dims = header.substr(lp + 1, rp - lp - 1);
+    for (char& c : dims)
+        if (c == ',') c = ' ';
+    std::istringstream is(dims);
+    if (!(is >> rows >> cols)) return false;
+    if (rows <= 0 || cols <= 0) return false;
+    out.resize((size_t)rows * (size_t)cols);
+    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)(out.size() * sizeof(float)));
+    return f.good() || f.eof();
+}
 
 int parse_chunk(const std::string& s) {
     if (s == "auto" || s == "AUTO") return 16;
@@ -459,6 +505,7 @@ void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool gre
     SampleParams sp;
     if (greedy_default) sp.temperature = 0.f;
     std::vector<int32_t> ids;
+    std::vector<std::string> images;
     bool ids_started = false;
     std::string tok;
     while (in >> tok) {
@@ -477,6 +524,15 @@ void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool gre
             else if (key == "seed") {
                 sp.seed = std::strtoull(val.c_str(), nullptr, 10);
                 sp.have_seed = true;
+            } else if (key == "img") {
+                size_t at = 0;
+                while (at <= val.size()) {
+                    const size_t comma = val.find(',', at);
+                    const std::string one = val.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                    if (!one.empty()) images.push_back(one);
+                    if (comma == std::string::npos) break;
+                    at = comma + 1;
+                }
             }
             continue;
         }
@@ -505,7 +561,8 @@ void handle_gen(Engine& engine, const std::string& line, GenGate& gate, bool gre
                 const double tps = ms > 0.0 ? (done * 1000.0 / ms) : 0.0;
                 std::printf("PP %d %d %.3f %.3f\n", done, total, ms, tps);
                 std::fflush(stdout);
-            });
+            },
+            images);
         std::printf("DONE %d %d %.3f %.3f %s 0 0 %d\n", gr.generated, gr.prompt, gr.prompt_ms, gr.decode_ms,
                     gr.finish.c_str(), gr.reused);
         std::fflush(stdout);
@@ -544,6 +601,7 @@ int run(int argc, char** argv) {
     std::string layer_split, gpus, kv_space;
     std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
+    std::string prefill_vram;
     std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
@@ -551,11 +609,13 @@ int run(int argc, char** argv) {
     std::string ssd_zerocopy;
     int page_probe = 32;
     std::string ssd_prefetch;
+    int ssd_prefetch_depth = 1;
     std::string ram_mode;
     std::string route_bias;
     float route_bias_in = 0.25f, route_bias_out = 0.15f, route_margin = 0.f;
     int route_protect = 2, route_pool = 12;
     std::string graphs;
+    std::string mmproj, vision_img, vision_out, vision_pixels, vision_size, vision_pixels_out;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -589,6 +649,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
         else if (a == "--minimax-prefill-expert-gemm") prefill_expert_gemm = next();
         else if (a == "--minimax-prefill-read") prefill_read = next();
+        else if (a == "--minimax-prefill-vram") prefill_vram = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
         else if (a == "--minimax-gpu-normrope") gpu_normrope = next();
@@ -598,6 +659,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
         else if (a == "--minimax-page-probe") page_probe = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-prefetch") ssd_prefetch = next();
+        else if (a == "--minimax-ssd-prefetch-depth") ssd_prefetch_depth = std::atoi(next().c_str());
         else if (a == "--minimax-route-bias") route_bias = next();
         else if (a == "--minimax-route-bias-in") route_bias_in = (float)std::atof(next().c_str());
         else if (a == "--minimax-route-bias-out") route_bias_out = (float)std::atof(next().c_str());
@@ -637,6 +699,12 @@ int run(int argc, char** argv) {
             pack_in = next();
             pack_out = next();
         }
+        else if (a == "--mmproj") mmproj = next();
+        else if (a == "--minimax-vision") vision_img = next();
+        else if (a == "--minimax-vision-out") vision_out = next();
+        else if (a == "--minimax-vision-pixels") vision_pixels = next();
+        else if (a == "--minimax-vision-size") vision_size = next();
+        else if (a == "--minimax-vision-pixels-out") vision_pixels_out = next();
         else if (a == "--prefill" || a == "--chunk") chunk = parse_chunk(next());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--minimax-pool-spin-us") pool_spin_us = std::atoi(next().c_str());
@@ -669,6 +737,75 @@ int run(int argc, char** argv) {
     }
     if (pack) return pack_quant(pack_type, pack_rows, pack_cols, pack_in, pack_out);
     if (unpack) return unpack_dequant(pack_type, pack_rows, pack_cols, pack_in, pack_out);
+    if (!vision_img.empty() || !vision_pixels.empty()) {
+        if (mmproj.empty()) {
+            std::fprintf(stderr, "strata-minimax: --minimax-vision needs --mmproj\n");
+            return 2;
+        }
+        if (vision_out.empty() && vision_pixels_out.empty()) {
+            std::fprintf(stderr, "strata-minimax: --minimax-vision needs --minimax-vision-out\n");
+            return 2;
+        }
+        try {
+            const auto t0 = std::chrono::steady_clock::now();
+            Vision vis(mmproj, cpu_threads > 0 ? cpu_threads : pool_workers);
+            ImageEmbeddings emb;
+            if (!vision_pixels_out.empty()) {
+                if (vision_img.empty()) {
+                    std::fprintf(stderr, "strata-minimax: --minimax-vision-pixels-out needs --minimax-vision\n");
+                    return 2;
+                }
+                std::vector<float> pv;
+                int64_t n = 0, rw = 0, rh = 0;
+                vis.preprocess_file(vision_img, pv, n, rw, rh);
+                write_npy_f32(vision_pixels_out, pv.data(), (int)n, 1176);
+                std::printf("PIXELS %lld %lld %lld %s\n", (long long)n, (long long)rw, (long long)rh,
+                            vision_pixels_out.c_str());
+                std::fflush(stdout);
+                return 0;
+            }
+            if (!vision_pixels.empty()) {
+                std::vector<float> pv;
+                int64_t rows = 0, cols = 0;
+                if (!read_npy_2d(vision_pixels, pv, rows, cols)) {
+                    std::fprintf(stderr, "strata-minimax: cannot read %s as a 2-D float32 .npy\n",
+                                 vision_pixels.c_str());
+                    return 2;
+                }
+                int64_t w = 0, h = 0;
+                if (!vision_size.empty()) {
+                    const auto x = vision_size.find('x');
+                    if (x == std::string::npos) {
+                        std::fprintf(stderr, "strata-minimax: --minimax-vision-size wants WxH\n");
+                        return 2;
+                    }
+                    w = std::atoll(vision_size.substr(0, x).c_str());
+                    h = std::atoll(vision_size.substr(x + 1).c_str());
+                }
+                if (w <= 0 || h <= 0) {
+                    std::fprintf(stderr, "strata-minimax: --minimax-vision-pixels needs --minimax-vision-size WxH\n");
+                    return 2;
+                }
+                if (cols != 1176) {
+                    std::fprintf(stderr, "strata-minimax: pixel_values must be [n, 1176], got [%lld, %lld]\n",
+                                 (long long)rows, (long long)cols);
+                    return 2;
+                }
+                emb = vis.encode_pixels(pv.data(), rows, w, h);
+            } else {
+                emb = vis.encode_file(vision_img);
+            }
+            write_npy_f32(vision_out, emb.data.data(), (int)emb.tokens, (int)emb.dim);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("VISION %lld %lld %lld %lld %.1f %s\n", (long long)emb.tokens, (long long)emb.dim,
+                        (long long)emb.width, (long long)emb.height, ms, vision_out.c_str());
+            std::fflush(stdout);
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-minimax: %s\n", e.what());
+            return 1;
+        }
+    }
     if (model.empty()) {
         std::fprintf(stderr, "strata-minimax: --model is required\n");
         return 2;
@@ -740,6 +877,7 @@ int run(int argc, char** argv) {
     opt.dump_dir = dump_dir;
     opt.dump_layers = dump_layers;
     opt.seed_hidden = seed_hidden;
+    opt.mmproj = mmproj;
     opt.layer_split = layer_split;
     opt.gpus = gpus;
     opt.kv_space = kv_space;
@@ -751,6 +889,7 @@ int run(int argc, char** argv) {
     opt.prefill_dense = prefill_dense;
     opt.prefill_expert_gemm = prefill_expert_gemm;
     opt.prefill_read = prefill_read;
+    opt.prefill_vram = prefill_vram;
     opt.expert_prefetch = expert_prefetch;
     opt.dense_mmvq = dense_mmvq;
     opt.gpu_normrope = gpu_normrope;
@@ -761,6 +900,7 @@ int run(int argc, char** argv) {
     opt.ssd_zerocopy = ssd_zerocopy;
     opt.page_probe = page_probe;
     opt.ssd_prefetch = ssd_prefetch;
+    opt.ssd_prefetch_depth = ssd_prefetch_depth;
     opt.route_bias = route_bias;
     opt.route_bias_in = route_bias_in;
     opt.route_bias_out = route_bias_out;
@@ -881,8 +1021,7 @@ int run(int argc, char** argv) {
             continue;
         }
         if (starts_with(line, "GENI ") || starts_with(line, "GENI")) {
-            std::printf("ERR minimax engine: GENI is not implemented (no vision encoder)\n");
-            std::fflush(stdout);
+            handle_gen(*engine, "GEN " + line.substr(4), gate, greedy, stats || profile_time);
             continue;
         }
         if (starts_with(line, "BGEN ") || starts_with(line, "BGENI ") || starts_with(line, "BGENI")) {
