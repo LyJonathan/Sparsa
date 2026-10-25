@@ -913,6 +913,8 @@ struct Engine::Impl {
     // ---- P3 expert tiers
     bool tiers_on = false;
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
+    bool verify_tensors = false;    // --minimax-verify-tensors: one digest line per tensor the engine resolved
+    int verify_mod = 1, verify_rem = 0;
     int vram_per_layer = 0;
     int ram_per_layer = 0;
     int moe_layers = 0;
@@ -1139,6 +1141,9 @@ struct Engine::Impl {
         scale_routed = (float)cfg.routed_scale;
         renorm = cfg.expert_weights_norm;
         dense_mmvq = opt.dense_mmvq != "off";
+        verify_tensors = opt.verify_tensors;
+        verify_mod = opt.verify_mod > 0 ? opt.verify_mod : 1;
+        verify_rem = opt.verify_rem;
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
@@ -1194,6 +1199,7 @@ struct Engine::Impl {
 
         ggml_cpu_init();
         load_tensors();
+        if (verify_tensors) verify_all_tensors();
         decide_norm();
         build_layers();
         read_eos();
@@ -1411,6 +1417,33 @@ struct Engine::Impl {
         output = must("output.weight");
         if (embd.ne0 != cfg.n_embd || embd.ne1 != cfg.n_vocab) fail("token_embd.weight has an unexpected shape");
         if (output.ne0 != cfg.n_embd || output.ne1 != cfg.n_vocab) fail("output.weight has an unexpected shape");
+    }
+
+    /// --minimax-verify-tensors: for every tensor this engine resolved, one line naming it, its byte length and an
+    /// FNV-1a 64 digest of the bytes it will actually read.  `--serve` and `--minimax-eval` both load through here, so
+    /// the pair of runs is the loader proof a mixed pack needs: the digests are compared against the same digest
+    /// taken over the donor packs' bytes, per tensor, N/N.  Opt-in and silent otherwise.
+    void verify_all_tensors() {
+        size_t n = 0, at = 0;
+        for (size_t si = 0; si < model.size(); ++si)
+        for (const TensorInfo& r : model.shard(si).tensors()) {
+            // `--minimax-verify-mod M --minimax-verify-rem R`: hash every M-th tensor starting at R.  A whole pass
+            // faults the pack's entire 130 GB through the mapping, which on this 128 GB box trips the RAM floor the
+            // launcher enforces, so the proof is taken in chunks and the union is the N/N.
+            if (++at % (size_t)verify_mod != (size_t)verify_rem + 1) continue;
+            Tensor t;
+            if (!try_must(r.name, t) || t.host == nullptr) continue;
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < t.bytes; ++i) {
+                h ^= (uint64_t)t.host[i];
+                h *= 1099511628211ull;
+            }
+            std::fprintf(stderr, "INFO minimax-verify %s %zu %016llx%c", r.name.c_str(), t.bytes,
+                         (unsigned long long)h, 10);
+            ++n;
+        }
+        std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod,
+                     verify_rem, 10);
     }
 
     void decide_norm() {
@@ -2550,6 +2583,44 @@ struct Engine::Impl {
             const size_t free_now = avail > headroom / 2 ? avail - headroom / 2 : 0;
             ram_budget = std::min(room, free_now);
         }
+        // P14 (Strata 0.2.6 / Project Maya v1.1.27 `--mmap-experts auto`): when EVERY expert left on the CPU fits
+        // in RAM with kCopyAllSpare to spare, take them all, and take them at load.  Maya's rule is all-or-none on
+        // purpose - "a PART copied cost decode speed on 32 / 64 GB of RAM" - because a partial tier still sends the
+        // rest to the drive every token while paying for the copies; with the tail gone the SSD leaves the decode
+        // entirely (their #339: +22% on 4x V100 with 504 GB, ~2x on a 20 GB Ada, +23% on 4x 3090 with 126 GB).
+        // The room is the same two figures Maya uses: the OS's available memory less the headroom, and - on Windows,
+        // where the pages are committed memory - what the commit limit can still back (RAM + page file).
+        constexpr size_t kCopyAllSpare = size_t{8} << 30;
+        bool ram_copy_all = false;
+        if (opt.memory_limit_mib <= 0 && !ram_inplace && !profile.empty()) {
+            size_t all_left = 0;
+            for (const Layer& L : layers) {
+                if (!L.moe) continue;
+                int in_vram = (int)L.vram.size();          // the per-device slot count, filled above
+                if (in_vram > (int)cfg.n_expert) in_vram = (int)cfg.n_expert;
+                all_left += (size_t)((int)cfg.n_expert - in_vram) * L.expert_bytes;
+            }
+            const size_t avail_room = avail > headroom ? avail - headroom : 0;
+#if defined(_WIN32)
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+            const size_t commit_room = GlobalMemoryStatusEx(&ms) ? (size_t)ms.ullAvailPageFile : SIZE_MAX;
+#else
+            const size_t commit_room = SIZE_MAX;
+#endif
+            const size_t can = std::min(avail_room, commit_room);
+            if (all_left + kCopyAllSpare <= can) {
+                ram_budget = all_left;
+                ram_copy_all = true;
+                std::fprintf(stderr,
+                             "INFO minimax-ram-tier copy-all: every expert left off the GPUs is %.1f GiB "
+                             "and %.1f GiB is usable (spare %.1f GiB >= 8 GiB), so the whole tail is pinned "
+                             "at load%c",
+                             (double)all_left / 1073741824.0, (double)can / 1073741824.0,
+                             (double)(can - all_left) / 1073741824.0, 10);
+            }
+        }
+        (void)ram_copy_all;   // the effect is in ram_budget; the fills below spend it
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
         // more slots than a cold one.  With a uniform count the layer budgets ignore the routing profile entirely;
         // the profile mass of MiniMax's layers is not uniform, so a proportional split holds more of the routes in

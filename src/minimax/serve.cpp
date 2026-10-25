@@ -592,7 +592,9 @@ int run(int argc, char** argv) {
     std::string profile, profile_save, routing_counts;
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
     int pool_spin_us = 0;
-    bool stats = false, stats_per_layer = false, profile_time = false, adaptive = true;
+    bool stats = false, verify_tensors = false;
+    int verify_mod = 1, verify_rem = 0;
+    bool stats_unused = false, stats_per_layer = false, profile_time = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
     std::string pack_type, pack_in, pack_out;
@@ -679,6 +681,9 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-ram-headroom-mib") ram_headroom_mib = std::atoi(next().c_str());
         else if (a == "--minimax-ram-mode") ram_mode = next();
         else if (a == "--minimax-stats") stats = true;
+        else if (a == "--minimax-verify-tensors") verify_tensors = true;
+        else if (a == "--minimax-verify-mod") verify_mod = std::atoi(next().c_str());
+        else if (a == "--minimax-verify-rem") verify_rem = std::atoi(next().c_str());
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
         else if (a == "--minimax-profile-time") profile_time = true;
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
@@ -875,6 +880,9 @@ int run(int argc, char** argv) {
     opt.pool_spin_us = pool_spin_us;
     opt.adaptive = adaptive;
     opt.stats = stats;
+    opt.verify_tensors = verify_tensors;
+    opt.verify_mod = verify_mod;
+    opt.verify_rem = verify_rem;
     opt.stats_per_layer = stats_per_layer;
     opt.profile_time = profile_time;
     opt.dump_dir = dump_dir;

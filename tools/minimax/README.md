@@ -1689,3 +1689,49 @@ the lock line's owner/pid/time and no BOM, a live owner refused, a stale PID tak
 refusal, the estimate from engine flags, the watchdog (a scripted `--ram-source seq:20,20,3` reading, so the decision
 and the kill are exercised without eating the box), stdin passthrough, the child's exit code, two launchers where one
 wins, and the interrupt release.
+
+### Round 4: the loader proof, and the A1 gate says IQ1_M is too lossy
+
+**The eval-path refusal was not a loader bug.** On the finished pack both entry points print the same line -
+`INFO minimax-norm mean=1.264317 over output_norm+blk.0.attn_norm (12288 values)` - and it is the same number the D3
+pack reports, so `--serve` and `--minimax-eval` resolve those tensors to identical bytes. The round-3 gate had opened
+the pack while `mix_layers.py` was still writing it. That line is now printed always, for exactly this reason.
+
+**The byte proof is mechanical now.** `--minimax-verify-tensors` prints `name bytes fnv1a-64` for every tensor the
+engine resolved; `--minimax-verify-mod M --minimax-verify-rem R` hashes every M-th one, because a whole pass faults
+the pack's 130 GB through the mapping and trips the launcher's RAM floor on a 128 GB box. `tools/minimax/verify_pack.py`
+compares those against the donor packs (a mixed pack holds one tensor *name* from more than one donor, so it picks the
+donor whose byte length matches what the engine read). Sample of the mixed pack, both a hot layer and a cold one:
+**6/6 identical to a donor** (`output_norm`, `blk.0.attn_norm`, `blk.59.attn_norm`, `blk.0.attn_q`, and
+`blk.35`/`blk.59` `ffn_gate_exps` - the cold ones read 528,482,304 B, the IQ1_M size, not D3's 698,351,616 B).
+
+**G3, six short prompts, the mixed pack against D3 in the same session and flags** (`--vram-slots 0`, all-CPU, so
+placement cannot be the difference; `--memory-limit-mib 96000`; 679 positions, two runs of three prompts):
+
+| arm | positions | top-1 | KL64 |
+| --- | ---: | ---: | ---: |
+| D3 (default) | 679 | **58.47%** | 1.328 |
+| **MIX, 25 of 57 MoE layers at IQ1_M (116.3 GB)** | 679 | **55.39%** | 1.453 |
+| - first half (chinese_local_llm, code_lru, math_bakery) | 339 | 47.49% (D3 48.9%) | 1.986 |
+| - second half (multi_turn_threads, prose_moe, tool_weather) | 340 | 63.24% (D3 67.9%) | 0.978 |
+
+**The gate fails: -3.1 points of top-1 against the default, and 4.0 below the 59.4% bar.** IQ1_M on 44% of the MoE
+layers - 40.5% of the profile's routing mass - is simply too lossy for this model, whatever it buys in speed (5.50
+tok/s against 3.56, ssd/token 2.8 against 13.4). The arithmetic for the next attempt: the honest middle band is
+**IQ2_XXS** (1,246 MB a layer against IQ1_M's 1,680 and D3's 2,322), so 25 IQ1_M + 25 IQ2_XXS would be 104.9 GB and
+lose less than half of what IQ1_M loses at the same size. That needs the published IQ2_XXS tier downloaded (~119 GB
+at this link's ~26 MB/s, so a job of its own), which is what round 4's remaining time did not cover.
+
+### The copy-all rule (Strata 0.2.6 / Maya v1.1.27 `--mmap-experts auto`), ported
+
+`init_tiers` now takes the whole tail when it fits with room to spare, instead of the profile's hottest part:
+
+```
+can = min(available - headroom, commit_room)          (commit_room = ullAvailPageFile on Windows)
+if (every expert left off the GPUs) + 8 GiB <= can:  pin all of them, at load
+```
+
+Maya's rule is all-or-none on purpose - "a PART copied cost decode speed on 32 / 64 GB of RAM" - because a partial
+tier still sends the rest to the drive every token while paying for the copies (their #339: +22% on 4 x V100 with
+504 GB, ~2x on a 20 GB Ada, +23% on 4 x 3090 with 126 GB). The 8 GiB spare is also what keeps this engine's own RAM
+floor satisfiable. It only fires when `--memory-limit-mib` is not given, so an operator's budget still wins.

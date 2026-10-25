@@ -154,7 +154,9 @@ def pack_str(s: str) -> bytes:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--hot', required=True, help='the reference pack (dense tensors and the warm layers)')
-    ap.add_argument('--cold', required=True, help='the pack the cold layers come from')
+    ap.add_argument('--cold', required=True, help='the pack the coldest layers come from (the lowest bits)')
+    ap.add_argument('--mid', help='a middle band pack (e.g. IQ2_XXS) taken by the next-coldest layers')
+    ap.add_argument('--mid-frac', type=float, default=0.0, help='share of MoE layers from the middle band')
     ap.add_argument('--out', required=True)
     ap.add_argument('--cold-frac', type=float, default=0.44, help='share of MoE layers from the cold pack')
     ap.add_argument('--order', default='mass', choices=('mass', 'deep', 'shallow'))
@@ -166,6 +168,7 @@ def main(argv=None) -> int:
     hot_first, cold_first = Path(a.hot), Path(a.cold)
     hot = index_pack(hot_first, gguf)
     cold = index_pack(cold_first, gguf)
+    mid = index_pack(Path(a.mid), gguf) if a.mid else {}
     print(f'hot  {hot_first.name}: {len(hot)} tensors, {len(shards(hot_first))} shards')
     print(f'cold {cold_first.name}: {len(cold)} tensors, {len(shards(cold_first))} shards')
 
@@ -190,15 +193,21 @@ def main(argv=None) -> int:
         rank = sorted(moe_layers, key=lambda li: (mass[li], -li))
     n_cold = max(0, min(len(moe_layers), int(round(a.cold_frac * len(moe_layers)))))
     cold_layers = set(rank[:n_cold])
+    n_mid = max(0, min(len(moe_layers) - n_cold, int(round(a.mid_frac * len(moe_layers))))) if a.mid else 0
+    mid_layers = set(rank[n_cold:n_cold + n_mid]) if n_mid else set()
 
-    expert_total = sum(layer_bytes(hot, li) if li not in cold_layers else layer_bytes(cold, li) for li in moe_layers)
+    def src_idx(li):
+        return cold if li in cold_layers else (mid if li in mid_layers else hot)
+    expert_total = sum(layer_bytes(src_idx(li), li) for li in moe_layers)
     other_total = sum(v[4] for k, v in hot.items() if not k.endswith('_exps.weight'))
     mass_cold = 100.0 * sum(mass[li] for li in cold_layers) / max(1e-9, sum(mass.values())) if a.profile else 0.0
-    print(f'MoE layers {len(moe_layers)}, {n_cold} cold ({100.0 * n_cold / len(moe_layers):.1f}%, '
-          f'{mass_cold:.1f}% of the profile mass)')
+    print(f'MoE layers {len(moe_layers)}, {n_cold} coldest ({100.0 * n_cold / len(moe_layers):.1f}%, '
+          f'{mass_cold:.1f}% of the profile mass)' + (f', {n_mid} middle' if n_mid else ''))
     print(f'experts: hot {hot_per / 1e9:.3f} GB/layer, cold {cold_per / 1e9:.3f} -> {expert_total / 1e9:.1f} GB')
     print(f'other tensors {other_total / 1e9:.2f} GB -> file ~{(expert_total + other_total) / 1e9:.1f} GB')
-    print('cold layers:', ','.join(str(x) for x in sorted(cold_layers)))
+    print('coldest layers:', ','.join(str(x) for x in sorted(cold_layers)))
+    if n_mid:
+        print('middle layers:', ','.join(str(x) for x in sorted(mid_layers)))
     if a.dry_run:
         return 0
 
@@ -213,7 +222,8 @@ def main(argv=None) -> int:
     for name in order:
         li = int(name.split('.')[1]) if name.startswith('blk.') else -1
         use_cold = name.endswith('_exps.weight') and li in cold_layers
-        src = cold[name] if use_cold else hot[name]
+        use_mid = name.endswith('_exps.weight') and li in mid_layers
+        src = (cold if use_cold else mid if use_mid else hot).get(name) or hot[name]
         path, qtype, shape, offset, nbytes = src
         infos += pack_str(name)
         infos += struct.pack('<I', len(shape))

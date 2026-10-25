@@ -47,6 +47,9 @@ struct EngineOptions {
                                     ///< is the tier and the CPU lane reads the mapping (nothing is copied)
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
+    bool verify_tensors = false;    ///< --minimax-verify-tensors: name/size/FNV-1a of every tensor the engine resolved
+    int verify_mod = 1;             ///< --minimax-verify-mod: hash every M-th tensor (the proof is taken in chunks)
+    int verify_rem = 0;             ///< --minimax-verify-rem: ... starting at this remainder
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
     bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 
