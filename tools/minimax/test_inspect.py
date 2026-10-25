@@ -92,17 +92,18 @@ def test_serve_handshake_and_refusal(tmp_path):
     build(gguf)
     p = run(['--model', str(gguf), '--serve', '--minimax-allow-nonstandard', '--max-context', '1024',
              '--not-an-engine-option', '700', '--batch', '1', '--cpu-threads', '1'],
-            stdin='GEN 8 temperature=0.7 1,2,3\nGENI 4 embeddings.bin 1,2\nSTOP\nQUIT\n')
+            stdin='GEN 8 temperature=0.7 1,2,3\nGENI 4 img=nope.png 1,2\nSTOP\nQUIT\n')
     assert p.returncode == 0, p.stderr
     assert 'INFO engine=minimax-m3' in p.stdout
     assert 'READY 1024 stop' in p.stdout
-    # The zero-weight file really runs. Eight new tokens, then GENI is refused with no second DONE.
+    # The zero-weight file really runs. Eight new tokens, then a picture is refused (this engine was started
+    # without --mmproj) with no second DONE.
     tokens = [ln for ln in p.stdout.splitlines() if ln.startswith('T ')]
     dones = [ln for ln in p.stdout.splitlines() if ln.startswith('DONE ')]
     assert len(tokens) == 8, p.stdout
     assert len(dones) == 1, p.stdout
     assert dones[0].split()[5] == 'length'
-    assert 'ERR minimax engine: GENI is not implemented (no vision encoder)' in p.stdout
+    assert 'ERR minimax engine: an image was sent but no vision encoder is loaded (pass --mmproj)' in p.stdout
     assert 'forward pass not implemented' not in p.stdout
     # Unknown serve flags are skipped, not fatal.
     assert 'ignoring --not-an-engine-option 700' in p.stderr
