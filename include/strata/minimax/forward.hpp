@@ -51,6 +51,9 @@ struct EngineOptions {
     int verify_mod = 1;             ///< --minimax-verify-mod: hash every M-th tensor (the proof is taken in chunks)
     int verify_rem = 0;             ///< --minimax-verify-rem: ... starting at this remainder
     bool verify_exit = false;       ///< --minimax-verify-exit: stop right after the resolution list
+    std::vector<std::string> expert_source;  ///< --expert-source lo-hi=<pack>: read those layers' expert tensors
+                                             ///< from that pack instead of the file being run (a sweep candidate
+                                             ///< without writing a second 130 GB GGUF)
     float pcie_share = 0.f;         ///< --minimax-pcie-share: share of each layer's RAM-tier experts the GPU reads
                                     ///< in place out of the mapped RAM tier (0 = off)
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs

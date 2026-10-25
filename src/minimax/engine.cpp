@@ -927,6 +927,26 @@ struct Engine::Impl {
     // P15 (A3, Maya #476): the zero-copy PCIe lane.  `ram_dev_base` is the device view of the pinned RAM tier after
     // `cudaHostRegisterMapped`; when it exists, a share of each layer's RAM-tier experts is computed by the GPU
     // reading them in place.  0 share = off, and a failed registration leaves it off with a line saying so.
+    // P16: --expert-source lo-hi=<pack>.  One model per range, kept open for the run.
+    struct AltPack {
+        int lo = 0, hi = 0;
+        std::string path;
+        std::unique_ptr<GgufModel> model;
+    };
+    std::vector<AltPack> alt_packs;
+    /// The leaf name of the file a tensor is resolved from (the base pack or an --expert-source).
+    const char* src_leaf(const std::string& name) {
+        if (name.rfind("blk.", 0) == 0 && name.find("_exps.weight") != std::string::npos) {
+            const int li = std::atoi(name.c_str() + 4);
+            for (const AltPack& a : alt_packs)
+                if (a.model != nullptr && li >= a.lo && li <= a.hi && a.model->find(name, nullptr) != nullptr)
+                    return alt_pack_leaf[(size_t)(&a - alt_packs.data())].c_str();
+        }
+        return base_leaf.c_str();
+    }
+    std::string opt_model_path;
+    std::vector<std::string> alt_pack_leaf;
+    std::string base_leaf;
     float pcie_share = 0.f;
     void* ram_dev_base = nullptr;
     int64_t tok_pcie = 0;
@@ -1145,7 +1165,8 @@ struct Engine::Impl {
         rb_picks += top;
     }
 
-    explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
+    explicit Impl(const std::string& path, const EngineOptions& o)
+        : opt(o), opt_model_path(path), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
         const std::string bad = check_structure(cfg);
         if (!bad.empty()) fail(bad);
@@ -1218,6 +1239,7 @@ struct Engine::Impl {
         tok_graph.assign((size_t)cfg.n_layers, nullptr);
 
         ggml_cpu_init();
+        open_alt_packs();
         load_tensors();
         if (verify_tensors) verify_all_tensors();
         decide_norm();
@@ -1353,7 +1375,24 @@ struct Engine::Impl {
 
     bool try_must(const std::string& name, Tensor& t) {
         size_t shard = 0;
-        const TensorInfo* info = model.find(name, &shard);
+        // P16: `--expert-source 3-7=<pack>` - an expert tensor whose layer is in the range is read from that pack
+        // instead of the file being run, so a quality sweep over layer blocks needs no second 130 GB GGUF: the
+        // base pack supplies everything else and the alternate supplies those layers' `ffn_*_exps` tensors.  The
+        // lookup is the same GgufModel one the base uses, so the bytes are the donor's own, unmoved.
+        const GgufModel* src = &model;
+        int alt_at = -1;
+        if (!alt_packs.empty() && name.rfind("blk.", 0) == 0 && name.find("_exps.weight") != std::string::npos) {
+            const int li = std::atoi(name.c_str() + 4);
+            for (size_t i = 0; i < alt_packs.size(); ++i) {
+                if (alt_packs[i].model == nullptr) continue;
+                if (li < alt_packs[i].lo || li > alt_packs[i].hi) continue;
+                if (alt_packs[i].model->find(name, nullptr) == nullptr) continue;
+                src = alt_packs[i].model.get();
+                alt_at = (int)i;
+                break;
+            }
+        }
+        const TensorInfo* info = src->find(name, &shard);
         if (!info) return false;
         t.name = name;
         t.type = (int)info->type;
@@ -1368,11 +1407,11 @@ struct Engine::Impl {
         t.ne1 = info->shape.size() > 1 ? (int64_t)info->shape[1] : 1;
         t.ne2 = info->shape.size() > 2 ? (int64_t)info->shape[2] : 1;
         if (info->shape.size() > 3) fail(name + " has more than 3 dimensions");
-        if (!model.in_bounds(*info, shard))
+        if (!src->in_bounds(*info, shard))
             fail(name + ": has an unknown type or lies past the end of its shard");
-        t.host = model.shard(shard).tensor_data(*info);
+        t.host = src->shard(shard).tensor_data(*info);
         t.shard = shard;
-        t.file_offset = model.shard(shard).data_start() + info->offset;
+        t.file_offset = src->shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
         if (strata::kernels::ikq::is_iqk_type(t.type)) {
             // An ik_llama.cpp format ported into the engine: ggml has no ids for these, so the geometry and
@@ -1433,6 +1472,34 @@ struct Engine::Impl {
         return w;
     }
 
+    void open_alt_packs() {
+        // P16: `--expert-source 3-7=D:\...gguf` (repeatable).  Opened here, once, and kept for the run; a range with
+        // no pack or a pack that will not open is refused by name, because a silent fallback would measure the base
+        // file and call it a block.
+        for (const std::string& spec : opt.expert_source) {
+            const auto eq = spec.find('=');
+            if (eq == std::string::npos) fail("--expert-source needs lo-hi=path (got '" + spec + "')");
+            const std::string range = spec.substr(0, eq);
+            const std::string path = spec.substr(eq + 1);
+            AltPack a;
+            a.path = path;
+            const auto dash = range.find('-');
+            a.lo = std::atoi(range.c_str());
+            a.hi = dash == std::string::npos ? a.lo : std::atoi(range.c_str() + dash + 1);
+            if (a.hi < a.lo) std::swap(a.lo, a.hi);
+            a.model = std::make_unique<GgufModel>(GgufModel::open(path));
+            std::fprintf(stderr, "INFO minimax-expert-source layers %d-%d from %s%c", a.lo, a.hi, path.c_str(), 10);
+            alt_packs.push_back(std::move(a));
+        }
+        for (const AltPack& a : alt_packs) alt_pack_leaf.push_back(base_leaf_name(a.path));
+        base_leaf = base_leaf_name(opt_model_path);
+    }
+
+    static std::string base_leaf_name(const std::string& path) {
+        const size_t at = path.find_last_of("/\\");
+        return at == std::string::npos ? path : path.substr(at + 1);
+    }
+
     void load_tensors() {
         embd = must("token_embd.weight");
         output = must("output.weight");
@@ -1451,8 +1518,9 @@ struct Engine::Impl {
         for (size_t si = 0; si < model.size(); ++si)
         for (const TensorInfo& r : model.shard(si).tensors()) {
             if ((++at % (size_t)verify_mod) != (size_t)verify_rem) continue;
-            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d%c", r.name.c_str(), si,
-                         (unsigned long long)r.offset, (unsigned long long)tensor_payload_bytes(r), (int)r.type, 10);
+            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d %s%c", r.name.c_str(), si,
+                         (unsigned long long)r.offset, (unsigned long long)tensor_payload_bytes(r), (int)r.type,
+                         src_leaf(r.name), 10);
             ++n;
         }
         std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod, verify_rem,

@@ -24,7 +24,7 @@ from pathlib import Path
 
 FNV_OFFSET = 1469598103934665603
 FNV_PRIME = 1099511628211
-VERIFY_RE = re.compile(r'INFO minimax-verify (\S+) (\d+) (\d+) (\d+) (\d+)$')
+VERIFY_RE = re.compile(r'INFO minimax-verify (\S+) (\d+) (\d+) (\d+) (\d+)(?: (\S+))?$')
 CHUNK = 64 << 20   # bounded, buffered reads: no mapping, so the proof costs a few MB of RAM, not the pack's size
 
 
@@ -99,7 +99,10 @@ def parse_log(path: Path) -> dict:
     for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
         m = VERIFY_RE.search(line.rstrip())
         if m:
-            got[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+            # the sixth field, when present, is the leaf name of the file the tensor came from - which with
+            # --expert-source is not always the pack being run
+            got[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)),
+                               m.group(6) or '')
     return got
 
 
@@ -114,12 +117,16 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     gguf = llama_gguf()
     pack_shards = shards(Path(a.pack))
+    donor_shards = [Path(x) for pth in a.donor for x in shards(Path(pth))]
     # a split GGUF stores each tensor at `data_start(shard) + tensor.offset`; the engine reports the offset relative
-    # to its shard's data block, so the file position needs that shard's data start added.
-    pack_data_start = []
-    for pth in pack_shards:
+    # to its shard's data block, so the file position needs that file's data start added.  With --expert-source a
+    # tensor can come from an alternate pack, so every candidate file's data start is read once.
+    data_start = {}
+    for pth in pack_shards + donor_shards:
+        if pth in data_start:
+            continue
         r = gguf.GGUFReader(str(pth))
-        pack_data_start.append(int(r.data_offset))
+        data_start[pth] = int(r.data_offset)
         del r
     donors = index_donors([Path(p) for p in a.donor], gguf)
     print(f'donors: {len(donors)} tensor names from {len(a.donor)} pack(s)')
@@ -142,18 +149,25 @@ def main(argv=None) -> int:
             if only_here or moved:
                 ok_all = False
         prev = offs
-        for name, (shard, offset, nbytes, qtype) in got.items():
-            if shard >= len(pack_shards):
+        for name, (shard, offset, nbytes, qtype, leaf) in got.items():
+            model_file = None
+            if leaf:
+                for cand in pack_shards + donor_shards:
+                    if cand.name == leaf:
+                        model_file = cand
+                        break
+            if model_file is None:
+                model_file = pack_shards[shard] if shard < len(pack_shards) else None
+            if model_file is None:
                 missing += 1
                 continue
-            model_file = pack_shards[shard]
             if name not in donors:
                 missing += 1
                 if missing <= 5:
                     print(f'{label:>10}: {name} is not in any donor')
                 continue
             dh, dn = digest_donor(pick_donor(donors[name], nbytes))
-            if dh == sha256_range(model_file, pack_data_start[shard] + offset, nbytes) and dn == nbytes:
+            if dh == sha256_range(model_file, data_start.get(model_file, 0) + offset, nbytes) and dn == nbytes:
                 same += 1
             else:
                 differ += 1

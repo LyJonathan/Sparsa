@@ -596,6 +596,7 @@ int run(int argc, char** argv) {
     int verify_mod = 1, verify_rem = 0;
     bool verify_exit = false;
     float pcie_share = 0.f;
+    std::vector<std::string> expert_source;
     bool stats_unused = false, stats_per_layer = false, profile_time = false, adaptive = true;
     bool pack = false, unpack = false;
     int64_t pack_rows = 0, pack_cols = 0;
@@ -688,6 +689,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-verify-rem") verify_rem = std::atoi(next().c_str());
         else if (a == "--minimax-verify-exit") verify_exit = true;
         else if (a == "--minimax-pcie-share") pcie_share = (float)std::atof(next().c_str());
+        else if (a == "--expert-source") expert_source.push_back(next());
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
         else if (a == "--minimax-profile-time") profile_time = true;
         else if (a == "--no-minimax-adaptive" || a == "--minimax-no-adaptive") adaptive = false;
@@ -889,6 +891,7 @@ int run(int argc, char** argv) {
     opt.verify_rem = verify_rem;
     opt.verify_exit = verify_exit;
     opt.pcie_share = pcie_share;
+    opt.expert_source = expert_source;
     opt.stats_per_layer = stats_per_layer;
     opt.profile_time = profile_time;
     opt.dump_dir = dump_dir;

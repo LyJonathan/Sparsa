@@ -1798,3 +1798,39 @@ GPU expert path with the **device address of their pinned bytes** as the base, i
 
 Not measured yet: the share has to be set from the two links' measured rates (the startup `INFO minimax-link` line
 gives them), and the whole-token A/B that keeps the lane only when it is >3% faster is still to be written.
+
+### Round 9: D3's baseline on the sweep's own flags, the link log's first reading, and two bugs in --expert-source
+
+**The baseline is measured with exactly the blocks' flags** (`--vram-slots 0 --memory-limit-mib 80000
+--layer-split auto --cpu-threads 12`, same six prompts, same reference logits, same build):
+
+| arm | prompt set | positions | top-1 | KL64 |
+| --- | --- | ---: | ---: | ---: |
+| D3 | subset (chinese_local_llm + code_lru) | 211 | 41.23% | **2.7021** |
+| D3 | all six | 679 | 58.32% | **1.3332** |
+
+That supersedes the 58.47%/1.328 taken at `--memory-limit-mib 104000`; the deltas a block is ranked by are against
+these two numbers.
+
+**The KL anomaly is not reproduced by the flag path yet, and the flag has two bugs.** `--expert-source 3-7=<IQ1_M>`
+(the round-9 answer to "don't write a 100+ GB file per block") resolves an expert tensor from an alternate pack
+through the same `GgufModel` lookup, and it reaches the model - but the run then dies with *"minimax SSD read: short
+read at 5897672192"*: the **SSD tier** still resolves its file by shard index against the **base** pack's file list,
+so a layer whose bytes live in the alternate pack is read from the wrong file. Until the SSD path is source-aware
+(the next fix), a block gate has to run with those experts resident - `--memory-limit-mib` large enough to hold them,
+which is exactly what the earlier file-based block did.
+
+That also means the earlier file-based `3-7` row (KL64 2.344 against D3's 2.686) has not been re-derived, and per the
+round-9 rule it is **not** used for ranking until it is.
+
+**`INFO minimax-link` first reading, under load:**
+
+```
+INFO minimax-link dev=0 h2d=3.29 GB/s pcie=gen3 x4
+INFO minimax-link dev=1 h2d=3.28 GB/s pcie=gen4 x16
+```
+
+NVML reports device 0 at **gen3 x4** - matching the ~3.5 GB/s ceiling the round-9 note derived - and device 1 at
+gen4 x16, but *both* measure ~3.3 GB/s, so the probe is not separating them: a 32 MiB pageable copy per call is
+probably limited by the copy engine's staging rather than by the link. The probe needs pinned source memory and a
+larger transfer before its number is used to split work between the lanes.
