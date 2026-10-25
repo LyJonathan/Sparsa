@@ -63,6 +63,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/iq_mt.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -913,6 +914,8 @@ struct Engine::Impl {
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
+    DevPtr pf_q32, pf_iq32;      // P13: the exact window's f32 queries (the token path's attention reads f32)
+    size_t pf_q32_bytes = 0, pf_iq32_bytes = 0;
     std::vector<float> pf_att_h;   // P7: device attention output when the layer's projection is on the CPU
     std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
@@ -5418,6 +5421,23 @@ struct Engine::Impl {
     // size comes from the scratch buffer, so an `lm_head` of 200 K rows costs a few dozen launches, not 200 K.
     // `row0`/`nrows` select a band of the weight rows (the lm_head is projected a vocabulary tile at a time so the
     // device never needs a 200 K x n_embd output buffer); -1/nrows<=0 means the whole matrix.
+    /// A dense projection for a small window (P13): the packed MMVQ path the token path uses, all `T` rows in one
+    /// launch.  `native_mmvq`'s multi-column layout is bitwise equal to its single-column one (the kernels' own
+    /// contract, `native_mmvq_set_multi_exact`), so a verify window's projections are the token path's arithmetic -
+    /// which the token path's `gemv` also reaches through, one column at a time.
+    bool mmvq_small(const Tensor& t, const float* X, int T, float* Y, int ldy, int64_t row0 = 0, int64_t nrows = 0) {
+        if (T < 1 || T > 8) return false;
+        if (!t.gpu || !t.dev.p || t.dev_f32 || !mmvq_dense_fits(t.type, t.ne0)) return false;
+        if (pf.empty() || !P().xq) return false;
+        const int64_t K = t.ne0;
+        if ((size_t)T * (size_t)(K / 32) * 36 > (size_t)rows_cap * q8_1_bytes(cfg.n_embd)) return false;
+        strata::kernels::quantize_q8_1_rows(X, T, (int)K, P().xq, cu::stream_legacy());
+        const int64_t N = nrows > 0 ? nrows : t.ne1;
+        const void* w = (const uint8_t*)t.dev.p + (size_t)row0 * t.row_bytes;
+        strata::kernels::native_mmvq(t.type, w, P().xq, Y, (int)K, (int)N, T, cu::stream_legacy());
+        return true;
+    }
+
     void gemm_gpu(const Tensor& t, const uint16_t* X16, const float* X32, float* Y, int T, int ldy, int64_t row0 = -1,
                   int64_t nrows = 0) {
         if (!t.gpu) fail(t.name + ": batched GEMM asked for a host tensor");
@@ -5541,6 +5561,28 @@ struct Engine::Impl {
         std::vector<uint8_t> aq(act_bytes * (size_t)T);
         for (int c = 0; c < T; ++c) act->from_float(X + (size_t)c * ldx, aq.data() + (size_t)c * act_bytes, K);
         const ggml_vec_dot_t dot = t.cpu->vec_dot;
+        // P13: a verify window routes one expert row to several tokens.  The multi-token row decodes the block once
+        // and is bit-identical to `dot` per column (src/kernels/cpu/iq_mt_test.cpp), so a window's expert pass costs
+        // one decode per row instead of one per (row, token), and the numbers do not move.
+        static const bool mt_on = [] {
+            const char* e = std::getenv("STRATA_IQ_MT");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (T > 1 && mt_on && strata::kernels::mt::supported(t.type)) {
+            // groups of up to 8 columns: one row decode serves eight tokens, a prompt chunk is walked in groups
+            pool.run(N, [&](int a, int b) {
+                for (int r = a; r < b; ++r) {
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
+                    for (int c0 = 0; c0 < T; c0 += strata::kernels::mt::kMaxCols) {
+                        const int n = std::min(strata::kernels::mt::kMaxCols, T - c0);
+                        const uint8_t* ptrs[strata::kernels::mt::kMaxCols];
+                        for (int c = 0; c < n; ++c) ptrs[c] = aq.data() + (size_t)(c0 + c) * act_bytes;
+                        strata::kernels::mt::dot_rows(t.type, row, ptrs, n, Y + (size_t)c0 * ldy + r, ldy, K);
+                    }
+                }
+            });
+            return;
+        }
         pool.run(N, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 const uint8_t* row = base + (size_t)r * t.row_bytes;
@@ -5958,12 +6000,23 @@ struct Engine::Impl {
     void moe_batch_cpu(const Layer& L, const float* H, int T, float* yout) {
         const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
         const int embd = (int)cfg.n_embd, ff = (int)cfg.n_ff_exp;
+        // P13: a verify window must be the token path's arithmetic, so a small window takes the router the token path
+        // takes (`gemv`, the device's packed q8_1 dots) one row at a time, and accumulates each token's experts in
+        // ROUTE order (`moe()` adds them in that order, and float addition is not associative).
+        const bool exact_window = T <= strata::kernels::mt::kMaxCols;
         std::vector<float> logits((size_t)T * nexp);
-        gemm_cpu(L.router, H, T, embd, logits.data(), nexp);
+        if (exact_window && L.router.gpu) {
+            for (int t = 0; t < T; ++t) gemv(L.router, H + (size_t)t * embd, logits.data() + (size_t)t * nexp);
+        } else {
+            gemm_cpu(L.router, H, T, embd, logits.data(), nexp);
+        }
         std::vector<int> ids;
         std::vector<float> wts;
         pf_routes(L, logits.data(), T, ids, wts);
         std::fill(yout, yout + (size_t)T * embd, 0.f);
+        // the routed experts' outputs per (token, route), so the final sum can follow `moe()`'s order
+        std::vector<float> per_route;
+        if (exact_window) per_route.assign((size_t)T * (size_t)top * (size_t)embd, 0.f);
         std::vector<std::vector<int>> tok_of((size_t)nexp);
         for (int t = 0; t < T; ++t)
             for (int s = 0; s < top; ++s) tok_of[(size_t)ids[(size_t)t * top + s]].push_back(t);
@@ -6015,17 +6068,43 @@ struct Engine::Impl {
                     for (size_t i = 0; i < (size_t)nt * embd; ++i) yd[i] *= fd;
                 for (int i = 0; i < nt; ++i) {
                     const int t = toks[a + (size_t)i];
+                    const float* src = yd.data() + (size_t)i * embd;
+                    if (exact_window) {
+                        for (int s = 0; s < top; ++s)
+                            if (ids[(size_t)t * top + s] == e)
+                                std::memcpy(per_route.data() + ((size_t)t * top + s) * embd, src,
+                                            (size_t)embd * sizeof(float));
+                        continue;
+                    }
                     float wsum = 0.f;
                     for (int s = 0; s < top; ++s)
                         if (ids[(size_t)t * top + s] == e) wsum += wts[(size_t)t * top + s];
                     float* dst = yout + (size_t)t * embd;
-                    const float* src = yd.data() + (size_t)i * embd;
                     for (int c = 0; c < embd; ++c) dst[c] += wsum * src[c];
                 }
             }
         }
+        if (exact_window) {
+            // `moe()`: yout += w[j] * expert_j, in route order, then the routed scale
+            for (int t = 0; t < T; ++t) {
+                float* dst = yout + (size_t)t * embd;
+                for (int s = 0; s < top; ++s) {
+                    const float wj = wts[(size_t)t * top + s];
+                    const float* src = per_route.data() + ((size_t)t * top + s) * embd;
+                    for (int c = 0; c < embd; ++c) dst[c] += wj * src[c];
+                }
+            }
+        }
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout[i] *= scale_routed;
-        if (L.have_shared) {
+        if (L.have_shared && exact_window) {
+            // the token path's shared expert is `mlp()`: device gemvs and the host swigluoai, one row at a time
+            std::vector<float> ye((size_t)embd);
+            for (int t = 0; t < T; ++t) {
+                mlp(L.gate, L.up, L.down, 0, H + (size_t)t * embd, ye.data(), (int)L.gate.ne1);
+                float* dst = yout + (size_t)t * embd;
+                for (int c = 0; c < embd; ++c) dst[c] += ye[(size_t)c];
+            }
+        } else if (L.have_shared) {
             const int sff = (int)L.gate.ne1;
             for (int c = 0; c < T; c += (int)rows_cap) {
                 const int nt = std::min<int>((int)rows_cap, T - c);
@@ -6377,21 +6456,34 @@ struct Engine::Impl {
             // the device and writes fp16 straight into the KV cache (and the MSA query buffer).
             const bool dev_prep = dev_attn && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
                                   (int64_t)pos0 + T <= p_rope_cap();
+            // P13: a small window takes the token path's attention one row at a time, which reads the queries as f32
+            const bool exact_window = dev_prep && T <= strata::kernels::mt::kMaxCols;
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
-                gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
+                if (!mmvq_small(L.wq, p.p32, T, p.y32, qlen)) gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
                 if (!dev_prep) cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
                 else {
                     pf_pos.resize((size_t)T);
                     for (int t = 0; t < T; ++t) pf_pos[(size_t)t] = (int32_t)(pos0 + t);
                     cu::copy_h2d(p.d_pos.p, pf_pos.data(), (size_t)T * sizeof(int32_t));
-                    cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H, H,
-                                       D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
-                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    if (exact_window) {
+                        const size_t need = (size_t)T * (size_t)qlen * 4;
+                        if (!pf_q32.p || pf_q32_bytes < need) {
+                            pf_q32 = DevPtr(cu::alloc(need + 4096));
+                            pf_q32_bytes = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, (float*)pf_q32.p, nullptr, (int64_t)T * H, H,
+                                           D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    } else {
+                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H,
+                                           H, D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    }
                 }
-                gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
+                if (!mmvq_small(L.wk, p.p32, T, p.y32, klen)) gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
                 if (!dev_prep) cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
                 else {
                     uint16_t* kdst = (uint16_t*)p.a16;
@@ -6407,7 +6499,7 @@ struct Engine::Impl {
                                    pf_k16.data(), (int)((size_t)T * (size_t)klen));
                     }
                 }
-                gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
+                if (!mmvq_small(L.wv, p.p32, T, p.y32, klen)) gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
                 if (!dev_prep) cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
                 else {
                     uint16_t* vdst = (uint16_t*)p.a16;
@@ -6457,14 +6549,24 @@ struct Engine::Impl {
                 iqf.resize((size_t)T * ilen);
                 ikf.resize((size_t)T * cfg.idx_dim);
                 if (gpu) {
-                    gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
+                    if (!mmvq_small(L.iq, p.p32, T, p.y32, ilen)) gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
                     if (!dev_prep) cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
-                    else
+                    else if (exact_window) {
+                        const size_t need = (size_t)T * (size_t)ilen * 4;
+                        if (!pf_iq32.p || pf_iq32_bytes < need) {
+                            pf_iq32 = DevPtr(cu::alloc(need + 4096));
+                            pf_iq32_bytes = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, (float*)pf_iq32.p, nullptr, (int64_t)T * HI,
+                                           HI, (int)cfg.idx_dim, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    } else {
                         cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, nullptr, (uint16_t*)p.d_iq16.p,
                                            (int64_t)T * HI, HI, (int)cfg.idx_dim, (int)cfg.n_rot,
                                            (const float*)W().rope_cos.p, (const float*)W().rope_sin.p,
                                            (const int32_t*)p.d_pos.p, eps, nullptr);
-                    gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
+                    }
+                    if (!mmvq_small(L.ik, p.p32, T, p.y32, (int)cfg.idx_dim)) gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
                     if (!dev_prep) cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
                     else
                         cu::head_norm_rope(p.y32, (const float*)L.d_ikn.p, nullptr,
@@ -6504,7 +6606,32 @@ struct Engine::Impl {
                 if (dev_prep) cu::sync();
                 t_kvw += dur(tix0, pfclock::now());
             }
-            if (dev_attn) {
+            if (exact_window) {
+                // P13: the token path's attention, one row at a time: the same block selection, the same gather and
+                // the same MSA kernel that a lone token goes through, so the window's attention is its arithmetic.
+                cu::sync();
+                const int64_t ilen_row = (int64_t)HI * cfg.idx_dim;
+                for (int t = 0; t < T; ++t) {
+                    const float* qd = (const float*)pf_q32.p + (size_t)t * (size_t)qlen;
+                    const float* iqd = (L.indexer && pf_iq32.p)
+                                           ? (const float*)pf_iq32.p + (size_t)t * (size_t)ilen_row
+                                           : nullptr;
+                    attend((int)li, L, pos0 + t, nullptr, qd, iqd, p.p32 + (size_t)t * (size_t)qlen);
+                }
+                cu::sync();
+                if (!gpu) {
+                    pf_att_h.resize((size_t)T * (size_t)qlen);
+                    cu::copy_d2h(pf_att_h.data(), p.p32, pf_att_h.size() * sizeof(float));
+                    gemm_cpu(L.wo, pf_att_h.data(), T, qlen, pf_moe_h.data(), ne);
+                } else {
+                    if (!mmvq_small(L.wo, p.p32, T, p.y32, ne)) {
+                        cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
+                        cu::sync();
+                        gemm_gpu(L.wo, p.a16, p.p32, p.y32, T, ne);
+                    }
+                    cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
+                }
+            } else if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
                 int nb = 0;
                 if (L.indexer) {
@@ -6564,7 +6691,8 @@ struct Engine::Impl {
                 } else {
                     if (!prefill_dense_f32) cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
                     cu::sync();
-                    gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
+                    if (!mmvq_small(L.wo, p.p32, T, p.y32, ne))
+                        gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
                     cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
                     t_prep += dur(tw0, pfclock::now());
                 }
@@ -6591,7 +6719,12 @@ struct Engine::Impl {
             const float* hn = pf_q.data();
             if (!L.moe) {
                 const int ff = (int)L.gate.ne1;
-                if (gpu) {
+                if (gpu && T <= strata::kernels::mt::kMaxCols) {
+                    // the dense FFN of a small window: `mlp()`, the token path's own call (device gemvs plus the host
+                    // swigluoai), which the batched tensor-core pass does not reproduce bit for bit
+                    for (int t = 0; t < T; ++t)
+                        mlp(L.gate, L.up, L.down, 0, hn + (size_t)t * ne, pf_moe_h.data() + (size_t)t * ne, ff);
+                } else if (gpu) {
                     cu::copy_h2d(p.p32, hn, (size_t)T * ne * sizeof(float));
                     cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                     cu::sync();
@@ -6662,7 +6795,7 @@ struct Engine::Impl {
             for (int n0 = 0; n0 < vocab; n0 += 4096) {
                 const int nt = std::min(4096, vocab - n0);
                 if ((int64_t)rows * nt > (int64_t)p.y32_elems) fail("output tile exceeds the workspace");
-                gemm_gpu(output, p.h16, p.p32, p.y32, rows, nt, n0, nt);
+                if (!mmvq_small(output, p.p32, rows, p.y32, nt, n0, nt)) gemm_gpu(output, p.h16, p.p32, p.y32, rows, nt, n0, nt);
                 cu::copy_d2h(pf_out_tile.data(), p.y32, (size_t)rows * nt * sizeof(float));
                 for (int i = 0; i < rows; ++i)
                     std::memcpy(logit_out + (size_t)i * vocab + n0, pf_out_tile.data() + (size_t)i * nt,

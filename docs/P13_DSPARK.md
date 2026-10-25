@@ -103,3 +103,59 @@ harness that produces them is `tools/minimax/bench_dspark.py --doc README.md --d
    per-column bit-identical by `native_mmvq_set_multi_exact`), which also removes the first exactness gap.
 3. Then: the per-query attention and the per-token shared expert in the window (the remaining exactness gaps), the
    sampled-mode distribution check on the slice, and the full-model sustained calibration.
+
+---
+
+# Round 2: the window's arithmetic
+
+The gates in round 1 said the window was slower and not bit-identical. Both came from the same two places: the CPU
+expert pass decoded each weight row once per token, and the batch path projected through cuBLAS/fp16 instead of the
+token path's kernels. This round changes both, and the exactness work is what makes the speed work meaningful.
+
+## 1. Multi-token CPU expert rows (`src/kernels/cpu/iq_mt.cpp`)
+
+`gemm_cpu_base` used to call ggml's one-pair `vec_dot` once per (row, token). `mt::dot_rows` decodes a row's IQ2_XS
+block ONCE - the 512-entry grid lookups, the sign masks, the scale bytes - and then runs the same integer
+multiply-accumulate for each token of the window. The per-column instruction sequence is ggml's, unchanged
+(`maddubs` on (grid, signed q8), `madd` with the sub-block scales, `sumi1`/`sumi2`, the per-block `fma` into an 8-lane
+float accumulator, one horizontal sum at the end), so a column's result is bit-identical to ggml's own dot.
+
+**Gate (unit, CPU only, no engine and no GPU: it needs no PC lock)** - `build/iq_mt_test.exe` builds random IQ2_XS rows
+and Q8_K activations with ggml's own quantizers and compares each column against ggml's `vec_dot` for the same column:
+
+```
+iq_mt_test --rows 800
+iq_mt_test: 15328 columns over IQ2_XS rows at 3072 and 6144 values, 0 mismatches (0 with a value difference)
+PASS (bit-identical to ggml's one-pair vec_dot)
+```
+
+The same kernel serves a prompt chunk in groups of 8 columns, so small-batch prefill gets the shared decode too; the
+prefill A/B is `tools/minimax/p13_gates.sh` step 4 (`STRATA_IQ_MT=1` against `=0`, same binary).
+
+## 2. Small-window dense projections through `native_mmvq`
+
+For a window of at most 8 rows, `forward_batch` now projects with `quantize_q8_1_rows` + `native_mmvq` (the token
+path's own kernel; its multi-column layout is bitwise equal to its single-column one by contract) instead of
+dequantize + cuBLAS: query/key/value, the indexer's q/k, the output projection and the head. That is one read of each
+matrix per window instead of a dequantize pass, and it is the token path's arithmetic by construction.
+
+## 3. The rest of the window is the token path's own code
+
+* the routed experts accumulate in ROUTE order (`moe()` adds them that way; float addition is not associative),
+  through the multi-token row above;
+* the router takes `gemv` one row at a time (the token path's call) instead of a batched CPU GEMM;
+* the shared expert takes `mlp()` one row at a time (device gemvs plus the host swigluoai, which the batched
+  tensor-core pass does not reproduce);
+* a dense layer's FFN takes `mlp()` per row;
+* the attention takes `attend()` per row - the token path's block selection, gather and MSA kernel - from f32
+  queries, instead of the batched MSA kernels.
+
+## Status of the gates in this round
+
+| gate | state |
+| --- | --- |
+| multi-token row equals ggml's dot (unit) | **PASS**, 0 mismatches, above |
+| window (8 rows) equals the token path, same placement (`gate_logits`, max abs 0.0) | **not run**: `pc-engine.lock` said `maya` for the whole round-2 window (an engine of the other task was resident throughout; available RAM 0.3-1.2 GB), so no engine was started. `tools/minimax/p13_gates.sh` runs it |
+| 200-token prefill A/B | **not run**, same reason (step 4 of the script) |
+| greedy speculative == plain decode | **not run** (step 5 of the script) |
+| full-model sustained test + sampled-mode distribution check | **not run** (`bench_dspark.py --doc README.md --doc-tokens 8000 --decode 1500 --temperature 0.7 --reps 3`, and `p13_sample_dist.py`) |
