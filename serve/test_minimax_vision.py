@@ -50,6 +50,54 @@ def test_template_writes_the_checkpoint_image_markers(tok):
     assert out.index(']<]start of image[>[') < out.index(']<]image[>[') < out.index(']<]end of image[>[')
 
 
+# The checkpoint's own chat_template.jinja (the one `sparsa.py download tokenizer` fetches) writes a bare image
+# token and leaves the wrapping to the HF processor.  The server has to produce the same prompt for it.
+CHECKPOINT_STYLE = """{%- for message in messages -%}
+{{- message.role }}:
+{%- if message.content is string -%}
+{{- message.content }}
+{%- else -%}
+{%- for tr in message.content -%}
+{%- if tr is mapping and tr.type == 'text' -%}
+{{- tr.text }}
+{%- elif tr is mapping and tr.type == 'image' -%}
+]<]image[>[
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ '\n' }}
+{%- endfor -%}
+"""
+
+
+def test_a_template_with_a_bare_image_token_gets_the_triple(tmp_path):
+    path = tmp_path / "checkpoint.jinja"
+    path.write_text(CHECKPOINT_STYLE, encoding="utf-8")
+    tpl = MiniMaxTemplate(path)
+    out = tpl.render([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image", "source": "x.png"}]}])
+    assert out.count(']<]start of image[>[') == 1
+    assert out.count(']<]image[>[') == 1
+    assert out.count(']<]end of image[>[') == 1
+
+
+def test_the_bare_image_template_still_prepares_the_picture(tok, tmp_path):
+    path = tmp_path / "checkpoint.jinja"
+    path.write_text(CHECKPOINT_STYLE, encoding="utf-8")
+    tpl = MiniMaxTemplate(path)
+    eng = MockEngine(tok, "ok", max_context=32768)
+    svc = Service(eng, tok, tpl, model_name="minimax-m3.1-flash", format="minimax_m3",
+                  engine_vision=EngineVision({"max_tokens": 576}))
+    src = "data:image/png;base64," + base64.b64encode(png_bytes()).decode()
+    messages, tools, kwargs = openai_to_messages({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe this"},
+        {"type": "image_url", "image_url": {"url": src}}]}]})
+    ids, _, _ = svc.prepare(messages, tools, kwargs, max_new=8)
+    assert ids.count(tok.ids[']<]image[>[']) == 391
+
+
+
 def test_token_count_matches_the_checkpoint_smart_resize():
     # 672x672 is the 576-token maximum; OCR's sizes round to 28-pixel blocks, then merge 2x2.
     assert EngineVision.tokens_for(672, 672) == 576

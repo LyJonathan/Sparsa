@@ -41,6 +41,33 @@ BYTELEVEL_PATTERN = regex.compile(
 
 DEFAULT_TEMPLATE = Path(__file__).with_name('minimax_chat_template.jinja')
 
+# A private-use marker that stands in for one image part while the template renders.  The rendered text is then
+# rewritten to the vision triple, so a template that writes only `]<]image[>[` (the checkpoint's own) and one that
+# writes the whole thing (this repository's) produce the same prompt.
+_IMAGE_SLOT_TEXT = '\ue000minimax-img-%d\ue001'
+_IMAGE_SLOT = re.compile('\ue000minimax-img-\\d+\ue001')
+
+
+def _image_slots(messages):
+    """(messages with each image part as a marker text part, whether any image was found).  The input is unchanged."""
+    if not isinstance(messages, (list, tuple)):
+        return messages, False
+    out, n = [], 0
+    for message in messages:
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'image':
+                    parts.append({'type': 'text', 'text': _IMAGE_SLOT_TEXT % n})
+                    n += 1
+                else:
+                    parts.append(part)
+            message = {**message, 'content': parts}
+        out.append(message)
+    return out, n > 0
+
+
 
 class MiniMaxTokenizer(Tokenizer):
     """Read ``tokenizer.json`` (byte-level BPE) without the ``tokenizers`` or ``transformers`` packages."""
@@ -202,7 +229,14 @@ class MiniMaxTemplate(ChatTemplate):
             kwargs.pop('reasoning_effort', None)
         if kwargs.get('enable_thinking') is False:
             kwargs.pop('reasoning_effort', None)
-        return super().render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        messages, slots = _image_slots(messages)
+        text = super().render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        if slots:
+            # The checkpoint's own chat_template.jinja writes a bare `]<]image[>[` and leaves the wrapping to the HF
+            # processor; serve/minimax_chat_template.jinja writes the whole triple.  Either way the prompt the engine
+            # reads is the processor's: start, one pad per image token, end.
+            text = _IMAGE_SLOT.sub(VISION_START + IMAGE_TOKEN + VISION_END, text)
+        return text
 
 
 _TAG = re.compile(r'<([A-Za-z_][\w.\-]*)>')
