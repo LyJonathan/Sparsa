@@ -42,7 +42,8 @@ def run(tag: str, extra: list[str], timeout: int = 900) -> int:
            # tiny RAM tier: everything lands on the SSD tier, which is the path under test
            '--memory-limit-mib', '600', '--minimax-verify-tensors', '--minimax-verify-exit',
            '--cpu-threads', '8'] + extra
-    launch = [sys.executable, str(LAUNCH), '--owner', 'maya', '--est-ram-gb', '25', '--min-free-gb', '10', '--'] + cmd
+    launch = [sys.executable, str(LAUNCH), '--owner', 'maya', '--est-ram-gb', '25', '--min-free-gb', '10',
+              '--max-minutes', '45', '--'] + cmd
     with open(TMP / f'{tag}.log', 'w') as log:
         p = subprocess.run(launch, stdout=log, stderr=subprocess.STDOUT, text=True, timeout=timeout)
     print(f'{tag}: rc {p.returncode}')

@@ -1913,3 +1913,15 @@ column is.
 What that leaves: the block's *logits* gain is not a better weight reconstruction, so it is either error cancellation
 against the FP32 reference on a 211-position subset or a property of those two prompts. The decisive test is the one
 ordered next: block 3-7 on **all six** prompts against D3 in the same session.
+
+### Round 11 status: the SSD fix works, the hash checker still mis-matches shards
+
+* **The `--expert-source` SSD path works.** `test_expert_source.py` ran both all-SSD arms (`--memory-limit-mib 600`,
+  every expert on the drive) to completion - `base: rc 0`, `alt: rc 0` - where the same shape of run previously died
+  with *"minimax SSD read: short read"*. Layer 3-7's bytes are now read from the alternate pack.
+* **`verify_pack.py` still fails on a multi-shard pack**, and the failure is in the checker, not the engine: a later
+  shard's data block can start at a few KiB (shard 2 of the D3 pack at **5120 B**), the engine reports an **absolute**
+  offset in the resolved file (confirmed against gguf-py: `blk.4.attn_k` at 53507072 in both), and the checker's
+  file/donor matching then picks the wrong side for tensors whose *size* coincides across the two donor packs. It
+  needs to match on (leaf, size) and fall back to the leaf's own donor, not the first donor whose length agrees.
+* The 6-prompt block gate (block 3-7 against D3, same session) is the next turn's first job, then the sweep.
