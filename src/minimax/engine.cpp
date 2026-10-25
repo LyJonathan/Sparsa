@@ -697,6 +697,9 @@ struct Engine::Impl {
     // the run's speculation counters
     int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_tokens = 0;
     double spec_round_ms = 0, spec_draft_ms = 0, spec_verify_ms = 0;
+    // per verify window: rows checked, and the routed experts the window touched (unique against one-token decode)
+    bool spec_count = false;
+    int64_t spec_checked = 0, spec_exp_union = 0, spec_exp_sum = 0, spec_exp_layers = 0;
 
     // ---- parity probes (P4).  Off unless --minimax-dump-dir / --minimax-seed-hidden is given.
     bool dump_on = false;
@@ -6020,6 +6023,15 @@ struct Engine::Impl {
         std::vector<std::vector<int>> tok_of((size_t)nexp);
         for (int t = 0; t < T; ++t)
             for (int s = 0; s < top; ++s) tok_of[(size_t)ids[(size_t)t * top + s]].push_back(t);
+        if (spec_count) {
+            // one read per (layer, expert) for the whole window; a one-token decode would have read T x top rows
+            int64_t uniq = 0;
+            for (const std::vector<int>& v : tok_of)
+                if (!v.empty()) ++uniq;
+            spec_exp_union += uniq;
+            spec_exp_sum += (int64_t)T * top;
+            ++spec_exp_layers;
+        }
         std::vector<float> xin((size_t)rows_cap * (size_t)embd);
         std::vector<float> hid((size_t)rows_cap * (size_t)ff);
         std::vector<float> yd((size_t)rows_cap * (size_t)embd);
@@ -6909,7 +6921,10 @@ struct Engine::Impl {
             win[0] = id0;
             for (int j = 1; j < T; ++j) win[(size_t)j] = ds_drafts[(size_t)(j - 1)];
             const double vt0 = spec_now();
+            spec_count = true;   // the per-window expert accounting in moe_batch_cpu
             forward_batch(win.data(), T, ds_rows.data(), T);
+            spec_count = false;
+            spec_checked += T;
             spec_verify_ms += spec_now() - vt0;
             ++spec_rounds;
             spec_drafted += k;
@@ -6997,18 +7012,32 @@ struct Engine::Impl {
             .count();
     }
 
-    /// The run's speculation counters, one line (nothing when the drafter never ran).
+    /// The run's speculation counters, one block (nothing when the drafter never ran).
     void spec_report() {
         if (spec_rounds <= 0) return;
         const double draft = spec_draft_ms, verify = spec_verify_ms, total = draft + verify;
+        const double rounds = (double)spec_rounds;
         std::fprintf(stderr,
                      "INFO minimax-spec rounds=%lld drafts=%lld accepted=%lld rate=%.3f per_round=%.2f tokens=%lld "
                      "draft_ms=%.1f verify_ms=%.1f round_ms=%.1f ms/token=%.1f\n",
                      (long long)spec_rounds, (long long)spec_drafted, (long long)spec_accepted,
                      spec_drafted > 0 ? (double)spec_accepted / (double)spec_drafted : 0.0,
-                     spec_rounds > 0 ? (double)spec_tokens / (double)spec_rounds : 0.0, (long long)spec_tokens, draft,
-                     verify, total, spec_tokens > 0 ? total / (double)spec_tokens : 0.0);
+                     rounds > 0 ? (double)spec_tokens / rounds : 0.0, (long long)spec_tokens, draft, verify, total,
+                     spec_tokens > 0 ? total / (double)spec_tokens : 0.0);
+        if (spec_checked > 0) {
+            const double per_verify = (double)spec_checked / rounds;
+            const double committed = (double)spec_tokens / rounds;
+            const double uniq = spec_exp_layers > 0 ? (double)spec_exp_union / (double)spec_exp_layers : 0.0;
+            const double sum1 = spec_exp_layers > 0 ? (double)spec_exp_sum / (double)spec_exp_layers : 0.0;
+            std::fprintf(stderr,
+                         "INFO minimax-spec-window checked_per_verify=%.2f committed_per_verify=%.2f "
+                         "accepted_per_verify=%.2f experts_unique_per_verify=%.2f "
+                         "experts_one_token_sum_per_verify=%.2f experts_ratio=%.3f layers_per_verify=%.1f\n",
+                         per_verify, committed, (double)(spec_accepted + spec_rounds) / rounds, uniq, sum1,
+                         sum1 > 0 ? uniq / sum1 : 0.0, (double)spec_exp_layers / rounds);
+        }
         spec_rounds = spec_drafted = spec_accepted = spec_tokens = 0;
+        spec_checked = spec_exp_union = spec_exp_sum = spec_exp_layers = 0;
         spec_draft_ms = spec_verify_ms = 0;
     }
 

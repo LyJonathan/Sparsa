@@ -17,6 +17,17 @@ BASE_ARGS="--gpus 0 --minimax-dense-layers-gpu 15 --minimax-tiers --minimax-vram
 --minimax-ram-experts-per-layer 128 --minimax-kv vram --cpu-threads 12 --memory-limit-mib 40000 \
 --minimax-allow-nonstandard"
 EXE=./build/strata-minimax.exe
+# Every engine run goes through the shared-PC launcher (lock, RAM floor, watchdog).  gate_logits.py takes a single
+# `--exe` string, so it is handed a shim that execs the launcher around the engine.
+OWNER=${PC_OWNER:-dspark}
+LAUNCH=tools/minimax/pc_launch.py
+SHIM=$(mktemp -d)/eng-dspark.sh
+cat > "$SHIM" <<SH
+#!/bin/bash
+exec python "$LAUNCH" --owner "$OWNER" --est-ram-gb "\${EST_RAM_GB:-40}" -- "$EXE" "\$@"
+SH
+chmod +x "$SHIM"
+if [ ! -f "$LAUNCH" ]; then echo "pc_launch.py is missing: run nothing on the shared PC without it" >&2; exit 1; fi
 IDS=tools/minimax/p13_ids.txt
 CTX=1024
 
@@ -36,14 +47,14 @@ PY
 
 echo
 echo "=== 2. a window (8 rows) vs the token path, same placement ==="
-python tools/minimax/gate_logits.py --exe $EXE --exe $EXE --label token --label window \
+python tools/minimax/gate_logits.py --exe $SHIM --exe $SHIM --label token --label window \
   --model $M --ids $IDS --ctx $CTX --allow \
   --arm-args "$BASE_ARGS --minimax-prefill-batch 0" \
   --arm-args "$BASE_ARGS --minimax-prefill-batch 8 --minimax-prefill-experts cpu"
 
 echo
 echo "=== 3. control: the multi-token row off (STRATA_IQ_MT=0) ==="
-STRATA_IQ_MT=0 python tools/minimax/gate_logits.py --exe $EXE --exe $EXE --label token --label window-noMT \
+STRATA_IQ_MT=0 python tools/minimax/gate_logits.py --exe $SHIM --exe $SHIM --label token --label window-noMT \
   --model $M --ids $IDS --ctx $CTX --allow \
   --arm-args "$BASE_ARGS --minimax-prefill-batch 0" \
   --arm-args "$BASE_ARGS --minimax-prefill-batch 8 --minimax-prefill-experts cpu"
@@ -52,7 +63,7 @@ echo
 echo "=== 4. 200-token prefill, multi-token row on and off ==="
 for rep in 1 2 3; do
   for mt in 1 0; do
-    STRATA_IQ_MT=$mt timeout 600 $EXE --model $M --serve $BASE_ARGS --max-context $CTX \
+    STRATA_IQ_MT=$mt timeout 900 $SHIM --model $M --serve $BASE_ARGS --max-context $CTX \
       --minimax-prefill-batch 200 --minimax-prefill-experts cpu <<< "GEN 0 temperature=0 $(head -c 4000 $IDS)
 STOP" 2>/dev/null | awk -v mt=$mt '/^DONE /{printf "rep %s mt=%s prompt_ms=%s (%d tokens) pp=%.1f tok/s\n", "'"$rep"'", mt, $4, $3, $3/$4*1000}'
   done
@@ -64,7 +75,7 @@ run() {
   local label=$1; shift
   local env=""
   if [ "$label" = "corrupt" ]; then env="STRATA_DSPARK_CORRUPT=1"; fi
-  env $env timeout 600 $EXE --model $M --serve $BASE_ARGS --max-context $CTX --minimax-prefill-batch 512 "$@" \
+  env $env timeout 900 $SHIM --model $M --serve $BASE_ARGS --max-context $CTX --minimax-prefill-batch 512 "$@" \
     <<< "GEN 32 temperature=0 seed=1 $(head -c 400 $IDS)
 STOP" 2>/tmp/p13.$label.err | grep -E "^T " | awk '{printf "%s ", $2}' > /tmp/p13.$label.toks
   echo "  $label: $(cat /tmp/p13.$label.toks)"

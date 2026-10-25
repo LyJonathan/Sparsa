@@ -32,6 +32,23 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 
 
+LAUNCH = HERE / 'pc_launch.py'
+
+
+def via_launcher(cmd: list[str], owner: str, est_gb: float | None) -> list[str]:
+    """Every engine run on the shared PC goes through pc_launch.py (the lock, the RAM floor, the watchdog)."""
+    if owner == 'none':
+        print('[bench] --launch-owner none: running the engine WITHOUT the shared-PC lock', file=sys.stderr)
+        return cmd
+    if not LAUNCH.exists():
+        raise SystemExit('tools/minimax/pc_launch.py is missing: every run on the shared PC goes through it '
+                         '(pass --launch-owner none to override, which skips the lock and the RAM floor)')
+    args = [sys.executable, str(LAUNCH), '--owner', owner]
+    if est_gb is not None:
+        args += ['--est-ram-gb', f'{est_gb:g}']
+    return args + ['--'] + cmd
+
+
 def exe() -> str:
     for c in [os.environ.get('STRATA_MINIMAX_EXE'), ROOT / 'build' / 'strata-minimax.exe',
               ROOT / 'build' / 'strata-minimax']:
@@ -60,8 +77,8 @@ def doc_prompt(path: str, n_tokens: int, question: str) -> list[int]:
 
 
 def run(model: str, prompt: list[int], decode: int, extra: list[str], ctx: int, temperature: float = 0.0,
-        seed: int = 1234, warmup: int = 0):
-    cmd = [exe(), '--model', model, '--serve', '--max-context', str(ctx), *extra]
+        seed: int = 1234, warmup: int = 0, owner: str = 'dspark', est_gb: float | None = None):
+    cmd = via_launcher([exe(), '--model', model, '--serve', '--max-context', str(ctx), *extra], owner, est_gb)
     gen = f'GEN {decode} temperature={temperature} seed={seed} ' + ' '.join(map(str, prompt))
     text = ''
     if warmup:
@@ -128,6 +145,10 @@ def main() -> int:
     ap.add_argument('--warmup', type=int, default=0)
     ap.add_argument('--ctx', type=int, default=16384)
     ap.add_argument('--plain-only', action='store_true')
+    ap.add_argument('--launch-owner', default='dspark',
+                    help="the shared-PC lock owner for pc_launch.py (default dspark; 'none' skips the launcher)")
+    ap.add_argument('--est-ram-gb', type=float, default=None,
+                    help="the run's host-RAM estimate for the launcher (default: pc_launch estimates it)")
     a, rest = ap.parse_known_args()
     extra = [x for x in rest if x != '--']
     base_ids = read_ids(a.ids) if a.ids else None
@@ -144,7 +165,8 @@ def main() -> int:
                 prompt[-1] = (prompt[-1] + rep + 1) % 200000
             else:
                 prompt = doc_prompt(a.doc, a.doc_tokens, a.question)
-            r = run(a.model, prompt, a.decode, extra + args, a.ctx, a.temperature, a.seed + rep, a.warmup)
+            r = run(a.model, prompt, a.decode, extra + args, a.ctx, a.temperature, a.seed + rep, a.warmup,
+                    a.launch_owner, a.est_ram_gb)
             r['tok_s'] = r['gen'] / r['decode_ms'] * 1000.0
             r['ssd_mb'] = r['ssd_bytes'] / 2 ** 20
             res[name].append(r)

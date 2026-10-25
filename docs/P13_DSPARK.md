@@ -159,3 +159,55 @@ matrix per window instead of a dequantize pass, and it is the token path's arith
 | 200-token prefill A/B | **not run**, same reason (step 4 of the script) |
 | greedy speculative == plain decode | **not run** (step 5 of the script) |
 | full-model sustained test + sampled-mode distribution check | **not run** (`bench_dspark.py --doc README.md --doc-tokens 8000 --decode 1500 --temperature 0.7 --reps 3`, and `p13_sample_dist.py`) |
+
+---
+
+# Round 3
+
+## A. One way to start a run: `tools/minimax/pc_launch.py` (its own PR, #31)
+
+Round 2's two OOM deaths were mine: an engine started while `pc-engine.lock` said `maya`. Instructions are not
+enough, so the lock, the RAM floor and a watchdog now live in one launcher, and every runner on this branch goes
+through it:
+
+* `tools/minimax/p13_gates.sh` builds a shim that execs `pc_launch.py --owner dspark -- <engine>` and hands that to
+  everything, including `gate_logits.py --exe`. It **refuses to run at all** when the launcher is absent.
+* `tools/minimax/bench_dspark.py` prefixes its engine command the same way (`--launch-owner`, default `dspark`;
+  `--launch-owner none` is the explicit escape hatch and says so on stderr).
+
+The launcher's own tests (`tools/minimax/test_pc_launch.py`, 12 cases, no engine) cover the protocol: take/release,
+owner/pid/time with no BOM, a live owner refused, a stale PID taken over, a bare-name lock refused, the RAM refusal
+with the child never started, the estimate from the engine's flags, the 2 s watchdog (through a scripted
+`--ram-source seq:` reading), stdin passthrough, the child's exit code, two launchers where exactly one wins, and the
+interrupt release. Exit codes: child's own, 2 lock held, 3 no RAM, 4 watchdog, 5 lock timeout, 130 interrupted.
+
+Interleaved reps take turns by construction: each run is its own launcher invocation, so the lock is taken and put
+back to `free` between runs and the Maya task can slot in.
+
+## B. The confidence gate, as the accepted plan
+
+`--speculative N` (default 4, capped by the pack's block of 7) is the most drafts a round may verify;
+`--minimax-spec-min-conf P` (default 0.9) is the cumulative product of the confidence head's scores at which the
+window stops, and `--minimax-spec-n-min` (default 1) is the floor of drafts checked whatever the scores say. The
+window therefore checks 1..4 drafts, never all 7: `k = max(n_min, longest prefix whose confidence product is >= P)`.
+
+## C. Per-verify accounting
+
+`moe_batch_cpu` already reads each distinct (layer, expert) once for the whole window (`tok_of[e]` groups the rows);
+it now also counts the union while a verify window runs, and the run prints, next to the existing spec line:
+
+```
+INFO minimax-spec-window checked_per_verify=.. committed_per_verify=.. accepted_per_verify=..
+     experts_unique_per_verify=.. experts_one_token_sum_per_verify=.. experts_ratio=.. layers_per_verify=..
+```
+
+`experts_one_token_sum_per_verify` is `T x top` - what `T` one-token decodes would have read - so `experts_ratio` is
+exactly the deduplication the window bought (1.0 = no dedup at all, `1/T` = perfect).
+
+## Gates: still waiting on the lock
+
+`pc-engine.lock` said `maya` for the whole round, with an engine resident (available RAM 0.3-1.3 GB), so **no engine
+run happened** - now enforced by the launcher rather than by intention. The runners are ready:
+`tools/minimax/p13_gates.sh` (slice) and
+`python tools/minimax/bench_dspark.py --doc README.md --doc-tokens 8000 --decode 1500 --temperature 0.7 --reps 3`
+(full model, sustained), plus `p13_sample_dist.py` for the sampled-distribution check.
