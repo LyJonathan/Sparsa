@@ -5429,6 +5429,11 @@ struct Engine::Impl {
     /// contract, `native_mmvq_set_multi_exact`), so a verify window's projections are the token path's arithmetic -
     /// which the token path's `gemv` also reaches through, one column at a time.
     bool mmvq_small(const Tensor& t, const float* X, int T, float* Y, int ldy, int64_t row0 = 0, int64_t nrows = 0) {
+        static const bool on = [] {
+            const char* e = std::getenv("STRATA_WINDOW_MMVQ");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (!on) return false;
         if (T < 1 || T > 8) return false;
         if (!t.gpu || !t.dev.p || t.dev_f32 || !mmvq_dense_fits(t.type, t.ne0)) return false;
         if (pf.empty() || !P().xq) return false;
@@ -6469,7 +6474,11 @@ struct Engine::Impl {
             const bool dev_prep = dev_attn && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
                                   (int64_t)pos0 + T <= p_rope_cap();
             // P13: a small window takes the token path's attention one row at a time, which reads the queries as f32
-            const bool exact_window = dev_prep && T <= strata::kernels::mt::kMaxCols;
+            static const bool window_attend = [] {
+                const char* e = std::getenv("STRATA_WINDOW_ATTEND");
+                return e == nullptr || e[0] != '0';
+            }();
+            const bool exact_window = dev_prep && window_attend && T <= strata::kernels::mt::kMaxCols;
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
