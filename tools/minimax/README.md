@@ -1886,3 +1886,30 @@ consequences, both of which the sweep has to respect:
 `tools/minimax/test_expert_source.py` is the check that the block's bytes really are the donor's: it forces every
 layer onto the SSD tier with a tiny `--memory-limit-mib` and hashes what the engine resolved, per tensor, against the
 donors. It has not been run yet - it is the first thing the next turn does, before the sweep uses any block number.
+
+### The imatrix explanation is rejected: IQ1_M reconstructs these layers *worse*, not better
+
+Engine-free, CPU only, no lock. Per tensor, two experts each, dequantized with `gguf.quants.dequantize` from both
+packs and compared with the source checkpoint's NVFP4 weights (`models/MiniMax-M3.1-Flash`, decoded with the E2M1
+table and the global-scale divisor).  `relF` is ‖q − s‖ / ‖s‖.
+
+| layer | matrix | D3 type | IQ1_M type | relF D3 | relF IQ1_M |
+| ---: | --- | --- | --- | ---: | ---: |
+| 3 | gate/up | IQ2_XS | IQ1_M | **0.324 / 0.324** | 0.501 / 0.501 |
+| 3 | down | IQ3_XXS | IQ2_XXS | **0.208** | 0.377 |
+| 30 | gate/up | IQ2_XS | IQ1_M | **0.307 / 0.307** | 0.465 / 0.465 |
+| 30 | down | IQ3_XXS | IQ2_XXS | **0.198** | 0.364 |
+| 55 | gate/up | IQ2_XS | IQ1_M | **0.308 / 0.308** | 0.468 / 0.468 |
+| 55 | down | IQ3_XXS | IQ2_XXS | **0.225** | 0.411 |
+
+D3 is closer to the source on **every** tensor sampled, in the block (layers 3-7), the middle (30) and the tail (55),
+by 1.5-1.8x. So "IQ1_M's imatrix fits these prompts better" does not explain the +1.90 points / −0.358 KL64 the block
+gate measured - and the two packs do not even record a `quantize.imatrix.*` key, so which imatrix each used cannot be
+checked from the files at all (both carry only `general.quantization_version` and `strata.indexer_quant`). The
+imatrix-weighted column of the check fell back to uniform weights for these shapes (`in_sum2`'s expert axis did not
+line up with the dequantized tensor's column axis), so it is not yet an independent number; the plain Frobenius
+column is.
+
+What that leaves: the block's *logits* gain is not a better weight reconstruction, so it is either error cancellation
+against the FP32 reference on a 211-position subset or a property of those two prompts. The decisive test is the one
+ordered next: block 3-7 on **all six** prompts against D3 in the same session.
