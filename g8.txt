@@ -1,0 +1,2 @@
+GEN 2 temperature=0 seed=1 758 21987 3498 7858 1124 4198 296 275
+STOP

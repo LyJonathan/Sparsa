@@ -917,10 +917,11 @@ struct Engine::Impl {
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
-    DevPtr pf_q32, pf_iq32;      // P13: the exact window's f32 queries (the token path's attention reads f32)
-    DevPtr win_xq;               // P13: the window's q8_1 activations, sized for the widest matrix it projects
-    size_t win_xq_bytes = 0;
-    size_t pf_q32_bytes = 0, pf_iq32_bytes = 0;
+    // P13: the exact window's scratch, ONE SET PER DEVICE: a window walks layers on both cards (the split), and the
+    // engine makes the layer's card current, so a single set would hand a device-0 pointer to a device-1 kernel.
+    std::vector<DevPtr> pf_q32, pf_iq32;      // f32 queries (the token path's attention reads f32)
+    std::vector<DevPtr> win_xq;               // q8_1 activations, sized for the widest matrix it projects
+    std::vector<size_t> pf_q32_bytes, pf_iq32_bytes, win_xq_bytes;
     std::vector<float> pf_att_h;   // P7: device attention output when the layer's projection is on the CPU
     std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
@@ -5445,17 +5446,22 @@ struct Engine::Impl {
         // its own q8_1 buffer, sized for the widest matrix the window projects (the o_proj is qlen wide, the dense
         // FFN's down matrix n_ff): the prompt workspace's one is only as wide as the hidden state
         const size_t need = (size_t)T * (size_t)(K / 32) * 36 + 64;
-        if (!win_xq.p || win_xq_bytes < need) {
-            win_xq = DevPtr(cu::alloc(need));
-            win_xq_bytes = need;
+        const size_t d = (size_t)std::max(0, cur);
+        if (win_xq.size() <= d) {
+            win_xq.resize(d + 1);
+            win_xq_bytes.resize(d + 1, 0);
+        }
+        if (!win_xq[d].p || win_xq_bytes[d] < need) {
+            win_xq[d] = DevPtr(cu::alloc(need));
+            win_xq_bytes[d] = need;
         }
         // `quantize_q8_1_rows` is the token path's quantizer, and the multi-column kernel keeps its per-column
         // layout bitwise equal to one column (native_mmvq_set_multi_exact, the default) - the dump gate in
         // docs/P13_DSPARK.md checks that per stage.
-        strata::kernels::quantize_q8_1_rows(X, T, (int)K, win_xq.p, cu::stream_legacy());
+        strata::kernels::quantize_q8_1_rows(X, T, (int)K, win_xq[d].p, cu::stream_legacy());
         const int64_t N = nrows > 0 ? nrows : t.ne1;
         const void* w = (const uint8_t*)t.dev.p + (size_t)row0 * t.row_bytes;
-        strata::kernels::native_mmvq(t.type, w, win_xq.p, Y, (int)K, (int)N, T, cu::stream_legacy());
+        strata::kernels::native_mmvq(t.type, w, win_xq[d].p, Y, (int)K, (int)N, T, cu::stream_legacy());
         return true;
     }
 
@@ -6530,11 +6536,16 @@ struct Engine::Impl {
                     cu::copy_h2d(p.d_pos.p, pf_pos.data(), (size_t)T * sizeof(int32_t));
                     if (exact_window) {
                         const size_t need = (size_t)T * (size_t)qlen * 4;
-                        if (!pf_q32.p || pf_q32_bytes < need) {
-                            pf_q32 = DevPtr(cu::alloc(need + 4096));
-                            pf_q32_bytes = need + 4096;
+                        const size_t dq = (size_t)std::max(0, cur);
+                        if (pf_q32.size() <= dq) {
+                            pf_q32.resize(dq + 1);
+                            pf_q32_bytes.resize(dq + 1, 0);
                         }
-                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, (float*)pf_q32.p, nullptr, (int64_t)T * H, H,
+                        if (!pf_q32[dq].p || pf_q32_bytes[dq] < need) {
+                            pf_q32[dq] = DevPtr(cu::alloc(need + 4096));
+                            pf_q32_bytes[dq] = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, (float*)pf_q32[dq].p, nullptr, (int64_t)T * H, H,
                                            D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
                                            (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
                     } else {
@@ -6613,11 +6624,16 @@ struct Engine::Impl {
                     if (!dev_prep) cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
                     else if (exact_window) {
                         const size_t need = (size_t)T * (size_t)ilen * 4;
-                        if (!pf_iq32.p || pf_iq32_bytes < need) {
-                            pf_iq32 = DevPtr(cu::alloc(need + 4096));
-                            pf_iq32_bytes = need + 4096;
+                        const size_t dq = (size_t)std::max(0, cur);
+                        if (pf_iq32.size() <= dq) {
+                            pf_iq32.resize(dq + 1);
+                            pf_iq32_bytes.resize(dq + 1, 0);
                         }
-                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, (float*)pf_iq32.p, nullptr, (int64_t)T * HI,
+                        if (!pf_iq32[dq].p || pf_iq32_bytes[dq] < need) {
+                            pf_iq32[dq] = DevPtr(cu::alloc(need + 4096));
+                            pf_iq32_bytes[dq] = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, (float*)pf_iq32[dq].p, nullptr, (int64_t)T * HI,
                                            HI, (int)cfg.idx_dim, (int)cfg.n_rot, (const float*)W().rope_cos.p,
                                            (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
                     } else {
@@ -6673,14 +6689,15 @@ struct Engine::Impl {
                 if (wdump) {
                     // the window's own q after norm+rope (row 0) under the token path's key
                     std::vector<float> q0((size_t)qlen);
-                    cu::copy_d2h(q0.data(), pf_q32.p, (size_t)qlen * sizeof(float));
+                    cu::copy_d2h(q0.data(), pf_q32[(size_t)std::max(0, cur)].p, (size_t)qlen * sizeof(float));
                     dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/q_after_rope", q0.data(), (int)qlen);
                 }
                 const int64_t ilen_row = (int64_t)HI * cfg.idx_dim;
+                const size_t dd = (size_t)std::max(0, cur);
                 for (int t = 0; t < T; ++t) {
-                    const float* qd = (const float*)pf_q32.p + (size_t)t * (size_t)qlen;
-                    const float* iqd = (L.indexer && pf_iq32.p)
-                                           ? (const float*)pf_iq32.p + (size_t)t * (size_t)ilen_row
+                    const float* qd = (const float*)pf_q32[dd].p + (size_t)t * (size_t)qlen;
+                    const float* iqd = (L.indexer && pf_iq32[dd].p)
+                                           ? (const float*)pf_iq32[dd].p + (size_t)t * (size_t)ilen_row
                                            : nullptr;
                     attend((int)li, L, pos0 + t, nullptr, qd, iqd, p.p32 + (size_t)t * (size_t)qlen);
                 }
