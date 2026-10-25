@@ -1858,3 +1858,31 @@ reported while the 256 MiB pinned copies were running.
 measurement error. Device 0's real rate is **3.3 GB/s**, which matches NVML's **gen3 x4** - and the earlier probe
 (pageable source, default stream) read ~3.3 GB/s on *both* cards, which is the driver's staging rate and cannot tell
 the two slots apart. Only the pinned 256 MiB probe's two directions are used from now on.
+
+### The KL anomaly is real, and it is a quant-versus-quant difference
+
+Round 8's file-based block read `--expert-source`-free and said block 3-7 was 0.34 KL64 *better* than D3; round 9
+could not re-derive it because `--expert-source` was broken. It is now fixed and the pair was re-run **back to back in
+one turn, same flags, same reference logits, same build** (subset of two prompts, 211 positions, `--vram-slots 0
+--memory-limit-mib 80000 --layer-split auto --cpu-threads 12`, reference SHA-256 `4f25e1a7be140715` in both runs):
+
+| arm | top-1 | KL64 |
+| --- | ---: | ---: |
+| D3 | 41.23% | 2.7021 |
+| D3 with layers 3-7's experts from IQ1_M | **43.13%** | **2.3443** |
+| delta | **+1.90 points** | **-0.3578** |
+
+So the effect reproduces on an independent path (a pack built by copying whole layers, and an override that reads
+those layers from another pack without writing a file), which rules out the file build as the cause. The leading
+explanation is that it is genuine: the two packs were quantized from the same checkpoint with **different imatrices**,
+and on these two prompts IQ1_M's is the better one, so "fewer bits" is not the same as "more error" here. Two
+consequences, both of which the sweep has to respect:
+
+* a block's KL delta is a statement about **that prompt set**, not about quantisation in general - hence the rule that
+  the ranking is validated on all six prompts (and, when it lands, on the held-out set);
+* a negative delta (a block that *helps*) is not evidence that more blocks will keep helping. The candidate has to be
+  measured as a whole mix, never by adding block deltas up.
+
+`tools/minimax/test_expert_source.py` is the check that the block's bytes really are the donor's: it forces every
+layer onto the SSD tier with a tiny `--memory-limit-mib` and hashes what the engine resolved, per tensor, against the
+donors. It has not been run yet - it is the first thing the next turn does, before the sweep uses any block number.
