@@ -92,6 +92,40 @@ PACKS = (
      "top1": None, "decode_tok_s": None, "measured_on": "not published", "recommended": True,
      "available": False, "about": "planned IQ1_S-based pack for 96 GB RAM; not published yet"},
 )
+# Speed provenance. A number is stale when it was not measured on engine v0.1.3 or later with the default
+# setup; a stale number cannot satisfy DEFAULT_SPEED_FLOOR_TOK_S and cannot make a pack the default.
+SPEED_META = {
+    "iq1-s": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 smoke)", "speed_ctx": 8192,
+              "speed_shared": False, "speed_stale": True,
+              "speed_note": "G3 smoke flags, not the default setup"},
+    "iq1-m": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 cloud smoke)", "speed_ctx": 8192,
+              "speed_shared": False, "speed_stale": True, "speed_note": "cloud G3 smoke, not the default PC setup"},
+    "iq2-kt": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 smoke)", "speed_ctx": 8192,
+               "speed_shared": False, "speed_stale": True, "speed_note": "G3 smoke flags, not the default setup",
+               "slice_engine": "v0.1.48", "slice_commit": "unrecorded", "slice_ctx": 1024,
+               "slice_shared": False, "slice_stale": False},
+    "iq2-xxs": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 smoke)", "speed_ctx": 8192,
+                "speed_shared": False, "speed_stale": True, "speed_note": "G3 smoke flags, not the default setup"},
+    "iq2-xs": {"speed_engine": "not measured", "speed_commit": "-", "speed_ctx": 0,
+               "speed_shared": False, "speed_stale": True, "speed_note": "no full-model decode number",
+               "slice_engine": "v0.1.48", "slice_commit": "unrecorded", "slice_ctx": 1024,
+               "slice_shared": False, "slice_stale": False},
+    "iq2-xs-d3": {"speed_engine": "v0.1.3", "speed_commit": "release (HF README)", "speed_ctx": 32768,
+                  "speed_shared": False, "speed_stale": False,
+                  "speed_note": "2x RTX 5070, 128 GB, default release setup"},
+    "iq2-kl": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 cloud smoke)", "speed_ctx": 8192,
+               "speed_shared": False, "speed_stale": True, "speed_note": "cloud G3 smoke, not the default PC setup"},
+    "iq3-k": {"speed_engine": "not measured", "speed_commit": "-", "speed_ctx": 0,
+              "speed_shared": False, "speed_stale": True, "speed_note": "no measured decode number"},
+    "iq4-ks": {"speed_engine": "not measured", "speed_commit": "-", "speed_ctx": 0,
+               "speed_shared": False, "speed_stale": True, "speed_note": "no measured decode number"},
+    "nvfp4": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 cloud smoke)", "speed_ctx": 8192,
+              "speed_shared": False, "speed_stale": True, "speed_note": "cloud G3 smoke, not the default PC setup"},
+}
+for _pack in PACKS:
+    _pack.update(SPEED_META.get(_pack["key"], {"speed_engine": "not published", "speed_commit": "-",
+                                               "speed_ctx": 0, "speed_shared": False, "speed_stale": True,
+                                               "speed_note": "not published"}))
 QUANTS = {p["key"]: (p["folder"], p["about"]) for p in PACKS}
 
 # The rule: best measured quality (Sparsa G3 top-1) among packs whose experts fit in the engine's RAM
@@ -103,6 +137,8 @@ QUANTS = {p["key"]: (p["folder"], p["about"]) for p in PACKS}
 RAM_FLOOR_GB = 10.0
 DISK_RESERVE_GB = 2.0
 DEFAULT_CONTEXT = 32768
+# A pack can be an auto-pick only with a fresh measured decode at or above this floor.
+DEFAULT_SPEED_FLOOR_TOK_S = 2.0
 
 # MiniMax-M3.1-Flash geometry (config.json) and the engine's host buffers.
 MODEL_LAYERS = 60
@@ -250,20 +286,40 @@ def pack_fits(machine: Machine, pack: dict, ctx: int = DEFAULT_CONTEXT, vram_slo
     return d["required_experts_gb"] <= d["ram_budget_gb"]
 
 
+STREAMING_REASON = "experts don't fit in RAM; streaming from SSD"
+
+
+def speed_usable(pack: dict) -> bool:
+    """A fresh measured decode at or above the floor. IQ2_KT is below it until its CPU path is fixed."""
+    return (pack.get("decode_tok_s") is not None
+            and not pack.get("speed_stale", True)
+            and pack["decode_tok_s"] >= DEFAULT_SPEED_FLOOR_TOK_S)
+
+
+def select_pack(machine: Machine, packs=PACKS, ctx: int = DEFAULT_CONTEXT,
+                vram_slots: int = -1) -> tuple[dict | None, str]:
+    """-> (pack, why). First the best-quality pack that fits RAM and clears the speed floor; if none, the
+    best-quality floor-clearing pack whose experts fit RAM+VRAM, streamed from SSD. Otherwise (None, '')."""
+    available = [p for p in packs
+                 if p.get("available", False)
+                 and p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb]
+    fitting = [p for p in available if pack_fits(machine, p, ctx, vram_slots) and speed_usable(p)]
+    if fitting:
+        pool = [p for p in fitting if p.get("recommended", True)] or fitting
+        return max(pool, key=lambda p: (pack_quality(p), -p["total_gb"], -p["experts_gb"])), ""
+    # Nothing fitting clears the floor. Fall back to a pack the combined RAM+VRAM can cover, with the
+    # SSD streaming the difference; this is what keeps 128 GB on the measured 4 tok/s D3.
+    combined_gb = machine.ram_gb + sum(machine.vram_gb)
+    fallback = [p for p in available if speed_usable(p) and p["experts_gb"] <= combined_gb]
+    if fallback:
+        pool = [p for p in fallback if p.get("recommended", True)] or fallback
+        return max(pool, key=lambda p: (pack_quality(p), -p["total_gb"], -p["experts_gb"])), STREAMING_REASON
+    return None, ""
+
+
 def choose_pack(machine: Machine, packs=PACKS, ctx: int = DEFAULT_CONTEXT,
                 vram_slots: int = -1) -> dict | None:
-    """The best measured-quality available pack that fits the engine's RAM tier and the free disk, among
-    packs with a measured decode speed. Ties go to the smaller download. IQ1_S is used only when nothing
-    else fits. A pack without a measured decode speed is never auto-picked."""
-    eligible = [p for p in packs
-                if p.get("available", False)
-                and p.get("decode_tok_s") is not None
-                and pack_fits(machine, p, ctx, vram_slots)
-                and p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb]
-    if not eligible:
-        return None
-    pool = [p for p in eligible if p.get("recommended", True)] or eligible
-    return max(pool, key=lambda p: (pack_quality(p), -p["total_gb"], -p["experts_gb"]))
+    return select_pack(machine, packs, ctx, vram_slots)[0]
 
 
 def pack_warning(pack: dict | None) -> str:
@@ -409,6 +465,8 @@ def build_config(args) -> dict:
                 f"        python sparsa.py download {pack['key']} --dir {models_dir}")
         say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM "
             f"({pack['experts_gb']:.1f} GB of experts, {machine.gpu_count} GPU(s)): {folder}")
+        if reason:
+            say("sparsa: " + reason)
         warning = pack_warning(pack)
         if warning:
             say(warning)
@@ -597,12 +655,13 @@ def cmd_inspect(args) -> int:
 
 def cmd_pick(args) -> int:
     machine = machine_specs(args.models_dir)
-    pack = choose_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
+    pack, reason = select_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
     if args.json:
         say(json.dumps({"machine": {"ram_gb": machine.ram_gb, "vram_gb": list(machine.vram_gb),
                                     "free_disk_gb": machine.free_disk_gb,
                                     "context": args.context, "vram_slots": args.vram_slots},
-                        "pack": pack, "warning": pack_warning(pack)}, indent=2))
+                        "pack": pack, "reason": reason, "warning": pack_warning(pack),
+                        "speed_floor_tok_s": DEFAULT_SPEED_FLOOR_TOK_S}, indent=2))
         return 0
     say(f"sparsa: {machine.ram_gb:.0f} GB RAM, {machine.gpu_count} GPU(s) "
         f"({', '.join(f'{x:.0f} GB' for x in machine.vram_gb) or 'none'}), "
@@ -613,7 +672,8 @@ def cmd_pick(args) -> int:
         disk = p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb
         state = "published" if p["available"] else "NOT PUBLISHED"
         top1 = "n/a" if p.get("top1") is None else f"{p['top1']:.1f}%"
-        speed = "n/a" if p.get("decode_tok_s") is None else f"{p['decode_tok_s']:.2f} tok/s"
+        speed = "n/a" if p.get("decode_tok_s") is None else (
+            f"{p['decode_tok_s']:.2f} tok/s" + ("*" if p.get("speed_stale") else ""))
         rec = "" if p.get("recommended", True) else "  NOT RECOMMENDED"
         mark = "  <- pick" if pack is not None and p["key"] == pack["key"] else ""
         say(f"  {p['key']:<10} top-1 {top1:>5}  {speed:<11}  experts {p['experts_gb']:7.1f} GB  "
@@ -623,9 +683,21 @@ def cmd_pick(args) -> int:
             f"{state}{rec}{mark}")
         if p.get("measured_on"):
             say(f"             measured on {p['measured_on']}")
+        if p.get("decode_tok_s") is not None:
+            say(f"             speed: engine {p.get('speed_engine')} ({p.get('speed_commit')}), "
+                f"ctx {p.get('speed_ctx')}, shared={'yes' if p.get('speed_shared') else 'no'}, "
+                f"{'STALE' if p.get('speed_stale') else 'fresh'}"
+                + (f" - {p['speed_note']}" if p.get("speed_note") else ""))
+        if p.get("slice_decode_tok_s") is not None:
+            say(f"             15-layer slice: {p['slice_decode_tok_s']:.2f} tok/s, engine "
+                f"{p.get('slice_engine')}, ctx {p.get('slice_ctx')}, "
+                f"{'STALE' if p.get('slice_stale') else 'fresh'}")
     if pack is None:
-        say("sparsa: no pack with a measured decode speed fits this machine")
+        say(f"sparsa: no pack clears the {DEFAULT_SPEED_FLOOR_TOK_S:.1f} tok/s speed floor with a usable "
+            "measurement here")
     else:
+        if reason:
+            say("sparsa: " + reason + f" ({pack['key']})")
         warning = pack_warning(pack)
         if warning:
             say(warning)
@@ -635,11 +707,14 @@ def cmd_pick(args) -> int:
 def cmd_download(args) -> int:
     if args.what is None:
         machine = machine_specs(args.dir)
-        pack = choose_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
+        pack, reason = select_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
         if pack is None:
-            raise SystemExit(f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
+            raise SystemExit(f"sparsa: no pack clears the {DEFAULT_SPEED_FLOOR_TOK_S:.1f} tok/s speed floor "
+                             f"with a usable measurement here ({machine.ram_gb:.0f} GB RAM, "
                              f"{machine.free_disk_gb:.0f} GB free disk); `python sparsa.py pick` lists the tiers")
         say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM: {pack['about']}")
+        if reason:
+            say("sparsa: " + reason)
         warning = pack_warning(pack)
         if warning:
             say(warning)
