@@ -80,15 +80,14 @@ BPE merges, so the small tokenizer files come from the checkpoint (about 10 MB).
 
 ```sh
 python sparsa.py download iq2-xs-d3 --dir D:/models
-M=D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3
-python sparsa.py download tokenizer --dir $M/tokenizer
-python sparsa.py download mmproj --dir $M          # picture input; skip it for text only
+python sparsa.py download tokenizer --dir D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3/tokenizer
+python sparsa.py download mmproj --dir D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3   # skip for text only
 ```
 
 **3. Serve it.**
 
 ```sh
-python sparsa.py serve --model $M
+python sparsa.py serve --model D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3
 ```
 
 It prints the run settings it wrote and the files it found, starts the engine (a minute or two to load),
@@ -127,7 +126,7 @@ By default the server listens on `127.0.0.1` only. `--access lan` makes an API k
 address:
 
 ```sh
-python sparsa.py serve --model $M --access lan
+python sparsa.py serve --model D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3 --access lan
 # sparsa: LAN address http://192.168.1.50:8080/v1   (API key: sk-strata-...)
 ```
 
