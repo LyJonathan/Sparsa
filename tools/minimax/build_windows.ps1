@@ -17,7 +17,11 @@ param(
     [string] $GgmlSubstDrive = "L:",
     [switch] $Clean,
     [switch] $ConfigureOnly,
-    [int] $Jobs = 0
+    [int] $Jobs = 0,
+    # The cards the binary must run on.  "120" builds only for the RTX 50 series; a release meant for other
+    # people spells the range, e.g. "75;80;86;89;120" (Turing, Ampere, Ada, Blackwell).  CUDA 13 dropped sm_70
+    # and older, so 75 is the floor.
+    [string] $CudaArch = "120"
 )
 $ErrorActionPreference = "Stop"
 
@@ -124,7 +128,7 @@ try {
         "-DSTRATA_BUILD_TESTS=OFF",
         "-DSTRATA_Q6K_EXPERTS=ON",
         "-DSTRATA_MMQ_KQUANTS=ON",
-        "-DCMAKE_CUDA_ARCHITECTURES=120"
+        "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
     )
     if ($Ggml) { $cfgArgs += "-DSTRATA_GGML_DIR=$Ggml" }
     & $Cmake @cfgArgs
