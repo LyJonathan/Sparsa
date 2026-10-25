@@ -50,6 +50,7 @@ struct EngineOptions {
     bool verify_tensors = false;    ///< --minimax-verify-tensors: name/size/FNV-1a of every tensor the engine resolved
     int verify_mod = 1;             ///< --minimax-verify-mod: hash every M-th tensor (the proof is taken in chunks)
     int verify_rem = 0;             ///< --minimax-verify-rem: ... starting at this remainder
+    bool verify_exit = false;       ///< --minimax-verify-exit: stop right after the resolution list
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
     bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 

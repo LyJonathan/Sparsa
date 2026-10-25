@@ -479,6 +479,16 @@ size_t host_available_bytes() {
 
 // Can this process back `bytes` of new host memory?  Windows counts commit against RAM + pagefile; elsewhere shape
 // it from the available memory.  Used to size the long-context KV cache before touching any page.
+// A symbol from a run-time-loaded library (NVML): nullptr when the library or the symbol is not there, so every
+// caller keeps working on a box without it.
+void* resolve_symbol(void* lib, const char* name) {
+#if defined(_WIN32)
+    return lib ? (void*)GetProcAddress((HMODULE)lib, name) : nullptr;
+#else
+    return lib ? dlsym(lib, name) : nullptr;
+#endif
+}
+
 bool host_commit_ok(size_t bytes) {
 #if defined(_WIN32)
     MEMORYSTATUSEX mem{};
@@ -915,6 +925,7 @@ struct Engine::Impl {
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
     bool verify_tensors = false;    // --minimax-verify-tensors: one digest line per tensor the engine resolved
     int verify_mod = 1, verify_rem = 0;
+    bool verify_exit = false;
     int vram_per_layer = 0;
     int ram_per_layer = 0;
     int moe_layers = 0;
@@ -1144,6 +1155,7 @@ struct Engine::Impl {
         verify_tensors = opt.verify_tensors;
         verify_mod = opt.verify_mod > 0 ? opt.verify_mod : 1;
         verify_rem = opt.verify_rem;
+        verify_exit = opt.verify_exit;
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
@@ -1258,6 +1270,7 @@ struct Engine::Impl {
         // The row/col limits are also the CPU gemv guard. Device buffers exist only when a layer can be uploaded.
         size_workspace();
         if (!cpu_only) alloc_workspace();
+        if (!cpu_only) log_links();
         place_weights();
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
         if (opt.tiers || opt.expert_resident == "all") {
@@ -1419,31 +1432,28 @@ struct Engine::Impl {
         if (output.ne0 != cfg.n_embd || output.ne1 != cfg.n_vocab) fail("output.weight has an unexpected shape");
     }
 
-    /// --minimax-verify-tensors: for every tensor this engine resolved, one line naming it, its byte length and an
-    /// FNV-1a 64 digest of the bytes it will actually read.  `--serve` and `--minimax-eval` both load through here, so
-    /// the pair of runs is the loader proof a mixed pack needs: the digests are compared against the same digest
-    /// taken over the donor packs' bytes, per tensor, N/N.  Opt-in and silent otherwise.
+    /// --minimax-verify-tensors: print the resolution of every tensor - name, shard index, byte offset inside the
+    /// file, byte length, ggml type - and nothing else.  No hashing and no page touching: a whole pass over this
+    /// pack's 130 GB of mappings trips the 10 GB RAM floor, and `tools/minimax/verify_pack.py` can stream the ranges
+    /// from the file with bounded reads and SHA-256 them itself.  `--minimax-verify-exit` stops right after the list
+    /// (exit 0) so a proof costs seconds.  This is also the serve-versus-eval comparison: the two entry points must
+    /// resolve every tensor to the same shard, offset and length.
     void verify_all_tensors() {
         size_t n = 0, at = 0;
         for (size_t si = 0; si < model.size(); ++si)
         for (const TensorInfo& r : model.shard(si).tensors()) {
-            // `--minimax-verify-mod M --minimax-verify-rem R`: hash every M-th tensor starting at R.  A whole pass
-            // faults the pack's entire 130 GB through the mapping, which on this 128 GB box trips the RAM floor the
-            // launcher enforces, so the proof is taken in chunks and the union is the N/N.
-            if (++at % (size_t)verify_mod != (size_t)verify_rem + 1) continue;
-            Tensor t;
-            if (!try_must(r.name, t) || t.host == nullptr) continue;
-            uint64_t h = 1469598103934665603ull;
-            for (size_t i = 0; i < t.bytes; ++i) {
-                h ^= (uint64_t)t.host[i];
-                h *= 1099511628211ull;
-            }
-            std::fprintf(stderr, "INFO minimax-verify %s %zu %016llx%c", r.name.c_str(), t.bytes,
-                         (unsigned long long)h, 10);
+            if ((++at % (size_t)verify_mod) != (size_t)verify_rem) continue;
+            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d%c", r.name.c_str(), si,
+                         (unsigned long long)r.offset, (unsigned long long)tensor_payload_bytes(r), (int)r.type, 10);
             ++n;
         }
-        std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod,
-                     verify_rem, 10);
+        std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod, verify_rem,
+                     10);
+        if (verify_exit) {
+            std::fprintf(stderr, "INFO minimax-verify exit after resolution%c", 10);
+            std::fflush(stderr);
+            std::exit(0);
+        }
     }
 
     void decide_norm() {
@@ -2156,6 +2166,56 @@ struct Engine::Impl {
         }
         cu::dealloc(d);
         return best;
+    }
+
+    /// The PCIe link each card is really on: the driver's own generation and width for the device (NVML, loaded at
+    /// run time so the engine does not link against it) plus this process's measured host->device rate.  A card in an
+    /// x4 slot reports the card's capability through CUDA, not the slot's, so the driver figure and the measured rate
+    /// together are what a split or a PCIe expert lane has to be priced on - and on this box they disagree by 3x
+    /// (device 0 measured 6.4 GB/s against device 1's 21.9).  Nothing here changes behaviour: it is the log the
+    /// decision is made from.
+    void log_links() {
+        struct Nvml {
+            void* lib = nullptr;
+            int (*init)() = nullptr;
+            int (*byIndex)(unsigned, void**) = nullptr;
+            int (*gen)(void*, unsigned*) = nullptr;
+            int (*width)(void*, unsigned*) = nullptr;
+            bool ok = false;
+        } nv;
+#if defined(_WIN32)
+        nv.lib = (void*)LoadLibraryA("nvml.dll");
+        if (!nv.lib) nv.lib = (void*)LoadLibraryA("C:/Program Files/NVIDIA Corporation/NVSMI/nvml.dll");
+#else
+        nv.lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+#endif
+        if (nv.lib) {
+            nv.init = (int (*)())resolve_symbol(nv.lib, "nvmlInit_v2");
+            nv.byIndex = (int (*)(unsigned, void**))resolve_symbol(nv.lib, "nvmlDeviceGetHandleByIndex_v2");
+            nv.gen = (int (*)(void*, unsigned*))resolve_symbol(nv.lib, "nvmlDeviceGetCurrPcieLinkGeneration");
+            nv.width = (int (*)(void*, unsigned*))resolve_symbol(nv.lib, "nvmlDeviceGetCurrPcieLinkWidth");
+            nv.ok = nv.init && nv.byIndex && nv.gen && nv.width && nv.init() == 0;
+        }
+        for (size_t d = 0; d < devs.size(); ++d) {
+            unsigned gen = 0, width = 0;
+            if (nv.ok) {
+                void* h = nullptr;
+                if (nv.byIndex((unsigned)devs[d], &h) == 0) {
+                    if (nv.gen(h, &gen) != 0) gen = 0;
+                    if (nv.width(h, &width) != 0) width = 0;
+                }
+            }
+            const double gbs = h2d_gbs((int)devs[d]);
+            std::fprintf(stderr, "INFO minimax-link dev=%d h2d=%.2f GB/s pcie=%s%c", (int)devs[d], gbs,
+                         gen ? (std::string("gen") + std::to_string(gen) + " x" + std::to_string(width)).c_str()
+                             : "unknown",
+                         10);
+        }
+#if defined(_WIN32)
+        if (nv.lib) FreeLibrary((HMODULE)nv.lib);
+#else
+        if (nv.lib) dlclose(nv.lib);
+#endif
     }
 
     /// P13b: the split point, chosen where the arithmetic is exact.  `choose_split_and_kv` prices the layers by their

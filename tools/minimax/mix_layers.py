@@ -160,6 +160,8 @@ def main(argv=None) -> int:
     ap.add_argument('--out', required=True)
     ap.add_argument('--cold-frac', type=float, default=0.44, help='share of MoE layers from the cold pack')
     ap.add_argument('--order', default='mass', choices=('mass', 'deep', 'shallow'))
+    ap.add_argument('--cold-layers', help='explicit MoE layers to take from the cold pack, "35,36,37" (overrides '
+                                          '--cold-frac/--order), which is how a sensitivity sweep names one block')
     ap.add_argument('--profile', help='STRP profile: its per-layer routing mass orders the cold layers')
     ap.add_argument('--dry-run', action='store_true', help='print the plan and the sizes, write nothing')
     a = ap.parse_args(argv)
@@ -191,8 +193,16 @@ def main(argv=None) -> int:
         rank = sorted(moe_layers)
     else:
         rank = sorted(moe_layers, key=lambda li: (mass[li], -li))
-    n_cold = max(0, min(len(moe_layers), int(round(a.cold_frac * len(moe_layers)))))
-    cold_layers = set(rank[:n_cold])
+    if a.cold_layers:
+        cold_layers = {int(x) for x in a.cold_layers.replace(' ', '').split(',') if x != ''}
+        unknown = cold_layers - set(moe_layers)
+        if unknown:
+            raise SystemExit(f'--cold-layers names layers with no experts in the hot pack: {sorted(unknown)}')
+        n_cold = len(cold_layers)
+        rank = sorted(moe_layers, key=lambda li: (0 if li in cold_layers else 1, li))
+    else:
+        n_cold = max(0, min(len(moe_layers), int(round(a.cold_frac * len(moe_layers)))))
+        cold_layers = set(rank[:n_cold])
     n_mid = max(0, min(len(moe_layers) - n_cold, int(round(a.mid_frac * len(moe_layers))))) if a.mid else 0
     mid_layers = set(rank[n_cold:n_cold + n_mid]) if n_mid else set()
 

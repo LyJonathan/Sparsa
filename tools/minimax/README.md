@@ -1735,3 +1735,37 @@ Maya's rule is all-or-none on purpose - "a PART copied cost decode speed on 32 /
 tier still sends the rest to the drive every token while paying for the copies (their #339: +22% on 4 x V100 with
 504 GB, ~2x on a 20 GB Ada, +23% on 4 x 3090 with 126 GB). The 8 GiB spare is also what keeps this engine's own RAM
 floor satisfiable. It only fires when `--memory-limit-mib` is not given, so an operator's budget still wins.
+
+### Round 7: the loader proof's mechanism, the link log, and the first sweep block
+
+**Loader proof (`--minimax-verify-tensors`) does no hashing and touches no pages.** It prints, per resolved tensor,
+`name shard offset bytes type`, then `--minimax-verify-exit` returns 0 straight away - so a proof costs seconds and a
+few MB of RAM instead of faulting 130 GB through the mapping (which is what tripped the 10 GB floor in round 4).
+`tools/minimax/verify_pack.py` takes those lines from **both** entry points, streams each range in 64 MiB buffered
+reads and SHA-256s it, compares with the donor tensor of the same name *and length* (a mixed pack holds one name from
+two donors), and cross-checks that `--serve` and `--minimax-eval` resolved every tensor to the same shard, offset and
+length. Its modulo filter had an off-by-one (`at % mod != rem + 1`) that reported `total=0`; fixed and rebuilt.
+
+**`INFO minimax-link dev=N h2d=X GB/s pcie=genG xW`** at startup: the driver's own generation and width (NVML loaded
+at run time, so nothing links against it) beside this process's measured host-to-device rate. CUDA reports what the
+*card* can do, not what the slot gives it - device 0 measured 6.4 GB/s against device 1's 21.9 on this box - so a
+split or a PCIe expert lane has to be priced on both.
+
+**The sweep driver** (`tools/minimax/sweep_blocks.py`) swaps one block of consecutive MoE layers to a cold donor,
+gates it with the same all-CPU harness, records loss-per-GB, and deletes the candidate pack after its run.
+`mix_layers.py --cold-layers 36,37,38,39,40` names a block, which is how a sweep candidate is built without touching
+the fraction/order heuristics.
+
+First measured block, subset gate (chinese_local_llm + code_lru, 211 positions, `--memory-limit-mib 80000`):
+
+| block | layers | GB saved | top-1 | KL64 | D3 on the same subset |
+| --- | --- | ---: | ---: | ---: | --- |
+| 3-7 | 5 | 3.44 | **43.13%** | 2.344 | 41.69% / 2.686 |
+
+The earliest block is **+1.4 points** better than the baseline on that subset - free gigabytes, and the reason a
+per-block sweep is the right instrument: *where* the bits go matters more than how many. The remaining blocks were
+lost to the round's I/O contention (a concurrent IQ2_XXS download raised the page-cache floor until the watchdog
+stopped two gates) and to the lock going to the other task; they are the first thing the next round re-runs.
+
+`--memory-limit-mib 80000` is now the sweep's budget (77 GB free before the run, per the launcher's own line), and
+the download is paused rather than run beside a gate.
