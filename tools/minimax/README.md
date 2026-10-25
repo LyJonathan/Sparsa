@@ -1471,3 +1471,149 @@ default stream, which wait behind the layer's queued GPU work, while `prefetch_f
 the same bytes on the side stream.
 
 
+## P13: the VRAM slot count is per device (and two measured negatives)
+
+The decode gap to Project Maya, third pass: `_ref/research/MAYA_GAP_3.md` holds the full table and every number.
+Two of its rows became measurements here, one of them a change.
+
+### The slot count is per device, not one number for the split
+
+The old rule sized the expert slots as `free / (MoE layers x expert bytes)` **and then took the minimum over the
+devices**, giving every layer that many slots. On this box the two cards are not equal: upstream's "last card" rule
+puts `lm_head` (Q6_K, 1.0 GB) on the card that owns the last layer, and the KV is per layer per device, so the card
+that binds has ~1 GB less room for experts. Measured on the full pack with the new `INFO minimax-vram-slots` line
+(`dev=`, `moe_layers=`, `free=`, `slots_here=`, `shared_min=`):
+
+| context | device 0 (25 MoE layers) | device 1 (32 MoE layers) | old shared count | total slots before -> after |
+| --- | ---: | ---: | ---: | --- |
+| 88 | 10 | 6 | 6 | 342 -> 442 (+29%) |
+| 8 192 | 9 | 5 | 5 | — |
+| 32 768 | 6 | 2 | 2 | 114 -> 214 (+88%) |
+
+Each layer now gets its own card's count, so a layer's cost is that card's `moe_layers x expert_bytes` and the
+split's imbalance costs nothing. An explicit `--minimax-vram-slots-per-layer` stays uniform (the caller asked for
+that number), which is also what makes the A/B below possible with one binary. `vram_slots_per_layer` in
+`--minimax-stats` still reports the minimum across devices, so old logs stay comparable.
+
+**Measured**, full pack, one binary, 64-token real-text prompt then 16 greedy tokens, 3 `GEN` requests in each of
+two interleaved arms, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin --memory-limit-mib 86000`:
+
+| arm | decode tok/s (3 reps, median) | `--minimax-profile-time` total ms/token | vram hits/token | hit rate | ram/token | ssd/token | ssd MB/token |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `--minimax-vram-slots-per-layer 6` (the old rule) | 3.73 (4.16 / 3.36 / 3.73) | 233.8 | 61.3 | 26.9% | 150.9 | 13.8 | 251 |
+| **auto, per device** (new default) | **4.04** (3.66 / 4.15 / 4.04) | **215.0** | **74.0** | **32.4%** | **139.9** | 12.7 | 230 |
+
+The phase table for the same pair: `cpu_ram` 129.7 -> 118.1, `ssd_wait` 18.6 -> 13.4, `cpu_ssd` 9.8 -> 6.5,
+`admit` 9.7 -> 6.5, `gpu_begin` 6.3 -> 7.7, `gpu_stream` 6.5 -> 7.9, `attn` 28.5 -> 29.5. The lane and every
+SSD-side phase fall because a sixth of the routes moved from the RAM tier to the VRAM tier. Rep-to-rep spread on
+this drive is +-10%, so the median and the profile total are what the claim rests on, not one rep.
+
+The change is inert when the tier is off (`--minimax-vram-slots-per-layer 0`, the all-CPU parity gate): `q == 0`
+and `L.vram.size() == 0`, so the allocation, the profile fill and the RAM split all take the same branch as before.
+`q_dev` is only consulted when slots exist. **Gates re-run on this branch** (`gate_logits.py`, merge base
+`9ada09d0` against this branch, real-weight 15-layer slice, 64 real-text tokens):
+
+| arm | max abs | KL | top1 | |
+| --- | ---: | ---: | ---: | --- |
+| all CPU (`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`), 2 GPUs | **0.0** | 0.0 | 1.000 | identical |
+| tiers, explicit uniform count (`--minimax-vram-slots-per-layer 4`), 1 GPU | **0.0** | 0.0 | 1.000 | identical |
+| tiers, explicit uniform count 4, 2 GPUs | **0.0** | 0.0 | 1.000 | identical |
+| tiers auto, 1 GPU (one card, so the placement is the same as the old rule) | 0.0 | 0.0 | 1.000 | identical |
+| **tiers auto, 2 GPUs: old 6/6 against new 10/6** | 9.48e-01 | 2.57e-03 | 0.969 | DIFFERS |
+| control: new auto (10/6) against new all-CPU, same binary | 9.83e-01 | 4.66e-03 | 0.938 | DIFFERS |
+
+Two-arm controls with *different* arguments on the same path read KL 5.25e-03 / top-1 0.906, so the harness detects
+a difference when there is one.
+
+**Why the last two rows are not 0.0, and why that is the tier's existing property rather than this change.** Only
+the placement moves between the last two arms - same binary, same flags but `--minimax-vram-slots-per-layer 0` -
+and it still differs, so the *VRAM expert kernel is not bit-identical to the CPU one*. That is the P3 tier's
+documented behaviour and it is known: the device iq kernels quantize the activation with `q8_1` while the CPU path
+uses ggml's `Q8_K` (the synthetic-file gate in the P3 section records the same cause at max-abs 2.1e-2). So
+**no gate can be 0.0 across a slot-count change**; the question a slot change has to pass is KL. On the slice,
+moving to the larger per-device cache reads **KL 2.57e-03 and top-1 0.969**, against the P7b decision rule
+(top-1 drop <= 1 point *for a routing change* and KL increase <= 0.02); the top-1 drop is bigger because a
+sixth of the routes change *kernel*, not their expert. A larger VRAM cache is therefore a small numeric change
+traded for speed, exactly like any other slot count: the tiers have never been bit-identical and the flag that
+makes them so is `--minimax-vram-slots-per-layer 0`.
+
+### Rejected: Project Maya's 20 ms pool spin (`--minimax-pool-spin-us`)
+
+Maya spins 20 ms before a worker sleeps (19 workers on a 20-core part 28.3 tok/s, 18 -> 47.2). Here it loses:
+12 threads with a 20 ms spin measured `cpu_ram` 182.8 ms/token against 139.5 without, interleaved, same binary,
+and 24 threads with the spin 122.0 against 110.5 without. **The default stays 0.**
+
+### Rejected: 24 threads on the 12-core/24-thread part
+
+The lane does like the SMT sibling - on the 15-layer slice with all 12 MoE layers pinned it is 6 threads 10.7 GB/s,
+12 threads 22.0, 24 threads 24.7, i.e. linear in *hardware threads* to 12 and +12% for the sibling - but the pool
+shares the box with the thread that issues each layer's GPU work. Same-binary 3-rep A/B: `cpu_ram` 129.9 -> 121.5
+(**-6.5%**) while `attn` 28.2 -> 31.1, `router` 5.7 -> 7.1, `gpu_begin` 5.7 -> 8.8, `shared` 15.4 -> 18.4,
+`admit` 10.0 -> 17.4, so the token goes 232.2 -> 248.9 ms and 3.52 -> 3.17 tok/s. **The default stays at the
+physical core count**; `--cpu-threads` still raises it.
+
+### The lane's ceiling, measured (priority 1 of the round)
+
+`cpu_ram` is 130 of a 232 ms token, so it was the first target. It is **compute-bound per hardware thread**, not
+bandwidth-bound: 2.05 GB/s a thread, 24.7 GB/s at 12 cores / 24 threads, and the DDR4-3200 ceiling (~40 GB/s) is
+never approached. `ggml_vec_dot_iq2_xs_q8_K` asserts `nrc == 1`, and Strata's AVX2 IQ row kernel is within 5% of it
+at one token (P5c), so the remaining bit-identical headroom is the SMT sibling - which the A/B above says is not
+worth taking. Project Maya's GLM lane does the *same* arithmetic at one token; its advantage there is a per-expert
+`[gate|up|down]` blob and a ~48-piece job split, neither of which changes the inner loop.
+
+### The context default is 16 K (launcher plan and the engine's unasked default)
+
+The KV is f16 and it is allocated for the whole context **per layer per device**, so it comes straight out of the
+binding card's expert slots. Measured with the new `INFO minimax-vram-slots` line on the full pack:
+
+| context | KV (f16) | slots/layer device 0 | device 1 |
+| ---: | ---: | ---: | ---: |
+| 88 | 0.01 GiB | 10 | 6 |
+| 8 192 | 1.05 GiB | 9 | 5 |
+| **16 384** | 2.11 GiB | **8** | **4** |
+| 32 768 | 4.22 GiB | 6 | 2 |
+
+`strata_cli/launch/catalog.py::max_context` recommended 32 K for a card under 14 GB and the engine capped an
+unasked context at 32 K; both are 16 K now, and `--max-context` (or the dashboard's context control) still raises
+it. The trade is explicit: +2 slots a layer on the binding card for a conversation that does not need 32 K.
+
+### Where the MoE layers go across two unequal cards: the link, not just the slots
+
+The split is picked before any weight is uploaded, so it is priced on layer bytes. Measured with `--layer-split K`
+(full pack, ctx 16384, 3 interleaved `GEN` reps, same binary):
+
+| K (layers on device 0) | slots/layer dev0 / dev1 | decode tok/s (median) | profile ms/token | `cpu_ram` | ssd MB/token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| auto (29/28) | 5 / 6 | 3.56 | 226.2 | 113.4 | 231 |
+| 30 (27/30) | 7 / 5 | 2.43 | 867.4 | 100.9 | 212 (drive window: `ssd_wait` 672 ms, discard) |
+| **24 (21/36)** | **12 / 2** | **4.08** | **196.6** | 100.0 | 246 |
+
+`--layer-split 24` is **+14.6%** over auto even though its total slot count (324) is *below* auto's (328), and the
+coverage curve of §3 cannot tell the two apart (7.04 against 7.03). The difference is the link: device 0 is on
+**PCIe 3.0 x4** (Gen4 x16 on device 1), so every expert it holds is copied over a quarter of the bandwidth -
+`gpu_stream` and `gpu_begin` fall when its MoE layers are fewer. That is the term Project Maya's `STRATA_GLM_SPLIT`
+prices ("each layer's reads over each card's memory bandwidth") and this engine does not have.
+
+An attempt to make `auto` search the split points is **not** in this branch: the search runs before
+`place_weights()`, where a device's real free VRAM (after its own work buffers, MSA scratch and the model's fixed
+allocations, ~3 GB on this box) is not yet known, and a model of it misprices the choice - the first attempt picked
+56/4 by maximising the slot *sum*, which is unbounded, and the coverage-curve version picked a split 14 points
+worse than the measured best. The honest fix is to move the decision after the dense upload (the refactor the
+per-device slot count already needed), and until then `--layer-split 24` is the measured answer for this box.
+
+### A1: the RAM-fit pack, per-layer mixing (assembled, not yet accepted by the engine)
+
+`tools/minimax/mix_layers.py` builds a mixed pack by copying whole layers' expert tensors, bit for bit, from two
+published packs, so nothing is re-quantized. Measured sizes for this pack set:
+
+| | bytes/layer of experts | 57 layers |
+| --- | ---: | ---: |
+| D3 (gate/up IQ2_XS, down IQ3_XXS) | 2.322 GB | 132.3 GB |
+| IQ1_M (all three IQ1_M) | 1.680 GB | 95.7 GB |
+
+25 of the 57 MoE layers taken from IQ1_M gives **116.3 GB of experts** (43.9% of the layers, 40.5% of the profile's
+routing mass, deepest-first), a ~130 GB file - i.e. `ssd/token` 0 with ~6 GB of it in VRAM slots instead of pinned.
+The assembled file passes a structural read (`1188` tensors, per-layer types as intended) but the engine rejects it
+at the last tensor: the source is a 13-shard pack whose `split.no`/`split.count`/`split.tensors.count` keys are
+`u16`/`i32` and describe 13 shards, and a single-file output has to drop them (or be written as 13 shards). That is
+the next step, with the G3 six-prompt gate, before the mix is a default or even a documented recipe.

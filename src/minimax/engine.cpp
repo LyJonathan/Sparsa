@@ -1200,21 +1200,30 @@ struct Engine::Impl {
         init_probes();
 
         threads = opt.cpu_threads;
+        const char* thread_src = "--cpu-threads";
         if (threads <= 0) {
-            // P7: the default is the physical core count, not the logical one.  Decode here is bandwidth-bound:
-            // the CPU expert dots stream 2.4-4 GB per token out of the RAM tier, and on a 12-core/24-thread part
-            // the second SMT thread per core adds contention rather than throughput (measured on the 15-layer
-            // slice, see tools/minimax/README.md).  A machine that reports no SMT is unaffected.
+            // P13: measured, the default stays the physical core count.  Decode is not bandwidth-bound (P7's
+            // reason), it is compute-bound per hardware thread, so SMT does help the lane a little - but on the
+            // full 60-layer model the 24 spinning pool workers also compete with the thread that issues each
+            // layer's GPU work, and the two effects nearly cancel in opposite directions over the whole token.
+            //   slice, all 12 MoE layers pinned (48 experts, 787 MB a token), lane GB/s by thread count:
+            //     6 threads 10.7, 12 threads 22.0, 24 threads 24.7 - one SMT sibling per core is worth ~12%,
+            //     and the dual-channel DDR4-3200 ceiling (~40 GB/s) is never reached at any count.
+            //   full model, same box, interleaved A/B of the same binary (`--cpu-threads 12` against no flag):
+            //     `cpu_ram` 129.9 -> 121.5 ms (-6.5%, the lane likes the second thread) but `attn` 28.2 -> 31.1,
+            //     `router` 5.7 -> 7.1, `gpu_begin` 5.7 -> 8.8, `shared` 15.4 -> 18.4, `admit` 10.0 -> 17.4, so
+            //     the token 232.2 -> 248.9 ms/token and 3.52 -> 3.17 tok/s: a regression.
+            // A machine that reports no SMT is unaffected either way; `--cpu-threads` still lets a caller raise it.
             const int phys = physical_cores();
             const int logical = (int)std::thread::hardware_concurrency();
             threads = phys > 0 ? phys : (logical > 1 && logical % 2 == 0 ? logical / 2 : logical);
+            thread_src = phys > 0 ? "physical cores" : "logical CPUs / 2";
         }
         if (threads <= 0) threads = 4;
         if (threads > 64) threads = 64;
         pool.spin_us = std::max(0, opt.pool_spin_us);
-        std::fprintf(stderr, "INFO minimax-threads=%d (source=%s, logical=%d)\n", threads,
-                     opt.cpu_threads > 0 ? "--cpu-threads" : "physical cores",
-                     (int)std::thread::hardware_concurrency());
+        std::fprintf(stderr, "INFO minimax-threads=%d (source=%s, physical=%d, logical=%d)\n", threads,
+                     thread_src, physical_cores(), (int)std::thread::hardware_concurrency());
         pool.start(threads);
 
         // N=0 is the all-CPU dense path: no device, no CUDA runtime calls. Automatic placement (-1), any
@@ -2280,6 +2289,16 @@ struct Engine::Impl {
                              "workspace before sizing expert slots\n",
                              (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
         }
+        // P13: the slot count is per device, not one number for the split.  The old rule took the minimum over the
+        // devices and gave every layer that many slots, which throws away whatever the roomier card has left: on
+        // this 2 x RTX 5070 12 GB box the card that owns `lm_head` (upstream's "last card" rule, +1.0 GB of Q6_K)
+        // and the other one differ by ~1 GB, which at 18 MB an expert is 4 slots a layer - measured at ctx 88:
+        // dev0 10 slots/layer, dev1 6, so 25 x 4 = 100 of the ~440 slots the VRAM could hold went unused.  It is
+        // worse the more the KV takes (the KV is per layer and per device): ctx 8192 has 9 / 5, ctx 32768 6 / 2.
+        // Each card now gets its own count, so a layer's cost is that card's `moe_layers x expert_bytes` and the
+        // split's imbalance costs nothing.  An explicit `--minimax-vram-slots-per-layer` stays uniform (the caller
+        // asked for that number) and the same `min` is still what the stats line reports.
+        std::vector<int> q_dev(devs.size(), 0);
         if (q < 0) {
             q = (int)cfg.n_expert;
             for (size_t d = 0; d < devs.size(); ++d) {
@@ -2290,12 +2309,17 @@ struct Engine::Impl {
                 // init_prefill shrinks the batch to whatever room that count left, as before.
                 const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_swap ? 0 : prefill_need,
                                                         max_expert_bytes, (int)dev_moe[d], (int)cfg.n_expert, -1);
+                q_dev[d] = pl.slots;
                 if (pl.slots < q) q = pl.slots;
             }
             if (q < 0) q = 0;
         }
         if (q < 0) q = 0;
         if (q > cfg.n_expert) q = (int)cfg.n_expert;
+        if (q_dev.empty() || q_dev.size() != devs.size()) q_dev.assign(devs.size(), q);
+        for (size_t d = 0; d < q_dev.size(); ++d)
+            if (q_dev[d] <= 0) q_dev[d] = q;   // an explicit count, or a device the auto plan skipped
+        if (q_dev.size() == 1 && q_dev[0] < q) q_dev[0] = q;
         if (q > 0) {
             if (!tiers_gpu_possible())
                 fail("--minimax-vram-slots-per-layer needs a CUDA device (dense_layers_gpu=0 still starts CUDA "
@@ -2316,11 +2340,26 @@ struct Engine::Impl {
                          "--vram-reserve-mib.");
                 }
             }
+            // P13: the slot count is a `min` over the devices, so a card that comes out ahead leaves its VRAM
+            // unused.  On this box it is the card that owns `lm_head` (upstream's "last card" rule: +1.0 GB of
+            // Q6_K) that binds, and the two 12 GB cards are otherwise nearly equal - so print each card's own
+            // figure next to the shared count.  A per-device count is the obvious next step (it needs the profile
+            // fill and the RAM split to read it per layer), and this line is the number that decides whether it is
+            // worth it.
+            for (size_t d = 0; d < devs.size(); ++d) {
+                if (dev_moe[d] <= 0) continue;
+                const size_t per_slot = (size_t)dev_moe[d] * max_expert_bytes;
+                std::fprintf(stderr,
+                             "INFO minimax-vram-slots dev=%d moe_layers=%d free=%zu MiB slots_here=%d "
+                             "shared_min=%d" "\n",
+                             (int)devs[d], (int)dev_moe[d], dev_budget[d] >> 20, q_dev[d], q);
+            }
             for (Layer& L : layers) {
                 if (!L.moe) continue;
+                const int ql = q_dev[(size_t)L.dev];
                 use_device_index(L.dev);
-                L.vram.reserve((size_t)q);
-                for (int s = 0; s < q; ++s) {
+                L.vram.reserve((size_t)ql);
+                for (int s = 0; s < ql; ++s) {
                     Layer::VramSlot slot;
                     slot.mem = DevPtr(cu::alloc(L.expert_bytes));
                     L.vram.push_back(std::move(slot));
@@ -2415,7 +2454,7 @@ struct Engine::Impl {
                 if (!L.moe) continue;
                 const int s = seen[(size_t)(pl + cfg.leading_dense)]++;
                 const int nn = ram_n[(size_t)(pl + cfg.leading_dense)];
-                if (s < vram_per_layer) continue;   // the profile's top q per layer went to VRAM
+                if (s < (int)L.vram.size()) continue;   // the profile's top slots of this layer went to VRAM
                 if (nn >= cap) continue;
                 if (spent + L.expert_bytes > ram_budget) break;
                 ram_n[(size_t)(pl + cfg.leading_dense)] = nn + 1;
@@ -2575,7 +2614,8 @@ struct Engine::Impl {
                 }
                 std::sort(order.begin(), order.end());
                 int at = 0;
-                for (int s = 0; s < vram_per_layer && at < (int)order.size(); ++s, ++at)
+                const int vq = (int)L.vram.size();
+                for (int s = 0; s < vq && at < (int)order.size(); ++s, ++at)
                     vram_fill(L, s, order[(size_t)at].second);
                 for (int s = 0; s < L.ram_n && at < (int)order.size(); ++s, ++at)
                     ram_fill(L, s, order[(size_t)at].second);
