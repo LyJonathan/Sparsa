@@ -49,5 +49,5 @@ jobs:
         env:
           STRATA_GGML_DIR: ${{ github.workspace }}/llama.cpp
         run: |
-          tools/minimax/build_linux.sh
+          sh tools/minimax/build_linux.sh
           test -x build/strata-minimax
