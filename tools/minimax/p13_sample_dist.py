@@ -41,7 +41,10 @@ def read_ids(path: str) -> list[int]:
 def draw_first_tokens(model: str, ids: list[int], draws: int, extra: list[str], ctx: int, temperature: float,
                       top_k: int) -> list[int]:
     """`draws` one-token generations in ONE process: the first token after the prompt, per request."""
+    launcher = pathlib.Path(__file__).with_name('pc_launch.py')
     cmd = [exe(), '--model', model, '--serve', '--max-context', str(ctx), *extra]
+    if launcher.exists():   # the shared PC: every engine run goes through the lock + RAM floor + watchdog
+        cmd = [sys.executable, str(launcher), '--owner', os.environ.get('PC_OWNER', 'dspark'), '--'] + cmd
     text = ''
     for s in range(draws):
         text += (f'GEN 1 temperature={temperature} top_k={top_k} seed={1000 + s} ' + ' '.join(map(str, ids)) + '\n')
@@ -92,7 +95,7 @@ def main() -> int:
     dof = max(1, int(keep.sum()) - 1)
     # a crude p-value bound: chi2 beyond 2*dof + 8 is far in the tail
     ok = tv <= 0.10 and chi2 <= 2.0 * dof + 8
-    print(f'draws {a.draws} each, temperature {a.temperature}, top_k {a.top_k}')
+    print(f'draws {a.draws} each (the second token of each request), temperature {a.temperature}, top_k {a.top_k}')
     print(f'  distinct tokens: plain {len(set(plain))}, dspark {len(set(spec))}')
     print(f'  total variation between the arms: {tv:.4f}')
     print(f'  chi-square {chi2:.1f} on {dof} dof (threshold {2.0 * dof + 8:.1f})')
