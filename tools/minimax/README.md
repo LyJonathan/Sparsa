@@ -1576,3 +1576,44 @@ binding card's expert slots. Measured with the new `INFO minimax-vram-slots` lin
 `strata_cli/launch/catalog.py::max_context` recommended 32 K for a card under 14 GB and the engine capped an
 unasked context at 32 K; both are 16 K now, and `--max-context` (or the dashboard's context control) still raises
 it. The trade is explicit: +2 slots a layer on the binding card for a conversation that does not need 32 K.
+
+### Where the MoE layers go across two unequal cards: the link, not just the slots
+
+The split is picked before any weight is uploaded, so it is priced on layer bytes. Measured with `--layer-split K`
+(full pack, ctx 16384, 3 interleaved `GEN` reps, same binary):
+
+| K (layers on device 0) | slots/layer dev0 / dev1 | decode tok/s (median) | profile ms/token | `cpu_ram` | ssd MB/token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| auto (29/28) | 5 / 6 | 3.56 | 226.2 | 113.4 | 231 |
+| 30 (27/30) | 7 / 5 | 2.43 | 867.4 | 100.9 | 212 (drive window: `ssd_wait` 672 ms, discard) |
+| **24 (21/36)** | **12 / 2** | **4.08** | **196.6** | 100.0 | 246 |
+
+`--layer-split 24` is **+14.6%** over auto even though its total slot count (324) is *below* auto's (328), and the
+coverage curve of §3 cannot tell the two apart (7.04 against 7.03). The difference is the link: device 0 is on
+**PCIe 3.0 x4** (Gen4 x16 on device 1), so every expert it holds is copied over a quarter of the bandwidth -
+`gpu_stream` and `gpu_begin` fall when its MoE layers are fewer. That is the term Project Maya's `STRATA_GLM_SPLIT`
+prices ("each layer's reads over each card's memory bandwidth") and this engine does not have.
+
+An attempt to make `auto` search the split points is **not** in this branch: the search runs before
+`place_weights()`, where a device's real free VRAM (after its own work buffers, MSA scratch and the model's fixed
+allocations, ~3 GB on this box) is not yet known, and a model of it misprices the choice - the first attempt picked
+56/4 by maximising the slot *sum*, which is unbounded, and the coverage-curve version picked a split 14 points
+worse than the measured best. The honest fix is to move the decision after the dense upload (the refactor the
+per-device slot count already needed), and until then `--layer-split 24` is the measured answer for this box.
+
+### A1: the RAM-fit pack, per-layer mixing (assembled, not yet accepted by the engine)
+
+`tools/minimax/mix_layers.py` builds a mixed pack by copying whole layers' expert tensors, bit for bit, from two
+published packs, so nothing is re-quantized. Measured sizes for this pack set:
+
+| | bytes/layer of experts | 57 layers |
+| --- | ---: | ---: |
+| D3 (gate/up IQ2_XS, down IQ3_XXS) | 2.322 GB | 132.3 GB |
+| IQ1_M (all three IQ1_M) | 1.680 GB | 95.7 GB |
+
+25 of the 57 MoE layers taken from IQ1_M gives **116.3 GB of experts** (43.9% of the layers, 40.5% of the profile's
+routing mass, deepest-first), a ~130 GB file - i.e. `ssd/token` 0 with ~6 GB of it in VRAM slots instead of pinned.
+The assembled file passes a structural read (`1188` tensors, per-layer types as intended) but the engine rejects it
+at the last tensor: the source is a 13-shard pack whose `split.no`/`split.count`/`split.tensors.count` keys are
+`u16`/`i32` and describe 13 shards, and a single-file output has to drop them (or be written as 13 shards). That is
+the next step, with the G3 six-prompt gate, before the mix is a default or even a documented recipe.
