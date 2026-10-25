@@ -62,6 +62,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/iq_mt.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -5519,6 +5520,28 @@ struct Engine::Impl {
         std::vector<uint8_t> aq(act_bytes * (size_t)T);
         for (int c = 0; c < T; ++c) act->from_float(X + (size_t)c * ldx, aq.data() + (size_t)c * act_bytes, K);
         const ggml_vec_dot_t dot = t.cpu->vec_dot;
+        // P13: one weight row, several tokens (a prompt chunk, a speculative verify window).  The multi-token row
+        // decodes the IQ2_XS block once and is bit-identical to `dot` per column (src/kernels/cpu/iq_mt_test.cpp),
+        // so the same numbers come out of one decode per row instead of one per (row, token).
+        // STRATA_IQ_MT=0 is the A/B switch.
+        static const bool mt_on = [] {
+            const char* e = std::getenv("STRATA_IQ_MT");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (T > 1 && mt_on && strata::kernels::mt::supported(t.type)) {
+            pool.run(N, [&](int a, int b) {
+                for (int r = a; r < b; ++r) {
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
+                    for (int c0 = 0; c0 < T; c0 += strata::kernels::mt::kMaxCols) {
+                        const int n = std::min(strata::kernels::mt::kMaxCols, T - c0);
+                        const uint8_t* ptrs[strata::kernels::mt::kMaxCols];
+                        for (int c = 0; c < n; ++c) ptrs[c] = aq.data() + (size_t)(c0 + c) * act_bytes;
+                        strata::kernels::mt::dot_rows(t.type, row, ptrs, n, Y + (size_t)c0 * ldy + r, ldy, K);
+                    }
+                }
+            });
+            return;
+        }
         pool.run(N, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 const uint8_t* row = base + (size_t)r * t.row_bytes;
