@@ -43,41 +43,47 @@ GGUF_PART = "-00001-of-"
 # LyJonathan/MiniMax-M3.1-Flash-GGUF: the published tiers, plus the planned mixed tiers as placeholders.
 # `experts_gb` is the sum of the routed `*_exps` tensors, read from each pack's GGUF headers; `total_gb`
 # is the whole 13-part download (the published README sizes). Both use decimal GB, the unit the README
-# prints. The picker only considers `available` packs, so a placeholder can never be chosen or downloaded
-# before it exists.
+# prints. `top1` is the Sparsa G3 result from the HF README's Quality table. The picker only considers
+# `available` packs, so a placeholder can never be chosen or downloaded before it exists.
 PACKS = (
     {"key": "iq1-s", "folder": "MiniMax-M3.1-Flash-IQ1_S", "experts_gb": 83.915, "total_gb": 94.786,
-     "about": "IQ1_S experts; Sparsa and llama.cpp (patched); 44.3 % top-1, loops in practice",
-     "available": True},
-    {"key": "iq1-m", "folder": "MiniMax-M3.1-Flash-IQ1_M", "experts_gb": 95.750, "total_gb": 106.620,
-     "about": "IQ1_M experts; 47.1 % top-1", "available": True},
-    {"key": "iq2-kt", "folder": "MiniMax-M3.1-Flash-IQ2_KT", "experts_gb": 110.094, "total_gb": 123.820,
-     "about": "IQ2_KT experts (ik_llama.cpp's type); Sparsa only; 56.3 % top-1", "available": True},
-    {"key": "iq2-xxs", "folder": "MiniMax-M3.1-Flash-IQ2_XXS", "experts_gb": 110.811, "total_gb": 124.537,
-     "about": "IQ2_XXS experts; 52.0 % top-1", "available": True},
-    {"key": "iq2-xs", "folder": "MiniMax-M3.1-Flash-IQ2_XS", "experts_gb": 119.418, "total_gb": 133.143,
-     "about": "IQ2_XS experts; Sparsa and llama.cpp (patched); 46.8 % top-1 on the harder set",
-     "available": True},
-    {"key": "iq2-xs-d3", "folder": "MiniMax-M3.1-Flash-IQ2_XS-D3", "experts_gb": 132.328, "total_gb": 146.054,
-     "about": "IQ2_XS gate/up + IQ3_XXS down; 59.4 % top-1", "available": True},
-    {"key": "iq2-kl", "folder": "MiniMax-M3.1-Flash-IQ2_KL", "experts_gb": 138.963, "total_gb": 152.688,
-     "about": "IQ2_KL experts; Sparsa only; 59.8 % top-1", "available": True},
-    {"key": "iq3-k", "folder": "MiniMax-M3.1-Flash-IQ3_K", "experts_gb": 177.513, "total_gb": 191.239,
-     "about": "IQ3_K experts; Sparsa only; 69.8 % top-1", "available": True},
-    {"key": "iq4-ks", "folder": "MiniMax-M3.1-Flash-IQ4_KS", "experts_gb": 219.830, "total_gb": 233.555,
-     "about": "IQ4_KS experts; Sparsa only; 74.4 % top-1", "available": True},
-    {"key": "nvfp4", "folder": "MiniMax-M3.1-Flash-NVFP4", "experts_gb": 232.381, "total_gb": 246.107,
-     "about": "the checkpoint's NVFP4 expert values; Sparsa only; 77.3 % top-1", "available": True},
+     "top1": 44.3, "recommended": False, "available": True,
+     "about": "IQ1_S experts; 44.3 % top-1; NOT RECOMMENDED (it loops in practice)"},
+    {"key": "iq1-m", "folder": "MiniMax-M3.1-Flash-IQ1_M", "experts_gb": 95.750, "total_gb": 106.620, "available": True,
+     "top1": 47.1, "recommended": True, "about": "IQ1_M experts; 47.1 % top-1"},
+    {"key": "iq2-kt", "folder": "MiniMax-M3.1-Flash-IQ2_KT", "experts_gb": 110.094, "total_gb": 123.820, "available": True,
+     "top1": 56.3, "recommended": True,
+     "about": "IQ2_KT experts (ik_llama.cpp's type); Sparsa only; 56.3 % top-1"},
+    {"key": "iq2-xxs", "folder": "MiniMax-M3.1-Flash-IQ2_XXS", "experts_gb": 110.811, "total_gb": 124.537, "available": True,
+     "top1": 52.0, "recommended": True, "about": "IQ2_XXS experts; 52.0 % top-1"},
+    {"key": "iq2-xs", "folder": "MiniMax-M3.1-Flash-IQ2_XS", "experts_gb": 119.418, "total_gb": 133.143, "available": True,
+     "top1": None, "quality_rank": 59.3, "recommended": True,
+     "about": "IQ2_XS experts; no Sparsa G3 number (ranked just below IQ2_XS-D3)"},
+    {"key": "iq2-xs-d3", "folder": "MiniMax-M3.1-Flash-IQ2_XS-D3", "experts_gb": 132.328, "total_gb": 146.054, "available": True,
+     "top1": 59.4, "recommended": True, "about": "IQ2_XS gate/up + IQ3_XXS down; 59.4 % top-1"},
+    {"key": "iq2-kl", "folder": "MiniMax-M3.1-Flash-IQ2_KL", "experts_gb": 138.963, "total_gb": 152.688, "available": True,
+     "top1": 59.8, "recommended": True, "about": "IQ2_KL experts; Sparsa only; 59.8 % top-1"},
+    {"key": "iq3-k", "folder": "MiniMax-M3.1-Flash-IQ3_K", "experts_gb": 177.513, "total_gb": 191.239, "available": True,
+     "top1": 69.8, "recommended": True, "about": "IQ3_K experts; Sparsa only; 69.8 % top-1"},
+    {"key": "iq4-ks", "folder": "MiniMax-M3.1-Flash-IQ4_KS", "experts_gb": 219.830, "total_gb": 233.555, "available": True,
+     "top1": 74.4, "recommended": True, "about": "IQ4_KS experts; Sparsa only; 74.4 % top-1"},
+    {"key": "nvfp4", "folder": "MiniMax-M3.1-Flash-NVFP4", "experts_gb": 232.381, "total_gb": 246.107, "available": True,
+     "top1": 77.3, "recommended": True,
+     "about": "the checkpoint's NVFP4 expert values; Sparsa only; 77.3 % top-1"},
     # Planned, not published: a mixed pack with about 100 GB of experts for a 128 GB machine, and an
     # IQ1_S-based pack for a 96 GB machine. Kept here so the picker stays data-driven.
     {"key": "mix-128", "folder": "MiniMax-M3.1-Flash-MIX128", "experts_gb": 100.0, "total_gb": 0.0,
+     "top1": None, "recommended": True,
      "about": "planned mixed ~100 GB-expert pack for 128 GB RAM; not published yet", "available": False},
     {"key": "iq1-s-96", "folder": "MiniMax-M3.1-Flash-IQ1_S-96", "experts_gb": 84.0, "total_gb": 0.0,
+     "top1": None, "recommended": True,
      "about": "planned IQ1_S-based pack for 96 GB RAM; not published yet", "available": False},
 )
+
 QUANTS = {p["key"]: (p["folder"], p["about"]) for p in PACKS}
 
-# The rule from the model's GGUF README: the largest pack whose experts fit in RAM with this much to spare.
+# The rule: best measured quality (Sparsa G3 top-1) among packs whose experts fit in RAM with this much
+# to spare and whose download fits the disk. Ties go to the smaller pack.
 RAM_RESERVE_GB = 10.0
 # The mmproj (1.73 GB) and the tokenizer files sit beside the pack; keep room for them on disk.
 DISK_RESERVE_GB = 2.0
@@ -153,21 +159,32 @@ def machine_specs(path: str | os.PathLike | None = None) -> Machine:
     return Machine(total_ram_gb(), gpu_vram_gb(), free_disk_gb(path))
 
 
+def pack_quality(pack: dict) -> float:
+    """The pack's Sparsa G3 top-1 for ranking; IQ2_XS has no G3 run and uses its explicit rank just below
+    IQ2_XS-D3. A placeholder with no number ranks last (and is never selectable anyway)."""
+    return pack.get("quality_rank", pack.get("top1") if pack.get("top1") is not None else -1.0)
+
+
 def choose_pack(machine: Machine, packs=PACKS) -> dict | None:
-    """The largest available pack whose experts fit in RAM with RAM_RESERVE_GB to spare and whose download
-    fits the free disk. A pack missing either test is skipped; None when no published pack fits."""
-    best = None
+    """The best measured-quality available pack whose experts fit in RAM with RAM_RESERVE_GB to spare and
+    whose download fits the free disk. Ties go to the smaller download. IQ1_S is only used when nothing else
+    fits. None when no published pack fits."""
     budget = machine.ram_gb - RAM_RESERVE_GB
-    for pack in packs:
-        if not pack.get("available", False):
-            continue
-        if pack["experts_gb"] > budget:
-            continue
-        if pack["total_gb"] + DISK_RESERVE_GB > machine.free_disk_gb:
-            continue
-        if best is None or pack["total_gb"] > best["total_gb"]:
-            best = pack
-    return best
+    eligible = [p for p in packs
+                if p.get("available", False)
+                and p["experts_gb"] <= budget
+                and p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb]
+    if not eligible:
+        return None
+    pool = [p for p in eligible if p.get("recommended", True)] or eligible
+    return max(pool, key=lambda p: (pack_quality(p), -p["total_gb"], -p["experts_gb"]))
+
+
+def pack_warning(pack: dict | None) -> str:
+    if pack is None or pack.get("recommended", True):
+        return ""
+    return (f"sparsa: WARNING {pack['key']} is not recommended: it loops in practice "
+            f"({pack['top1']:.1f} % top-1). It was picked only because nothing else fits.")
 
 
 def pick_pack(machine: Machine | None = None) -> dict | None:
@@ -305,6 +322,9 @@ def build_config(args) -> dict:
                 f"        python sparsa.py download {pack['key']} --dir {models_dir}")
         say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM "
             f"({pack['experts_gb']:.1f} GB of experts, {machine.gpu_count} GPU(s)): {folder}")
+        warning = pack_warning(pack)
+        if warning:
+            say(warning)
         args.model = str(folder)
     first, parts = find_model_guf(args.model)
     engine = find_engine(args.engine)
@@ -495,7 +515,7 @@ def cmd_pick(args) -> int:
     if args.json:
         say(json.dumps({"machine": {"ram_gb": machine.ram_gb, "vram_gb": list(machine.vram_gb),
                                     "free_disk_gb": machine.free_disk_gb},
-                        "pack": pack}, indent=2))
+                        "pack": pack, "warning": pack_warning(pack)}, indent=2))
         return 0
     say(f"sparsa: {machine.ram_gb:.0f} GB RAM, {machine.gpu_count} GPU(s) "
         f"({', '.join(f'{x:.0f} GB' for x in machine.vram_gb) or 'none'}), "
@@ -506,12 +526,19 @@ def cmd_pick(args) -> int:
         fits = p["experts_gb"] <= machine.ram_gb - RAM_RESERVE_GB
         disk = p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb
         state = "published" if p["available"] else "NOT PUBLISHED"
+        top1 = "n/a" if p.get("top1") is None else f"{p['top1']:.1f}%"
+        rec = "" if p.get("recommended", True) else "  NOT RECOMMENDED"
         mark = "  <- pick" if pack is not None and p["key"] == pack["key"] else ""
-        say(f"  {p['key']:<10} experts {p['experts_gb']:7.1f} GB  pack {p['total_gb']:7.1f} GB  "
+        say(f"  {p['key']:<10} top-1 {top1:>5}  experts {p['experts_gb']:7.1f} GB  "
+            f"pack {p['total_gb']:7.1f} GB  "
             f"{'RAM ok' if fits else 'too big for RAM'}, {'disk ok' if disk else 'too big for disk'}  "
-            f"{state}{mark}")
+            f"{state}{rec}{mark}")
     if pack is None:
         say("sparsa: no published pack fits this machine")
+    else:
+        warning = pack_warning(pack)
+        if warning:
+            say(warning)
     return 0
 
 
@@ -523,6 +550,9 @@ def cmd_download(args) -> int:
             raise SystemExit(f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
                              f"{machine.free_disk_gb:.0f} GB free disk); `python sparsa.py pick` lists the tiers")
         say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM: {pack['about']}")
+        warning = pack_warning(pack)
+        if warning:
+            say(warning)
         args.what = pack["key"]
     if args.what in QUANTS and not next(p for p in PACKS if p["key"] == args.what)["available"]:
         raise SystemExit(f"sparsa: {args.what} is planned but not published yet; nothing to download")
