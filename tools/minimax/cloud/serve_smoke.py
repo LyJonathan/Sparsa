@@ -25,10 +25,10 @@ CUDA_LIB = "/usr/local/lib/python3.13/site-packages/nvidia/cu13/lib"
 TOKENIZER = "/work/tok/tokenizer.json"
 
 
-def detok(ids):
+def detok(ids, tokenizer=TOKENIZER):
     try:
         from tokenizers import Tokenizer
-        return Tokenizer.from_file(TOKENIZER).decode([int(i) for i in ids], skip_special_tokens=False)
+        return Tokenizer.from_file(tokenizer).decode([int(i) for i in ids], skip_special_tokens=False)
     except Exception as e:
         return "<no tokenizer: %s>" % e
 
@@ -46,6 +46,10 @@ def main():
     ap.add_argument("--vram-slots", default="0")
     ap.add_argument("--max-context", default="8192")
     ap.add_argument("--temperature", default="0", help="0 is greedy, the reproducible choice")
+    ap.add_argument("--tokenizer", default=TOKENIZER,
+                    help="tokenizer.json used only to print the prompt and continuation")
+    ap.add_argument("--cuda-lib", default=CUDA_LIB,
+                    help="extra LD_LIBRARY_PATH entry; skipped when the directory is absent")
     args = ap.parse_args()
 
     prompt_ids = [int(x) for x in np.fromfile(args.ids, dtype=np.int32)[:args.prompt_tokens]]
@@ -58,7 +62,8 @@ def main():
            "--cpu-threads", args.cpu_threads, "--minimax-stats"]
     print("CMD " + " ".join(cmd), flush=True)
     env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = CUDA_LIB + ":" + env.get("LD_LIBRARY_PATH", "")
+    if os.path.isdir(args.cuda_lib):
+        env["LD_LIBRARY_PATH"] = args.cuda_lib + ":" + env.get("LD_LIBRARY_PATH", "")
     logpath = "/tmp/serve_smoke.log"
     log = open(logpath, "wb")
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, env=env, bufsize=0)
@@ -127,9 +132,9 @@ def main():
     for line in [l for l in txt.splitlines() if "minimax-stats" in l][-2:]:
         print(line, flush=True)
     print("---- prompt ----", flush=True)
-    print(detok(prompt_ids), flush=True)
+    print(detok(prompt_ids, args.tokenizer), flush=True)
     print("---- continuation (greedy, %d tokens) ----" % len(out_ids), flush=True)
-    print(detok(out_ids), flush=True)
+    print(detok(out_ids, args.tokenizer), flush=True)
     print("---- ids ----", flush=True)
     print(" ".join(str(i) for i in out_ids), flush=True)
     f = done.split()
