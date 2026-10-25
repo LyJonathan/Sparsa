@@ -42,51 +42,89 @@ GGUF_PART = "-00001-of-"
 
 # LyJonathan/MiniMax-M3.1-Flash-GGUF: the published tiers, plus the planned mixed tiers as placeholders.
 # `experts_gb` is the sum of the routed `*_exps` tensors, read from each pack's GGUF headers; `total_gb`
-# is the whole 13-part download (the published README sizes). Both use decimal GB, the unit the README
-# prints. `top1` is the Sparsa G3 result from the HF README's Quality table. The picker only considers
-# `available` packs, so a placeholder can never be chosen or downloaded before it exists.
+# is the whole 13-part download (the published README sizes). `top1` is the Sparsa G3 result from the HF
+# README Quality table. `decode_tok_s` and `measured_on` are measured full-model decode numbers; a pack
+# without one is shown but is never auto-picked. `default_ok` is false for the not-recommended IQ1_S and
+# for placeholders. The picker only considers `available` packs.
+PC = "2x RTX 5070 12 GB, Ryzen 9 5900X, 128 GB"
+CLOUD = "RTX PRO 6000 96 GB, 160 GiB RAM"
 PACKS = (
     {"key": "iq1-s", "folder": "MiniMax-M3.1-Flash-IQ1_S", "experts_gb": 83.915, "total_gb": 94.786,
-     "top1": 44.3, "recommended": False, "available": True,
+     "top1": 44.3, "decode_tok_s": 1.85, "measured_on": PC, "recommended": False, "available": True,
      "about": "IQ1_S experts; 44.3 % top-1; NOT RECOMMENDED (it loops in practice)"},
-    {"key": "iq1-m", "folder": "MiniMax-M3.1-Flash-IQ1_M", "experts_gb": 95.750, "total_gb": 106.620, "available": True,
-     "top1": 47.1, "recommended": True, "about": "IQ1_M experts; 47.1 % top-1"},
-    {"key": "iq2-kt", "folder": "MiniMax-M3.1-Flash-IQ2_KT", "experts_gb": 110.094, "total_gb": 123.820, "available": True,
-     "top1": 56.3, "recommended": True,
+    {"key": "iq1-m", "folder": "MiniMax-M3.1-Flash-IQ1_M", "experts_gb": 95.750, "total_gb": 106.620,
+     "top1": 47.1, "decode_tok_s": 0.90, "measured_on": CLOUD, "recommended": True, "available": True,
+     "about": "IQ1_M experts; 47.1 % top-1"},
+    {"key": "iq2-kt", "folder": "MiniMax-M3.1-Flash-IQ2_KT", "experts_gb": 110.094, "total_gb": 123.820,
+     "top1": 56.3, "decode_tok_s": 0.35, "measured_on": PC, "recommended": True, "available": True,
      "about": "IQ2_KT experts (ik_llama.cpp's type); Sparsa only; 56.3 % top-1"},
-    {"key": "iq2-xxs", "folder": "MiniMax-M3.1-Flash-IQ2_XXS", "experts_gb": 110.811, "total_gb": 124.537, "available": True,
-     "top1": 52.0, "recommended": True, "about": "IQ2_XXS experts; 52.0 % top-1"},
-    {"key": "iq2-xs", "folder": "MiniMax-M3.1-Flash-IQ2_XS", "experts_gb": 119.418, "total_gb": 133.143, "available": True,
-     "top1": None, "quality_rank": 59.3, "recommended": True,
-     "about": "IQ2_XS experts; no Sparsa G3 number (ranked just below IQ2_XS-D3)"},
-    {"key": "iq2-xs-d3", "folder": "MiniMax-M3.1-Flash-IQ2_XS-D3", "experts_gb": 132.328, "total_gb": 146.054, "available": True,
-     "top1": 59.4, "recommended": True, "about": "IQ2_XS gate/up + IQ3_XXS down; 59.4 % top-1"},
-    {"key": "iq2-kl", "folder": "MiniMax-M3.1-Flash-IQ2_KL", "experts_gb": 138.963, "total_gb": 152.688, "available": True,
-     "top1": 59.8, "recommended": True, "about": "IQ2_KL experts; Sparsa only; 59.8 % top-1"},
-    {"key": "iq3-k", "folder": "MiniMax-M3.1-Flash-IQ3_K", "experts_gb": 177.513, "total_gb": 191.239, "available": True,
-     "top1": 69.8, "recommended": True, "about": "IQ3_K experts; Sparsa only; 69.8 % top-1"},
-    {"key": "iq4-ks", "folder": "MiniMax-M3.1-Flash-IQ4_KS", "experts_gb": 219.830, "total_gb": 233.555, "available": True,
-     "top1": 74.4, "recommended": True, "about": "IQ4_KS experts; Sparsa only; 74.4 % top-1"},
-    {"key": "nvfp4", "folder": "MiniMax-M3.1-Flash-NVFP4", "experts_gb": 232.381, "total_gb": 246.107, "available": True,
-     "top1": 77.3, "recommended": True,
+    {"key": "iq2-xxs", "folder": "MiniMax-M3.1-Flash-IQ2_XXS", "experts_gb": 110.811, "total_gb": 124.537,
+     "top1": 52.0, "decode_tok_s": 0.66, "measured_on": PC, "recommended": True, "available": True,
+     "about": "IQ2_XXS experts; 52.0 % top-1"},
+    {"key": "iq2-xs", "folder": "MiniMax-M3.1-Flash-IQ2_XS", "experts_gb": 119.418, "total_gb": 133.143,
+     "top1": None, "quality_rank": 59.3, "decode_tok_s": None, "measured_on": "not measured",
+     "recommended": True, "available": True,
+     "about": "IQ2_XS experts; no Sparsa G3 number (ranked just below IQ2_XS-D3); no full-model decode speed"},
+    {"key": "iq2-xs-d3", "folder": "MiniMax-M3.1-Flash-IQ2_XS-D3", "experts_gb": 132.328, "total_gb": 146.054,
+     "top1": 59.4, "decode_tok_s": 4.0, "measured_on": PC + " (HF README)", "recommended": True,
+     "available": True, "about": "IQ2_XS gate/up + IQ3_XXS down; 59.4 % top-1"},
+    {"key": "iq2-kl", "folder": "MiniMax-M3.1-Flash-IQ2_KL", "experts_gb": 138.963, "total_gb": 152.688,
+     "top1": 59.8, "decode_tok_s": 0.27, "measured_on": CLOUD, "recommended": True, "available": True,
+     "about": "IQ2_KL experts; Sparsa only; 59.8 % top-1"},
+    {"key": "iq3-k", "folder": "MiniMax-M3.1-Flash-IQ3_K", "experts_gb": 177.513, "total_gb": 191.239,
+     "top1": 69.8, "decode_tok_s": None, "measured_on": "not measured", "recommended": True,
+     "available": True, "about": "IQ3_K experts; Sparsa only; 69.8 % top-1"},
+    {"key": "iq4-ks", "folder": "MiniMax-M3.1-Flash-IQ4_KS", "experts_gb": 219.830, "total_gb": 233.555,
+     "top1": 74.4, "decode_tok_s": None, "measured_on": "not measured", "recommended": True,
+     "available": True, "about": "IQ4_KS experts; Sparsa only; 74.4 % top-1"},
+    {"key": "nvfp4", "folder": "MiniMax-M3.1-Flash-NVFP4", "experts_gb": 232.381, "total_gb": 246.107,
+     "top1": 77.3, "decode_tok_s": 0.14, "measured_on": CLOUD, "recommended": True, "available": True,
      "about": "the checkpoint's NVFP4 expert values; Sparsa only; 77.3 % top-1"},
     # Planned, not published: a mixed pack with about 100 GB of experts for a 128 GB machine, and an
-    # IQ1_S-based pack for a 96 GB machine. Kept here so the picker stays data-driven.
+    # IQ1_S-based pack for a 96 GB machine. When the mixed pack's measured top-1, decode and size are
+    # filled in and `available` becomes true, it competes normally and wins when it is the best fit.
     {"key": "mix-128", "folder": "MiniMax-M3.1-Flash-MIX128", "experts_gb": 100.0, "total_gb": 0.0,
-     "top1": None, "recommended": True,
-     "about": "planned mixed ~100 GB-expert pack for 128 GB RAM; not published yet", "available": False},
+     "top1": None, "decode_tok_s": None, "measured_on": "not published", "recommended": True,
+     "available": False, "about": "planned mixed ~100 GB-expert pack for 128 GB RAM; not published yet"},
     {"key": "iq1-s-96", "folder": "MiniMax-M3.1-Flash-IQ1_S-96", "experts_gb": 84.0, "total_gb": 0.0,
-     "top1": None, "recommended": True,
-     "about": "planned IQ1_S-based pack for 96 GB RAM; not published yet", "available": False},
+     "top1": None, "decode_tok_s": None, "measured_on": "not published", "recommended": True,
+     "available": False, "about": "planned IQ1_S-based pack for 96 GB RAM; not published yet"},
 )
-
 QUANTS = {p["key"]: (p["folder"], p["about"]) for p in PACKS}
 
-# The rule: best measured quality (Sparsa G3 top-1) among packs whose experts fit in RAM with this much
-# to spare and whose download fits the disk. Ties go to the smaller pack.
-RAM_RESERVE_GB = 10.0
-# The mmproj (1.73 GB) and the tokenizer files sit beside the pack; keep room for them on disk.
+# The rule: best measured quality (Sparsa G3 top-1) among packs whose experts fit in the engine's RAM
+# expert tier and whose download fits the disk. Ties go to the smaller pack.
+#
+# The fit arithmetic follows src/minimax/engine.cpp's "minimax-ram-tier plan" line and
+# include/strata/minimax/vram_plan.hpp. The engine's own headroom is 1/16 of physical RAM clamped to
+# 3..10 GiB; the requirement here is the 10 GB floor, so the larger of the two is the same 10 GiB.
+RAM_FLOOR_GB = 10.0
 DISK_RESERVE_GB = 2.0
+DEFAULT_CONTEXT = 32768
+
+# MiniMax-M3.1-Flash geometry (config.json) and the engine's host buffers.
+MODEL_LAYERS = 60
+MOE_LAYERS = 57
+N_EMBD = 6144
+N_FF_EXP = 3072
+N_VOCAB = 200064
+HEAD_DIM = 128
+N_HEAD_KV = 4
+IDX_DIM = 128
+# 135 KiB per token, the same figure pc_launch.py and the engine use for host K/V.
+KV_GB_PER_TOKEN = 135.0 / 1024.0 / 1024.0
+VRAM_RESERVE_GB = 700.0 / 1024.0          # --vram-reserve-mib default
+PREFILL_WORKSPACE_GB = 0.55              # the 4096-token batched-prompt workspace per card (engine log)
+
+# The dense weights that stay host-side even when every layer is on a GPU: shared experts + embeddings.
+SHARED_EXPERT_PARAMS = MOE_LAYERS * 3 * N_EMBD * N_FF_EXP
+EMBED_PARAMS = N_VOCAB * N_EMBD
+ATTENTION_PARAMS = 6.65e9
+DENSE_MLP_PARAMS = 0.68e9
+OUTPUT_PARAMS = N_VOCAB * N_EMBD
+DENSE_PARAMS = SHARED_EXPERT_PARAMS + EMBED_PARAMS + ATTENTION_PARAMS + DENSE_MLP_PARAMS + OUTPUT_PARAMS
+HOST_DENSE_FRACTION = (SHARED_EXPERT_PARAMS + EMBED_PARAMS) / DENSE_PARAMS
+HOST_WORK_GB = (N_VOCAB + 8 * N_FF_EXP + 16 * N_EMBD + 4096) * 4 / 1e9
 
 
 @dataclass(frozen=True)
@@ -165,14 +203,60 @@ def pack_quality(pack: dict) -> float:
     return pack.get("quality_rank", pack.get("top1") if pack.get("top1") is not None else -1.0)
 
 
-def choose_pack(machine: Machine, packs=PACKS) -> dict | None:
-    """The best measured-quality available pack whose experts fit in RAM with RAM_RESERVE_GB to spare and
-    whose download fits the free disk. Ties go to the smaller download. IQ1_S is only used when nothing else
-    fits. None when no published pack fits."""
-    budget = machine.ram_gb - RAM_RESERVE_GB
+def fit_detail(machine: Machine, pack: dict, ctx: int = DEFAULT_CONTEXT, vram_slots: int = -1) -> dict:
+    """The RAM expert budget and what this pack needs, from the engine's own constants.
+
+    `budget = min(physical, available) - 10 GiB - host dense - host K/V - host workspace` (the engine's
+    ram-tier plan with the required 10 GB floor). VRAM holds every dense layer that fits after K/V and
+    the reserve; any free VRAM then holds expert slots, which reduce what the RAM tier must hold.
+    `vram_slots`: -1/auto, 0/off, or a per-layer count.
+    """
+    dense_gb = max(0.0, pack["total_gb"] - pack["experts_gb"])
+    host_dense = dense_gb
+    dense_vram = 0.0
+    gpu_layers = 0
+    host_kv = ctx * KV_GB_PER_TOKEN
+    if machine.vram_gb:
+        reserve = VRAM_RESERVE_GB * machine.gpu_count
+        kv_vram = ctx * KV_GB_PER_TOKEN
+        per_layer = dense_gb * (1.0 - HOST_DENSE_FRACTION) / MODEL_LAYERS
+        usable = sum(machine.vram_gb) - reserve - kv_vram
+        gpu_layers = 0 if per_layer <= 0 else max(0, min(MODEL_LAYERS, int(usable / per_layer)))
+        dense_vram = min(dense_gb * (1.0 - HOST_DENSE_FRACTION), gpu_layers * per_layer)
+        host_dense = max(0.0, dense_gb - dense_vram)
+        host_kv = 0.0                                    # sparsa passes --minimax-kv vram
+
+    budget = machine.ram_gb - RAM_FLOOR_GB - host_dense - host_kv - HOST_WORK_GB
+    vram_experts = 0.0
+    if machine.vram_gb and vram_slots != 0:
+        free = (sum(machine.vram_gb) - VRAM_RESERVE_GB * machine.gpu_count
+                - ctx * KV_GB_PER_TOKEN - dense_vram - PREFILL_WORKSPACE_GB * machine.gpu_count)
+        per_expert_layer = pack["experts_gb"] / MOE_LAYERS      # one slot on every MoE layer
+        slots = max(0, int(free / per_expert_layer)) if per_expert_layer > 0 else 0
+        if vram_slots > 0:
+            slots = min(slots, vram_slots)
+        slots = min(slots, 128)
+        vram_experts = min(pack["experts_gb"], slots * per_expert_layer)
+    required = max(0.0, pack["experts_gb"] - vram_experts)
+    return {"ram_budget_gb": max(0.0, budget), "required_experts_gb": required,
+            "vram_experts_gb": vram_experts, "host_dense_gb": host_dense,
+            "host_kv_gb": host_kv, "gpu_layers": gpu_layers}
+
+
+def pack_fits(machine: Machine, pack: dict, ctx: int = DEFAULT_CONTEXT, vram_slots: int = -1) -> bool:
+    d = fit_detail(machine, pack, ctx, vram_slots)
+    return d["required_experts_gb"] <= d["ram_budget_gb"]
+
+
+def choose_pack(machine: Machine, packs=PACKS, ctx: int = DEFAULT_CONTEXT,
+                vram_slots: int = -1) -> dict | None:
+    """The best measured-quality available pack that fits the engine's RAM tier and the free disk, among
+    packs with a measured decode speed. Ties go to the smaller download. IQ1_S is used only when nothing
+    else fits. A pack without a measured decode speed is never auto-picked."""
     eligible = [p for p in packs
                 if p.get("available", False)
-                and p["experts_gb"] <= budget
+                and p.get("decode_tok_s") is not None
+                and pack_fits(machine, p, ctx, vram_slots)
                 and p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb]
     if not eligible:
         return None
@@ -187,8 +271,9 @@ def pack_warning(pack: dict | None) -> str:
             f"({pack['top1']:.1f} % top-1). It was picked only because nothing else fits.")
 
 
-def pick_pack(machine: Machine | None = None) -> dict | None:
-    return choose_pack(machine or machine_specs())
+def pick_pack(machine: Machine | None = None, ctx: int = DEFAULT_CONTEXT,
+              vram_slots: int = -1) -> dict | None:
+    return choose_pack(machine or machine_specs(), ctx=ctx, vram_slots=vram_slots)
 
 
 MMPROJ = "mmproj-MiniMax-M3.1-Flash-F16.gguf"
@@ -308,11 +393,11 @@ def find_mmproj(model: Path, explicit: str | None) -> Path | None:
 def build_config(args) -> dict:
     if not args.model or str(args.model).strip().lower() in ("auto", "pick"):
         machine = machine_specs(args.models_dir)
-        pack = choose_pack(machine)
+        pack = choose_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
         if pack is None:
             raise SystemExit(
-                f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
-                f"{machine.free_disk_gb:.0f} GB free disk) with {RAM_RESERVE_GB:.0f} GB of RAM to spare.\n"
+                f"sparsa: no pack with a measured decode speed fits this machine ({machine.ram_gb:.0f} GB RAM, "
+                f"{machine.free_disk_gb:.0f} GB free disk) in the RAM tier with the {RAM_FLOOR_GB:.0f} GB floor.\n"
                 "        `python sparsa.py pick` shows the published tiers and what they need.")
         models_dir = Path(args.models_dir or Path.cwd() / "models").expanduser()
         folder = models_dir / pack["folder"]
@@ -347,9 +432,8 @@ def build_config(args) -> dict:
         # path).  "ram" is a different mode (device attention over a RAM KV) and is not the same thing.
         cfg_args += ["--minimax-kv", "host"]
     if not args.cpu and not args.no_tiers:
-        # The VRAM expert slots are OFF by default (0): the auto count is measured to leave too little VRAM for
-        # the batched-prefill workspace, and with 128 experts top-4 most routes are not resident anyway; the RAM
-        # tier is what makes the token fast.  --vram-slots N turns them on.
+        # --vram-slots -1 (the default) fills free VRAM after dense, KV, workspace and the reserve; 0 turns
+        # expert slots off and makes the RAM tier hold every routed expert.
         cfg_args += ["--minimax-tiers", "--minimax-vram-slots-per-layer", str(args.vram_slots),
                      "--vram-reserve-mib", str(args.vram_reserve_mib)]
         if args.ram_gib:
@@ -511,30 +595,34 @@ def cmd_inspect(args) -> int:
 
 def cmd_pick(args) -> int:
     machine = machine_specs(args.models_dir)
-    pack = choose_pack(machine)
+    pack = choose_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
     if args.json:
         say(json.dumps({"machine": {"ram_gb": machine.ram_gb, "vram_gb": list(machine.vram_gb),
-                                    "free_disk_gb": machine.free_disk_gb},
+                                    "free_disk_gb": machine.free_disk_gb,
+                                    "context": args.context, "vram_slots": args.vram_slots},
                         "pack": pack, "warning": pack_warning(pack)}, indent=2))
         return 0
     say(f"sparsa: {machine.ram_gb:.0f} GB RAM, {machine.gpu_count} GPU(s) "
         f"({', '.join(f'{x:.0f} GB' for x in machine.vram_gb) or 'none'}), "
-        f"{machine.free_disk_gb:.0f} GB free disk")
-    say(f"sparsa: experts budget {machine.ram_gb - RAM_RESERVE_GB:.1f} GB "
-        f"(RAM minus {RAM_RESERVE_GB:.0f} GB to spare)")
+        f"{machine.free_disk_gb:.0f} GB free disk, {args.context} context")
     for p in PACKS:
-        fits = p["experts_gb"] <= machine.ram_gb - RAM_RESERVE_GB
+        d = fit_detail(machine, p, args.context, args.vram_slots)
+        fits = p["available"] and d["required_experts_gb"] <= d["ram_budget_gb"]
         disk = p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb
         state = "published" if p["available"] else "NOT PUBLISHED"
         top1 = "n/a" if p.get("top1") is None else f"{p['top1']:.1f}%"
+        speed = "n/a" if p.get("decode_tok_s") is None else f"{p['decode_tok_s']:.2f} tok/s"
         rec = "" if p.get("recommended", True) else "  NOT RECOMMENDED"
         mark = "  <- pick" if pack is not None and p["key"] == pack["key"] else ""
-        say(f"  {p['key']:<10} top-1 {top1:>5}  experts {p['experts_gb']:7.1f} GB  "
+        say(f"  {p['key']:<10} top-1 {top1:>5}  {speed:<11}  experts {p['experts_gb']:7.1f} GB  "
+            f"need {d['required_experts_gb']:7.1f}/{d['ram_budget_gb']:7.1f} GB  "
             f"pack {p['total_gb']:7.1f} GB  "
-            f"{'RAM ok' if fits else 'too big for RAM'}, {'disk ok' if disk else 'too big for disk'}  "
+            f"{'fit' if fits else 'no fit'}, {'disk ok' if disk else 'too big for disk'}  "
             f"{state}{rec}{mark}")
+        if p.get("measured_on"):
+            say(f"             measured on {p['measured_on']}")
     if pack is None:
-        say("sparsa: no published pack fits this machine")
+        say("sparsa: no pack with a measured decode speed fits this machine")
     else:
         warning = pack_warning(pack)
         if warning:
@@ -545,7 +633,7 @@ def cmd_pick(args) -> int:
 def cmd_download(args) -> int:
     if args.what is None:
         machine = machine_specs(args.dir)
-        pack = choose_pack(machine)
+        pack = choose_pack(machine, ctx=args.context, vram_slots=args.vram_slots)
         if pack is None:
             raise SystemExit(f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
                              f"{machine.free_disk_gb:.0f} GB free disk); `python sparsa.py pick` lists the tiers")
@@ -595,8 +683,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--gpu", help="cards to use, as nvidia-smi numbers them (default: all)")
         p.add_argument("--cpu", action="store_true", help="run every matrix on the processor (tests only)")
         p.add_argument("--no-tiers", action="store_true", help="no RAM expert tier: every expert is read from the SSD")
-        p.add_argument("--vram-slots", type=int, default=0,
-                       help="VRAM expert slots per layer (default 0: off; the auto count starves prefill)")
+        p.add_argument("--vram-slots", type=int, default=-1,
+                       help="VRAM expert slots per layer (default -1: auto, free VRAM after dense/KV/workspace; "
+                            "0 turns them off)")
         p.add_argument("--threads", type=int, help="CPU expert workers (default: the engine's own count)")
         p.add_argument("--vram-reserve-mib", type=int, default=700, help="VRAM kept free (default 700)")
         p.add_argument("--ram-gib", type=float, help="cap the RAM expert tier at this many GiB")
@@ -637,10 +726,14 @@ def main(argv: list[str] | None = None) -> int:
     dl.add_argument("what", nargs="?", choices=[*QUANTS, "tokenizer", "mmproj"],
                     help="what to download (omit it to pick the largest pack that fits this machine)")
     dl.add_argument("--dir", default="models", help="where the files go (default: ./models)")
+    dl.add_argument("--context", type=int, default=DEFAULT_CONTEXT, help="context length for the automatic pick")
+    dl.add_argument("--vram-slots", type=int, default=-1, help="VRAM expert slots per layer (-1 auto, 0 off)")
     dl.add_argument("--print-only", action="store_true", help="only print the command")
 
     pick = sp.add_parser("pick", help="show this machine's specs and the pack it would pick")
     pick.add_argument("--models-dir", help="where downloaded packs live (default: ./models)")
+    pick.add_argument("--context", type=int, default=DEFAULT_CONTEXT, help="context length for the RAM-tier fit")
+    pick.add_argument("--vram-slots", type=int, default=-1, help="VRAM expert slots per layer (-1 auto, 0 off)")
     pick.add_argument("--json", action="store_true", help="print JSON")
 
     args = ap.parse_args(argv)

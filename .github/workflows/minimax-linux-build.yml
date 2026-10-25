@@ -8,6 +8,7 @@ on:
     branches:
       - feat/minimax-engine
       - main
+      - sync/**
     paths:
       - 'CMakeLists.txt'
       - 'cmake/**'

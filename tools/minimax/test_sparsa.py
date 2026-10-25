@@ -53,9 +53,9 @@ def test_plan_is_the_minimax_format_and_starts_at_part_one(tmp_path):
     assert "sampling" not in cfg
     assert cfg["arch"] == "minimax_m3"
     assert cfg["args"][cfg["args"].index("--model") + 1].endswith("-00001-of-00013.gguf")
-    # the measured arm: the RAM tier on, the VRAM expert slots off (auto starves prefill)
+    # the RAM tier on, and the VRAM expert slots auto-sized from free VRAM (0 turns them off)
     assert "--minimax-tiers" in cfg["args"]
-    assert cfg["args"][cfg["args"].index("--minimax-vram-slots-per-layer") + 1] == "0"
+    assert cfg["args"][cfg["args"].index("--minimax-vram-slots-per-layer") + 1] == "-1"
     # chat reads the prompt in one batched chunk by default ("auto" -> 4096, the engine shrinks it to what fits)
     assert cfg["args"][cfg["args"].index("--minimax-prefill-batch") + 1] == "4096"
     # ... with the int8 expert dots: the tensor-core arm failed the full-model G3 gate, so it is opt-in
