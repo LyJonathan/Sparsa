@@ -41,7 +41,8 @@ text = ("The history of the printing press begins in the fifteenth century, when
         "hundred towns across Europe, and the number of books in circulation had grown from a few thousand to "
         "millions. Printers experimented with typefaces, page layouts and paper sizes, and each experiment changed how "
         "readers encountered a text.")
-open('tools/minimax/p13_ids.txt', 'w').write(' '.join(map(str, t.encode(text).ids)))
+ids = t.encode(text).ids * 3   # ~250 tokens: the 200-token prefill A/B takes the first 200
+open('tools/minimax/p13_ids.txt', 'w').write(' '.join(map(str, ids)))
 PY
 
 echo
