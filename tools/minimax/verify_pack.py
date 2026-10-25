@@ -114,6 +114,13 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     gguf = llama_gguf()
     pack_shards = shards(Path(a.pack))
+    # a split GGUF stores each tensor at `data_start(shard) + tensor.offset`; the engine reports the offset relative
+    # to its shard's data block, so the file position needs that shard's data start added.
+    pack_data_start = []
+    for pth in pack_shards:
+        r = gguf.GGUFReader(str(pth))
+        pack_data_start.append(int(r.data_offset))
+        del r
     donors = index_donors([Path(p) for p in a.donor], gguf)
     print(f'donors: {len(donors)} tensor names from {len(a.donor)} pack(s)')
     ok_all = True
@@ -146,7 +153,7 @@ def main(argv=None) -> int:
                     print(f'{label:>10}: {name} is not in any donor')
                 continue
             dh, dn = digest_donor(pick_donor(donors[name], nbytes))
-            if dh == sha256_range(model_file, offset, nbytes) and dn == nbytes:
+            if dh == sha256_range(model_file, pack_data_start[shard] + offset, nbytes) and dn == nbytes:
                 same += 1
             else:
                 differ += 1

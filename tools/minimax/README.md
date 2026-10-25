@@ -1744,7 +1744,19 @@ few MB of RAM instead of faulting 130 GB through the mapping (which is what trip
 `tools/minimax/verify_pack.py` takes those lines from **both** entry points, streams each range in 64 MiB buffered
 reads and SHA-256s it, compares with the donor tensor of the same name *and length* (a mixed pack holds one name from
 two donors), and cross-checks that `--serve` and `--minimax-eval` resolved every tensor to the same shard, offset and
-length. Its modulo filter had an off-by-one (`at % mod != rem + 1`) that reported `total=0`; fixed and rebuilt.
+length. Its modulo filter had an off-by-one (`at % mod != rem + 1`) that reported `total=0`; fixed, and the report also
+has to add each shard's data start, since a split GGUF stores a tensor at `data_start(shard) + offset` while the
+engine reports the offset inside its shard.
+
+**Measured on a 13-shard pack, all 1188 tensors, both entry points** (`--minimax-verify-exit`, so each run is a few
+seconds and a few MB):
+
+```
+     serve: 1188/1188 tensors identical to a donor
+      eval: resolution against the first log: 0 tensors only here, 0 resolved differently
+      eval: 1188/1188 tensors identical to a donor
+PROOF PASS - SHA-256 of every tensor, streamed in 64 MiB reads, and every log resolving every tensor the same way
+```
 
 **`INFO minimax-link dev=N h2d=X GB/s pcie=genG xW`** at startup: the driver's own generation and width (NVML loaded
 at run time, so nothing links against it) beside this process's measured host-to-device rate. CUDA reports what the
