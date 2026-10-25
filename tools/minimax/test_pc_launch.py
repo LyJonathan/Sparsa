@@ -270,5 +270,15 @@ def test_watchdog_uses_effective_ram_after_dirty_pages(tmp_path: Path):
     assert read(lock) == "free"
 
 
+def test_turn_limit_stops_the_child_and_releases(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    p = run(["--owner", "dspark", "--lock", str(lock), *LOCK_ONLY, "--max-minutes", "0.03", "--poll", "0.05",
+             "--", *py("import time; time.sleep(30)")], timeout=90)
+    assert p.returncode == 6, p.stderr
+    assert "TURN LIMIT" in p.stderr
+    assert read(lock) == "free"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

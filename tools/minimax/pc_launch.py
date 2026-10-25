@@ -23,6 +23,8 @@ What it does, in order:
    workspace, margin); the breakdown and both RAM numbers are printed.
 3. WATCHES the child: every `--poll` seconds (default 2), if effective RAM falls below `--min-free-gb` it stops
    the child's whole process tree and exits 4 with the available, modified and effective readings that triggered it.
+   `--max-minutes` is the turn limit: at the limit the launcher stops the same child tree, releases the lock and
+   exits 6, so the next task in the queue can take the PC.
 4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM handlers put the lock back to `free` - on a clean exit, a child
    crash, Ctrl-C, or a watchdog kill.
 
@@ -56,6 +58,7 @@ EXIT_LOCK_HELD = 2
 EXIT_NO_RAM = 3
 EXIT_WATCHDOG = 4
 EXIT_LOCK_TIMEOUT = 5
+EXIT_TURN_LIMIT = 6
 
 # Windows: still-running exit code of a process handle (GetExitCodeProcess -> STILL_ACTIVE)
 _STILL_ACTIVE = 259
@@ -518,7 +521,7 @@ def _spawn(argv: Sequence[str]) -> subprocess.Popen:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="Exit codes: the child's own, 2 lock held, 3 not enough RAM, 4 watchdog, "
-                                        "5 lock timeout, 130 interrupted.")
+                                        "5 lock timeout, 6 turn limit, 130 interrupted.")
     ap.add_argument("--owner", help="who takes the lock ('dspark', 'maya', ...)")
     ap.add_argument("--est-ram-gb", type=float, default=None,
                     help="the run's host-RAM need; without it the engine flags are read (see estimate_ram_gb)")
@@ -528,6 +531,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     help="the lock file (default %(default)s, STRATA_PC_LOCK overrides)")
     ap.add_argument("--lock-timeout", type=float, default=10.0, help="how long to wait for the lock mutex")
     ap.add_argument("--poll", type=float, default=2.0, help="the watchdog's interval in seconds (default 2)")
+    ap.add_argument("--max-minutes", type=float, default=None,
+                    help="stop the child cleanly after this many minutes and release the lock (turn limit)")
     ap.add_argument("--no-watchdog", action="store_true", help="do not stop the run on low RAM (not recommended)")
     ap.add_argument("--dry-run", action="store_true", help="take the lock, check the RAM, print, release, do nothing")
     ap.add_argument("--ram-source", default="auto",
@@ -621,6 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         log("starting: " + " ".join(cmd))
         t0 = time.monotonic()
+        turn_deadline = t0 + a.max_minutes * 60.0 if a.max_minutes and a.max_minutes > 0 else None
         child = _spawn(cmd)
         next_tree = 0.0
         while True:
@@ -634,6 +640,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rc = child.wait(timeout=a.poll)
                 break
             except subprocess.TimeoutExpired:
+                if turn_deadline is not None and time.monotonic() >= turn_deadline:
+                    log(f"TURN LIMIT: {a.max_minutes:.1f} minutes reached; stopping pid {child.pid} and its children, "
+                        "then releasing the lock for the next task")
+                    _kill_tree(child.pid)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return EXIT_TURN_LIMIT
                 if a.no_watchdog or stop_signals["received"]:
                     continue
                 now_gb, dirty_gb = ram.available(), ram.modified()
