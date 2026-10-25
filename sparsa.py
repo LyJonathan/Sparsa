@@ -110,9 +110,13 @@ SPEED_META = {
                "speed_shared": False, "speed_stale": True, "speed_note": "no full-model decode number",
                "slice_engine": "v0.1.48", "slice_commit": "unrecorded", "slice_ctx": 1024,
                "slice_shared": False, "slice_stale": False},
-    "iq2-xs-d3": {"speed_engine": "v0.1.3", "speed_commit": "release (HF README)", "speed_ctx": 32768,
-                  "speed_shared": False, "speed_stale": False,
-                  "speed_note": "2x RTX 5070, 128 GB, default release setup"},
+    # D3's number is the reference baseline. A future full-model speed must match these settings or be
+    # marked not comparable (speed_stale=True / its own note).
+    "iq2-xs-d3": {"speed_engine": "v0.1.2", "speed_commit": "v0.1.2 release measurement, repeated as ~4 tok/s in v0.1.3 README",
+                  "speed_ctx": 32768, "speed_shared": False, "speed_stale": False,
+                  "speed_settings": "sparsa.py serve defaults: 4096-token prefill chunk, int8 expert dots, "
+                                    "RAM tier capped at 84 GiB, 64 greedy tokens, idle box",
+                  "speed_note": "reference baseline for comparable speeds"},
     "iq2-kl": {"speed_engine": "v0.1.48", "speed_commit": "unrecorded (G3 cloud smoke)", "speed_ctx": 8192,
                "speed_shared": False, "speed_stale": True, "speed_note": "cloud G3 smoke, not the default PC setup"},
     "iq3-k": {"speed_engine": "not measured", "speed_commit": "-", "speed_ctx": 0,

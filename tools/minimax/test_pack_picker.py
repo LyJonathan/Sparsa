@@ -58,7 +58,8 @@ def test_speed_provenance_and_staleness_are_recorded():
             assert key in p, (p["key"], key)
     d3 = next(p for p in sparsa.PACKS if p["key"] == "iq2-xs-d3")
     assert d3["decode_tok_s"] == 4.0 and d3["speed_stale"] is False
-    assert d3["speed_engine"].startswith("v0.1.")
+    assert d3["speed_engine"] == "v0.1.2"
+    assert "84 GiB" in d3["speed_settings"] and "4096-token prefill chunk" in d3["speed_settings"]
     kt = next(p for p in sparsa.PACKS if p["key"] == "iq2-kt")
     assert kt["speed_stale"] is True          # G3 smoke setup, not the default setup
 
