@@ -30,6 +30,9 @@ THINK_END = '</mm:think>'
 CALL_START = '<tool_call>'
 CALL_END = '</tool_call>'
 IMAGE_TOKEN = ']<]image[>['
+VISION_START = ']<]start of image[>['
+VISION_END = ']<]end of image[>['
+IMAGE_PAD_ID = 200025
 EOS_ID = 200020          # [e~[ in the released tokenizer; also read from tokenizer_config.json below
 
 # Hugging Face's ByteLevel pre-tokenizer, \p classes included: this is the split the released BPE was trained on.
@@ -37,6 +40,33 @@ BYTELEVEL_PATTERN = regex.compile(
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
 
 DEFAULT_TEMPLATE = Path(__file__).with_name('minimax_chat_template.jinja')
+
+# A private-use marker that stands in for one image part while the template renders.  The rendered text is then
+# rewritten to the vision triple, so a template that writes only `]<]image[>[` (the checkpoint's own) and one that
+# writes the whole thing (this repository's) produce the same prompt.
+_IMAGE_SLOT_TEXT = '\ue000minimax-img-%d\ue001'
+_IMAGE_SLOT = re.compile('\ue000minimax-img-\\d+\ue001')
+
+
+def _image_slots(messages):
+    """(messages with each image part as a marker text part, whether any image was found).  The input is unchanged."""
+    if not isinstance(messages, (list, tuple)):
+        return messages, False
+    out, n = [], 0
+    for message in messages:
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'image':
+                    parts.append({'type': 'text', 'text': _IMAGE_SLOT_TEXT % n})
+                    n += 1
+                else:
+                    parts.append(part)
+            message = {**message, 'content': parts}
+        out.append(message)
+    return out, n > 0
+
 
 
 class MiniMaxTokenizer(Tokenizer):
@@ -51,9 +81,20 @@ class MiniMaxTokenizer(Tokenizer):
         model = data.get('model') or {}
         if model.get('type') != 'BPE':
             raise ValueError(f"MiniMax requires a byte-level BPE tokenizer, got {model.get('type')!r}")
+        # The released tokenizer.json normalizes to NFC (a Sequence holding it in some exports).  NFC is applied
+        # per pre-tokenizer piece below, which is where it can change the bytes: the pattern keeps a letter and
+        # its combining marks in one piece, so composition never crosses a split.
         normalizer = data.get('normalizer')
-        if normalizer not in (None, {'type': 'Sequence', 'normalizers': []}):
-            raise ValueError('MiniMax tokenizer has a normalizer; only the released identity normalizer is supported')
+        if isinstance(normalizer, dict) and normalizer.get('type') == 'Sequence':
+            parts = normalizer.get('normalizers') or []
+            if len(parts) == 1:
+                normalizer = parts[0]
+        if normalizer in (None, {'type': 'Sequence', 'normalizers': []}):
+            self.nfc = False
+        elif isinstance(normalizer, dict) and normalizer.get('type') == 'NFC':
+            self.nfc = True
+        else:
+            raise ValueError(f'MiniMax tokenizer has an unsupported normalizer ({normalizer!r}); only NFC is known')
 
         vocab = dict(model['vocab'])
         added = data.get('added_tokens') or []
@@ -80,7 +121,10 @@ class MiniMaxTokenizer(Tokenizer):
         self._special_re = self._alt(list(self.special_tokens))
         self._always_re = self._special_re
         self._added_bytes = {t['id']: t['content'].encode('utf-8') for t in added}
-        self.control_tokens = []
+        # The template's own control literals.  `literal_tags` marks these inside user text so a file an agent
+        # reads cannot open an image/tool/reasoning block (#150, #554).
+        self.control_tokens = [IMAGE_TOKEN, VISION_START, VISION_END, THINK_BEGIN, THINK_END,
+                               CALL_START, CALL_END, NS]
         self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
 
         self.splits: list[regex.Pattern] = []
@@ -93,9 +137,12 @@ class MiniMaxTokenizer(Tokenizer):
             for part in parts:
                 if part.get('type') == 'Split':
                     pattern = part.get('pattern') or {}
-                    if (part.get('behavior') != 'Isolated' or part.get('invert') or 'Regex' not in pattern):
+                    behavior, invert = part.get('behavior'), bool(part.get('invert'))
+                    # The released tokenizer keeps ONLY what the pattern matches ("Removed" + invert, the
+                    # GPT-4 split); "Isolated" keeps the matches and the text between them.
+                    if 'Regex' not in pattern or (behavior, invert) not in (('Isolated', False), ('Removed', True)):
                         raise ValueError('unsupported MiniMax Split pre-tokenizer')
-                    self.splits.append(regex.compile(pattern['Regex']))
+                    self.splits.append((regex.compile(pattern['Regex']), behavior == 'Removed'))
                     continue
                 if part.get('type') != 'ByteLevel':
                     raise ValueError(f"unsupported MiniMax pre-tokenizer {part.get('type')!r}")
@@ -114,9 +161,12 @@ class MiniMaxTokenizer(Tokenizer):
 
     def _pieces(self, text: str):
         pieces = [text]
-        for pattern in self.splits:
+        for pattern, keep_only in self.splits:
             split = []
             for piece in pieces:
+                if keep_only:
+                    split.extend(m.group() for m in pattern.finditer(piece) if m.end() > m.start())
+                    continue
                 pos = 0
                 for match in pattern.finditer(piece):
                     if match.start() > pos:
@@ -134,13 +184,23 @@ class MiniMaxTokenizer(Tokenizer):
 
     def _encode_plain(self, text: str):
         out: list[int] = []
+        cache = self._piece_ids
         for piece in self._pieces(text):
-            mapped = ''.join(BYTE_TO_UNICODE[b] for b in piece.encode('utf-8'))
-            for token in self._bpe(mapped):
-                i = self.ids.get(token)
-                if i is None:
-                    raise KeyError(f'BPE produced a token outside the vocabulary: {token!r}')
-                out.append(i)
+            if self.nfc:
+                import unicodedata
+                piece = unicodedata.normalize('NFC', piece)
+            got = cache.get(piece)
+            if got is None:
+                mapped = ''.join(BYTE_TO_UNICODE[b] for b in piece.encode('utf-8'))
+                got = []
+                for token in self._bpe(mapped):
+                    i = self.ids.get(token)
+                    if i is None:
+                        raise KeyError(f'BPE produced a token outside the vocabulary: {token!r}')
+                    got.append(i)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
+            out.extend(got)
         return out
 
     def token_bytes(self, i):
@@ -169,7 +229,14 @@ class MiniMaxTemplate(ChatTemplate):
             kwargs.pop('reasoning_effort', None)
         if kwargs.get('enable_thinking') is False:
             kwargs.pop('reasoning_effort', None)
-        return super().render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        messages, slots = _image_slots(messages)
+        text = super().render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        if slots:
+            # The checkpoint's own chat_template.jinja writes a bare `]<]image[>[` and leaves the wrapping to the HF
+            # processor; serve/minimax_chat_template.jinja writes the whole triple.  Either way the prompt the engine
+            # reads is the processor's: start, one pad per image token, end.
+            text = _IMAGE_SLOT.sub(VISION_START + IMAGE_TOKEN + VISION_END, text)
+        return text
 
 
 _TAG = re.compile(r'<([A-Za-z_][\w.\-]*)>')
@@ -240,7 +307,10 @@ class MiniMaxOutputParser:
         self.unread_names: list[str] = []
 
     def feed(self, delta):
-        self.buf += delta
+        # The namespace token is a prompt delimiter the model sometimes repeats in its output (it did on
+        # the full model, right after a tool call's text).  It is never part of an answer, so it is removed
+        # before anything is shown; a partial one at a chunk's end is held, like a split tag.
+        self.buf = (self.buf + delta).replace(NS, '')
         out: list[Event] = []
         while self.buf:
             if self.state in ('reasoning', 'content'):
@@ -248,7 +318,7 @@ class MiniMaxOutputParser:
                         else (THINK_END, CALL_START))
                 found = [(self.buf.find(tag), tag) for tag in tags if tag in self.buf]
                 if not found:
-                    hold = OutputParser._hold(self, self.buf, tags)
+                    hold = OutputParser._hold(self, self.buf, tags + (NS,))
                     safe = len(self.buf) - hold
                     if safe:
                         out.append(Event(self.state, self.buf[:safe]))

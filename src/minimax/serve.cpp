@@ -1,8 +1,9 @@
 // src/minimax/serve.cpp - MiniMax-M3.1-Flash inspect, teacher-forced eval, and the serve line protocol.
 //
 // Inspect never constructs the engine (no CUDA). Serve and eval load the GGUF, refuse a non-M3.1 file unless
-// --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE. GENI and BGEN
-// answer with ERR and no DONE. Unknown --flags are ignored only in --serve, matching the shared server config.
+// --minimax-allow-nonstandard is set, then build the forward pass. GEN streams T / PP / DONE; GENI is GEN with
+// `img=` pictures the mmproj reads (an image without --mmproj is refused), and BGEN answers with ERR and no DONE.
+// Unknown --flags are ignored only in --serve, matching the shared server config.
 // An unasked context is min(model, 32768); only --max-context raises it.
 #if defined(_WIN32)
 #ifndef NOMINMAX
