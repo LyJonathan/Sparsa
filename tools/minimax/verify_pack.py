@@ -114,6 +114,8 @@ def main(argv=None) -> int:
     ap.add_argument('--donor', action='append', required=True, help='first shard of a donor pack (repeatable)')
     ap.add_argument('--label', action='append', default=[])
     ap.add_argument('--quiet', action='store_true', help='only the totals and mismatches')
+    ap.add_argument('--selftest', action='store_true',
+                    help="prove the checker can fail: rerun with one tensor's offset moved, and require DIFFERS")
     a = ap.parse_args(argv)
     gguf = llama_gguf()
     pack_shards = shards(Path(a.pack))
@@ -121,6 +123,17 @@ def main(argv=None) -> int:
     # a split GGUF stores each tensor at `data_start(shard) + tensor.offset`; the engine reports the offset relative
     # to its shard's data block, so the file position needs that file's data start added.  With --expert-source a
     # tensor can come from an alternate pack, so every candidate file's data start is read once.
+    # The engine's flat list is the base pack's shards and then each --expert-source pack's, in the order given on
+    # the engine's command line.  `--donor` usually repeats the base pack (it is one of the donors), so drop that
+    # duplicate: without this, index 13 lands on the base pack's second shard instead of the first alternate pack's.
+    flat_files = list(pack_shards)
+    seen_packs = {pack_shards[0].resolve()}
+    for donor_first in a.donor:
+        ds = shards(Path(donor_first))
+        if ds[0].resolve() in seen_packs:
+            continue
+        seen_packs.add(ds[0].resolve())
+        flat_files.extend(ds)
     data_start = {}
     for pth in pack_shards + donor_shards:
         if pth in data_start:
@@ -150,17 +163,16 @@ def main(argv=None) -> int:
                 ok_all = False
         prev = offs
         for name, (shard, offset, nbytes, qtype, leaf) in got.items():
-            model_file = None
-            if leaf:
-                for cand in pack_shards + donor_shards:
-                    if cand.name == leaf:
-                        model_file = cand
-                        break
-            if model_file is None:
-                model_file = pack_shards[shard] if shard < len(pack_shards) else None
+            # The engine's shard index is an index into ONE flat file list: the base pack's shards and then each
+            # --expert-source pack's, in the order the packs were given - which is also this script's --donor order.
+            # So the shard index alone names the file (the reported leaf is only a cross-check: for a base tensor it
+            # is the file the run was pointed at, not that tensor's shard).
+            model_file = flat_files[shard] if shard < len(flat_files) else None
             if model_file is None:
                 missing += 1
                 continue
+            if leaf and model_file.name != leaf and shard >= len(pack_shards):
+                print(f'{label:>10}: note: shard {shard} is {model_file.name} but the log says {leaf}')
             if name not in donors:
                 missing += 1
                 if missing <= 5:
@@ -180,6 +192,39 @@ def main(argv=None) -> int:
         print(f'{label:>10}: {same}/{total} tensors identical to a donor'
               + (f' ({differ} differ' if differ else '') + (f', {missing} not in a donor' if missing else '') + ')')
         ok_all = ok_all and differ == 0 and missing == 0 and same == total and total > 0
+    if a.selftest:
+        # the negative control: a checker that cannot say DIFFERS proves nothing.  Move one tensor's offset by 4096
+        # bytes in a copy of the first log and require the comparison to fail.
+        first = Path(a.engine_log[0])
+        broken = first.with_suffix('.shifted.log')
+        lines = []
+        moved = False
+        for line in first.read_text(encoding='utf-8', errors='replace').splitlines():
+            m = VERIFY_RE.search(line.rstrip())
+            if m and not moved:
+                line = line.replace(f' {m.group(3)} ', f' {int(m.group(3)) + 4096} ', 1)
+                moved = True
+            lines.append(line)
+        broken.write_text(chr(10).join(lines) + chr(10), encoding='utf-8')
+        print(f'selftest: {broken.name} moves one offset by 4096 bytes; the check must now fail')
+        # the shifted log must actually be the one compared: swap the FIRST --engine-log's value
+        src = list(argv) if argv is not None else sys.argv[1:]
+        src = [x for x in src if x != '--selftest']
+        args2 = []
+        swapped = False
+        for i, x in enumerate(src):
+            if x == '--engine-log' and not swapped and i + 1 < len(src):
+                args2.extend(['--engine-log', str(broken)])
+                swapped = True
+                src[i + 1] = None  # type: ignore[call-overload]
+                continue
+            if x is None:
+                continue
+            args2.append(x)
+        rc2 = main(args2)
+        print('selftest', 'PASS (a moved offset was caught)' if rc2 != 0 else 'FAIL (the checker cannot detect a wrong byte)')
+        return 0 if (rc2 != 0 and ok_all) else 1
+
     print('PROOF', 'PASS' if ok_all else 'FAIL',
           '- SHA-256 of every tensor, streamed in 64 MiB reads, and every log resolving every tensor the same way')
     return 0 if ok_all else 1

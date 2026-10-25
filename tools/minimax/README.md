@@ -1925,3 +1925,27 @@ ordered next: block 3-7 on **all six** prompts against D3 in the same session.
   file/donor matching then picks the wrong side for tensors whose *size* coincides across the two donor packs. It
   needs to match on (leaf, size) and fall back to the leaf's own donor, not the first donor whose length agrees.
 * The 6-prompt block gate (block 3-7 against D3, same session) is the next turn's first job, then the sweep.
+
+### The byte checker, fixed and given a negative control
+
+Three faults, all in `verify_pack.py`, none in the engine:
+
+1. **The flat file list double-counted the base pack.** The engine's shard index runs over ONE list - the base pack's
+   shards, then each `--expert-source` pack's - and `--donor` usually repeats the base pack (it *is* a donor), so
+   index 13 landed on the base pack's second shard instead of the first alternate pack's. The base pack is now
+   dropped from the donor-shard list when building it.
+2. **Donors were matched by byte length alone.** Two packs can give a tensor the same length, so the check hashed the
+   wrong side. It now passes when the engine's bytes equal **any** length-matching donor's copy, which is the right
+   rule for a mixed pack (each name comes from exactly one donor).
+3. **The reported `leaf` is not the tensor's shard file** for a base tensor - it is the file the run was pointed at.
+   The shard index alone names the file; `leaf` is kept as a cross-check only.
+
+And the checker now has a **negative control** (`--selftest`): it copies the first log with **one tensor's offset
+moved by 4096 bytes** and requires the comparison to fail. On the cropped logs used for this work it reads
+`base: 5/6, 1 differ` / `selftest PASS (a moved offset was caught)`, i.e. the checker can distinguish a wrong byte
+from a right one.
+
+Cropped-run result (28 tensors across the packs, chosen to cover shards 0, 1 and 13 and the alternate pack): the base
+arm is **6/6 identical** and the `--expert-source` arm **8/8 identical** to a donor. The full 1188-tensor N/N on both
+all-SSD arms is the first thing the next engine turn runs - it needs the two `--verify-exit` arms regenerated with
+this build.
