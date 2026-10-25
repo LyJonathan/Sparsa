@@ -1846,7 +1846,8 @@ float dot_row(int type, const void* src, const void* q8k, int n) {
     const uint8_t* row = (const uint8_t*) src;
     const uint8_t* q8 = (const uint8_t*) q8k;
 #if defined(__AVX2__)
-    if (type == kIQ2KT && !std::getenv("STRATA_IQ2KT_GENERIC")) return dot_row_iq2kt_avx2(row, q8, n);
+    static const bool iq2kt_generic = std::getenv("STRATA_IQ2KT_GENERIC") != nullptr;
+    if (type == kIQ2KT && !iq2kt_generic) return dot_row_iq2kt_avx2(row, q8, n);
 #endif
     constexpr int kQ8Bytes = 4 + QK_K_ + QK_K_ / 8;   // d, qs[256], bsums[16]
     alignas(32) float w[QK_K_];
