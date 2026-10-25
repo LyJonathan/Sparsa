@@ -12,9 +12,9 @@
 //     AVX2 scan and its comparison order, so a tensor quantizes to the same bytes ik produces;
 //   * `quantize_row_iq2_kt_impl` / `quantize_row_iq3_kt_impl`, with their constants unchanged;
 //   * the dequantizers, as ik's `to_float` produces them.
-// Not ported: ik's `iqk_mul_mat` tile kernels.  `dot_row` here decodes a block with the same codebook and
-// dots it in AVX2 float; it trades some of ik's speed for being short enough to audit, and the engine's hot
-// path is the grouped CUDA kernel anyway.
+// Not ported: ik's `iqk_mul_mat` tile kernels.  IQ2_KT's `dot_row` does use the AVX2 trellis decode from
+// `Trellis3` plus a 32-value integer dot, the same idea as ik's AVX2 `mul_mat_iq2_kt_q8_2_x4_T`; the other
+// formats still decode a block with the same codebook and dot it in AVX2 float.
 //
 // This file needs AVX2 for the quantizer, exactly like ik (it refuses to quantize these formats without
 // AVX2).  The engine builds it with /arch:AVX2 next to the other IQ kernels.
@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1738,10 +1739,115 @@ void dequantize_row(int type, const void* src, float* dst, int64_t n) {
     }
 }
 
+#if defined(__AVX2__)
+#ifndef MM256_SET_M128I
+#define MM256_SET_M128I(hi, lo) _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+#endif
+#ifndef MM256_SET1_M128I
+#define MM256_SET1_M128I(v) _mm256_inserti128_si256(_mm256_castsi128_si256(v), v, 1)
+#endif
+
+// ik's `Trellis3<true, false>` (is_8, not abs): one 128-value half of an IQ2_KT block in AVX2.
+// Ported from iqk_gemm_ktquants.cpp; see THIRD_PARTY_NOTICES.md.
+struct TrellisIQ2KT {
+    constexpr static uint32_t ka = 0xCBAC1FED;
+    constexpr static uint32_t ka1 = ka * ka;
+    constexpr static uint32_t ka2 = ka1 * ka;
+    constexpr static uint32_t ka3 = ka2 * ka;
+    constexpr static uint32_t ka4 = ka3 * ka;
+    constexpr static uint32_t ka5 = ka4 * ka;
+    constexpr static uint32_t ka6 = ka5 * ka;
+    constexpr static uint32_t ka7 = ka6 * ka;
+    const __m256i mka = _mm256_setr_epi32(ka, ka1, ka2, ka3, ka4, ka5, ka6, ka7);
+    const __m256i shuffle = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
+
+    inline void next_128(const uint16_t* val, uint32_t v0, __m256i* result) const {
+        __m256i aux[16];
+        for (int k = 0; k < 4; ++k) {
+            auto v128 = _mm_add_epi32(_mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i*) (val + 4 * k))),
+                                      _mm_set1_epi32((int) v0));
+            auto v = MM256_SET1_M128I(v128);
+            aux[4 * k + 0] = _mm256_shuffle_epi32(v, 0x00);
+            aux[4 * k + 1] = _mm256_shuffle_epi32(v, 0x55);
+            aux[4 * k + 2] = _mm256_shuffle_epi32(v, 0xaa);
+            aux[4 * k + 3] = _mm256_shuffle_epi32(v, 0xff);
+        }
+        for (int i = 0; i < 16; ++i) aux[i] = _mm256_mullo_epi32(aux[i], mka);
+        const auto mask = _mm256_set1_epi32(0x3f3f3f3f);
+        for (int i = 0; i < 16; ++i) aux[i] = _mm256_and_si256(aux[i], mask);
+        const auto offset = _mm256_set1_epi32(-126);
+        for (int i = 0; i < 16; ++i) {
+            auto dot = _mm256_maddubs_epi16(aux[i], _mm256_set1_epi32(0x01010101));
+            aux[i] = _mm256_add_epi32(offset, _mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+        }
+        for (int k = 0; k < 4; ++k) {
+            auto v1 = _mm256_packs_epi32(aux[4 * k + 0], aux[4 * k + 1]);
+            auto v2 = _mm256_packs_epi32(aux[4 * k + 2], aux[4 * k + 3]);
+            result[k] = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(v1, v2), shuffle);
+        }
+    }
+};
+
+inline __m256 dot32_acc(__m256 acc, const int8_t* w, const int8_t* q8, float scale) {
+    const __m256i vw = _mm256_loadu_si256((const __m256i*) w);
+    const __m256i vq = _mm256_loadu_si256((const __m256i*) q8);
+    const __m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(vw, vw), _mm256_sign_epi8(vq, vw));
+    const __m256i sumi = _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(scale), acc);
+}
+
+inline float hsum256(__m256 x) {
+    __m128 lo = _mm256_castps256_ps128(x);
+    __m128 hi = _mm256_extractf128_ps(x, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+// IQ2_KT + Q8_K with the AVX2 trellis decode and an integer 32-value dot per group.  ik's q8_K fast path
+// is AVX-512 only; this is the same trellis decode feeding an AVX2 maddubs dot.  It uses a different
+// accumulation order from the scalar reference, so the gate is KL on the slice, not max-abs 0.
+float dot_row_iq2kt_avx2(const uint8_t* row, const uint8_t* q8, int n) {
+    constexpr int kQ8Bytes = 4 + QK_K_ + QK_K_ / 8;
+    constexpr int kTrellisStride = 68;
+    const TrellisIQ2KT trellis;
+    float d0;
+    std::memcpy(&d0, row, sizeof(d0));
+    const float post = dequant_factor(kIQ2KT);
+    const uint8_t* blocks = row + 4;
+    __m256 accv = _mm256_setzero_ps();
+    alignas(32) int8_t vals[QK_K_];
+    for (int ib = 0; ib < n / QK_K_; ++ib) {
+        const uint8_t* blk = blocks + (int64_t) ib * kTrellisStride;
+        __m256i half[4];
+        trellis.next_128((const uint16_t*) (blk + 4), 4096, half);
+        for (int k = 0; k < 4; ++k) _mm256_store_si256((__m256i*) (vals + 32 * k), half[k]);
+        trellis.next_128((const uint16_t*) (blk + 4 + 32), 4096, half);
+        for (int k = 0; k < 4; ++k) _mm256_store_si256((__m256i*) (vals + 128 + 32 * k), half[k]);
+
+        const uint8_t* qb = q8 + (int64_t) ib * kQ8Bytes;
+        float dq;
+        std::memcpy(&dq, qb, sizeof(dq));
+        const int8_t* qs = (const int8_t*) (qb + 4);
+        for (int k = 0; k < 4; ++k) {
+            const float sl = d0 * post * (float) kIq4kValues[blk[k] & 0xf] * dq;
+            const float sh = d0 * post * (float) kIq4kValues[blk[k] >> 4] * dq;
+            accv = dot32_acc(accv, vals + 32 * k, qs + 32 * k, sl);
+            accv = dot32_acc(accv, vals + 128 + 32 * k, qs + 128 + 32 * k, sh);
+        }
+    }
+    return hsum256(accv);
+}
+#endif  // __AVX2__
+
 float dot_row(int type, const void* src, const void* q8k, int n) {
     if (n <= 0 || (n % QK_K_) != 0) throw std::runtime_error("ikq: dot width");
     const uint8_t* row = (const uint8_t*) src;
     const uint8_t* q8 = (const uint8_t*) q8k;
+#if defined(__AVX2__)
+    if (type == kIQ2KT && !std::getenv("STRATA_IQ2KT_GENERIC")) return dot_row_iq2kt_avx2(row, q8, n);
+#endif
     constexpr int kQ8Bytes = 4 + QK_K_ + QK_K_ / 8;   // d, qs[256], bsums[16]
     alignas(32) float w[QK_K_];
     float total = 0.f;

@@ -45,9 +45,11 @@ codebook and the cluster search the trellis quantizers build, the five quantizat
 AVX2 evaluation order of `find_best_scale_avx2` / `evaluate_block_iq4k`, so the bytes match ik's), the
 dequantizers, and the q8_1 dot products of `ggml-cuda/template-instances/mmvq-instance-iq*` into
 `src/kernels/cuda/iq_kernels.cu` (`vec_dot_iq2_kt_q8_1` and friends, plus the `dq_*` dequantizers from
-`ggml-cuda/convert.cu`); the type ids are Strata's own (see `include/strata/kernels/iqk_types.hpp` for why) and
-ik's `iqk_mul_mat` tile kernels are not ported. `tools/minimax/quant/src/test_ikq.cpp` compares the port against
-ik's own output, byte for byte, on 24 cases (six per format).
+`ggml-cuda/convert.cu`). The AVX2 IQ2_KT trellis decode and 32-value dot in `src/kernels/cpu/iqk_quants.cpp`
+(`TrellisIQ2KT` / `dot_row_iq2kt_avx2`) are ported from `iqk_gemm_ktquants.cpp`'s `Trellis3` and the AVX2
+IQ2_KT q8 decode/dot path. The type ids are Strata's own (see `include/strata/kernels/iqk_types.hpp` for why) and
+ik's `iqk_mul_mat` tile kernels are otherwise not ported. `tools/minimax/quant/src/test_ikq.cpp` compares the port
+against ik's own output, byte for byte, on 24 cases (six per format).
 
 ```
 MIT License
