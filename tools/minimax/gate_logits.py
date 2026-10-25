@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ import numpy as np
 def run(exe: str, model: str, ids: list[int], out: Path, extra: list[str], ctx: int) -> np.ndarray:
     txt = out.with_suffix('.ids')
     txt.write_text(' '.join(str(i) for i in ids), encoding='utf-8')
-    cmd = [exe, '--model', model, '--minimax-eval', str(txt), '--minimax-dump-logits', str(out),
+    cmd = shlex.split(exe) + ['--model', model, '--minimax-eval', str(txt), '--minimax-dump-logits', str(out),
            '--max-context', str(ctx), '--minimax-allow-nonstandard', *extra]
     p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=7200)
     if p.returncode != 0:

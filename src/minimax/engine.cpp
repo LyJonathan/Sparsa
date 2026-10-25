@@ -10,6 +10,7 @@
 #include "strata/kernels/iqk_types.hpp"
 
 #include "cuda_ops.hpp"
+#include "dspark.hpp"
 #include "strata/minimax/vision.hpp"
 
 #if defined(_WIN32)
@@ -62,6 +63,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/iq_mt.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -74,6 +76,9 @@ constexpr int kF32 = 0;
 constexpr int kF16 = 1;
 constexpr int kBF16 = 30;
 constexpr int kTile = 128;
+/// The batched MoE takes the device (tensor cores) only for a real prompt chunk: its per-expert dequantize-to-fp16
+/// costs several times the expert's own bytes, which a 2-8 row verify window cannot amortize (P13).
+constexpr int kGpuExpertsMinRows = 16;
 constexpr int32_t kNotResident = -1;
 
 struct DevPtr {
@@ -676,6 +681,26 @@ struct Engine::Impl {
     std::vector<Layer> layers;
     std::unordered_set<int32_t> eos;
 
+    // ---- P13: DSpark speculative decoding (opt-in; see dspark.hpp).  The drafter reads the target's residual
+    // stream at `dspark->geom().taps`, so a small ring of those rows is kept for every forwarded position, and the
+    // ring is seeded lazily (a position is turned into the drafter's K/V row once it is committed).
+    std::unique_ptr<DsparkDrafter> dspark;
+    std::vector<char> ds_slot;         ///< [n_layers] tap slot of the layer, or -1
+    std::vector<float> ds_tap;         ///< [ds_cap][tap_width] ring of the taps, by position % ds_cap
+    int64_t ds_cap = 0, ds_tapw = 0;
+    bool ds_tap_out = false;           ///< STRATA_DSPARK_TAP=output: take the layer's own output instead of its input
+    int64_t ds_seeded = 0;             ///< positions [0, ds_seeded) are in the drafter's ring
+    std::vector<float> ds_ids;         ///< [rows][n_embd] the block's embeddings
+    std::vector<float> ds_rows;        ///< [rows][n_vocab] the verify window's logits
+    std::vector<int32_t> ds_drafts;
+    std::vector<float> ds_conf;
+    // the run's speculation counters
+    int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_tokens = 0;
+    double spec_round_ms = 0, spec_draft_ms = 0, spec_verify_ms = 0;
+    // per verify window: rows checked, and the routed experts the window touched (unique against one-token decode)
+    bool spec_count = false;
+    int64_t spec_checked = 0, spec_exp_union = 0, spec_exp_sum = 0, spec_exp_layers = 0;
+
     // ---- parity probes (P4).  Off unless --minimax-dump-dir / --minimax-seed-hidden is given.
     bool dump_on = false;
     std::string dump_dir;
@@ -892,6 +917,11 @@ struct Engine::Impl {
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
+    // P13: the exact window's scratch, ONE SET PER DEVICE: a window walks layers on both cards (the split), and the
+    // engine makes the layer's card current, so a single set would hand a device-0 pointer to a device-1 kernel.
+    std::vector<DevPtr> pf_q32, pf_iq32;      // f32 queries (the token path's attention reads f32)
+    std::vector<DevPtr> win_xq;               // q8_1 activations, sized for the widest matrix it projects
+    std::vector<size_t> pf_q32_bytes, pf_iq32_bytes, win_xq_bytes;
     std::vector<float> pf_att_h;   // P7: device attention output when the layer's projection is on the CPU
     std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
@@ -1253,6 +1283,7 @@ struct Engine::Impl {
         size_workspace();
         if (!cpu_only) alloc_workspace();
         place_weights();
+        load_dspark();   // P13: before the expert slots are sized, so they see the drafter's VRAM
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
         if (opt.tiers || opt.expert_resident == "all") {
             init_tiers();
@@ -4899,9 +4930,12 @@ struct Engine::Impl {
             std::fprintf(stderr,
                          "INFO minimax-prefill-dense=f16 (the down GEMM's activation is fp16; measured KL 1.7e-3 "
                          "against f32 on the real slice, +9%% prefill)\n");
-        if (dump_on) {
+        // The parity dump used to force the per-token path.  P13's identity gate needs the opposite: the SAME dump
+        // keys from the batched path so the two can be diffed stage by stage (STRATA_DUMP_BATCH=1 opts in).
+        static const bool dump_batch = std::getenv("STRATA_DUMP_BATCH") != nullptr;
+        if (dump_on && !dump_batch) {
             std::fprintf(stderr, "strata-minimax: --minimax-prefill-batch is off because the parity dump needs the "
-                                 "per-token path\n");
+                                 "per-token path (STRATA_DUMP_BATCH=1 keeps it on for the window diff)\n");
             return;
         }
         batch_cap = opt.prefill_batch;
@@ -5396,6 +5430,41 @@ struct Engine::Impl {
     // size comes from the scratch buffer, so an `lm_head` of 200 K rows costs a few dozen launches, not 200 K.
     // `row0`/`nrows` select a band of the weight rows (the lm_head is projected a vocabulary tile at a time so the
     // device never needs a 200 K x n_embd output buffer); -1/nrows<=0 means the whole matrix.
+    /// A dense projection for a small window (P13): the packed MMVQ path the token path uses, all `T` rows in one
+    /// launch.  `native_mmvq`'s multi-column layout is bitwise equal to its single-column one (the kernels' own
+    /// contract, `native_mmvq_set_multi_exact`), so a verify window's projections are the token path's arithmetic -
+    /// which the token path's `gemv` also reaches through, one column at a time.
+    bool mmvq_small(const Tensor& t, const float* X, int T, float* Y, int ldy, int64_t row0 = 0, int64_t nrows = 0) {
+        static const bool on = [] {
+            const char* e = std::getenv("STRATA_WINDOW_MMVQ");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (!on) return false;
+        if (T < 1 || T > 8) return false;
+        if (!t.gpu || !t.dev.p || t.dev_f32 || !mmvq_dense_fits(t.type, t.ne0)) return false;
+        const int64_t K = t.ne0;
+        // its own q8_1 buffer, sized for the widest matrix the window projects (the o_proj is qlen wide, the dense
+        // FFN's down matrix n_ff): the prompt workspace's one is only as wide as the hidden state
+        const size_t need = (size_t)T * (size_t)(K / 32) * 36 + 64;
+        const size_t d = (size_t)std::max(0, cur);
+        if (win_xq.size() <= d) {
+            win_xq.resize(d + 1);
+            win_xq_bytes.resize(d + 1, 0);
+        }
+        if (!win_xq[d].p || win_xq_bytes[d] < need) {
+            win_xq[d] = DevPtr(cu::alloc(need));
+            win_xq_bytes[d] = need;
+        }
+        // `quantize_q8_1_rows` is the token path's quantizer, and the multi-column kernel keeps its per-column
+        // layout bitwise equal to one column (native_mmvq_set_multi_exact, the default) - the dump gate in
+        // docs/P13_DSPARK.md checks that per stage.
+        strata::kernels::quantize_q8_1_rows(X, T, (int)K, win_xq[d].p, cu::stream_legacy());
+        const int64_t N = nrows > 0 ? nrows : t.ne1;
+        const void* w = (const uint8_t*)t.dev.p + (size_t)row0 * t.row_bytes;
+        strata::kernels::native_mmvq(t.type, w, win_xq[d].p, Y, (int)K, (int)N, T, cu::stream_legacy());
+        return true;
+    }
+
     void gemm_gpu(const Tensor& t, const uint16_t* X16, const float* X32, float* Y, int T, int ldy, int64_t row0 = -1,
                   int64_t nrows = 0) {
         if (!t.gpu) fail(t.name + ": batched GEMM asked for a host tensor");
@@ -5519,6 +5588,28 @@ struct Engine::Impl {
         std::vector<uint8_t> aq(act_bytes * (size_t)T);
         for (int c = 0; c < T; ++c) act->from_float(X + (size_t)c * ldx, aq.data() + (size_t)c * act_bytes, K);
         const ggml_vec_dot_t dot = t.cpu->vec_dot;
+        // P13: a verify window routes one expert row to several tokens.  The multi-token row decodes the block once
+        // and is bit-identical to `dot` per column (src/kernels/cpu/iq_mt_test.cpp), so a window's expert pass costs
+        // one decode per row instead of one per (row, token), and the numbers do not move.
+        static const bool mt_on = [] {
+            const char* e = std::getenv("STRATA_IQ_MT");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (T > 1 && mt_on && strata::kernels::mt::supported(t.type)) {
+            // groups of up to 8 columns: one row decode serves eight tokens, a prompt chunk is walked in groups
+            pool.run(N, [&](int a, int b) {
+                for (int r = a; r < b; ++r) {
+                    const uint8_t* row = base + (size_t)r * t.row_bytes;
+                    for (int c0 = 0; c0 < T; c0 += strata::kernels::mt::kMaxCols) {
+                        const int n = std::min(strata::kernels::mt::kMaxCols, T - c0);
+                        const uint8_t* ptrs[strata::kernels::mt::kMaxCols];
+                        for (int c = 0; c < n; ++c) ptrs[c] = aq.data() + (size_t)(c0 + c) * act_bytes;
+                        strata::kernels::mt::dot_rows(t.type, row, ptrs, n, Y + (size_t)c0 * ldy + r, ldy, K);
+                    }
+                }
+            });
+            return;
+        }
         pool.run(N, [&](int a, int b) {
             for (int r = a; r < b; ++r) {
                 const uint8_t* row = base + (size_t)r * t.row_bytes;
@@ -5614,6 +5705,8 @@ struct Engine::Impl {
         };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && !ds_tap_out)
+                tap_put(pos, (size_t)ds_slot[(size_t)li], x.data());
             if (kv_mode != 0 || L.want_gpu) use_layer_device(li);
             const auto t_layer = tokclock::now();
             const bool dbg = dumping(li);
@@ -5847,6 +5940,8 @@ struct Engine::Impl {
                 moe(L, h.data(), proj.data());
             }
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && ds_tap_out)
+                tap_put(pos, (size_t)ds_slot[(size_t)li], x.data());
             if (prefetch_slots > 0 && li + 1 < cfg.n_layers) {
                 // The SSD lookahead is issued from inside moe() (it needs this layer's FFN input); only the VRAM
                 // fill is left here, and it keeps its one-layer distance and its exact router input.
@@ -5932,15 +6027,53 @@ struct Engine::Impl {
     void moe_batch_cpu(const Layer& L, const float* H, int T, float* yout) {
         const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
         const int embd = (int)cfg.n_embd, ff = (int)cfg.n_ff_exp;
+        // P13: a verify window must be the token path's arithmetic, so a small window takes the router the token path
+        // takes (`gemv`, the device's packed q8_1 dots) one row at a time, and accumulates each token's experts in
+        // ROUTE order (`moe()` adds them in that order, and float addition is not associative).
+        const bool exact_window = T <= strata::kernels::mt::kMaxCols;
         std::vector<float> logits((size_t)T * nexp);
-        gemm_cpu(L.router, H, T, embd, logits.data(), nexp);
+        if (exact_window && L.router.gpu) {
+            for (int t = 0; t < T; ++t) gemv(L.router, H + (size_t)t * embd, logits.data() + (size_t)t * nexp);
+        } else {
+            gemm_cpu(L.router, H, T, embd, logits.data(), nexp);
+        }
         std::vector<int> ids;
         std::vector<float> wts;
         pf_routes(L, logits.data(), T, ids, wts);
+        if (dumping((int64_t)(&L - layers.data()))) {
+            const int64_t li = (int64_t)(&L - layers.data());
+            dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/router_logits", logits.data(), nexp);
+            dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/router_weights_batch",
+                     wts.data(), (int)((size_t)T * (size_t)top));
+        }
         std::fill(yout, yout + (size_t)T * embd, 0.f);
+        // the routed experts' outputs per (token, route), so the final sum can follow `moe()`'s order
+        std::vector<float> per_route;
+        if (exact_window) per_route.assign((size_t)T * (size_t)top * (size_t)embd, 0.f);
         std::vector<std::vector<int>> tok_of((size_t)nexp);
         for (int t = 0; t < T; ++t)
             for (int s = 0; s < top; ++s) tok_of[(size_t)ids[(size_t)t * top + s]].push_back(t);
+        if (std::getenv("STRATA_WINDOW_DEBUG")) {
+            int64_t uniq = 0, pinned = 0;
+            for (int e = 0; e < nexp; ++e) {
+                if (tok_of[(size_t)e].empty()) continue;
+                ++uniq;
+                const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)e] : -1;
+                if (rs >= 0) ++pinned;
+            }
+            std::fprintf(stderr, "INFO window-moe layer=%lld T=%d uniq=%lld pinned=%lld ssd_or_map=%lld\n",
+                         (long long)(&L - layers.data()), T, (long long)uniq, (long long)pinned,
+                         (long long)(uniq - pinned));
+        }
+        if (spec_count) {
+            // one read per (layer, expert) for the whole window; a one-token decode would have read T x top rows
+            int64_t uniq = 0;
+            for (const std::vector<int>& v : tok_of)
+                if (!v.empty()) ++uniq;
+            spec_exp_union += uniq;
+            spec_exp_sum += (int64_t)T * top;
+            ++spec_exp_layers;
+        }
         std::vector<float> xin((size_t)rows_cap * (size_t)embd);
         std::vector<float> hid((size_t)rows_cap * (size_t)ff);
         std::vector<float> yd((size_t)rows_cap * (size_t)embd);
@@ -5989,17 +6122,43 @@ struct Engine::Impl {
                     for (size_t i = 0; i < (size_t)nt * embd; ++i) yd[i] *= fd;
                 for (int i = 0; i < nt; ++i) {
                     const int t = toks[a + (size_t)i];
+                    const float* src = yd.data() + (size_t)i * embd;
+                    if (exact_window) {
+                        for (int s = 0; s < top; ++s)
+                            if (ids[(size_t)t * top + s] == e)
+                                std::memcpy(per_route.data() + ((size_t)t * top + s) * embd, src,
+                                            (size_t)embd * sizeof(float));
+                        continue;
+                    }
                     float wsum = 0.f;
                     for (int s = 0; s < top; ++s)
                         if (ids[(size_t)t * top + s] == e) wsum += wts[(size_t)t * top + s];
                     float* dst = yout + (size_t)t * embd;
-                    const float* src = yd.data() + (size_t)i * embd;
                     for (int c = 0; c < embd; ++c) dst[c] += wsum * src[c];
                 }
             }
         }
+        if (exact_window) {
+            // `moe()`: yout += w[j] * expert_j, in route order, then the routed scale
+            for (int t = 0; t < T; ++t) {
+                float* dst = yout + (size_t)t * embd;
+                for (int s = 0; s < top; ++s) {
+                    const float wj = wts[(size_t)t * top + s];
+                    const float* src = per_route.data() + ((size_t)t * top + s) * embd;
+                    for (int c = 0; c < embd; ++c) dst[c] += wj * src[c];
+                }
+            }
+        }
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout[i] *= scale_routed;
-        if (L.have_shared) {
+        if (L.have_shared && exact_window) {
+            // the token path's shared expert is `mlp()`: device gemvs and the host swigluoai, one row at a time
+            std::vector<float> ye((size_t)embd);
+            for (int t = 0; t < T; ++t) {
+                mlp(L.gate, L.up, L.down, 0, H + (size_t)t * embd, ye.data(), (int)L.gate.ne1);
+                float* dst = yout + (size_t)t * embd;
+                for (int c = 0; c < embd; ++c) dst[c] += ye[(size_t)c];
+            }
+        } else if (L.have_shared) {
             const int sff = (int)L.gate.ne1;
             for (int c = 0; c < T; c += (int)rows_cap) {
                 const int nt = std::min<int>((int)rows_cap, T - c);
@@ -6291,6 +6450,8 @@ struct Engine::Impl {
         const int qlen = H * D, klen = HKV * D;
         const int BLK = (int)cfg.idx_block;
         tok_stats = TokenStats{};
+        const auto t_window = std::chrono::steady_clock::now();
+        if (opt.profile_time) prof = Prof{};
         const Tensor& embd_t = embd;
 
         for (int t = 0; t < T; ++t) {
@@ -6336,29 +6497,64 @@ struct Engine::Impl {
             PfBuf& p = pf.empty() ? p_dummy : P();
             // ---- attention block
             const auto ta0 = pfclock::now();
+            // P13: the dump probe of a window's FIRST row, under the token path's own keys, so the two paths can be
+            // compared stage by stage (docs/P13_DSPARK.md, the same-placement identity gate).
+            const bool wdump = dumping(li) && pos0 == 0;
+            if (wdump) {
+                const std::string wpfx = "L" + std::to_string(src_layer[(size_t)li]);
+                dbuf_put(wpfx + "/residual_in", pf_h.data(), ne);
+            }
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && !ds_tap_out) {
+                const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
+                for (int t = t0; t < T; ++t)
+                    tap_put(pos0 + t, (size_t)ds_slot[(size_t)li], pf_h.data() + (size_t)t * ne);
+            }
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
+            if (wdump) dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_input", hq, ne);
             const auto ta1 = pfclock::now();
             // P5c: with the fused device path the projections never come back to the host: norm+rope runs on
             // the device and writes fp16 straight into the KV cache (and the MSA query buffer).
             const bool dev_prep = dev_attn && gpu_norm_rope && L.d_qn.p && cfg.n_rot > 0 &&
                                   (int64_t)pos0 + T <= p_rope_cap();
+            // P13: a small window takes the token path's attention one row at a time, which reads the queries as f32
+            static const bool window_attend = [] {
+                const char* e = std::getenv("STRATA_WINDOW_ATTEND");
+                return e == nullptr || e[0] != '0';
+            }();
+            const bool exact_window = dev_prep && window_attend && T <= strata::kernels::mt::kMaxCols;
             if (gpu) {
                 cu::copy_h2d(p.p32, hq, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
-                gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
+                if (!mmvq_small(L.wq, p.p32, T, p.y32, qlen)) gemm_gpu(L.wq, p.h16, p.p32, p.y32, T, qlen);
                 if (!dev_prep) cu::copy_d2h(qf.data(), p.y32, (size_t)T * qlen * sizeof(float));
                 else {
                     pf_pos.resize((size_t)T);
                     for (int t = 0; t < T; ++t) pf_pos[(size_t)t] = (int32_t)(pos0 + t);
                     cu::copy_h2d(p.d_pos.p, pf_pos.data(), (size_t)T * sizeof(int32_t));
-                    cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H, H,
-                                       D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
-                                       (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    if (exact_window) {
+                        const size_t need = (size_t)T * (size_t)qlen * 4;
+                        const size_t dq = (size_t)std::max(0, cur);
+                        if (pf_q32.size() <= dq) {
+                            pf_q32.resize(dq + 1);
+                            pf_q32_bytes.resize(dq + 1, 0);
+                        }
+                        if (!pf_q32[dq].p || pf_q32_bytes[dq] < need) {
+                            pf_q32[dq] = DevPtr(cu::alloc(need + 4096));
+                            pf_q32_bytes[dq] = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, (float*)pf_q32[dq].p, nullptr, (int64_t)T * H, H,
+                                           D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    } else {
+                        cu::head_norm_rope(p.y32, (const float*)L.d_qn.p, nullptr, (uint16_t*)p.d_q16.p, (int64_t)T * H,
+                                           H, D, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    }
                 }
-                gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
+                if (!mmvq_small(L.wk, p.p32, T, p.y32, klen)) gemm_gpu(L.wk, p.h16, p.p32, p.y32, T, klen);
                 if (!dev_prep) cu::copy_d2h(pf_kv.data(), p.y32, (size_t)T * klen * sizeof(float));
                 else {
                     uint16_t* kdst = (uint16_t*)p.a16;
@@ -6374,7 +6570,7 @@ struct Engine::Impl {
                                    pf_k16.data(), (int)((size_t)T * (size_t)klen));
                     }
                 }
-                gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
+                if (!mmvq_small(L.wv, p.p32, T, p.y32, klen)) gemm_gpu(L.wv, p.h16, p.p32, p.y32, T, klen);
                 if (!dev_prep) cu::copy_d2h(vf.data(), p.y32, (size_t)T * klen * sizeof(float));
                 else {
                     uint16_t* vdst = (uint16_t*)p.a16;
@@ -6424,14 +6620,29 @@ struct Engine::Impl {
                 iqf.resize((size_t)T * ilen);
                 ikf.resize((size_t)T * cfg.idx_dim);
                 if (gpu) {
-                    gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
+                    if (!mmvq_small(L.iq, p.p32, T, p.y32, ilen)) gemm_gpu(L.iq, p.h16, p.p32, p.y32, T, ilen);
                     if (!dev_prep) cu::copy_d2h(iqf.data(), p.y32, iqf.size() * sizeof(float));
-                    else
+                    else if (exact_window) {
+                        const size_t need = (size_t)T * (size_t)ilen * 4;
+                        const size_t dq = (size_t)std::max(0, cur);
+                        if (pf_iq32.size() <= dq) {
+                            pf_iq32.resize(dq + 1);
+                            pf_iq32_bytes.resize(dq + 1, 0);
+                        }
+                        if (!pf_iq32[dq].p || pf_iq32_bytes[dq] < need) {
+                            pf_iq32[dq] = DevPtr(cu::alloc(need + 4096));
+                            pf_iq32_bytes[dq] = need + 4096;
+                        }
+                        cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, (float*)pf_iq32[dq].p, nullptr, (int64_t)T * HI,
+                                           HI, (int)cfg.idx_dim, (int)cfg.n_rot, (const float*)W().rope_cos.p,
+                                           (const float*)W().rope_sin.p, (const int32_t*)p.d_pos.p, eps, nullptr);
+                    } else {
                         cu::head_norm_rope(p.y32, (const float*)L.d_iqn.p, nullptr, (uint16_t*)p.d_iq16.p,
                                            (int64_t)T * HI, HI, (int)cfg.idx_dim, (int)cfg.n_rot,
                                            (const float*)W().rope_cos.p, (const float*)W().rope_sin.p,
                                            (const int32_t*)p.d_pos.p, eps, nullptr);
-                    gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
+                    }
+                    if (!mmvq_small(L.ik, p.p32, T, p.y32, (int)cfg.idx_dim)) gemm_gpu(L.ik, p.h16, p.p32, p.y32, T, (int)cfg.idx_dim);
                     if (!dev_prep) cu::copy_d2h(ikf.data(), p.y32, ikf.size() * sizeof(float));
                     else
                         cu::head_norm_rope(p.y32, (const float*)L.d_ikn.p, nullptr,
@@ -6471,7 +6682,45 @@ struct Engine::Impl {
                 if (dev_prep) cu::sync();
                 t_kvw += dur(tix0, pfclock::now());
             }
-            if (dev_attn) {
+            if (exact_window) {
+                // P13: the token path's attention, one row at a time: the same block selection, the same gather and
+                // the same MSA kernel that a lone token goes through, so the window's attention is its arithmetic.
+                cu::sync();
+                if (wdump) {
+                    // the window's own q after norm+rope (row 0) under the token path's key
+                    std::vector<float> q0((size_t)qlen);
+                    cu::copy_d2h(q0.data(), pf_q32[(size_t)std::max(0, cur)].p, (size_t)qlen * sizeof(float));
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/q_after_rope", q0.data(), (int)qlen);
+                }
+                const int64_t ilen_row = (int64_t)HI * cfg.idx_dim;
+                const size_t dd = (size_t)std::max(0, cur);
+                for (int t = 0; t < T; ++t) {
+                    const float* qd = (const float*)pf_q32[dd].p + (size_t)t * (size_t)qlen;
+                    const float* iqd = (L.indexer && pf_iq32[dd].p)
+                                           ? (const float*)pf_iq32[dd].p + (size_t)t * (size_t)ilen_row
+                                           : nullptr;
+                    attend((int)li, L, pos0 + t, nullptr, qd, iqd, p.p32 + (size_t)t * (size_t)qlen);
+                }
+                cu::sync();
+                if (!gpu) {
+                    pf_att_h.resize((size_t)T * (size_t)qlen);
+                    cu::copy_d2h(pf_att_h.data(), p.p32, pf_att_h.size() * sizeof(float));
+                    gemm_cpu(L.wo, pf_att_h.data(), T, qlen, pf_moe_h.data(), ne);
+                } else {
+                    if (!mmvq_small(L.wo, p.p32, T, p.y32, ne)) {
+                        cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
+                        cu::sync();
+                        gemm_gpu(L.wo, p.a16, p.p32, p.y32, T, ne);
+                    }
+                    cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
+                }
+                if (wdump) {
+                    std::vector<float> core((size_t)qlen);
+                    cu::copy_d2h(core.data(), p.p32, (size_t)qlen * sizeof(float));
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_core_out", core.data(), (int)qlen);
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_out", pf_moe_h.data(), ne);
+                }
+            } else if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
                 int nb = 0;
                 if (L.indexer) {
@@ -6531,7 +6780,8 @@ struct Engine::Impl {
                 } else {
                     if (!prefill_dense_f32) cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
                     cu::sync();
-                    gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
+                    if (!mmvq_small(L.wo, p.p32, T, p.y32, ne))
+                        gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
                     cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
                     t_prep += dur(tw0, pfclock::now());
                 }
@@ -6551,13 +6801,19 @@ struct Engine::Impl {
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
 
             const auto t_ffn = pfclock::now();
+            if (opt.profile_time) prof.attn += dur(t_layer, t_ffn);
             // ---- FFN block
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.ffn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hn = pf_q.data();
             if (!L.moe) {
                 const int ff = (int)L.gate.ne1;
-                if (gpu) {
+                if (gpu && T <= strata::kernels::mt::kMaxCols) {
+                    // the dense FFN of a small window: `mlp()`, the token path's own call (device gemvs plus the host
+                    // swigluoai), which the batched tensor-core pass does not reproduce bit for bit
+                    for (int t = 0; t < T; ++t)
+                        mlp(L.gate, L.up, L.down, 0, hn + (size_t)t * ne, pf_moe_h.data() + (size_t)t * ne, ff);
+                } else if (gpu) {
                     cu::copy_h2d(p.p32, hn, (size_t)T * ne * sizeof(float));
                     cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                     cu::sync();
@@ -6574,7 +6830,7 @@ struct Engine::Impl {
                                     (size_t)nt * ne * sizeof(float));
                     }
                 }
-            } else if (gpu && prefill_gpu_experts) {
+            } else if (gpu && prefill_gpu_experts && T >= kGpuExpertsMinRows) {
                 cu::copy_h2d(p.p32, hn, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
@@ -6584,6 +6840,16 @@ struct Engine::Impl {
             }
             for (int t = 0; t < T; ++t)
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
+            if (wdump) {
+                const std::string wpfx = "L" + std::to_string(src_layer[(size_t)li]);
+                dbuf_put(wpfx + "/moe_out", pf_moe_h.data(), ne);
+                dbuf_put(wpfx + "/layer_out", pf_h.data(), ne);
+            }
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && ds_tap_out) {
+                const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
+                for (int t = t0; t < T; ++t)
+                    tap_put(pos0 + t, (size_t)ds_slot[(size_t)li], pf_h.data() + (size_t)t * ne);
+            }
             if (time_on) {
                 const double f = ms(t_ffn);
                 std::fprintf(stderr,
@@ -6598,6 +6864,14 @@ struct Engine::Impl {
         if (time_on) {
             std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f\n", t_idx, t_topk,
                          t_msa, t_prep, t_kvw);
+        }
+        if (opt.profile_time) {
+            // a verify window reports per token like the token path, so the two phase tables line up
+            prof.total = dur(t_window, pfclock::now());
+            prof_acc(prof_sum, prof);
+            prof_tokens += T;
+            const std::string line = prof_line(prof, prof_tokens);
+            std::fprintf(stderr, "%s\n", line.c_str());
         }
 
         // ---- final norm and output projection
@@ -6615,7 +6889,7 @@ struct Engine::Impl {
             for (int n0 = 0; n0 < vocab; n0 += 4096) {
                 const int nt = std::min(4096, vocab - n0);
                 if ((int64_t)rows * nt > (int64_t)p.y32_elems) fail("output tile exceeds the workspace");
-                gemm_gpu(output, p.h16, p.p32, p.y32, rows, nt, n0, nt);
+                if (!mmvq_small(output, p.p32, rows, p.y32, nt, n0, nt)) gemm_gpu(output, p.h16, p.p32, p.y32, rows, nt, n0, nt);
                 cu::copy_d2h(pf_out_tile.data(), p.y32, (size_t)rows * nt * sizeof(float));
                 for (int i = 0; i < rows; ++i)
                     std::memcpy(logit_out + (size_t)i * vocab + n0, pf_out_tile.data() + (size_t)i * nt,
@@ -6639,13 +6913,330 @@ struct Engine::Impl {
         }
     }
 
+    // ---- P13: one speculative decode pass.  Each round takes the token the plain loop would take, asks the drafter
+    // for up to `opt.spec` more, verifies them with ONE batched forward, and commits the longest matching prefix.
+    // A draft that does not match is simply not committed: the round's last row is the target's own logits, which is
+    // exactly the state the plain loop would hold, so the draft can only ever change the speed.
+    void decode_spec(int max_new, const SampleParams& sp, std::atomic<bool>& stop,
+                     const std::function<void(int32_t)>& on_token, GenerateResult& gr, std::vector<int32_t>& hist) {
+        const int V = (int)cfg.n_vocab;
+        const DsparkGeometry& g = dspark->geom();
+        // the verify window is a batched forward: it cannot be wider than the prompt workspace
+        const int kd_max = (int)std::min<int64_t>(opt.spec, std::min<int64_t>(g.block, batch_cap - 1));
+        const int64_t mask_id = g.mask_id;
+        const int ne = (int)cfg.n_embd;
+        // temperature > 0: the draft is a point mass and the window is accepted by rejection sampling, which leaves
+        // the target's own distribution; greedy: a draft is kept when the target's argmax agrees with it.
+        const bool sampled = sp.temperature > 0.f;
+        const float cum = opt.spec_min_conf;   // stop where the product of the confidences falls below this
+        const int n_min = opt.spec_n_min;      // ... but always verify at least this many drafts
+        std::vector<float> row((size_t)V), vrow((size_t)V), prow((size_t)V);
+        std::string err;
+        int emitted = 0;
+        bool have_pending = false;
+        int32_t pending = 0;
+        auto finish = [&](const char* why) {
+            // the plain loop leaves its last sampled token in `held` but not in the cache; mirror that exactly
+            n_past -= 1;
+            gr.finish = why;
+            gr.generated = emitted;
+        };
+        while (true) {
+            if (stop.load(std::memory_order_relaxed)) {
+                // mid-round the cache already holds the last emitted token, which is the plain loop's state too
+                gr.finish = "cancel";
+                gr.generated = emitted;
+                return;
+            }
+            if (emitted >= max_new) {
+                gr.finish = "length";
+                gr.generated = emitted;
+                return;
+            }
+            int32_t id0 = 0;
+            if (have_pending) {
+                id0 = pending;   // drawn from the target's own distribution when the window was cut short
+                have_pending = false;
+            } else {
+                row = last_logits;
+                if (!finite_row(row.data(), V)) {
+                    gr.finish = "nonfinite";
+                    gr.generated = emitted;
+                    return;
+                }
+                id0 = sample(row, sp, hist);
+            }
+            const int64_t p0 = n_past;
+            // ---- the drafts
+            int k = 0;
+            if (kd_max > 0 && max_new - emitted > 1) {
+                if (!dspark_seed_to(p0, err)) fail("minimax-dspark: " + err);
+                const int want = std::min(kd_max, max_new - emitted - 1);
+                const int rows = want + 1;
+                input_row(p0, id0, ds_ids.data());
+                for (int j = 1; j < rows; ++j)
+                    decode_f32(embd, embd.host + (size_t)mask_id * embd.row_bytes,
+                               ds_ids.data() + (size_t)j * (size_t)ne, ne);
+                const double dt0 = spec_now();
+                if (!dspark->draft(ds_ids.data(), id0, p0, ds_drafts.data(), ds_conf.data(), err))
+                    fail("minimax-dspark: " + err);
+                spec_draft_ms += spec_now() - dt0;
+                // two GPUs: check one draft, and up to four while the product of the confidences holds
+                float prod = 1.f;
+                int keep = 0;
+                for (int j = 0; j < want; ++j) {
+                    prod *= ds_conf[(size_t)j];
+                    if (keep < n_min || cum <= 0.f || prod >= cum)
+                        ++keep;
+                    else
+                        break;
+                }
+                k = std::max(1, keep);
+                // A test hook (tools/minimax/test_dspark.py): a wrong first draft makes every round reject, so the
+                // output must still equal plain decode - that is the rollback gate.
+                if (std::getenv("STRATA_DSPARK_CORRUPT")) {
+                    for (int j = 0; j < k; ++j) ds_drafts[(size_t)j] = (int32_t)((ds_drafts[(size_t)j] + 7919) % V);
+                }
+            }
+            const int T = k + 1;
+            std::vector<int32_t> win((size_t)T);
+            win[0] = id0;
+            for (int j = 1; j < T; ++j) win[(size_t)j] = ds_drafts[(size_t)(j - 1)];
+            const double vt0 = spec_now();
+            spec_count = true;   // the per-window expert accounting in moe_batch_cpu
+            forward_batch(win.data(), T, ds_rows.data(), T);
+            spec_count = false;
+            spec_checked += T;
+            spec_verify_ms += spec_now() - vt0;
+            ++spec_rounds;
+            spec_drafted += k;
+            auto emit = [&](int32_t id) {
+                if (on_token) on_token(id);
+                hist.push_back(id);
+                held.push_back(id);
+                ++emitted;
+                ++spec_tokens;
+                return eos.count(id) != 0;
+            };
+            // the round's first token is the plain loop's own sample; the batch already holds its logits
+            n_past = p0 + 1;
+            std::memcpy(last_logits.data(), ds_rows.data(), (size_t)V * sizeof(float));
+            if (!finite_row(last_logits.data(), V)) {
+                gr.finish = "nonfinite";
+                gr.generated = emitted;
+                return;
+            }
+            if (emit(id0)) {
+                finish("stop");
+                return;
+            }
+            if (emitted >= max_new) {
+                finish("length");
+                return;
+            }
+            for (int j = 0; j < k; ++j) {
+                const float* rrow = ds_rows.data() + (size_t)j * (size_t)V;
+                if (!finite_row(rrow, V)) {
+                    gr.finish = "nonfinite";
+                    gr.generated = emitted;
+                    return;
+                }
+                if (sampled) {
+                    // rejection sampling with a point-mass proposal: keep the draft with the target's own
+                    // probability, else draw the correction from the residual (p - q)+ - q puts all its mass on the
+                    // draft - so the emitted token is distributed exactly as the target's own sample.
+                    prow.assign(rrow, rrow + V);
+                    apply_penalties(prow.data(), sp, hist);
+                    to_dist(prow.data(), sp);
+                    const float px = prow[(size_t)ds_drafts[(size_t)j]];
+                    if (uniform() < (double)px) {
+                        ++spec_accepted;
+                        n_past = p0 + j + 2;
+                        std::memcpy(last_logits.data(), rrow + V, (size_t)V * sizeof(float));
+                        if (emit(ds_drafts[(size_t)j])) {
+                            finish("stop");
+                            return;
+                        }
+                        if (emitted >= max_new) {
+                            finish("length");
+                            return;
+                        }
+                        continue;
+                    }
+                    prow[(size_t)ds_drafts[(size_t)j]] = 0.f;
+                    const float rest = 1.f - px;
+                    if (rest > 1e-6f)
+                        for (int v = 0; v < V; ++v) prow[(size_t)v] /= rest;
+                    pending = draw_dist(prow.data());
+                    have_pending = true;
+                    n_past = p0 + j + 1;   // the correction token has not been through the target yet
+                    break;
+                }
+                std::memcpy(vrow.data(), rrow, (size_t)V * sizeof(float));
+                if (sample(vrow, sp, hist) != ds_drafts[(size_t)j]) break;   // the matching prefix ends here
+                ++spec_accepted;
+                n_past = p0 + j + 2;
+                std::memcpy(last_logits.data(), rrow + V, (size_t)V * sizeof(float));
+                if (emit(ds_drafts[(size_t)j])) {
+                    finish("stop");
+                    return;
+                }
+                if (emitted >= max_new) {
+                    finish("length");
+                    return;
+                }
+            }
+        }
+    }
+
+    static double spec_now() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    /// The run's speculation counters, one block (nothing when the drafter never ran).
+    void spec_report() {
+        if (spec_rounds <= 0) return;
+        const double draft = spec_draft_ms, verify = spec_verify_ms, total = draft + verify;
+        const double rounds = (double)spec_rounds;
+        std::fprintf(stderr,
+                     "INFO minimax-spec rounds=%lld drafts=%lld accepted=%lld rate=%.3f per_round=%.2f tokens=%lld "
+                     "draft_ms=%.1f verify_ms=%.1f round_ms=%.1f ms/token=%.1f\n",
+                     (long long)spec_rounds, (long long)spec_drafted, (long long)spec_accepted,
+                     spec_drafted > 0 ? (double)spec_accepted / (double)spec_drafted : 0.0,
+                     rounds > 0 ? (double)spec_tokens / rounds : 0.0, (long long)spec_tokens, draft, verify, total,
+                     spec_tokens > 0 ? total / (double)spec_tokens : 0.0);
+        if (spec_checked > 0) {
+            const double per_verify = (double)spec_checked / rounds;
+            const double committed = (double)spec_tokens / rounds;
+            const double uniq = spec_exp_layers > 0 ? (double)spec_exp_union / (double)spec_exp_layers : 0.0;
+            const double sum1 = spec_exp_layers > 0 ? (double)spec_exp_sum / (double)spec_exp_layers : 0.0;
+            std::fprintf(stderr,
+                         "INFO minimax-spec-window checked_per_verify=%.2f committed_per_verify=%.2f "
+                         "accepted_per_verify=%.2f experts_unique_per_verify=%.2f "
+                         "experts_one_token_sum_per_verify=%.2f experts_ratio=%.3f layers_per_verify=%.1f\n",
+                         per_verify, committed, (double)(spec_accepted + spec_rounds) / rounds, uniq, sum1,
+                         sum1 > 0 ? uniq / sum1 : 0.0, (double)spec_exp_layers / rounds);
+        }
+        spec_rounds = spec_drafted = spec_accepted = spec_tokens = 0;
+        spec_checked = spec_exp_union = spec_exp_sum = spec_exp_layers = 0;
+        spec_draft_ms = spec_verify_ms = 0;
+    }
+
     void reset() {
         n_past = 0;
         held.clear();
         have_logits = false;
+        ds_seeded = 0;
+        if (dspark) dspark->reset();
     }
 
-    int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
+    // ============================================================================== P13: DSpark speculative decoding
+
+    /// Load the draft head (before the expert tiers are sized, so the slots see its VRAM) and bind the head.
+    void load_dspark() {
+        if (opt.dspark_pack.empty() || opt.spec <= 0) {
+            if (opt.spec > 0) fail("--speculative needs --dspark-model (tools/minimax/dspark_pack.py writes it)");
+            return;
+        }
+        if (devs.empty()) fail("--speculative needs a GPU for the draft head (the dense layers are all on the CPU)");
+        int dev = opt.dspark_gpu >= 0 ? opt.dspark_gpu : devs.back();
+        bool known = false;
+        for (int d : devs) known = known || d == dev;
+        if (!known)
+            std::fprintf(stderr, "INFO minimax-dspark: device %d is not one of --gpus; the drafter runs there anyway\n",
+                         dev);
+        dspark = std::make_unique<DsparkDrafter>();
+        std::string err;
+        std::fprintf(stderr, "INFO minimax-dspark load: the pack (%s) on device %d\n",
+                     opt.dspark_pack.c_str(), dev);
+        if (!dspark->load(opt.dspark_pack, dev, opt.dspark_window, err)) fail(err);
+        std::fprintf(stderr, "INFO minimax-dspark load: weights on the device, %.0f MiB\n",
+                     (double)dspark->vram_bytes() / 1048576.0);
+        const DsparkGeometry& g = dspark->geom();
+        if (g.n_embd != cfg.n_embd) fail("the DSpark pack is " + std::to_string(g.n_embd) + " wide, the model " +
+                                         std::to_string(cfg.n_embd));
+        if (g.vocab != cfg.n_vocab) fail("the DSpark pack's vocabulary is " + std::to_string(g.vocab) +
+                                         ", the model's " + std::to_string(cfg.n_vocab));
+        for (int64_t l : g.taps)
+            if (l < 0 || l >= cfg.n_layers) fail("a DSpark tap layer is outside the model");
+        if (opt.spec > g.block) fail("--speculative " + std::to_string(opt.spec) + " is more than the pack's " +
+                                     std::to_string(g.block) + " drafts per round");
+        // the target's own head: the device copy when the dense layers put it there, else its mapped bytes
+        if (output_gpu && output.dev.p && !output.dev_f32) {
+            if (!dspark->bind_head(output.dev.p, nullptr, 0, output.type, output.ne1, output.ne0, err)) fail(err);
+        } else if (mmvq_dense_type(output.type) && output.host) {
+            if (!dspark->bind_head(nullptr, output.host, output.bytes, output.type, output.ne1, output.ne0, err))
+                fail(err);
+        } else {
+            fail("the head's type has no device path the drafter can use (--minimax-dense-layers-gpu 0 puts the "
+                 "head on the CPU; the drafter needs it on its device)");
+        }
+        std::fprintf(stderr, "INFO minimax-dspark load: head bound\n");
+        ds_slot.assign((size_t)cfg.n_layers, -1);
+        for (size_t i = 0; i < g.taps.size(); ++i) ds_slot[(size_t)g.taps[i]] = (char)i;
+        ds_tapw = g.tap_width();
+        ds_cap = dspark->window() + g.rows() + 8;
+        ds_tap.assign((size_t)ds_cap * (size_t)ds_tapw, 0.f);
+        ds_ids.assign((size_t)g.rows() * (size_t)cfg.n_embd, 0.f);
+        ds_rows.assign((size_t)g.rows() * (size_t)cfg.n_vocab, 0.f);
+        ds_drafts.assign((size_t)g.block, 0);
+        ds_conf.assign((size_t)g.block, 0.f);
+        std::fprintf(stderr, "INFO minimax-dspark load: taps %lld wide, ring of %lld positions (%.0f MiB)\n",
+                     (long long)ds_tapw, (long long)ds_cap,
+                     (double)((size_t)ds_cap * (size_t)ds_tapw * sizeof(float)) / 1048576.0);
+        ds_seeded = 0;
+        // loading the drafter leaves its device current; put the engine back on the default one so the allocations
+        // that follow (the device KV, the prompt workspace, the expert slots) start from the same place as ever
+        cu::set_device(0);
+        if (const char* t = std::getenv("STRATA_DSPARK_TAP")) ds_tap_out = std::string(t) == "output";
+        std::fprintf(stderr,
+                     "INFO minimax-dspark pack=%s dev=%d layers=%lld window=%lld block=%lld drafts=%d vram=%.0f "
+                     "MiB taps=", opt.dspark_pack.c_str(), dev, (long long)g.n_layers, (long long)g.window,
+                     (long long)g.block, opt.spec, (double)dspark->vram_bytes() / 1048576.0);
+        for (size_t i = 0; i < g.taps.size(); ++i) std::fprintf(stderr, "%s%lld", i ? "," : "", (long long)g.taps[i]);
+        std::fprintf(stderr, "\n");
+    }
+
+    void tap_put(int64_t pos, size_t slot, const float* src) {
+        if (ds_tap.empty()) return;
+        std::memcpy(ds_tap.data() + (size_t)(pos % ds_cap) * (size_t)ds_tapw + slot * (size_t)cfg.n_embd, src,
+                    (size_t)cfg.n_embd * sizeof(float));
+    }
+
+    /// The token's input row: its embedding, or the image rows that replace it.
+    void input_row(int64_t pos, int32_t token, float* dst) {
+        decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, dst, cfg.n_embd);
+        if ((size_t)pos < img_row.size() && img_row[(size_t)pos] >= 0)
+            std::memcpy(dst, img_data.data() + (size_t)img_row[(size_t)pos] * (size_t)cfg.n_embd,
+                        (size_t)cfg.n_embd * sizeof(float));
+    }
+
+    /// Turn every committed position the drafter has not seen yet into its K/V row.
+    bool dspark_seed_to(int64_t upto, std::string& err) {
+        if (!dspark || ds_seeded >= upto) return true;
+        int64_t from = ds_seeded;
+        if (upto - from > ds_cap) from = upto - ds_cap;
+        // the drafter turns tap rows into its K/V rows a batch at a time; hand it the ring's rows in small batches so
+        // the staging buffer stays a few hundred KiB even when a long prompt is seeded at once
+        const int64_t step = std::max<int64_t>(1, dspark->geom().rows());
+        std::vector<float> buf((size_t)step * (size_t)ds_tapw);
+        for (int64_t p = from; p < upto; p += step) {
+            const int64_t n = std::min(step, upto - p);
+            for (int64_t i = 0; i < n; ++i)
+                std::memcpy(buf.data() + (size_t)i * (size_t)ds_tapw,
+                            ds_tap.data() + (size_t)((p + i) % ds_cap) * (size_t)ds_tapw,
+                            (size_t)ds_tapw * sizeof(float));
+            if (!dspark->seed(buf.data(), n, p, err)) return false;
+            ds_seeded = p + n;
+        }
+        ds_seeded = upto;
+        return true;
+    }
+
+    /// The repetition penalties, in place: the plain sampler's first step, split out so the speculative path can draw
+    /// from exactly the distribution the plain path draws from (same order of operations, same rounding).
+    void apply_penalties(float* row, const SampleParams& sp, const std::vector<int32_t>& hist) {
         const int n = (int)cfg.n_vocab;
         if (sp.penalty_repeat != 1.f || sp.penalty_freq != 0.f || sp.penalty_present != 0.f) {
             int window = sp.penalty_last_n;
@@ -6660,12 +7251,19 @@ struct Engine::Impl {
                 row[(size_t)id] -= (float)kv.second * sp.penalty_freq + sp.penalty_present;
             }
         }
-        if (!(sp.temperature > 0.f)) {
-            int best = 0;
-            for (int i = 1; i < n; ++i)
-                if (row[(size_t)i] > row[(size_t)best]) best = i;
-            return best;
-        }
+    }
+
+    /// The first index of the largest value (`>`: a tie keeps the lower id, as the plain path does).
+    static int argmax_row(const float* row, int n) {
+        int best = 0;
+        for (int i = 1; i < n; ++i)
+            if (row[(size_t)i] > row[(size_t)best]) best = i;
+        return best;
+    }
+
+    /// temperature, top_k, softmax, min_p, top_p: the plain sampler's filters, leaving a normalized pmf in `row`.
+    void to_dist(float* row, const SampleParams& sp) {
+        const int n = (int)cfg.n_vocab;
         const float inv_t = 1.f / sp.temperature;
         for (int i = 0; i < n; ++i) row[(size_t)i] *= inv_t;
         if (sp.top_k > 0 && sp.top_k < n) {
@@ -6675,14 +7273,13 @@ struct Engine::Impl {
                 if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
                 return a < b;
             });
-            // nth_element's first top_k entries are the kept ids, unsorted. The cutoff is their minimum.
             float cut = row[(size_t)order[0]];
             for (int i = 1; i < sp.top_k; ++i)
                 if (row[(size_t)order[(size_t)i]] < cut) cut = row[(size_t)order[(size_t)i]];
             for (int i = 0; i < n; ++i)
                 if (row[(size_t)i] < cut) row[(size_t)i] = -std::numeric_limits<float>::infinity();
         }
-        softmax_inplace(row.data(), n);
+        softmax_inplace(row, n);
         if (sp.min_p > 0.f) {
             float peak = 0.f;
             for (int i = 0; i < n; ++i)
@@ -6696,13 +7293,13 @@ struct Engine::Impl {
             if (sum > 0.f)
                 for (int i = 0; i < n; ++i) row[(size_t)i] /= sum;
         }
-        std::vector<int> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
-            return a < b;
-        });
         if (sp.top_p > 0.f && sp.top_p < 1.f) {
+            std::vector<int> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
+                return a < b;
+            });
             float c = 0.f;
             int keep = 0;
             for (; keep < n; ++keep) {
@@ -6727,6 +7324,11 @@ struct Engine::Impl {
             if (sum > 0.f)
                 for (int i = 0; i < n; ++i) row[(size_t)i] /= sum;
         }
+    }
+
+    /// One draw from a normalized pmf: the plain sampler's last step.
+    int draw_dist(const float* row) {
+        const int n = (int)cfg.n_vocab;
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         double r = dist(rng);
         double c = 0.0;
@@ -6737,6 +7339,19 @@ struct Engine::Impl {
         for (int i = n - 1; i >= 0; --i)
             if (row[(size_t)i] > 0.f) return i;
         return 0;
+    }
+
+    /// A uniform draw in [0,1) from the same generator the sampler uses (the speculative acceptance test).
+    double uniform() {
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng);
+    }
+
+    int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
+        apply_penalties(row.data(), sp, hist);
+        if (!(sp.temperature > 0.f)) return argmax_row(row.data(), (int)cfg.n_vocab);
+        to_dist(row.data(), sp);
+        return draw_dist(row.data());
     }
 };
 
@@ -6962,6 +7577,20 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
 
     const auto t1 = clock::now();
     std::vector<int32_t> hist = impl_->held;
+    // P13: with a DSpark drafter, each round verifies a window instead of one token per forward.  Greedy keeps a
+    // draft when the target's argmax agrees; temperature > 0 accepts it by rejection sampling, so the tokens keep the
+    // target's own distribution (see decode_spec).
+    if (impl_->dspark && impl_->opt.spec > 0 && impl_->img_rows == 0) {
+        if (!impl_->batch_on)
+            fail("--speculative needs the batched forward: pass --minimax-prefill-batch (0 is the token path)");
+        // the verify window is a batched forward, so it needs the prompt workspace: hold it for the decode loop (the
+        // default --minimax-prefill-vram reserve sized the expert slots with room for exactly this)
+        Impl::PrefillWs ws(impl_);
+        impl_->decode_spec(max_new, sp, stop, on_token, gr, hist);
+        gr.decode_ms = ms_since(t1);
+        impl_->spec_report();
+        return gr;
+    }
     for (int n = 0; n < max_new; ++n) {
         if (stop.load(std::memory_order_relaxed)) {
             gr.finish = "cancel";

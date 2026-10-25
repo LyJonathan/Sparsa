@@ -129,6 +129,16 @@ struct EngineOptions {
     int route_protect = 2;          ///< the exact top-N experts are never displaced
     int route_pool = 12;            ///< a pick must stay inside the exact top-N
     float route_margin = 0.f;       ///< 0: nudge every expert in the pool; else only within this of the cutoff
+
+    // ---- P13: DSpark speculative decoding (opt-in).  The draft head proposes, ONE batched forward of the target
+    // verifies, and the longest matching prefix is committed; with temperature > 0 the drafter is skipped, so the
+    // sampling path is unchanged.  `dspark_pack` is the GGUF tools/minimax/dspark_pack.py writes.
+    std::string dspark_pack;        ///< the draft head's pack (empty: no speculation)
+    int spec = 0;                   ///< drafts per verify window (0: plain decode, 1..block)
+    int dspark_gpu = -1;            ///< the drafter's device (-1: the last GPU this run uses)
+    int64_t dspark_window = 0;      ///< ring rows kept per layer (0: the pack's sliding window)
+    float spec_min_conf = 0.9f;     ///< cut the window where the confidence head's running product falls below this
+    int spec_n_min = 1;             ///< ... but always verify at least this many drafts (Maya's two-GPU rule)
 };
 
 struct SampleParams {

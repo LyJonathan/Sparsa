@@ -72,3 +72,28 @@ Copyright (c) 2023-2024 The ggml authors
 Copyright (c) 2023-2024 The llama.cpp authors
 Copyright (c) 2026 agentionai
 ```
+
+## Project Maya (DSpark) and MiniMax-M3.1-Flash's DSpark draft head
+
+`src/minimax/dspark.cpp`, `src/minimax/dspark.hpp`, `tools/minimax/dspark_pack.py` and the DSpark part of
+`src/minimax/cuda_ops.cu` implement MiniMax-M3.1-Flash's own DSpark draft head (the checkpoint's
+`dspark/config.json` and `model-dspark-00001.safetensors`) for the MiniMax engine. The reading of the checkpoint -
+what the block is (a context projection from five of the target's layers into a per-layer K/V ring, a block of
+mask rows, a rank-256 Markov head, a confidence head), how the block rows are positioned and how the head's argmax
+is walked left to right - follows
+
+  * [project-maya](https://github.com/mw00/project-maya) `tools/ds4/dspark_ref.py` and `src/ds4/ds4_model.cu`
+    (MIT, Copyright (c) 2026 the project-maya authors), the DSpark drafter for DeepSeek-V4.1-Flash, which in turn
+    follows DeepSeek's `inference/model.py` (MIT, Copyright (c) 2023-2026 DeepSeek); and
+  * Strata's own DFlash2 drafter (`src/core/dflash2.cpp`, `src/kernels/cuda/dflash2.cu`, incoai's
+    Qwen3.8-Flash-Next-DFlash2, Apache-2.0), whose block/ring/selector design this one mirrors so the two families
+    behave the same way.
+
+The window gating (one draft at least, up to four while the product of the confidence scores holds at 0.9), the
+two-GPU verify-window shape and the speed-calibration gate (an 8k-token document, ~1,500 tokens, keep the drafter
+only above +5%) are project-maya's `docs/SETTINGS.md` ("Drafting with DFlash2"). No Maya source file was copied:
+the drafter here is written against Strata's own kernels (`native_mmvq`, `head_norm_rope`, `quantize_q8_1_rows`)
+and its own GGUF pack format.
+
+The 4-bit packs follow llama.cpp's `quantize_row_q4_0_ref` / `quantize_row_q5_0_ref` block layouts
+(`third_party/ggml/VERSION.txt`), verified block for block by `tools/minimax/test_dspark.py`.

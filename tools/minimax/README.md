@@ -1651,3 +1651,47 @@ the lock line's owner/pid/time and no BOM, a live owner refused, a stale PID tak
 refusal, the estimate from engine flags, the watchdog (a scripted `--ram-source seq:20,20,3` reading, so the decision
 and the kill are exercised without eating the box), stdin passthrough, the child's exit code, two launchers where one
 wins, and the interrupt release.
+## P13: DSpark speculative decoding (opt-in; `--dspark-model` + `--speculative`)
+
+MiniMax-M3.1-Flash ships its own draft head, **DSpark**, beside the weights (`dspark/config.json`,
+`dspark/model-dspark-00001.safetensors`, 2.3 GiB of MXFP8/BF16). It is a *block* drafter, not a chain of MTP
+layers:
+
+* **context** - the target's residual stream at five of its layers (`dspark_target_layer_ids` = 3, 17, 31, 45, 59) is
+  concatenated (5 x 6144 = 30720 values) and projected by `fc` to the drafter's width. That row is the only thing the
+  drafter knows about the past: each of its five layers turns it into one K/V row of that layer's ring. There is no
+  autoregressive K/V of drafted tokens, so a rejected draft leaves nothing to roll back.
+* **block** - one forward pass of `block_size + 1` = 8 rows: the last committed token, then seven mask tokens
+  (`dspark_noise_token_id` = 200058), with full (non-causal) attention inside the block over the ring plus the
+  block's own keys. Row *j* sits at position `p0 + j`; each mask row predicts the token in its own slot.
+* **head** - the target's own `lm_head` (the pack carries no head of its own) plus a rank-256 Markov bias
+  `logits[v] += <markov_w1[v], markov_w2[prev]>`, which turns the block's rows into a chain left to right, plus a
+  sigmoid confidence head per row.
+
+`tools/minimax/dspark_pack.py` writes the pack (a GGUF the engine's own reader takes): `--type q4_0` (1.16 GiB,
+the default here), `q5_0` (1.38 GiB), `q8_0` (2.03 GiB) or `f16`. The 4/5-bit blocks follow llama.cpp's
+`quantize_row_q4_0_ref` / `quantize_row_q5_0_ref` layouts; `tools/minimax/test_dspark.py` decodes a tensor from the
+checkpoint and from the pack and asserts the type's own quantization noise, so a wrong block layout or a missed E8M0
+scale cannot pass.
+
+### The round
+
+1. The plain loop's own token ("the anchor") is drawn exactly as without speculation.
+2. The drafter drafts up to `--speculative N` tokens (default 4). The window is cut where the product of the
+   confidence head's scores falls below `--minimax-spec-min-conf` (default 0.9), but never below
+   `--minimax-spec-n-min` drafts (default 1) - the two-GPU rule Maya measured.
+3. ONE batched forward (`forward_batch`, the prompt path) verifies the anchor plus the drafts. Each routed expert is
+   read once for every window token that routes to it (`moe_batch_cpu` groups the rows per expert and reads the
+   expert's bytes once), instead of once per token.
+4. Greedy: the longest prefix whose target argmax agrees with the draft is committed, and the round's last row
+   becomes the state - exactly what the plain loop would hold. Temperature > 0: each draft is kept with probability
+   `p_target(draft)` (rejection sampling with a point-mass proposal) and otherwise replaced by a draw from the
+   residual `(p - q)+`, so the emitted tokens keep the target's own distribution.
+5. Rollback is `n_past`: the K/V and the indexer keys of the positions past the accepted prefix are overwritten by
+   the next forward before any query can read them, and nothing else in the state moves. `STRATA_DSPARK_CORRUPT=1`
+   (a test hook) replaces every draft with a wrong token, so every round rejects and every round rolls back - the
+   tokens must still be identical to plain decode, which is the rollback gate.
+
+### Measured
+
+Numbers and the phase tables are in `docs/P13_DSPARK.md` (they are filled in from the runs on the target box).

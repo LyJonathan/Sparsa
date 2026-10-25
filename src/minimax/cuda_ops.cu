@@ -1172,8 +1172,7 @@ void swiglu_rows_f32(const float* g, const float* u, float* h, int64_t rows, int
 }
 
 void moe_combine_rows(const float* Y, const int32_t* ent_tok, const float* ent_w, int64_t n_rows, int64_t n_embd,
-                      float* out, int64_t n_tok, bool zero, void* stream) {
-    const long long n = n_rows * n_embd;
+                      float* out, int64_t n_tok, bool zero, void* stream) {    const long long n = n_rows * n_embd;
     if (n <= 0) return;
     if (zero) check(cudaMemsetAsync(out, 0, (size_t)n_tok * (size_t)n_embd * sizeof(float), (cudaStream_t)stream),
                     "moe_combine zero");
@@ -1233,6 +1232,82 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
                                                                    (const __half*)q, blk, nblk, q_per_kv, q_per_idx,
                                                                    dim, blk_size, dense_all, pos0, max_blk, out);
     check(cudaGetLastError(), "msa_attn_batch launch");
+}
+
+// ============================================================================ DSpark: the draft block's attention
+//
+// One warp per (block row, query head): each lane owns dim/32 consecutive components of q, k and v, so the row's
+// softmax is a warp reduction.  Every key is visible - the ring's committed rows AND every row of the block (a
+// block drafter's rows are at the same diffusion step, so the block is not causal) - which is exactly what the MSA
+// kernels cannot express: theirs is causal over the target's cache.  The ring is a circular buffer of `nring`
+// valid rows and the block's keys sit in their own buffer, so no copy or re-ordering is needed per round.
+__global__ void dspark_attn_kernel(const __half* __restrict__ q, const __half* __restrict__ kring,
+                                   const __half* __restrict__ vring, int nring, const __half* __restrict__ kblk,
+                                   const __half* __restrict__ vblk, int T, int H, int HKV, int dim,
+                                   float* __restrict__ out) {
+    const int t = blockIdx.x / H;
+    const int h = blockIdx.x - t * H;
+    const int kv = h / (H / HKV);
+    const int lane = threadIdx.x;                 // 32
+    const int per = dim / 32;                     // components per lane
+    const int d0 = lane * per;
+    const __half* qr = q + ((size_t)t * H + h) * (size_t)dim;
+    float qv[8];
+    for (int i = 0; i < per; ++i) qv[i] = __half2float(qr[d0 + i]);
+    float acc[8];
+    for (int i = 0; i < per; ++i) acc[i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    const float scale = rsqrtf((float)dim);
+    const size_t kvs = (size_t)HKV * (size_t)dim;
+    const int nk = nring + T;
+    for (int kk = 0; kk < nk; ++kk) {
+        const __half* kb = kk < nring ? kring + (size_t)kk * kvs + (size_t)kv * (size_t)dim
+                                      : kblk + (size_t)(kk - nring) * kvs + (size_t)kv * (size_t)dim;
+        float s = 0.f;
+        for (int i = 0; i < per; ++i) s += qv[i] * __half2float(kb[d0 + i]);
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        s = __shfl_sync(0xffffffffu, s, 0) * scale;
+        const __half* vb = kk < nring ? vring + (size_t)kk * kvs + (size_t)kv * (size_t)dim
+                                      : vblk + (size_t)(kk - nring) * kvs + (size_t)kv * (size_t)dim;
+        float w;
+        if (s > m) {
+            const float corr = __expf(m - s);
+            l = l * corr + 1.f;
+            for (int i = 0; i < per; ++i) acc[i] *= corr;
+            m = s;
+            w = 1.f;
+        } else {
+            w = __expf(s - m);
+            l += w;
+        }
+        for (int i = 0; i < per; ++i) acc[i] += w * __half2float(vb[d0 + i]);
+    }
+    const float inv = l > 0.f ? 1.f / l : 0.f;
+    float* orow = out + ((size_t)t * H + h) * (size_t)dim;
+    for (int i = 0; i < per; ++i) orow[d0 + i] = acc[i] * inv;
+}
+
+
+__global__ void dspark_add_kernel(float* __restrict__ y, const float* __restrict__ a, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += a[i];
+}
+
+void dspark_add(float* y, const float* add, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const long long blocks = (n + 255) / 256;
+    dspark_add_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>(y, add, n);
+    check(cudaGetLastError(), "dspark_add launch");
+}
+
+void dspark_attn(const void* q, const void* kring, const void* vring, int nring, const void* kblk, const void* vblk,
+                 int t_rows, int heads, int hkv, int dim, float* out, void* stream) {
+    if (t_rows <= 0 || heads <= 0 || dim % 32 != 0) return;
+    const dim3 grid((unsigned)(t_rows * heads));
+    dspark_attn_kernel<<<grid, 32, 0, (cudaStream_t)stream>>>((const __half*)q, (const __half*)kring,
+                                                             (const __half*)vring, nring, (const __half*)kblk,
+                                                             (const __half*)vblk, t_rows, heads, hkv, dim, out);
+    check(cudaGetLastError(), "dspark_attn launch");
 }
 
 }  // namespace strata::minimax::cu
