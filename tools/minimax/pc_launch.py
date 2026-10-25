@@ -10,17 +10,21 @@ check the RAM" in a brief is not enough.  This launcher makes it mechanical:
 What it does, in order:
 
 1. TAKES THE LOCK (`pc-engine.lock`, plain ASCII, no BOM) and refuses if another owner holds it with a live PID.
-     - the file is `free` when unused, else `<owner> <pid> <iso-time>`; a bare name with no PID (an older task's
-       hand-written lock) counts as held;
+     - the file is `free` when unused, else `<owner> <pid> <iso-time>` followed by a `tree <pids...>` line
+       recording the child process tree it started; a bare name with no PID (an older task's hand-written
+       lock) counts as held. `--who` prints both, so a task can check before touching any process;
      - a PID that is no longer running is STALE: the launcher says so and takes over;
      - it is taken atomically: a sidecar `pc-engine.lock.lck` created with O_EXCL is the mutex, and the lock itself is
        written to a temp file and renamed over (so a reader never sees a half-written lock).
-2. REFUSES TO START IF THE RAM WILL NOT FIT: available RAM from `GlobalMemoryStatusEx` (Windows) or
-   `/proc/meminfo` (Linux) via ctypes/stdlib - no PowerShell, no WMI - minus the run's estimate must stay at or above
-   `--min-free-gb` (default 10).  The estimate is `--est-ram-gb`, or `estimate_ram_gb()` reading the engine's own
-   flags (pinned expert budget, dense host copy, KV, prefill workspace, margin); the breakdown is printed.
-3. WATCHES the child: every `--poll` seconds (default 2), if available RAM falls below `--min-free-gb` it stops the
-   child's whole process tree and exits 4 with the reading that triggered it.
+2. REFUSES TO START IF THE RAM WILL NOT FIT: effective available RAM (available physical minus modified/dirty
+   file-cache pages, from PDH `\Memory\Modified Page List Bytes` on Windows or `/proc/meminfo` on Linux)
+   minus the run's estimate must stay at or above `--min-free-gb` (default 10). The estimate is `--est-ram-gb`,
+   or `estimate_ram_gb()` reading the engine's own flags (pinned expert budget, dense host copy, KV, prefill
+   workspace, margin); the breakdown and both RAM numbers are printed.
+3. WATCHES the child: every `--poll` seconds (default 2), if effective RAM falls below `--min-free-gb` it stops
+   the child's whole process tree and exits 4 with the available, modified and effective readings that triggered it.
+   `--max-minutes` is the turn limit: at the limit the launcher stops the same child tree, releases the lock and
+   exits 6, so the next task in the queue can take the PC.
 4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM handlers put the lock back to `free` - on a clean exit, a child
    crash, Ctrl-C, or a watchdog kill.
 
@@ -54,6 +58,7 @@ EXIT_LOCK_HELD = 2
 EXIT_NO_RAM = 3
 EXIT_WATCHDOG = 4
 EXIT_LOCK_TIMEOUT = 5
+EXIT_TURN_LIMIT = 6
 
 # Windows: still-running exit code of a process handle (GetExitCodeProcess -> STILL_ACTIVE)
 _STILL_ACTIVE = 259
@@ -96,20 +101,127 @@ def memory_gb() -> tuple[float, float]:
     return total / gb, avail / gb
 
 
+# ---- modified (dirty) file-cache pages
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("longValue", ctypes.c_long), ("doubleValue", ctypes.c_double),
+                    ("largeValue", ctypes.c_longlong), ("AnsiStringValue", ctypes.c_char_p),
+                    ("WideStringValue", ctypes.c_wchar_p)]
+    _anonymous_ = ("u",)
+    _fields_ = [("CStatus", ctypes.c_ulong), ("u", _U)]
+
+
+def modified_page_bytes() -> int:
+    """Dirty file-cache pages: Windows `\\Memory\\Modified Page List Bytes` via PDH, Linux Meminfo Dirty+Writeback.
+
+    Downloads leave dirty pages that MemoryAvailable still counts as available, so the launcher must take them out
+    of the RAM it expects the engine to get. A counter that cannot be read is 0, never an invented number."""
+    if sys.platform == "win32":
+        pdh = ctypes.windll.pdh
+        query = ctypes.c_void_p()
+        counter = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+            return 0
+        try:
+            add = getattr(pdh, "PdhAddEnglishCounterW", None) or pdh.PdhAddCounterW
+            if add(query, "\\Memory\\Modified Page List Bytes", 0, ctypes.byref(counter)) != 0:
+                return 0
+            if pdh.PdhCollectQueryData(query) != 0:
+                return 0
+            value = _PDH_FMT_COUNTERVALUE()
+            if pdh.PdhGetFormattedCounterValue(counter, 0x00000200, None, ctypes.byref(value)) != 0:
+                return 0
+            return int(value.doubleValue)
+        finally:
+            pdh.PdhCloseQuery(query)
+    try:
+        info = Path("/proc/meminfo").read_text(encoding="ascii", errors="replace")
+        total = 0
+        for key in ("Dirty", "Writeback"):
+            m = re.search(rf"^{key}:\s+(\d+) kB", info, re.M)
+            if m:
+                total += int(m.group(1)) * 1024
+        return total
+    except OSError:
+        return 0
+
+
+def modified_page_gb() -> float:
+    return modified_page_bytes() / (1024.0 ** 3)
+
+
+def process_tree(root: int) -> tuple[int, ...]:
+    """`root` and every descendant currently visible, parent before child. Used only for the lock record."""
+    if root <= 0:
+        return ()
+    children: dict[int, list[int]] = {}
+    if sys.platform == "win32":
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                        ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
+                        ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                        ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == ctypes.c_void_p(-1).value:
+            return (root,)
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                children.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+    else:
+        try:
+            for path in Path("/proc").iterdir():
+                if not path.name.isdigit():
+                    continue
+                try:
+                    stat = (path / "stat").read_text(encoding="ascii", errors="replace")
+                    ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                except (OSError, ValueError, IndexError):
+                    continue
+                children.setdefault(ppid, []).append(int(path.name))
+        except OSError:
+            return (root,)
+    out, queue, seen = [], [root], set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        queue.extend(sorted(children.get(pid, ())))
+    return tuple(out)
+
+
 class RamSource:
     """Where the RAM reading comes from: the machine, or (tests and dry runs only) a scripted sequence in GB.
 
-    `auto` measures.  `seq:20,20,3` returns 20, then 20, then 3 (and 3 for every later poll) without touching the
+    `auto` measures. `seq:20,20,3` returns 20, then 20, then 3 (and 3 for every later poll) without touching the
     machine - it is how the watchdog's decision is tested on a box whose free RAM this test cannot control.
     """
 
-    def __init__(self, spec: str = "auto"):
-        self.fixed: list[float] = []
+    def __init__(self, spec: str = "auto", modified_spec: str = "auto"):
+        self.fixed = self._sequence(spec, "--ram-source")
+        self.modified_fixed = self._sequence(modified_spec, "--modified-source")
         self.i = 0
-        if spec and spec != "auto":
-            if not spec.startswith("seq:"):
-                raise ValueError(f"--ram-source wants 'auto' or 'seq:g1,g2,...', got {spec!r}")
-            self.fixed = [float(x) for x in spec[len("seq:"):].split(",") if x.strip()]
+        self.mi = 0
+
+    @staticmethod
+    def _sequence(spec: str, name: str) -> list[float]:
+        if not spec or spec == "auto":
+            return []
+        if not spec.startswith("seq:"):
+            raise ValueError(f"{name} wants 'auto' or 'seq:g1,g2,...', got {spec!r}")
+        return [float(x) for x in spec[len("seq:"):].split(",") if x.strip()]
 
     def total(self) -> float:
         return memory_gb()[0]
@@ -119,6 +231,13 @@ class RamSource:
             return memory_gb()[1]
         v = self.fixed[min(self.i, len(self.fixed) - 1)]
         self.i += 1
+        return v
+
+    def modified(self) -> float:
+        if not self.modified_fixed:
+            return modified_page_gb()
+        v = self.modified_fixed[min(self.mi, len(self.modified_fixed) - 1)]
+        self.mi += 1
         return v
 
 
@@ -155,12 +274,13 @@ class LockState:
     """What `pc-engine.lock` says: free, held by a live owner, held by a dead one, or a bare name (held)."""
 
     def __init__(self, owner: str = "free", pid: int | None = None, stamp: str = "", raw: str = "",
-                 bare: bool = False):
+                 bare: bool = False, tree: tuple[int, ...] = ()):
         self.owner = owner
         self.pid = pid
         self.stamp = stamp
         self.raw = raw
         self.bare = bare
+        self.tree = tree
 
     @property
     def free(self) -> bool:
@@ -187,11 +307,16 @@ def parse_lock(text: str) -> LockState:
     raw = text.replace("\ufeff", "").strip()
     if raw == "" or raw.lower().startswith("free"):
         return LockState(raw=raw)
-    parts = raw.split()
+    lines = raw.splitlines()
+    parts = lines[0].split()
     owner = parts[0]
+    tree: tuple[int, ...] = ()
+    for line in lines[1:]:
+        if line.startswith("tree "):
+            tree = tuple(int(x) for x in line[5:].split() if x.isdigit())
     if len(parts) >= 2 and parts[1].isdigit():
-        return LockState(owner=owner, pid=int(parts[1]), stamp=" ".join(parts[2:]), raw=raw)
-    return LockState(owner=owner, raw=raw, bare=True)
+        return LockState(owner=owner, pid=int(parts[1]), stamp=" ".join(parts[2:]), raw=raw, tree=tree)
+    return LockState(owner=owner, raw=raw, bare=True, tree=tree)
 
 
 def read_lock(path: Path) -> LockState:
@@ -215,9 +340,24 @@ def write_lock_free(path: Path) -> None:
     _write_atomic(path, LOCK_FREE)
 
 
-def write_lock_owner(path: Path, owner: str, pid: int, stamp: str | None = None) -> None:
+def write_lock_owner(path: Path, owner: str, pid: int, stamp: str | None = None,
+                     tree: Iterable[int] = ()) -> None:
     stamp = stamp or datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-    _write_atomic(path, f"{owner} {pid} {stamp}".encode("ascii"))
+    lines = [f"{owner} {pid} {stamp}"]
+    pids = [int(x) for x in tree if int(x) > 0]
+    if pids:
+        lines.append("tree " + " ".join(str(x) for x in pids))
+    _write_atomic(path, ("\n".join(lines) + "\n").encode("ascii"))
+
+
+def write_lock_tree(path: Path, owner: str, owner_pid: int, tree: Iterable[int]) -> bool:
+    """Update the held lock's child-PID record, if it is still this launcher's lock."""
+    with lock_guard(path, 10.0):
+        state = read_lock(path)
+        if state.free or state.owner != owner or state.pid != owner_pid:
+            return False
+        write_lock_owner(path, owner, owner_pid, state.stamp, tree)
+        return True
 
 
 class LockBusy(RuntimeError):
@@ -381,8 +521,8 @@ def _spawn(argv: Sequence[str]) -> subprocess.Popen:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="Exit codes: the child's own, 2 lock held, 3 not enough RAM, 4 watchdog, "
-                                        "5 lock timeout, 130 interrupted.")
-    ap.add_argument("--owner", required=True, help="who takes the lock ('dspark', 'maya', ...)")
+                                        "5 lock timeout, 6 turn limit, 130 interrupted.")
+    ap.add_argument("--owner", help="who takes the lock ('dspark', 'maya', ...)")
     ap.add_argument("--est-ram-gb", type=float, default=None,
                     help="the run's host-RAM need; without it the engine flags are read (see estimate_ram_gb)")
     ap.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB,
@@ -391,23 +531,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                     help="the lock file (default %(default)s, STRATA_PC_LOCK overrides)")
     ap.add_argument("--lock-timeout", type=float, default=10.0, help="how long to wait for the lock mutex")
     ap.add_argument("--poll", type=float, default=2.0, help="the watchdog's interval in seconds (default 2)")
+    ap.add_argument("--max-minutes", type=float, default=None,
+                    help="stop the child cleanly after this many minutes and release the lock (turn limit)")
     ap.add_argument("--no-watchdog", action="store_true", help="do not stop the run on low RAM (not recommended)")
     ap.add_argument("--dry-run", action="store_true", help="take the lock, check the RAM, print, release, do nothing")
     ap.add_argument("--ram-source", default="auto",
                     help="where the RAM reading comes from: 'auto' measures; 'seq:g1,g2,...' is a scripted sequence "
                          "in GB, for the tests and dry runs (it never touches the machine)")
+    ap.add_argument("--modified-source", default="auto",
+                    help="dirty-page reading: 'auto' (PDH / /proc/meminfo) or 'seq:g1,g2,...' for tests")
+    ap.add_argument("--who", action="store_true",
+                    help="print the lock owner and the process tree it recorded, then exit")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- the command to run")
     a = ap.parse_args(argv)
+    lock = Path(a.lock)
 
+    if a.who:
+        state = read_lock(lock)
+        print(f"owner={state.owner} pid={state.pid or 0} stamp={state.stamp or '-'} "
+              f"state={'free' if state.free else 'held'}")
+        if not state.free:
+            print("tree=" + " ".join(str(x) for x in state.tree))
+            for pid in state.tree:
+                print(f"  {pid} alive={'yes' if pid_alive(pid) else 'no'}")
+        return 0
+
+    if not a.owner:
+        ap.error("--owner is required")
     try:
-        ram = RamSource(a.ram_source)
+        ram = RamSource(a.ram_source, a.modified_source)
     except ValueError as e:
         ap.error(str(e))
 
     cmd = [c for c in a.cmd if c != "--"]
     if not cmd:
         ap.error("a command is required after --")
-    lock = Path(a.lock)
 
     try:
         was = acquire(lock, a.owner, a.lock_timeout)
@@ -440,20 +598,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
 
     try:
-        total_gb, avail_gb = ram.total(), ram.available()
+        total_gb, avail_gb, mod_gb = ram.total(), ram.available(), ram.modified()
+        effective_gb = max(0.0, avail_gb - mod_gb)
         if ram.fixed:
             log(f"RAM reading is scripted (--ram-source {a.ram_source})")
+        if ram.modified_fixed:
+            log(f"dirty-page reading is scripted (--modified-source {a.modified_source})")
         if a.est_ram_gb is not None:
             est, parts = a.est_ram_gb, [f"estimate given on the command line ({a.est_ram_gb:.1f} GB)"]
         else:
             est, parts = estimate_ram_gb(cmd, total_gb)
         for p in parts:
             log("  " + p)
-        log(f"RAM: {avail_gb:.1f} GB available of {total_gb:.1f} GB, this run needs about {est:.1f} GB")
-        left = avail_gb - est
+        log(f"RAM: {avail_gb:.1f} GB available of {total_gb:.1f} GB, {mod_gb:.1f} GB in modified (dirty) pages "
+            f"-> {effective_gb:.1f} GB effective; this run needs about {est:.1f} GB")
+        left = effective_gb - est
         if left < a.min_free_gb:
             log(f"REFUSING: {left:.1f} GB would be left, under the {a.min_free_gb:.0f} GB floor "
-                f"(available {avail_gb:.1f} GB - estimate {est:.1f} GB)")
+                f"(effective {effective_gb:.1f} GB = available {avail_gb:.1f} - modified {mod_gb:.1f}, "
+                f"estimate {est:.1f} GB)")
             return EXIT_NO_RAM
         log(f"{left:.1f} GB would be left free (floor {a.min_free_gb:.0f} GB)")
 
@@ -463,18 +626,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         log("starting: " + " ".join(cmd))
         t0 = time.monotonic()
+        turn_deadline = t0 + a.max_minutes * 60.0 if a.max_minutes and a.max_minutes > 0 else None
         child = _spawn(cmd)
+        next_tree = 0.0
         while True:
+            if time.monotonic() >= next_tree:
+                try:
+                    write_lock_tree(lock, a.owner, os.getpid(), process_tree(child.pid))
+                except OSError as e:
+                    log(f"could not record the child tree in the lock: {e}")
+                next_tree = time.monotonic() + 10.0
             try:
                 rc = child.wait(timeout=a.poll)
                 break
             except subprocess.TimeoutExpired:
+                if turn_deadline is not None and time.monotonic() >= turn_deadline:
+                    log(f"TURN LIMIT: {a.max_minutes:.1f} minutes reached; stopping pid {child.pid} and its children, "
+                        "then releasing the lock for the next task")
+                    _kill_tree(child.pid)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return EXIT_TURN_LIMIT
                 if a.no_watchdog or stop_signals["received"]:
                     continue
-                now_gb = ram.available()
-                if now_gb < a.min_free_gb:
-                    log(f"WATCHDOG: {now_gb:.1f} GB available is under the {a.min_free_gb:.0f} GB floor; "
-                        f"stopping pid {child.pid} and its children")
+                now_gb, dirty_gb = ram.available(), ram.modified()
+                effective_now = max(0.0, now_gb - dirty_gb)
+                if effective_now < a.min_free_gb:
+                    log(f"WATCHDOG: {effective_now:.1f} GB effective is under the {a.min_free_gb:.0f} GB floor "
+                        f"(available {now_gb:.1f}, modified {dirty_gb:.1f}); stopping pid {child.pid} and its children")
                     _kill_tree(child.pid)
                     try:
                         child.wait(timeout=10)

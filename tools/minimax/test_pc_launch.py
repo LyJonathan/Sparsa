@@ -23,7 +23,7 @@ ROOT = HERE.parents[1]
 
 
 # the lock cases must not trip the RAM gate: the box may be busy with the other task while they run
-LOCK_ONLY = ["--est-ram-gb", "0.1", "--min-free-gb", "0"]
+LOCK_ONLY = ["--est-ram-gb", "0.1", "--min-free-gb", "0", "--modified-source", "seq:0"]
 
 
 def py(code: str) -> list[str]:
@@ -59,12 +59,13 @@ def test_lock_line_carries_owner_pid_and_time(tmp_path: Path):
             f"print(pathlib.Path(r'{lock}').read_text('ascii'))")
     p = run(["--owner", "dspark", "--lock", str(lock), *LOCK_ONLY, "--", *py(code)])
     assert p.returncode == 0, p.stderr
-    line = p.stdout.strip()
-    parts = line.split()
-    assert len(parts) == 3, line
+    lines = p.stdout.strip().splitlines()
+    parts = lines[0].split()
+    assert len(parts) == 3, lines[0]
     assert parts[0] == "dspark"
     assert parts[1].isdigit()
     assert "T" in parts[2]          # an ISO timestamp
+    assert lines[1].startswith("tree ") and lines[1].split()[1].isdigit()
     assert b"\xef\xbb\xbf" not in lock.read_bytes()
 
 
@@ -103,7 +104,8 @@ def test_refuses_when_ram_will_not_fit(tmp_path: Path):
     lock = tmp_path / "pc-engine.lock"
     lock.write_bytes(b"free")
     marker = tmp_path / "ran.txt"
-    p = run(["--owner", "dspark", "--lock", str(lock), "--est-ram-gb", "100000", "--",
+    p = run(["--owner", "dspark", "--lock", str(lock), "--est-ram-gb", "100000",
+             "--modified-source", "seq:0", "--",
              *py(f"open(r'{marker}','w').write('x')")])
     assert p.returncode == 3, p.stderr
     assert "REFUSING" in p.stderr and "floor" in p.stderr
@@ -129,7 +131,7 @@ def test_watchdog_stops_the_run(tmp_path: Path):
     lock = tmp_path / "pc-engine.lock"
     lock.write_bytes(b"free")
     p = run(["--owner", "dspark", "--lock", str(lock), "--ram-source", "seq:20,20,3,3", "--est-ram-gb", "1",
-             "--min-free-gb", "10", "--poll", "0.2", "--", *py("import time; time.sleep(30)")], timeout=90)
+             "--modified-source", "seq:0", "--min-free-gb", "10", "--poll", "0.2", "--", *py("import time; time.sleep(30)")], timeout=90)
     assert p.returncode == 4, p.stderr
     assert "WATCHDOG" in p.stderr and "3.0 GB" in p.stderr
     assert read(lock) == "free"
@@ -203,6 +205,78 @@ def test_interrupt_releases(tmp_path: Path):
     finally:
         if proc.poll() is None:
             proc.kill()
+    assert read(lock) == "free"
+
+
+def test_the_lock_records_the_child_tree_and_who_prints_it(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    proc = subprocess.Popen([sys.executable, str(LAUNCH), "--owner", "dspark", "--lock", str(lock), *LOCK_ONLY,
+                             "--", *py("import time; time.sleep(8)")],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 20
+        tree = []
+        while time.monotonic() < deadline:
+            lines = read(lock).splitlines()
+            if len(lines) > 1 and lines[1].startswith("tree "):
+                tree = [int(x) for x in lines[1].split()[1:]]
+                break
+            time.sleep(0.05)
+        assert tree, read(lock)
+        assert all(pid > 0 for pid in tree)
+        who = run(["--who", "--lock", str(lock)], timeout=30)
+        assert who.returncode == 0, who.stderr
+        assert "owner=dspark" in who.stdout
+        assert "tree=" + " ".join(str(x) for x in tree) in who.stdout
+    finally:
+        proc.communicate(timeout=60)
+    assert read(lock) == "free"
+
+
+def test_dirty_pages_count_against_the_floor(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    marker = tmp_path / "ran.txt"
+    p = run(["--owner", "dspark", "--lock", str(lock), "--ram-source", "seq:20",
+             "--modified-source", "seq:15", "--est-ram-gb", "1", "--min-free-gb", "10", "--",
+             *py(f"open(r'{marker}','w').write('x')")])
+    assert p.returncode == 3, p.stderr
+    assert "modified (dirty) pages" in p.stderr
+    assert "15.0" in p.stderr and "effective" in p.stderr
+    assert not marker.exists()
+    assert read(lock) == "free"
+
+
+def test_dirty_pages_are_logged_and_leave_enough_when_small(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    p = run(["--owner", "dspark", "--lock", str(lock), "--ram-source", "seq:20",
+             "--modified-source", "seq:1", "--est-ram-gb", "1", "--min-free-gb", "10", "--",
+             *py("print('ran')")])
+    assert p.returncode == 0, p.stderr
+    assert "ran" in p.stdout
+    assert "20.0 GB available" in p.stderr and "1.0 GB in modified" in p.stderr
+
+
+def test_watchdog_uses_effective_ram_after_dirty_pages(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    p = run(["--owner", "dspark", "--lock", str(lock), "--ram-source", "seq:20,20,20",
+             "--modified-source", "seq:0,0,15", "--est-ram-gb", "1", "--min-free-gb", "10",
+             "--poll", "0.2", "--", *py("import time; time.sleep(30)")], timeout=90)
+    assert p.returncode == 4, p.stderr
+    assert "WATCHDOG" in p.stderr and "modified 15.0" in p.stderr
+    assert read(lock) == "free"
+
+
+def test_turn_limit_stops_the_child_and_releases(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    p = run(["--owner", "dspark", "--lock", str(lock), *LOCK_ONLY, "--max-minutes", "0.03", "--poll", "0.05",
+             "--", *py("import time; time.sleep(30)")], timeout=90)
+    assert p.returncode == 6, p.stderr
+    assert "TURN LIMIT" in p.stderr
     assert read(lock) == "free"
 
 
