@@ -1431,4 +1431,33 @@ is not a bigger workspace but a cheaper admission: the compulsory fill is three 
 default stream, which wait behind the layer's queued GPU work, while `prefetch_for` already knows how to enqueue
 the same bytes on the side stream.
 
+### MiniMax-M3.1-Flash IQ1_M, fully resident (no SSD in the token at all)
+
+The other way out of the drive's slow windows is a model that fits: IQ1_M is 106.6 GB (13 shards, every one
+verified against the repo's `SHA256SUMS`), which leaves a 128 GB box ~25 GB after the tier. Flags: `--gpus 0,1
+--max-context 8192 --minimax-kv vram --minimax-tiers --minimax-vram-slots-per-layer -1
+--minimax-ram-experts-per-layer 128 --memory-limit-mib 98000 --minimax-prefill-batch 4096
+--minimax-prefill-expert-gemm mmvq`, 24 real-text tokens' worth of 400-token prompt, 32 greedy tokens, fresh
+process per rep. **`--minimax-stats` reports `ssd=0`, `ssd_bytes=0`, `ssd_wait=0` for every token of every rep**:
+the whole expert set is in the pinned tier (7 296 slots, 128 a layer) and 52 of the 221 routed experts a token sit
+in VRAM.
+
+| CPU threads | decode tok/s | ms/token | `cpu_ram` | prefill 400 tok |
+| --- | --- | ---: | ---: | --- |
+| 12 (the default: physical cores) | 3.51, 2.88, 2.87 | 285 / 347 / 348 | 201.5 ms | 21.2 tok/s (18.9 s) |
+| 12 + `--minimax-pool-spin-us 20` | 3.74, 3.66 | 267 / 273 | 182.1 ms | 20.3-21.5 tok/s |
+| **24 (SMT)** | **4.43, 4.46** | **226 / 224** | **133.0 ms** | 20.0-20.5 tok/s |
+
+The token is the CPU lane: `cpu_ram` is 71 % of it at 12 threads, and the rest is attention 31.9, shared 17.1,
+pick 13.6, router 6.3, gpu_begin 6.2, gpu_stream 5.7. With nothing coming off the drive the lane is compute-bound
+and the second thread of each core is not contention but **+27 %** -- the same result P8 measured on the 15-layer
+slice (+27 %) and the opposite of what the SSD-heavy full model showed (-1.4 %), so this is the placement rule:
+SMT pays when the lane is the bottleneck, not when the drive and the admissions share it. Both knobs change no
+arithmetic (row splits only), and neither the tokens nor the tier counters move otherwise.
+
+The honest comparison with the 146 GB IQ2_XS-D3 above is that the fully resident IQ1_M is **not faster**
+(4.46 against 3.33 tok/s) even though it reads nothing from the drive: its routed experts are ~2.0 GB a token at
+~15 GB/s against D3's ~2.4 GB at ~13 GB/s, i.e. the IQ1_M expert dot is slower per byte, and the smaller model
+buys bytes, not bandwidth. What it buys is the removal of the drive's multi-second windows from the token budget.
+
 
