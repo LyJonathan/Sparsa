@@ -1471,3 +1471,67 @@ default stream, which wait behind the layer's queued GPU work, while `prefetch_f
 the same bytes on the side stream.
 
 
+## P13: the VRAM slot count is per device (and two measured negatives)
+
+The decode gap to Project Maya, third pass: `_ref/research/MAYA_GAP_3.md` holds the full table and every number.
+Two of its rows became measurements here, one of them a change.
+
+### The slot count is per device, not one number for the split
+
+The old rule sized the expert slots as `free / (MoE layers x expert bytes)` **and then took the minimum over the
+devices**, giving every layer that many slots. On this box the two cards are not equal: upstream's "last card" rule
+puts `lm_head` (Q6_K, 1.0 GB) on the card that owns the last layer, and the KV is per layer per device, so the card
+that binds has ~1 GB less room for experts. Measured on the full pack with the new `INFO minimax-vram-slots` line
+(`dev=`, `moe_layers=`, `free=`, `slots_here=`, `shared_min=`):
+
+| context | device 0 (25 MoE layers) | device 1 (32 MoE layers) | old shared count | total slots before -> after |
+| --- | ---: | ---: | ---: | --- |
+| 88 | 10 | 6 | 6 | 342 -> 442 (+29%) |
+| 8 192 | 9 | 5 | 5 | — |
+| 32 768 | 6 | 2 | 2 | 114 -> 214 (+88%) |
+
+Each layer now gets its own card's count, so a layer's cost is that card's `moe_layers x expert_bytes` and the
+split's imbalance costs nothing. An explicit `--minimax-vram-slots-per-layer` stays uniform (the caller asked for
+that number), which is also what makes the A/B below possible with one binary. `vram_slots_per_layer` in
+`--minimax-stats` still reports the minimum across devices, so old logs stay comparable.
+
+**Measured**, full pack, one binary, 64-token real-text prompt then 16 greedy tokens, 3 `GEN` requests in each of
+two interleaved arms, `--gpus 0,1 --layer-split auto --minimax-profile mm3-d3.bin --memory-limit-mib 86000`:
+
+| arm | decode tok/s (3 reps, median) | `--minimax-profile-time` total ms/token | vram hits/token | hit rate | ram/token | ssd/token | ssd MB/token |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `--minimax-vram-slots-per-layer 6` (the old rule) | 3.73 (4.16 / 3.36 / 3.73) | 233.8 | 61.3 | 26.9% | 150.9 | 13.8 | 251 |
+| **auto, per device** (new default) | **4.04** (3.66 / 4.15 / 4.04) | **215.0** | **74.0** | **32.4%** | **139.9** | 12.7 | 230 |
+
+The phase table for the same pair: `cpu_ram` 129.7 -> 118.1, `ssd_wait` 18.6 -> 13.4, `cpu_ssd` 9.8 -> 6.5,
+`admit` 9.7 -> 6.5, `gpu_begin` 6.3 -> 7.7, `gpu_stream` 6.5 -> 7.9, `attn` 28.5 -> 29.5. The lane and every
+SSD-side phase fall because a sixth of the routes moved from the RAM tier to the VRAM tier. Rep-to-rep spread on
+this drive is +-10%, so the median and the profile total are what the claim rests on, not one rep.
+
+The change is inert when the tier is off (`--minimax-vram-slots-per-layer 0`, the all-CPU parity gate): `q == 0`
+and `L.vram.size() == 0`, so the allocation, the profile fill and the RAM split all take the same branch as before.
+`q_dev` is only consulted when slots exist.
+
+### Rejected: Project Maya's 20 ms pool spin (`--minimax-pool-spin-us`)
+
+Maya spins 20 ms before a worker sleeps (19 workers on a 20-core part 28.3 tok/s, 18 -> 47.2). Here it loses:
+12 threads with a 20 ms spin measured `cpu_ram` 182.8 ms/token against 139.5 without, interleaved, same binary,
+and 24 threads with the spin 122.0 against 110.5 without. **The default stays 0.**
+
+### Rejected: 24 threads on the 12-core/24-thread part
+
+The lane does like the SMT sibling - on the 15-layer slice with all 12 MoE layers pinned it is 6 threads 10.7 GB/s,
+12 threads 22.0, 24 threads 24.7, i.e. linear in *hardware threads* to 12 and +12% for the sibling - but the pool
+shares the box with the thread that issues each layer's GPU work. Same-binary 3-rep A/B: `cpu_ram` 129.9 -> 121.5
+(**-6.5%**) while `attn` 28.2 -> 31.1, `router` 5.7 -> 7.1, `gpu_begin` 5.7 -> 8.8, `shared` 15.4 -> 18.4,
+`admit` 10.0 -> 17.4, so the token goes 232.2 -> 248.9 ms and 3.52 -> 3.17 tok/s. **The default stays at the
+physical core count**; `--cpu-threads` still raises it.
+
+### The lane's ceiling, measured (priority 1 of the round)
+
+`cpu_ram` is 130 of a 232 ms token, so it was the first target. It is **compute-bound per hardware thread**, not
+bandwidth-bound: 2.05 GB/s a thread, 24.7 GB/s at 12 cores / 24 threads, and the DDR4-3200 ceiling (~40 GB/s) is
+never approached. `ggml_vec_dot_iq2_xs_q8_K` asserts `nrc == 1`, and Strata's AVX2 IQ row kernel is within 5% of it
+at one token (P5c), so the remaining bit-identical headroom is the SMT sibling - which the A/B above says is not
+worth taking. Project Maya's GLM lane does the *same* arithmetic at one token; its advantage there is a per-expert
+`[gate|up|down]` blob and a ~48-piece job split, neither of which changes the inner loop.
