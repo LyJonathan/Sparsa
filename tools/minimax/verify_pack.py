@@ -167,7 +167,8 @@ def main(argv=None) -> int:
                     print(f'{label:>10}: {name} is not in any donor')
                 continue
             dh, dn = digest_donor(pick_donor(donors[name], nbytes))
-            if dh == sha256_range(model_file, data_start.get(model_file, 0) + offset, nbytes) and dn == nbytes:
+            # the engine reports the ABSOLUTE offset inside the file it resolved the tensor in
+            if dh == sha256_range(model_file, offset, nbytes) and dn == nbytes:
                 same += 1
             else:
                 differ += 1

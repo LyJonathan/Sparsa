@@ -1,6 +1,10 @@
 ﻿// src/minimax/cuda_ops.cu - fp32 GEMV and GGUF dequant tiles for MiniMax dense tensors.
 #include "cuda_ops.hpp"
 
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -800,6 +804,71 @@ void* alloc(size_t bytes) {
 
 void dealloc(void* p) {
     if (p) cudaFree(p);
+}
+
+double host_to_device_gbs(int dev, size_t bytes, int rounds) {
+    // 256 MiB by default, from pinned memory, on this device's own stream: the number a split or a PCIe expert lane
+    // has to be priced on.  A pageable source measures the staging copy instead (3.3 GB/s on a gen3 x4 and on a
+    // gen4 x16 card alike), which cannot tell the two slots apart.
+    if (rounds < 1) rounds = 5;
+    if (bytes < (size_t{64} << 20)) bytes = size_t{256} << 20;
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) return 0.0;
+    if (cudaSetDevice(dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0.0;
+    }
+    void* host = nullptr;
+    void* dst = nullptr;
+    cudaStream_t st = nullptr;
+    double out = 0.0;
+    if (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        cudaSetDevice(prev);
+        return 0.0;
+    }
+    std::memset(host, 1, bytes);
+    if (cudaMalloc(&dst, bytes) != cudaSuccess || cudaStreamCreate(&st) != cudaSuccess) {
+        cudaGetLastError();
+        if (dst) cudaFree(dst);
+        if (st) cudaStreamDestroy(st);
+        cudaFreeHost(host);
+        cudaSetDevice(prev);
+        return 0.0;
+    }
+    std::vector<double> gbs;
+    for (int r = 0; r < rounds; ++r) {
+        cudaEvent_t a = nullptr, b = nullptr;
+        if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess) break;
+        cudaEventRecord(a, st);
+        if (cudaMemcpyAsync(dst, host, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            cudaGetLastError();
+            cudaEventDestroy(a);
+            cudaEventDestroy(b);
+            break;
+        }
+        cudaEventRecord(b, st);
+        if (cudaEventSynchronize(b) != cudaSuccess) {
+            cudaGetLastError();
+            cudaEventDestroy(a);
+            cudaEventDestroy(b);
+            break;
+        }
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        if (ms > 0.f) gbs.push_back((double)bytes / (ms * 1.0e6));
+        cudaEventDestroy(a);
+        cudaEventDestroy(b);
+    }
+    if (!gbs.empty()) {
+        std::sort(gbs.begin(), gbs.end());
+        out = gbs[gbs.size() / 2];
+    }
+    cudaStreamDestroy(st);
+    cudaFree(dst);
+    cudaFreeHost(host);
+    cudaSetDevice(prev);
+    return out;
 }
 
 void* host_register_mapped(void* host, size_t bytes) {

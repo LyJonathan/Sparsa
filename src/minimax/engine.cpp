@@ -960,6 +960,7 @@ struct Engine::Impl {
     std::unique_ptr<strata::core::PinnedArena> ram_arena;
     uint64_t ram_bytes = 0;
     std::vector<std::unique_ptr<strata::platform::DirectFile>> ssd_files;
+    std::vector<size_t> alt_shard_base;   // P16: first ssd_files index of each --expert-source pack
     uint8_t* ssd_stage = nullptr;
     size_t ssd_stage_bytes = 0;
     void* ssd_tmp = nullptr;
@@ -1410,7 +1411,7 @@ struct Engine::Impl {
         if (!src->in_bounds(*info, shard))
             fail(name + ": has an unknown type or lies past the end of its shard");
         t.host = src->shard(shard).tensor_data(*info);
-        t.shard = shard;
+        t.shard = alt_at >= 0 ? alt_shard_base[(size_t)alt_at] + shard : shard;
         t.file_offset = src->shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
         if (strata::kernels::ikq::is_iqk_type(t.type)) {
@@ -1515,12 +1516,18 @@ struct Engine::Impl {
     /// resolve every tensor to the same shard, offset and length.
     void verify_all_tensors() {
         size_t n = 0, at = 0;
+        std::vector<std::string> names;
         for (size_t si = 0; si < model.size(); ++si)
-        for (const TensorInfo& r : model.shard(si).tensors()) {
+            for (const TensorInfo& r : model.shard(si).tensors()) names.push_back(r.name);
+        for (const std::string& name : names) {
             if ((++at % (size_t)verify_mod) != (size_t)verify_rem) continue;
-            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d %s%c", r.name.c_str(), si,
-                         (unsigned long long)r.offset, (unsigned long long)tensor_payload_bytes(r), (int)r.type,
-                         src_leaf(r.name), 10);
+            // resolved the way the engine reads it - so an --expert-source tensor reports ITS file and its absolute
+            // offset in it, not the base pack's entry of the same name
+            Tensor t;
+            if (!try_must(name, t)) continue;
+            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d %s%c", name.c_str(), t.shard,
+                         (unsigned long long)t.file_offset, (unsigned long long)t.bytes, t.type,
+                         src_leaf(name), 10);
             ++n;
         }
         std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod, verify_rem,
@@ -2223,25 +2230,11 @@ struct Engine::Impl {
     /// PCIe 3.0 x4 against device 1's 4.0 x16), and it is measured rather than read from the topology because a
     /// runtime "Gen4 x16" on a card in an x4 slot reports the card, not the slot.  0 when it cannot be measured.
     double h2d_gbs(int dev) {
-        const size_t kBytes = size_t{32} << 20;
-        void* d = nullptr;
-        try {
-            d = cu::alloc(kBytes);
-        } catch (...) {
-            return 0.0;
-        }
-        std::vector<uint8_t> host(kBytes, 1);
-        double best = 0.0;
-        for (int round = 0; round < 3; ++round) {
-            cu::stream_sync(nullptr);
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < 8; ++i) cu::copy_h2d(d, host.data(), kBytes);
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            const double gbs = ms > 0.0 ? 8.0 * (double)kBytes / (ms * 1.0e6) : 0.0;
-            if (gbs > best) best = gbs;
-        }
-        cu::dealloc(d);
-        return best;
+        // P16: 256 MiB from PINNED memory on the device's own stream, median of five.  The old probe copied 8 x 32 MiB
+        // from a std::vector (pageable) on the default stream and measured ~3.3 GB/s on both cards - the driver's
+        // staging rate - which cannot tell a gen3 x4 slot from a gen4 x16 one, the single distinction a PCIe lane or
+        // a split needs.
+        return cu::host_to_device_gbs(dev, size_t{256} << 20, 5);
     }
 
     /// The PCIe link each card is really on: the driver's own generation and width for the device (NVML, loaded at
@@ -2908,12 +2901,29 @@ struct Engine::Impl {
         //
         // P9: this comes before the profile-driven fill, because with `--minimax-prefill-read direct` (implied by a
         // --memory-limit-mib budget) the pinned arena is filled through these files rather than through the mapping.
+        // P16: the list covers the base pack's shards and then every --expert-source pack's, so `t.shard` alone
+        // still names the file a tensor's bytes live in.  Every tier that opens a file by shard index - the SSD
+        // read, the prefetch, the PIN-time fill through these files - therefore reads the *tensor's own* file with
+        // no per-tier knowledge of where it came from.
+        ssd_files.clear();
+        alt_shard_base.clear();
+        for (const AltPack& a : alt_packs) alt_shard_base.push_back(ssd_files.size() + a.model->size() * 0);
         ssd_files.resize(model.size());
         for (size_t s = 0; s < model.size(); ++s) {
             ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
             std::string err;
             if (!ssd_files[s]->open(model.shard(s).path(), err))
                 fail("minimax SSD tier: " + err);
+        }
+        for (size_t ai = 0; ai < alt_packs.size(); ++ai) {
+            const GgufModel& am = *alt_packs[ai].model;
+            alt_shard_base[ai] = ssd_files.size();
+            for (size_t s = 0; s < am.size(); ++s) {
+                auto f = std::make_unique<strata::platform::DirectFile>();
+                std::string err;
+                if (!f->open(am.shard(s).path(), err)) fail("minimax SSD tier (alternate pack): " + err);
+                ssd_files.push_back(std::move(f));
+            }
         }
         // One staging slot per routed entry: several selected experts of one layer may be SSD misses, and their
         // byte slices have to stay alive together until the combine.
