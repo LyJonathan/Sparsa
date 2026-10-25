@@ -298,6 +298,24 @@ bool wait_input(StdinBuf& in, const std::atomic<bool>& shutdown, const std::atom
         if (in.eof) return false;
 #if defined(_WIN32)
         const HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+        // A REDIRECTED FILE (`strata-minimax --serve < ids.txt`) is not a pipe: PeekNamedPipe cannot see it and
+        // WaitForSingleObject below never wakes on it, so the reader spun forever and the engine looked hung.  Read
+        // the file in bounded chunks instead, and let the EOF flag end the conversation the way it does for a pipe.
+        if (GetFileType(h) == FILE_TYPE_DISK) {
+            bool got_any = false;
+            for (int k = 0; k < 256; ++k) {          // bounded: a redirected multi-GB file must not be slurped whole
+                char buf[4096];
+                DWORD n = 0;
+                if (!ReadFile(h, buf, sizeof buf, &n, nullptr) || n == 0) {
+                    in.eof = true;
+                    return got_any && !in.pending.empty();
+                }
+                in.pending.append(buf, (size_t)n);
+                got_any = true;
+                if (in.pending.find('\n') != std::string::npos) return true;
+            }
+            return got_any && !in.pending.empty();
+        }
         DWORD avail = 0;
         if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
             if (GetLastError() == ERROR_INVALID_FUNCTION) {
