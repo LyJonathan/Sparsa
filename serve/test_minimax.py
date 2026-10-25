@@ -184,3 +184,30 @@ def test_parser_thinking_disabled_starts_in_content():
     events = parser.feed("answer") + parser.finish()
     assert [(e.kind, e.text) for e in events] == [("content", "answer")]
     assert THINK_END not in "".join(e.text for e in events)
+
+
+def test_parser_adaptive_direct_answer_is_content_not_reasoning():
+    """The generation prompt is adaptive: with thinking on the model may answer without opening a think block."""
+    parser = MiniMaxOutputParser(thinking=True)
+    events = parser.feed("the answer") + parser.finish()
+    assert [(e.kind, e.text) for e in events] == [("content", "the answer")]
+
+
+def test_parser_adaptive_no_thinking_prefix_is_content():
+    parser = MiniMaxOutputParser(thinking=True)
+    events = []
+    for ch in "</mm:think>the answer":
+        events += parser.feed(ch)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "content") == "the answer"
+    assert not any(e.kind == "reasoning" for e in events)
+
+
+def test_parser_adaptive_think_tag_split_across_deltas():
+    parser = MiniMaxOutputParser(thinking=True)
+    events = []
+    for piece in ("<mm:", "thi", "nk>plan", "</mm:think>", "answer"):
+        events += parser.feed(piece)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "reasoning") == "plan"
+    assert "".join(e.text for e in events if e.kind == "content") == "answer"

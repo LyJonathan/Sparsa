@@ -8058,7 +8058,11 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "minimax-m3": "minimax-m3.1-flash"}
+                      "minimax-m3": "minimax-m3.1-flash", "minimax_m3": "minimax-m3.1-flash"}
+
+# The GGUF architecture is "minimax-m3"; the server's format and sparsa.py's config spell it "minimax_m3".
+# Both names must find MiniMax's own card, never another family's.
+MODEL_ARCH_ALIASES = {"minimax-m3": "minimax_m3"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8080,6 +8084,7 @@ MODEL_CARD_SAMPLING = {
 
 def model_card_sampling(arch, thinking) -> dict:
     """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+    arch = MODEL_ARCH_ALIASES.get(arch, arch) if arch else None
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
