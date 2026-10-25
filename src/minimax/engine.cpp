@@ -1423,6 +1423,12 @@ struct Engine::Impl {
         for (float v : a) sum += v;
         for (float v : b) sum += v;
         const double mean = sum / (double)(a.size() + b.size());
+        // Printed always: the mean over `output_norm.weight` and `blk.0.attn_norm.weight` is the engine's own proof
+        // that it resolved those two tensors to the right bytes, and comparing the line between `--serve` and
+        // `--minimax-eval` is how a loader difference between the two paths shows up (round 3's A1 pack lost a day
+        // to a gate that opened the pack while it was still being written; the mean is what would have said so).
+        std::fprintf(stderr, "INFO minimax-norm mean=%.6f over output_norm+blk.0.attn_norm (%lld values)%c",
+                     mean, (long long)(a.size() + b.size()), 10);
         const MetaValue* key = model.meta().get("minimax-m3.norm.add1");
         if (key) {
             if (key->type != MetaType::BOOL)
