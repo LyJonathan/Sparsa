@@ -7119,7 +7119,11 @@ struct Engine::Impl {
                          dev);
         dspark = std::make_unique<DsparkDrafter>();
         std::string err;
+        std::fprintf(stderr, "INFO minimax-dspark load: the pack (%s) on device %d\n",
+                     opt.dspark_pack.c_str(), dev);
         if (!dspark->load(opt.dspark_pack, dev, opt.dspark_window, err)) fail(err);
+        std::fprintf(stderr, "INFO minimax-dspark load: weights on the device, %.0f MiB\n",
+                     (double)dspark->vram_bytes() / 1048576.0);
         const DsparkGeometry& g = dspark->geom();
         if (g.n_embd != cfg.n_embd) fail("the DSpark pack is " + std::to_string(g.n_embd) + " wide, the model " +
                                          std::to_string(cfg.n_embd));
@@ -7139,6 +7143,7 @@ struct Engine::Impl {
             fail("the head's type has no device path the drafter can use (--minimax-dense-layers-gpu 0 puts the "
                  "head on the CPU; the drafter needs it on its device)");
         }
+        std::fprintf(stderr, "INFO minimax-dspark load: head bound\n");
         ds_slot.assign((size_t)cfg.n_layers, -1);
         for (size_t i = 0; i < g.taps.size(); ++i) ds_slot[(size_t)g.taps[i]] = (char)i;
         ds_tapw = g.tap_width();
@@ -7148,6 +7153,9 @@ struct Engine::Impl {
         ds_rows.assign((size_t)g.rows() * (size_t)cfg.n_vocab, 0.f);
         ds_drafts.assign((size_t)g.block, 0);
         ds_conf.assign((size_t)g.block, 0.f);
+        std::fprintf(stderr, "INFO minimax-dspark load: taps %lld wide, ring of %lld positions (%.0f MiB)\n",
+                     (long long)ds_tapw, (long long)ds_cap,
+                     (double)((size_t)ds_cap * (size_t)ds_tapw * sizeof(float)) / 1048576.0);
         ds_seeded = 0;
         // loading the drafter leaves its device current; put the engine back on the default one so the allocations
         // that follow (the device KV, the prompt workspace, the expert slots) start from the same place as ever
