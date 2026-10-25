@@ -1617,3 +1617,38 @@ The assembled file passes a structural read (`1188` tensors, per-layer types as 
 at the last tensor: the source is a 13-shard pack whose `split.no`/`split.count`/`split.tensors.count` keys are
 `u16`/`i32` and describe 13 shards, and a single-file output has to drop them (or be written as 13 shards). That is
 the next step, with the G3 six-prompt gate, before the mix is a default or even a documented recipe.
+
+### A1, continued: the mixed pack loads, runs +54%, and one path still refuses it
+
+`mix_layers.py` now writes a single-file GGUF the engine's reader accepts (`1188` tensors, `split.*` dropped,
+`kv_count` re-emitted, and the data block aligned on its **absolute** position - the key/value block ended 8 bytes
+into an alignment boundary on this pack, and aligning the info block's length instead of the file's position put the
+data 8 bytes past the table, which every tensor then read shifted). Audited tensor by tensor with gguf-py: `token_embd`,
+`blk.0.attn_norm`, `blk.30.ffn_gate_exps` (D3 shard 7), `blk.59.ffn_gate_exps` (IQ1_M shard 13) and `blk.59.attn_norm`
+(D3 shard 13) are **byte-identical** to their source packs.
+
+**Measured, serve path, 3 interleaved reps, ctx 16384, auto slots, profile mm3-d3.bin** (D3 at the same settings
+below for the phase comparison):
+
+| | D3 | MIX | |
+| --- | ---: | ---: | --- |
+| decode tok/s | 3.56 | **5.50** | +54% |
+| `--minimax-profile-time` total | 226.2 | **163.5** | -63 ms |
+| `cpu_ram` | 113.4 | 94.9 | fewer RAM experts |
+| `ssd_wait` | 18.6 | **2.2** | |
+| `cpu_ssd` | 9.4 | 0.9 | |
+| `admit` | 11.9 | 1.2 | |
+| ssd/token | 13.4 | **2.8** (43 MB) | the goal was 0 |
+| ssd MB/token | 231 | 43 | |
+
+The RAM tier sized itself to 100.0 GiB / 6753 experts (118.5 a layer), so 543 of 7296 experts still come off the
+drive; `--memory-limit-mib` above ~101 GiB leaves under 10 GiB free on this 128 GB box, so 2.8 a token is the floor
+for the 25-cold-layer pack as assembled.
+
+**Blocked on the gate:** `--minimax-eval` (the G3 harness's path) fails on this file with *"norm weights look
+un-baked (mean -8.6e11)"* - `decide_norm()`'s heuristic on `output_norm.weight` + `blk.0.attn_norm.weight`, both of
+which are byte-identical to the source, and the same binary loads the same file and decodes correctly in the serve
+path. `--minimax-allow-nonstandard` would pass it but that also tells the engine the norms are not +1-baked, which
+is wrong for this pack, so it is not a fix. Next step: find what the eval path maps differently (the last round's
+reader work added `GgufModel::open` shard grouping; a file with no `split.*` keys may resolve `blk.0` through a
+different shard index there).

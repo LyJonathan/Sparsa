@@ -67,7 +67,13 @@ _KV_FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8
 
 
 def read_kv_region(path: Path) -> tuple[bytearray, bytes, int]:
-    """(the 24-byte header, the key/value block verbatim, the key count)."""
+    """(the 24-byte header, the key/value block to write, the key count to write).
+
+    The block is copied byte for byte, minus the `split.*` bookkeeping: the source is a 13-shard pack and the output
+    is one file, so `split.no` / `split.count` / `split.tensors.count` must go (the engine's GgufModel treats a file
+    that declares `split.count > 1` as shard 1 of that many).  Both source packs spell them `u16`/`u16`/`i32`, but
+    nothing here assumes that: the whole key/value entry is dropped by its span, so the type does not matter.
+    """
     raw = Path(path).read_bytes()
     if raw[:4] != b'GGUF':
         raise SystemExit(f'{path}: not a GGUF')
@@ -76,8 +82,13 @@ def read_kv_region(path: Path) -> tuple[bytearray, bytes, int]:
         raise SystemExit(f'{path}: GGUF version {version}, expected 3')
     o = 24
     kv_count = struct.unpack_from('<Q', raw, 16)[0]
+    kept = bytearray()
+    n_kept = 0
+    all_keys = []
     for _ in range(kv_count):
+        start = o
         n = struct.unpack_from('<Q', raw, o)[0]
+        key = raw[o + 8:o + 8 + n].decode('utf-8', 'replace')
         o += 8 + n
         vt = struct.unpack_from('<I', raw, o)[0]
         o += 4
@@ -99,7 +110,15 @@ def read_kv_region(path: Path) -> tuple[bytearray, bytes, int]:
                     raise SystemExit(f'{path}: array of value type {sub} is not known')
         else:
             raise SystemExit(f'{path}: value type {vt} is not known')
-    return bytearray(raw[0:24]), bytes(raw[24:o]), kv_count
+        all_keys.append(key)
+        if key.startswith('split.'):
+            continue
+        kept += raw[start:o]
+        n_kept += 1
+    dropped = [k for k in all_keys if k.startswith('split.')]
+    if dropped:
+        print(f'dropping {len(dropped)} shard key(s): {", ".join(dropped)}', flush=True)
+    return bytearray(raw[0:24]), bytes(kept), n_kept
 
 
 def profile_mass(path: str, moe_layers: list[int]) -> dict:
@@ -204,8 +223,12 @@ def main(argv=None) -> int:
         infos += struct.pack('<Q', data_off)
         plan.append((name, path, offset, nbytes, use_cold))
         data_off += nbytes + ((-nbytes) % alignment)
-    struct.pack_into('<Q', hdr, 8, len(plan))
-    pad = (-len(infos)) % alignment
+    struct.pack_into('<Q', hdr, 8, len(plan))     # tensor count
+    struct.pack_into('<Q', hdr, 16, kv_count)     # key/value count: the dropped split.* keys must come off this
+    # the padding aligns the ABSOLUTE position of the data, not the length of the info block: the key/value block
+    # does not end on an alignment boundary (it ended 8 bytes in on this pack), so `(-len(infos)) % 32` alone put the
+    # data 8 bytes past where the table says it starts and every tensor read one expert's tail.
+    pad = (-(len(hdr) + len(kv_bytes) + len(infos))) % alignment
     total = len(hdr) + len(kv_bytes) + len(infos) + pad + data_off
     print(f'writing {out} ({total / 1e9:.1f} GB, {len(plan)} tensors, {kv_count} keys)', flush=True)
     done = 0

@@ -2093,6 +2093,109 @@ struct Engine::Impl {
         return c;
     }
 
+    /// Measured host->device rate for one device, GB/s: eight 32 MiB copies of a hot buffer, best of three rounds.
+    /// This is the number a split has to respect on a box whose cards sit on different links (device 0 here is
+    /// PCIe 3.0 x4 against device 1's 4.0 x16), and it is measured rather than read from the topology because a
+    /// runtime "Gen4 x16" on a card in an x4 slot reports the card, not the slot.  0 when it cannot be measured.
+    double h2d_gbs(int dev) {
+        const size_t kBytes = size_t{32} << 20;
+        void* d = nullptr;
+        try {
+            d = cu::alloc(kBytes);
+        } catch (...) {
+            return 0.0;
+        }
+        std::vector<uint8_t> host(kBytes, 1);
+        double best = 0.0;
+        for (int round = 0; round < 3; ++round) {
+            cu::stream_sync(nullptr);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 8; ++i) cu::copy_h2d(d, host.data(), kBytes);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const double gbs = ms > 0.0 ? 8.0 * (double)kBytes / (ms * 1.0e6) : 0.0;
+            if (gbs > best) best = gbs;
+        }
+        cu::dealloc(d);
+        return best;
+    }
+
+    /// P13b: the split point, chosen where the arithmetic is exact.  `choose_split_and_kv` prices the layers by their
+    /// bytes alone, before this engine's own work buffers, MSA scratch and fixed allocations exist, so it cannot see
+    /// how many expert slots a card will really have - and the slot count is what the cache is worth.  Here the
+    /// workspace is already allocated, so `cu::mem_on(dev).free_bytes` is the truth.  For every 2-way split point K
+    /// (the last device also pays `lm_head`) this computes each card's slot count the way the allocator will, turns
+    /// it into the share of routes the cache can serve (a linear coverage curve fitted to this box's measurements:
+    /// 26.9% of routes at 6 slots a layer against the model's 13.4%, so ~4.5% a slot up to saturation), and keeps the
+    /// best.  A card on a slower link gets fewer layers when two candidates are within 3%: the misses it serves are
+    /// streamed over that link.  Returns the split point, or 0 for "leave the assignment alone".
+    int best_split_2way(const std::vector<size_t>& cost, size_t out_b, const size_t reserve) {
+        if (devs.size() != 2 || opt.dense_layers_gpu < 0 || !opt.layer_split.empty()) return 0;
+        std::vector<size_t> free_b(2, 0);
+        for (size_t d = 0; d < 2; ++d) {
+            const cu::MemInfo mi = cu::mem_on(devs[d]);
+            free_b[d] = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
+        }
+        if (free_b[0] == 0 || free_b[1] == 0) return 0;
+        const int top = (int)cfg.n_expert;
+        const auto score_of = [&](int k) -> double {
+            double sc = 0.0;
+            for (int d = 0; d < 2; ++d) {
+                size_t spend = d + 1 == 2 ? out_b : 0;
+                size_t ex = 0;
+                int moe = 0;
+                for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                    const bool mine = d == 0 ? i < k : i >= k;
+                    if (!mine) continue;
+                    spend += cost[(size_t)i] + (kv_mode == 1 ? kv_layer_bytes() : 0);
+                    if (layers[(size_t)i].moe) {
+                        ++moe;
+                        ex += layers[(size_t)i].expert_bytes;
+                    }
+                }
+                if (moe <= 0 || ex == 0 || spend >= free_b[(size_t)d]) continue;
+                int sl = (int)((free_b[(size_t)d] - spend) / ex);
+                if (sl > top) sl = top;
+                double cover = 0.0448 * (double)sl;
+                if (cover > 1.0) cover = 1.0;
+                sc += (double)moe * cover;
+            }
+            return sc;
+        };
+        int cur = 0;
+        for (int64_t i = 0; i < cfg.n_layers; ++i) cur += layer_dev[(size_t)i] == 0 ? 1 : 0;
+        double best = score_of(cur);
+        int best_k = cur;
+        double slow = 1.0;
+        std::vector<double> gbs(2, 0.0);
+        for (size_t d = 0; d < 2; ++d) gbs[d] = h2d_gbs((int)d);
+        if (gbs[0] > 0.0 && gbs[1] > 0.0) slow = (gbs[0] < gbs[1] ? 0 : 1) == 0 ? 1.0 : 1.0;
+        const int slower = (gbs[0] > 0.0 && gbs[1] > 0.0) ? (gbs[0] < gbs[1] ? 0 : 1) : -1;
+        for (int k = 1; k < (int)cfg.n_layers; ++k) {
+            const double sc = score_of(k);
+            const bool better = sc > best * 1.03;
+            const bool tie = sc > best * 0.97;
+            int cur_slow = 0, cand_slow = 0;
+            for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                if (!layers[(size_t)i].moe) continue;
+                if (slower >= 0 && ((i < cur && slower == 0) || (i >= cur && slower == 1))) ++cur_slow;
+                if (slower >= 0 && ((i < k && slower == 0) || (i >= k && slower == 1))) ++cand_slow;
+            }
+            if (better || (tie && cand_slow < cur_slow)) {
+                best = sc;
+                best_k = k;
+            }
+        }
+        (void)slow;
+        std::fprintf(stderr, "INFO minimax-split probe: h2d %.1f / %.1f GB/s, %d/%d layers covers %.3f of the routes",
+                     gbs[0], gbs[1], cur, (int)cfg.n_layers - cur, score_of(cur));
+        if (best_k == cur) {
+            std::fprintf(stderr, " (kept)%c", 10);
+            return 0;
+        }
+        std::fprintf(stderr, " ; %d/%d covers %.3f (keeping it)%c", best_k, (int)cfg.n_layers - best_k, best, 10);
+        return best_k;
+    }
+
     void place_weights() {
         if (opt.dense_layers_gpu == 0) {
             dense_gpu = 0;
@@ -2104,6 +2207,16 @@ struct Engine::Impl {
         const size_t out_b = gpu_bytes(output);
         const size_t reserve = (size_t)(opt.vram_reserve_mib > 0 ? opt.vram_reserve_mib : 0) << 20;
         const bool automatic = opt.dense_layers_gpu < 0;
+        // P13b: re-decide the 2-way split here, where the workspace is allocated and the free VRAM is exact.
+        if (devs.size() == 2 && automatic && opt.layer_split.empty() && opt.dense_layers_gpu != 0) {
+            const int k = best_split_2way(cost, out_b, reserve);
+            if (k > 0) {
+                for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                    layer_dev[(size_t)i] = i < k ? 0 : 1;
+                    layers[(size_t)i].dev = layer_dev[(size_t)i];
+                }
+            }
+        }
         int N = -1;
         if (devs.size() > 1 || !automatic) {
             // P4 split (or an explicit count): every layer up to the count goes on its own device.  The split
@@ -2693,9 +2806,25 @@ struct Engine::Impl {
                 d = base + 2 * L.expert_gu;
             }
         }
-        cu::copy_h2d(p, g, L.expert_gu);
-        cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
-        cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
+        // P13c (A3, step 1): the three copies go on the layer's side stream instead of the default one.  Every
+        // consumer of a VRAM expert slot is a kernel this engine enqueues on `W().side` (`gpu_experts_begin`) or a
+        // later copy on the same stream (`vram_swap`, `prefetch_for`), so the slot's bytes are ordered before their
+        // first reader either way and the *same bytes land in the same slot* - bit-identical by construction.  What
+        // changes is that the copies no longer wait behind the layer's already-queued GPU work, which on the
+        // compulsory-admission path (no profile, first use of an expert) was three synchronous round trips on the
+        // critical path of the layer that needs them.  A synchronous barrier is kept when no side stream exists yet
+        // (the fill at startup, where there is nothing to overlap with).
+        const bool async = W().side != nullptr && tokens_seen > 0;
+        if (async) {
+            cu::copy_h2d_async(p, g, L.expert_gu, W().side);
+            cu::copy_h2d_async(p + L.expert_gu, u, L.expert_gu, W().side);
+        }
+        if (!async) {
+            cu::copy_h2d(p, g, L.expert_gu);
+            cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
+        }
+        if (async) cu::copy_h2d_async(p + 2 * L.expert_gu, d, L.expert_down, W().side);
+        else cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
     }
