@@ -66,7 +66,7 @@ echo "=== 4. 200-token prefill, multi-token row on and off ==="
 for rep in 1 2 3; do
   for mt in 1 0; do
     STRATA_IQ_MT=$mt timeout 900 $SHIM --model $M --serve $BASE_ARGS --max-context $CTX \
-      --minimax-prefill-batch 200 --minimax-prefill-experts cpu <<< "GEN 0 temperature=0 $(head -c 4000 $IDS)
+      --minimax-prefill-batch 200 --minimax-prefill-experts cpu <<< "GEN 0 temperature=0 $(cut -d" " -f1-200 $IDS)
 STOP" 2>/dev/null | awk -v mt=$mt '/^DONE /{printf "rep %s mt=%s prompt_ms=%s (%d tokens) pp=%.1f tok/s\n", "'"$rep"'", mt, $4, $3, $3/$4*1000}'
   done
 done
@@ -78,7 +78,7 @@ run() {
   local env=""
   if [ "$label" = "corrupt" ]; then env="STRATA_DSPARK_CORRUPT=1"; fi
   env $env timeout 900 $SHIM --model $M --serve $BASE_ARGS --max-context $CTX --minimax-prefill-batch 512 "$@" \
-    <<< "GEN 32 temperature=0 seed=1 $(head -c 400 $IDS)
+    <<< "GEN 32 temperature=0 seed=1 $(cut -d" " -f1-60 $IDS)
 STOP" 2>/tmp/p13.$label.err | grep -E "^T " | awk '{printf "%s ", $2}' > /tmp/p13.$label.toks
   echo "  $label: $(cat /tmp/p13.$label.toks)"
   grep -E "INFO minimax-spec" /tmp/p13.$label.err | tail -1 | sed 's/^/  /'
