@@ -97,6 +97,28 @@ python make_heldout.py --out prompts.jsonl \
 
 ## Reference run (A100, fp32) and scoring
 
+Produced on Thunder Compute, 1x A100-SXM4-80GB, 16 vCPU, 128 GB, torch
+2.14.1+cu130, transformers 5.20.2, `stream_run.py --device cuda --dtype fp32`.
+All 14 prompts in one pass: **3,295.8 s (55.0 min)** of layer streaming plus
+15.0 s for the head, 3.0 s/layer for the six short prompts and ~33 s/layer once
+the 3,034-token prompt is in the batch; peak RSS **135.8 GB** (the layer weights
+plus mmap'd shards, as the original reference run measured 135.6 GB).
+
+Verification of the run, both done on the box:
+
+* **cross-check against the original G3 reference.** `tool_weather` and
+  `code_lru` were re-run through the same code path on the same GPU and compared
+  with `_local/ref_out/logits/`: **max abs diff 0.000e+00, exact-match fraction
+  100%, KL64 0.0, full-vocab KL 0.0, top-1 100%** over 242 positions. The
+  reference is bit-reproducible, so a later re-run needs no explanation budget.
+  `compare_xcheck.py` is the script (`_local/ref_out/xcheck/xcheck.json`).
+* **self-check of the scorer.** The held-out reference fed back as if it were the
+  quant through `g3_sparsa.score_prompt` gives KL64 0.0, full-vocab KL 0.0 and
+  top-1 100% on all 1,792 positions (`_local/g3_heldout/selfcheck.json`), so the
+  scoring path, the `--minimax-last-k 128` alignment and the ids binaries agree.
+
+## Scoring
+
 The reference is produced by the same code path and precision as the original
 G3 reference (`tools/minimax/ref/stream_run.py --device cuda --dtype fp32`), and
 saved in the same layout, one directory per prompt:
