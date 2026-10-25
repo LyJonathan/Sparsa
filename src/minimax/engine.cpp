@@ -7105,6 +7105,9 @@ struct Engine::Impl {
         ds_drafts.assign((size_t)g.block, 0);
         ds_conf.assign((size_t)g.block, 0.f);
         ds_seeded = 0;
+        // loading the drafter leaves its device current; put the engine back on the default one so the allocations
+        // that follow (the device KV, the prompt workspace, the expert slots) start from the same place as ever
+        cu::set_device(0);
         if (const char* t = std::getenv("STRATA_DSPARK_TAP")) ds_tap_out = std::string(t) == "output";
         std::fprintf(stderr,
                      "INFO minimax-dspark pack=%s dev=%d layers=%lld window=%lld block=%lld drafts=%d vram=%.0f "
