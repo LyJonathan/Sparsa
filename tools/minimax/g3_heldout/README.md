@@ -3,32 +3,43 @@
 An independent second gate for the Sparsa MiniMax-M3.1-Flash quantisation work.
 The mixed-quant layer recipe ("A1 mix", ~100 GB of experts) is chosen on the
 six short G3 prompts (`chinese_local_llm`, `code_lru`, `math_bakery`,
-`multi_turn_threads`, `prose_moe`, `tool_weather`, see
-`_local/g3_iq2xs/`).  Anything tuned that hard against those prompts has to be
-checked on prompts it has never seen, which is what this set is for.
+`multi_turn_threads`, `prose_moe`, `tool_weather`, see `_local/g3_iq2xs/`).
+Anything tuned that hard against those prompts has to be checked on prompts it
+has never seen, which is what this set is for.
+
+The set is deliberately larger than a one-off gate needs (14 prompts, not 6-8):
+the FP32 reference costs ~30 minutes of A100 time to make and is then reused for
+**every future pack**, so breadth is nearly free and re-running it is not.
 
 Run artefacts live in `_local/ref_out/heldout/` (git-ignored, this PC) and
 `_local/g3_heldout/` (ids + D3 results).  Nothing here is committed as a binary
 except the prompt text itself.
 
-## The 8 prompts
+## The 14 prompts
 
 | id | domain | tokens | format |
 |---|---|---:|---|
 | `sql_retention_cohort` | analytics SQL: weekly cohort-retention curve with window functions | 305 | raw text |
-| `science_abstract_critique` | materials-science abstract + reviewer-style critique of unsupported claims | 478 | raw text |
+| `shell_log_pipeline` | POSIX `sh` + `awk` streaming log report | 293 | raw text |
+| `code_rust_ringbuffer` | Rust `no_std` const-generic ring buffer + tests | 412 | raw text |
+| `math_number_theory` | pure maths: characterisation of sums of two squares, with proofs | 384 | raw text |
+| `math_probability_urn` | probability: urn sampling and a Polya urn | 277 | raw text |
+| `science_abstract_critique` | materials-science abstract + reviewer-style critique | 478 | raw text |
 | `story_lighthouse` | creative fiction: flash-fiction opening under hard constraints | 164 | raw text |
 | `japanese_tea_ceremony` | Japanese: a short structured essay (普通体) | 148 | raw text |
-| `chem_stoich_road_salt` | chemistry: stoichiometry, freezing-point depression, unit tracking | 303 | raw text |
-| `legal_consult_turns` | legal prose: clause-by-clause review of an NDA, multi-turn | 612 | chat |
+| `french_atelier_peinture` | French: an essay on "un atelier n'est pas un lieu" | 262 | raw text |
+| `chem_stoich_road_salt` | chemistry: stoichiometry, freezing-point depression, units | 303 | raw text |
+| `legal_consult_turns` | legal prose: clause-by-clause NDA review, multi-turn | 612 | chat |
 | `api_pagination_chat` | OpenAPI 3.1 spec reading + resumable-client design | 577 | chat |
-| `long_science_darwin` | long Victorian natural-history prose + an argument-reconstruction question | 3,034 | raw text |
-| **total** | | **5,621** | 6 raw / 2 chat |
+| `multi_turn_debug_session` | multi-turn production-debugging dialogue | 547 | chat |
+| `long_science_darwin` | long Victorian natural-history prose + argument reconstruction | 3,034 | raw text |
+| **total** | | **7,796** | 11 raw / 3 chat |
 
-Two domains are covered twice on purpose, in different registers: scientific
-prose appears both as a modern abstract-to-critique task and as a 3,034-token
-1859 document, and the two chat prompts exercise the template on a legal and an
-API-spec task.
+Coverage: maths (two kinds), code in three languages (SQL, shell, Rust), two
+non-English languages (Japanese, French), legal prose, fiction, a scientific
+abstract, a chemistry word problem, three multi-turn/chat prompts, and exactly
+one long-context document.  Only the long document is expensive, so the whole
+set still costs about 30 minutes of A100 time.
 
 ## Why these are held out
 
@@ -36,12 +47,12 @@ Every domain differs from every G3 domain:
 
 | G3 has | held-out has instead |
 |---|---|
-| Python coding task (`code_lru`) and CPython source (`long_code_stdlib`) | analytics SQL |
-| an MoE explainer in plain English (`prose_moe`) | legal opinion register, and a peer-review critique |
-| Chinese (`chinese_local_llm`) | Japanese |
+| Python coding task (`code_lru`) and CPython source (`long_code_stdlib`) | analytics SQL, POSIX shell, and Rust |
+| an MoE explainer in plain English (`prose_moe`) | legal opinion register, a peer-review critique, and a debugging dialogue |
+| Chinese (`chinese_local_llm`) | Japanese and French |
 | a tool-call conversation (`tool_weather`) | an OpenAPI spec to read, no tools |
-| a linear-programming word problem (`math_bakery`) | chemistry with molar masses and units |
-| a multi-turn chat about threads (`multi_turn_threads`) | a multi-turn NDA consultation |
+| a linear-programming word problem (`math_bakery`) | chemistry with molar masses and units; a number-theory proof; an urn/Pólya probability problem |
+| a multi-turn chat about threads (`multi_turn_threads`) | a multi-turn NDA consultation and a production incident dialogue |
 | Austen, 1813 fiction (`long_prose_austen`) | Darwin, 1859 scientific prose |
 
 Note that the two `template: chat` prompts still carry the checkpoint's own
@@ -52,11 +63,11 @@ the template injects it; that is the same code path G3 used, not extra content.
 
 `make_heldout.py` is a near-copy of `tools/minimax/ref/make_prompts.py`:
 
-* 6 prompts carry `text` with `template: null`.  They are tokenized **verbatim**,
+* 11 prompts carry `text` with `template: null`.  They are tokenized **verbatim**,
   with the chat template *not* applied - the same handling the reference used for
   6 of its 8 prompts, i.e. the model sees an untemplated document followed by a
   question.
-* 2 prompts carry `messages` with `template: "chat"` and are rendered through the
+* 3 prompts carry `messages` with `template: "chat"` and are rendered through the
   checkpoint's `chat_template.jinja` with `add_generation_prompt=True`, via
   `tools/minimax/ref/chat.py` (`apply_chat_template`).  Byte-identical to G3.
 * `rendered_text` is stored in `prompts.jsonl` for both kinds, so the reference
@@ -66,7 +77,8 @@ the template injects it; that is the same code path G3 used, not extra content.
   `stream_run.encode_prompt` does it.
 * lengths stay inside the G3 range (84-5,536 tokens).  `long_science_darwin` at
   3,034 tokens is past 17 blocks of 128 keys (2,176), so MSA actually deselects
-  blocks - the reason G3 has two >2,500-token prompts.
+  blocks - the reason G3 has two >2,500-token prompts.  It is the only long
+  prompt here, because each one adds ~15 minutes to a reference pass.
 
 ## Reproducing
 
