@@ -10,6 +10,7 @@
 #include "strata/kernels/iqk_types.hpp"
 
 #include "cuda_ops.hpp"
+#include "dspark.hpp"
 #include "strata/minimax/vision.hpp"
 
 #if defined(_WIN32)
@@ -74,6 +75,9 @@ constexpr int kF32 = 0;
 constexpr int kF16 = 1;
 constexpr int kBF16 = 30;
 constexpr int kTile = 128;
+/// The batched MoE takes the device (tensor cores) only for a real prompt chunk: its per-expert dequantize-to-fp16
+/// costs several times the expert's own bytes, which a 2-8 row verify window cannot amortize (P13).
+constexpr int kGpuExpertsMinRows = 16;
 constexpr int32_t kNotResident = -1;
 
 struct DevPtr {
@@ -676,6 +680,23 @@ struct Engine::Impl {
     std::vector<Layer> layers;
     std::unordered_set<int32_t> eos;
 
+    // ---- P13: DSpark speculative decoding (opt-in; see dspark.hpp).  The drafter reads the target's residual
+    // stream at `dspark->geom().taps`, so a small ring of those rows is kept for every forwarded position, and the
+    // ring is seeded lazily (a position is turned into the drafter's K/V row once it is committed).
+    std::unique_ptr<DsparkDrafter> dspark;
+    std::vector<char> ds_slot;         ///< [n_layers] tap slot of the layer, or -1
+    std::vector<float> ds_tap;         ///< [ds_cap][tap_width] ring of the taps, by position % ds_cap
+    int64_t ds_cap = 0, ds_tapw = 0;
+    bool ds_tap_out = false;           ///< STRATA_DSPARK_TAP=output: take the layer's own output instead of its input
+    int64_t ds_seeded = 0;             ///< positions [0, ds_seeded) are in the drafter's ring
+    std::vector<float> ds_ids;         ///< [rows][n_embd] the block's embeddings
+    std::vector<float> ds_rows;        ///< [rows][n_vocab] the verify window's logits
+    std::vector<int32_t> ds_drafts;
+    std::vector<float> ds_conf;
+    // the run's speculation counters
+    int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_tokens = 0;
+    double spec_round_ms = 0, spec_draft_ms = 0, spec_verify_ms = 0;
+
     // ---- parity probes (P4).  Off unless --minimax-dump-dir / --minimax-seed-hidden is given.
     bool dump_on = false;
     std::string dump_dir;
@@ -1253,6 +1274,7 @@ struct Engine::Impl {
         size_workspace();
         if (!cpu_only) alloc_workspace();
         place_weights();
+        load_dspark();   // P13: before the expert slots are sized, so they see the drafter's VRAM
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
         if (opt.tiers || opt.expert_resident == "all") {
             init_tiers();
@@ -5614,6 +5636,8 @@ struct Engine::Impl {
         };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && !ds_tap_out)
+                tap_put(pos, (size_t)ds_slot[(size_t)li], x.data());
             if (kv_mode != 0 || L.want_gpu) use_layer_device(li);
             const auto t_layer = tokclock::now();
             const bool dbg = dumping(li);
@@ -5847,6 +5871,8 @@ struct Engine::Impl {
                 moe(L, h.data(), proj.data());
             }
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && ds_tap_out)
+                tap_put(pos, (size_t)ds_slot[(size_t)li], x.data());
             if (prefetch_slots > 0 && li + 1 < cfg.n_layers) {
                 // The SSD lookahead is issued from inside moe() (it needs this layer's FFN input); only the VRAM
                 // fill is left here, and it keeps its one-layer distance and its exact router input.
@@ -6291,6 +6317,8 @@ struct Engine::Impl {
         const int qlen = H * D, klen = HKV * D;
         const int BLK = (int)cfg.idx_block;
         tok_stats = TokenStats{};
+        const auto t_window = std::chrono::steady_clock::now();
+        if (opt.profile_time) prof = Prof{};
         const Tensor& embd_t = embd;
 
         for (int t = 0; t < T; ++t) {
@@ -6336,6 +6364,11 @@ struct Engine::Impl {
             PfBuf& p = pf.empty() ? p_dummy : P();
             // ---- attention block
             const auto ta0 = pfclock::now();
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && !ds_tap_out) {
+                const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
+                for (int t = t0; t < T; ++t)
+                    tap_put(pos0 + t, (size_t)ds_slot[(size_t)li], pf_h.data() + (size_t)t * ne);
+            }
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
@@ -6551,6 +6584,7 @@ struct Engine::Impl {
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
 
             const auto t_ffn = pfclock::now();
+            if (opt.profile_time) prof.attn += dur(t_layer, t_ffn);
             // ---- FFN block
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.ffn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
@@ -6574,7 +6608,7 @@ struct Engine::Impl {
                                     (size_t)nt * ne * sizeof(float));
                     }
                 }
-            } else if (gpu && prefill_gpu_experts) {
+            } else if (gpu && prefill_gpu_experts && T >= kGpuExpertsMinRows) {
                 cu::copy_h2d(p.p32, hn, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
@@ -6584,6 +6618,11 @@ struct Engine::Impl {
             }
             for (int t = 0; t < T; ++t)
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
+            if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && ds_tap_out) {
+                const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
+                for (int t = t0; t < T; ++t)
+                    tap_put(pos0 + t, (size_t)ds_slot[(size_t)li], pf_h.data() + (size_t)t * ne);
+            }
             if (time_on) {
                 const double f = ms(t_ffn);
                 std::fprintf(stderr,
@@ -6598,6 +6637,14 @@ struct Engine::Impl {
         if (time_on) {
             std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f\n", t_idx, t_topk,
                          t_msa, t_prep, t_kvw);
+        }
+        if (opt.profile_time) {
+            // a verify window reports per token like the token path, so the two phase tables line up
+            prof.total = dur(t_window, pfclock::now());
+            prof_acc(prof_sum, prof);
+            prof_tokens += T;
+            const std::string line = prof_line(prof, prof_tokens);
+            std::fprintf(stderr, "%s\n", line.c_str());
         }
 
         // ---- final norm and output projection
@@ -6639,13 +6686,302 @@ struct Engine::Impl {
         }
     }
 
+    // ---- P13: one speculative decode pass.  Each round takes the token the plain loop would take, asks the drafter
+    // for up to `opt.spec` more, verifies them with ONE batched forward, and commits the longest matching prefix.
+    // A draft that does not match is simply not committed: the round's last row is the target's own logits, which is
+    // exactly the state the plain loop would hold, so the draft can only ever change the speed.
+    void decode_spec(int max_new, const SampleParams& sp, std::atomic<bool>& stop,
+                     const std::function<void(int32_t)>& on_token, GenerateResult& gr, std::vector<int32_t>& hist) {
+        const int V = (int)cfg.n_vocab;
+        const DsparkGeometry& g = dspark->geom();
+        // the verify window is a batched forward: it cannot be wider than the prompt workspace
+        const int kd_max = (int)std::min<int64_t>(opt.spec, std::min<int64_t>(g.block, batch_cap - 1));
+        const int64_t mask_id = g.mask_id;
+        const int ne = (int)cfg.n_embd;
+        // temperature > 0: the draft is a point mass and the window is accepted by rejection sampling, which leaves
+        // the target's own distribution; greedy: a draft is kept when the target's argmax agrees with it.
+        const bool sampled = sp.temperature > 0.f;
+        const float cum = opt.spec_min_conf;   // stop where the product of the confidences falls below this
+        const int n_min = opt.spec_n_min;      // ... but always verify at least this many drafts
+        std::vector<float> row((size_t)V), vrow((size_t)V), prow((size_t)V);
+        std::string err;
+        int emitted = 0;
+        bool have_pending = false;
+        int32_t pending = 0;
+        auto finish = [&](const char* why) {
+            // the plain loop leaves its last sampled token in `held` but not in the cache; mirror that exactly
+            n_past -= 1;
+            gr.finish = why;
+            gr.generated = emitted;
+        };
+        while (true) {
+            if (stop.load(std::memory_order_relaxed)) {
+                // mid-round the cache already holds the last emitted token, which is the plain loop's state too
+                gr.finish = "cancel";
+                gr.generated = emitted;
+                return;
+            }
+            if (emitted >= max_new) {
+                gr.finish = "length";
+                gr.generated = emitted;
+                return;
+            }
+            int32_t id0 = 0;
+            if (have_pending) {
+                id0 = pending;   // drawn from the target's own distribution when the window was cut short
+                have_pending = false;
+            } else {
+                row = last_logits;
+                if (!finite_row(row.data(), V)) {
+                    gr.finish = "nonfinite";
+                    gr.generated = emitted;
+                    return;
+                }
+                id0 = sample(row, sp, hist);
+            }
+            const int64_t p0 = n_past;
+            // ---- the drafts
+            int k = 0;
+            if (kd_max > 0 && max_new - emitted > 1) {
+                if (!dspark_seed_to(p0, err)) fail("minimax-dspark: " + err);
+                const int want = std::min(kd_max, max_new - emitted - 1);
+                const int rows = want + 1;
+                input_row(p0, id0, ds_ids.data());
+                for (int j = 1; j < rows; ++j)
+                    decode_f32(embd, embd.host + (size_t)mask_id * embd.row_bytes,
+                               ds_ids.data() + (size_t)j * (size_t)ne, ne);
+                const double dt0 = spec_now();
+                if (!dspark->draft(ds_ids.data(), id0, p0, ds_drafts.data(), ds_conf.data(), err))
+                    fail("minimax-dspark: " + err);
+                spec_draft_ms += spec_now() - dt0;
+                // two GPUs: check one draft, and up to four while the product of the confidences holds
+                float prod = 1.f;
+                int keep = 0;
+                for (int j = 0; j < want; ++j) {
+                    prod *= ds_conf[(size_t)j];
+                    if (keep < n_min || cum <= 0.f || prod >= cum)
+                        ++keep;
+                    else
+                        break;
+                }
+                k = std::max(1, keep);
+                // A test hook (tools/minimax/test_dspark.py): a wrong first draft makes every round reject, so the
+                // output must still equal plain decode - that is the rollback gate.
+                if (std::getenv("STRATA_DSPARK_CORRUPT")) {
+                    for (int j = 0; j < k; ++j) ds_drafts[(size_t)j] = (int32_t)((ds_drafts[(size_t)j] + 7919) % V);
+                }
+            }
+            const int T = k + 1;
+            std::vector<int32_t> win((size_t)T);
+            win[0] = id0;
+            for (int j = 1; j < T; ++j) win[(size_t)j] = ds_drafts[(size_t)(j - 1)];
+            const double vt0 = spec_now();
+            forward_batch(win.data(), T, ds_rows.data(), T);
+            spec_verify_ms += spec_now() - vt0;
+            ++spec_rounds;
+            spec_drafted += k;
+            auto emit = [&](int32_t id) {
+                if (on_token) on_token(id);
+                hist.push_back(id);
+                held.push_back(id);
+                ++emitted;
+                ++spec_tokens;
+                return eos.count(id) != 0;
+            };
+            // the round's first token is the plain loop's own sample; the batch already holds its logits
+            n_past = p0 + 1;
+            std::memcpy(last_logits.data(), ds_rows.data(), (size_t)V * sizeof(float));
+            if (!finite_row(last_logits.data(), V)) {
+                gr.finish = "nonfinite";
+                gr.generated = emitted;
+                return;
+            }
+            if (emit(id0)) {
+                finish("stop");
+                return;
+            }
+            if (emitted >= max_new) {
+                finish("length");
+                return;
+            }
+            for (int j = 0; j < k; ++j) {
+                const float* rrow = ds_rows.data() + (size_t)j * (size_t)V;
+                if (!finite_row(rrow, V)) {
+                    gr.finish = "nonfinite";
+                    gr.generated = emitted;
+                    return;
+                }
+                if (sampled) {
+                    // rejection sampling with a point-mass proposal: keep the draft with the target's own
+                    // probability, else draw the correction from the residual (p - q)+ - q puts all its mass on the
+                    // draft - so the emitted token is distributed exactly as the target's own sample.
+                    prow.assign(rrow, rrow + V);
+                    apply_penalties(prow.data(), sp, hist);
+                    to_dist(prow.data(), sp);
+                    const float px = prow[(size_t)ds_drafts[(size_t)j]];
+                    if (uniform() < (double)px) {
+                        ++spec_accepted;
+                        n_past = p0 + j + 2;
+                        std::memcpy(last_logits.data(), rrow + V, (size_t)V * sizeof(float));
+                        if (emit(ds_drafts[(size_t)j])) {
+                            finish("stop");
+                            return;
+                        }
+                        if (emitted >= max_new) {
+                            finish("length");
+                            return;
+                        }
+                        continue;
+                    }
+                    prow[(size_t)ds_drafts[(size_t)j]] = 0.f;
+                    const float rest = 1.f - px;
+                    if (rest > 1e-6f)
+                        for (int v = 0; v < V; ++v) prow[(size_t)v] /= rest;
+                    pending = draw_dist(prow.data());
+                    have_pending = true;
+                    n_past = p0 + j + 1;   // the correction token has not been through the target yet
+                    break;
+                }
+                std::memcpy(vrow.data(), rrow, (size_t)V * sizeof(float));
+                if (sample(vrow, sp, hist) != ds_drafts[(size_t)j]) break;   // the matching prefix ends here
+                ++spec_accepted;
+                n_past = p0 + j + 2;
+                std::memcpy(last_logits.data(), rrow + V, (size_t)V * sizeof(float));
+                if (emit(ds_drafts[(size_t)j])) {
+                    finish("stop");
+                    return;
+                }
+                if (emitted >= max_new) {
+                    finish("length");
+                    return;
+                }
+            }
+        }
+    }
+
+    static double spec_now() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    /// The run's speculation counters, one line (nothing when the drafter never ran).
+    void spec_report() {
+        if (spec_rounds <= 0) return;
+        const double draft = spec_draft_ms, verify = spec_verify_ms, total = draft + verify;
+        std::fprintf(stderr,
+                     "INFO minimax-spec rounds=%lld drafts=%lld accepted=%lld rate=%.3f per_round=%.2f tokens=%lld "
+                     "draft_ms=%.1f verify_ms=%.1f round_ms=%.1f ms/token=%.1f\n",
+                     (long long)spec_rounds, (long long)spec_drafted, (long long)spec_accepted,
+                     spec_drafted > 0 ? (double)spec_accepted / (double)spec_drafted : 0.0,
+                     spec_rounds > 0 ? (double)spec_tokens / (double)spec_rounds : 0.0, (long long)spec_tokens, draft,
+                     verify, total, spec_tokens > 0 ? total / (double)spec_tokens : 0.0);
+        spec_rounds = spec_drafted = spec_accepted = spec_tokens = 0;
+        spec_draft_ms = spec_verify_ms = 0;
+    }
+
     void reset() {
         n_past = 0;
         held.clear();
         have_logits = false;
+        ds_seeded = 0;
+        if (dspark) dspark->reset();
     }
 
-    int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
+    // ============================================================================== P13: DSpark speculative decoding
+
+    /// Load the draft head (before the expert tiers are sized, so the slots see its VRAM) and bind the head.
+    void load_dspark() {
+        if (opt.dspark_pack.empty() || opt.spec <= 0) {
+            if (opt.spec > 0) fail("--speculative needs --dspark-model (tools/minimax/dspark_pack.py writes it)");
+            return;
+        }
+        if (devs.empty()) fail("--speculative needs a GPU for the draft head (the dense layers are all on the CPU)");
+        int dev = opt.dspark_gpu >= 0 ? opt.dspark_gpu : devs.back();
+        bool known = false;
+        for (int d : devs) known = known || d == dev;
+        if (!known)
+            std::fprintf(stderr, "INFO minimax-dspark: device %d is not one of --gpus; the drafter runs there anyway\n",
+                         dev);
+        dspark = std::make_unique<DsparkDrafter>();
+        std::string err;
+        if (!dspark->load(opt.dspark_pack, dev, opt.dspark_window, err)) fail(err);
+        const DsparkGeometry& g = dspark->geom();
+        if (g.n_embd != cfg.n_embd) fail("the DSpark pack is " + std::to_string(g.n_embd) + " wide, the model " +
+                                         std::to_string(cfg.n_embd));
+        if (g.vocab != cfg.n_vocab) fail("the DSpark pack's vocabulary is " + std::to_string(g.vocab) +
+                                         ", the model's " + std::to_string(cfg.n_vocab));
+        for (int64_t l : g.taps)
+            if (l < 0 || l >= cfg.n_layers) fail("a DSpark tap layer is outside the model");
+        if (opt.spec > g.block) fail("--speculative " + std::to_string(opt.spec) + " is more than the pack's " +
+                                     std::to_string(g.block) + " drafts per round");
+        // the target's own head: the device copy when the dense layers put it there, else its mapped bytes
+        if (output_gpu && output.dev.p && !output.dev_f32) {
+            if (!dspark->bind_head(output.dev.p, nullptr, 0, output.type, output.ne1, output.ne0, err)) fail(err);
+        } else if (mmvq_dense_type(output.type) && output.host) {
+            if (!dspark->bind_head(nullptr, output.host, output.bytes, output.type, output.ne1, output.ne0, err))
+                fail(err);
+        } else {
+            fail("the head's type has no device path the drafter can use (--minimax-dense-layers-gpu 0 puts the "
+                 "head on the CPU; the drafter needs it on its device)");
+        }
+        ds_slot.assign((size_t)cfg.n_layers, -1);
+        for (size_t i = 0; i < g.taps.size(); ++i) ds_slot[(size_t)g.taps[i]] = (char)i;
+        ds_tapw = g.tap_width();
+        ds_cap = dspark->window() + g.rows() + 8;
+        ds_tap.assign((size_t)ds_cap * (size_t)ds_tapw, 0.f);
+        ds_ids.assign((size_t)g.rows() * (size_t)cfg.n_embd, 0.f);
+        ds_rows.assign((size_t)g.rows() * (size_t)cfg.n_vocab, 0.f);
+        ds_drafts.assign((size_t)g.block, 0);
+        ds_conf.assign((size_t)g.block, 0.f);
+        ds_seeded = 0;
+        if (const char* t = std::getenv("STRATA_DSPARK_TAP")) ds_tap_out = std::string(t) == "output";
+        std::fprintf(stderr,
+                     "INFO minimax-dspark pack=%s dev=%d layers=%lld window=%lld block=%lld drafts=%d vram=%.0f "
+                     "MiB taps=", opt.dspark_pack.c_str(), dev, (long long)g.n_layers, (long long)g.window,
+                     (long long)g.block, opt.spec, (double)dspark->vram_bytes() / 1048576.0);
+        for (size_t i = 0; i < g.taps.size(); ++i) std::fprintf(stderr, "%s%lld", i ? "," : "", (long long)g.taps[i]);
+        std::fprintf(stderr, "\n");
+    }
+
+    void tap_put(int64_t pos, size_t slot, const float* src) {
+        if (ds_tap.empty()) return;
+        std::memcpy(ds_tap.data() + (size_t)(pos % ds_cap) * (size_t)ds_tapw + slot * (size_t)cfg.n_embd, src,
+                    (size_t)cfg.n_embd * sizeof(float));
+    }
+
+    /// The token's input row: its embedding, or the image rows that replace it.
+    void input_row(int64_t pos, int32_t token, float* dst) {
+        decode_f32(embd, embd.host + (size_t)token * embd.row_bytes, dst, cfg.n_embd);
+        if ((size_t)pos < img_row.size() && img_row[(size_t)pos] >= 0)
+            std::memcpy(dst, img_data.data() + (size_t)img_row[(size_t)pos] * (size_t)cfg.n_embd,
+                        (size_t)cfg.n_embd * sizeof(float));
+    }
+
+    /// Turn every committed position the drafter has not seen yet into its K/V row.
+    bool dspark_seed_to(int64_t upto, std::string& err) {
+        if (!dspark || ds_seeded >= upto) return true;
+        int64_t from = ds_seeded;
+        if (upto - from > ds_cap) from = upto - ds_cap;
+        // the drafter turns tap rows into its K/V rows a batch at a time; hand it the ring's rows in small batches so
+        // the staging buffer stays a few hundred KiB even when a long prompt is seeded at once
+        const int64_t step = std::max<int64_t>(1, dspark->geom().rows());
+        std::vector<float> buf((size_t)step * (size_t)ds_tapw);
+        for (int64_t p = from; p < upto; p += step) {
+            const int64_t n = std::min(step, upto - p);
+            for (int64_t i = 0; i < n; ++i)
+                std::memcpy(buf.data() + (size_t)i * (size_t)ds_tapw,
+                            ds_tap.data() + (size_t)((p + i) % ds_cap) * (size_t)ds_tapw,
+                            (size_t)ds_tapw * sizeof(float));
+            if (!dspark->seed(buf.data(), n, p, err)) return false;
+            ds_seeded = p + n;
+        }
+        ds_seeded = upto;
+        return true;
+    }
+
+    /// The repetition penalties, in place: the plain sampler's first step, split out so the speculative path can draw
+    /// from exactly the distribution the plain path draws from (same order of operations, same rounding).
+    void apply_penalties(float* row, const SampleParams& sp, const std::vector<int32_t>& hist) {
         const int n = (int)cfg.n_vocab;
         if (sp.penalty_repeat != 1.f || sp.penalty_freq != 0.f || sp.penalty_present != 0.f) {
             int window = sp.penalty_last_n;
@@ -6660,12 +6996,19 @@ struct Engine::Impl {
                 row[(size_t)id] -= (float)kv.second * sp.penalty_freq + sp.penalty_present;
             }
         }
-        if (!(sp.temperature > 0.f)) {
-            int best = 0;
-            for (int i = 1; i < n; ++i)
-                if (row[(size_t)i] > row[(size_t)best]) best = i;
-            return best;
-        }
+    }
+
+    /// The first index of the largest value (`>`: a tie keeps the lower id, as the plain path does).
+    static int argmax_row(const float* row, int n) {
+        int best = 0;
+        for (int i = 1; i < n; ++i)
+            if (row[(size_t)i] > row[(size_t)best]) best = i;
+        return best;
+    }
+
+    /// temperature, top_k, softmax, min_p, top_p: the plain sampler's filters, leaving a normalized pmf in `row`.
+    void to_dist(float* row, const SampleParams& sp) {
+        const int n = (int)cfg.n_vocab;
         const float inv_t = 1.f / sp.temperature;
         for (int i = 0; i < n; ++i) row[(size_t)i] *= inv_t;
         if (sp.top_k > 0 && sp.top_k < n) {
@@ -6675,14 +7018,13 @@ struct Engine::Impl {
                 if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
                 return a < b;
             });
-            // nth_element's first top_k entries are the kept ids, unsorted. The cutoff is their minimum.
             float cut = row[(size_t)order[0]];
             for (int i = 1; i < sp.top_k; ++i)
                 if (row[(size_t)order[(size_t)i]] < cut) cut = row[(size_t)order[(size_t)i]];
             for (int i = 0; i < n; ++i)
                 if (row[(size_t)i] < cut) row[(size_t)i] = -std::numeric_limits<float>::infinity();
         }
-        softmax_inplace(row.data(), n);
+        softmax_inplace(row, n);
         if (sp.min_p > 0.f) {
             float peak = 0.f;
             for (int i = 0; i < n; ++i)
@@ -6696,13 +7038,13 @@ struct Engine::Impl {
             if (sum > 0.f)
                 for (int i = 0; i < n; ++i) row[(size_t)i] /= sum;
         }
-        std::vector<int> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
-            return a < b;
-        });
         if (sp.top_p > 0.f && sp.top_p < 1.f) {
+            std::vector<int> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
+                return a < b;
+            });
             float c = 0.f;
             int keep = 0;
             for (; keep < n; ++keep) {
@@ -6727,6 +7069,11 @@ struct Engine::Impl {
             if (sum > 0.f)
                 for (int i = 0; i < n; ++i) row[(size_t)i] /= sum;
         }
+    }
+
+    /// One draw from a normalized pmf: the plain sampler's last step.
+    int draw_dist(const float* row) {
+        const int n = (int)cfg.n_vocab;
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         double r = dist(rng);
         double c = 0.0;
@@ -6737,6 +7084,19 @@ struct Engine::Impl {
         for (int i = n - 1; i >= 0; --i)
             if (row[(size_t)i] > 0.f) return i;
         return 0;
+    }
+
+    /// A uniform draw in [0,1) from the same generator the sampler uses (the speculative acceptance test).
+    double uniform() {
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng);
+    }
+
+    int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
+        apply_penalties(row.data(), sp, hist);
+        if (!(sp.temperature > 0.f)) return argmax_row(row.data(), (int)cfg.n_vocab);
+        to_dist(row.data(), sp);
+        return draw_dist(row.data());
     }
 };
 
@@ -6962,6 +7322,20 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
 
     const auto t1 = clock::now();
     std::vector<int32_t> hist = impl_->held;
+    // P13: with a DSpark drafter, each round verifies a window instead of one token per forward.  Greedy keeps a
+    // draft when the target's argmax agrees; temperature > 0 accepts it by rejection sampling, so the tokens keep the
+    // target's own distribution (see decode_spec).
+    if (impl_->dspark && impl_->opt.spec > 0 && impl_->img_rows == 0) {
+        if (!impl_->batch_on)
+            fail("--speculative needs the batched forward: pass --minimax-prefill-batch (0 is the token path)");
+        // the verify window is a batched forward, so it needs the prompt workspace: hold it for the decode loop (the
+        // default --minimax-prefill-vram reserve sized the expert slots with room for exactly this)
+        Impl::PrefillWs ws(impl_);
+        impl_->decode_spec(max_new, sp, stop, on_token, gr, hist);
+        gr.decode_ms = ms_since(t1);
+        impl_->spec_report();
+        return gr;
+    }
     for (int n = 0; n < max_new; ++n) {
         if (stop.load(std::memory_order_relaxed)) {
             gr.finish = "cancel";

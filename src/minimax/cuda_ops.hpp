@@ -149,4 +149,12 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
                     int heads, int q_per_kv, int q_per_idx, int dim, int blk_size, int dense_all, int64_t pos0,
                     int64_t n_tok, int64_t max_blk, float* out, void* stream);
 
+// ============================================================================================ DSpark: the drafter
+/// The draft block's attention: every query row sees `nring` ring rows and all `t_rows` block rows (non-causal).
+/// `q` fp16 [t_rows][heads][dim]; `kring`/`vring` fp16 [nring][hkv][dim]; `kblk`/`vblk` fp16 [t_rows][hkv][dim];
+/// `out` fp32 [t_rows][heads][dim].
+void dspark_add(float* y, const float* add, int64_t n, void* stream);
+void dspark_attn(const void* q, const void* kring, const void* vring, int nring, const void* kblk, const void* vblk,
+                 int t_rows, int heads, int hkv, int dim, float* out, void* stream);
+
 }  // namespace strata::minimax::cu

@@ -120,7 +120,18 @@ void usage() {
                  "  --mmproj PATH                     vision encoder (llama.cpp clip mmproj, minimax_m3)\n"
                  "  --minimax-vision IMAGE            encode IMAGE and write --minimax-vision-out (no LM loaded)\n"
                  "  --minimax-vision-pixels PV.npy    encode preprocessed pixel_values [n,1176] instead of a picture\n"
-                 "  --minimax-vision-size WxH         the resized size that goes with --minimax-vision-pixels\n");
+                 "  --minimax-vision-size WxH         the resized size that goes with --minimax-vision-pixels\n"
+                 "Speculative decoding (P13, opt-in): the model's own DSpark draft head proposes, one batched\n"
+                 "forward verifies, and the longest matching prefix is committed (greedy: the target's argmax;\n"
+                 "sampled: rejection sampling, so the distribution is the target's own).\n"
+                 "  --dspark-model PATH               the draft head's pack (tools/minimax/dspark_pack.py)\n"
+                 "  --speculative [N]                 drafts per round at most (bare: 4); needs --dspark-model\n"
+                 "                                    and a batched forward (--minimax-prefill-batch > 0)\n"
+                 "  --minimax-spec-n-min N            verify at least N drafts a round (default 1)\n"
+                 "  --minimax-spec-min-conf P         cut the window where the product of the confidence head's\n"
+                 "                                    scores falls below P (default 0.9, 0 = no cut)\n"
+                 "  --minimax-dspark-window N         ring rows the drafter keeps per layer (default: the pack's)\n"
+                 "  --minimax-dspark-gpu N            the drafter's CUDA device (default: the last one --gpus names)\n");
 }
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -615,6 +626,9 @@ int run(int argc, char** argv) {
     int route_protect = 2, route_pool = 12;
     std::string graphs;
     std::string mmproj, vision_img, vision_out, vision_pixels, vision_size, vision_pixels_out;
+    // P13: DSpark speculative decoding (opt-in)
+    std::string dspark_pack, dspark_window, dspark_gpu, spec_min_conf;
+    int spec = 0, spec_n_min = 1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -666,6 +680,18 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-route-pool") route_pool = std::atoi(next().c_str());
         else if (a == "--minimax-route-margin") route_margin = (float)std::atof(next().c_str());
         else if (a == "--minimax-graphs") graphs = next();
+        else if (a == "--dspark-model" || a == "--minimax-dspark") dspark_pack = next();
+        else if (a == "--minimax-dspark-window") dspark_window = next();
+        else if (a == "--minimax-dspark-gpu") dspark_gpu = next();
+        else if (a == "--minimax-spec-min-conf" || a == "--minimax-spec-cum") spec_min_conf = next();
+        else if (a == "--minimax-spec-n-min") spec_n_min = std::atoi(next().c_str());
+        else if (a == "--speculative" || a == "--spec") {
+            // bare: the default window; `--speculative N`: N drafts per round
+            if (i + 1 < argc && !starts_with(argv[i + 1], "--") && std::atoi(argv[i + 1]) > 0)
+                spec = std::atoi(argv[++i]);
+            else
+                spec = 4;   // Maya's two-GPU default: one draft at least, four while the confidences hold
+        }
         else if (a == "--minimax-expert-resident") expert_resident = next();
         else if (a == "--minimax-tiers") tiers = true;
         else if (a == "--minimax-profile") { profile = next(); tiers = true; }
@@ -911,6 +937,12 @@ int run(int argc, char** argv) {
     opt.route_pool = route_pool;
     opt.route_margin = route_margin;
     opt.graphs = graphs;
+    opt.dspark_pack = dspark_pack;
+    opt.spec = spec;
+    if (!dspark_window.empty()) opt.dspark_window = std::atoll(dspark_window.c_str());
+    if (!dspark_gpu.empty()) opt.dspark_gpu = std::atoi(dspark_gpu.c_str());
+    opt.spec_n_min = spec_n_min;
+    if (!spec_min_conf.empty()) opt.spec_min_conf = (float)std::atof(spec_min_conf.c_str());
 
     Engine* engine = nullptr;
     try {
