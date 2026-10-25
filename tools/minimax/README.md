@@ -1510,7 +1510,18 @@ this drive is +-10%, so the median and the profile total are what the claim rest
 
 The change is inert when the tier is off (`--minimax-vram-slots-per-layer 0`, the all-CPU parity gate): `q == 0`
 and `L.vram.size() == 0`, so the allocation, the profile fill and the RAM split all take the same branch as before.
-`q_dev` is only consulted when slots exist.
+`q_dev` is only consulted when slots exist. **Gates re-run on this branch** (`gate_logits.py`, merge base
+`9ada09d0` against this branch, real-weight 15-layer slice, 64 real-text tokens):
+
+| arm | max abs | KL | top1 | |
+| --- | ---: | ---: | ---: | --- |
+| all CPU (`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`) | **0.0** | 0.0 | 1.000 | identical |
+| tiers with an explicit uniform count (`--minimax-vram-slots-per-layer 4`) | **0.0** | 0.0 | 1.000 | identical |
+| tiers auto, one GPU (the placement is unchanged, so this is also 0.0) | 0.0 | 0.0 | 1.000 | identical |
+
+A two-arm control with *different* arguments on the same path reads KL 5.25e-03 / top-1 0.906, so the harness
+detects a difference when there is one.  With `--gpus 0,1` the auto placement differs by design (more slots on the
+roomier card), which is the P3 tier's documented non-bit-identity, not a regression.
 
 ### Rejected: Project Maya's 20 ms pool spin (`--minimax-pool-spin-us`)
 
