@@ -6047,6 +6047,18 @@ struct Engine::Impl {
         std::vector<std::vector<int>> tok_of((size_t)nexp);
         for (int t = 0; t < T; ++t)
             for (int s = 0; s < top; ++s) tok_of[(size_t)ids[(size_t)t * top + s]].push_back(t);
+        if (std::getenv("STRATA_WINDOW_DEBUG")) {
+            int64_t uniq = 0, pinned = 0;
+            for (int e = 0; e < nexp; ++e) {
+                if (tok_of[(size_t)e].empty()) continue;
+                ++uniq;
+                const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)e] : -1;
+                if (rs >= 0) ++pinned;
+            }
+            std::fprintf(stderr, "INFO window-moe layer=%lld T=%d uniq=%lld pinned=%lld ssd_or_map=%lld\n",
+                         (long long)(&L - layers.data()), T, (long long)uniq, (long long)pinned,
+                         (long long)(uniq - pinned));
+        }
         if (spec_count) {
             // one read per (layer, expert) for the whole window; a one-token decode would have read T x top rows
             int64_t uniq = 0;

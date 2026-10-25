@@ -44,6 +44,15 @@ constexpr int kCandidateCap = 8192;
 
 float sigmoidf_(double x) { return (float)(1.0 / (1.0 + std::exp(-x))); }
 
+namespace {
+/// The caller's device, restored when a drafter call returns.
+struct OnDevice {
+    int prev;
+    explicit OnDevice(int dev) : prev(cu::current_device()) { cu::set_device(dev); }
+    ~OnDevice() { cu::set_device(prev); }
+};
+}  // namespace
+
 }  // namespace
 
 struct DsparkDrafter::Impl {
@@ -183,6 +192,7 @@ DsparkDrafter::~DsparkDrafter() {
 }
 
 bool DsparkDrafter::load(const std::string& pack_path, int device, int64_t window, std::string& err) {
+    const int prev_device = cu::current_device();
     try {
         auto* im = new Impl();
         impl_ = im;
@@ -332,8 +342,10 @@ bool DsparkDrafter::load(const std::string& pack_path, int device, int64_t windo
         for (const auto& kv : im->mats)
             if (kv.second.dev) bytes += (int64_t)kv.second.bytes;
         vram_ = bytes;
+        cu::set_device(prev_device);
         return true;
     } catch (const std::exception& e) {
+        cu::set_device(prev_device);
         err = e.what();
         return false;
     }
@@ -346,7 +358,7 @@ bool DsparkDrafter::bind_head(const void* dev, const void* host, size_t host_byt
         return false;
     }
     Impl* im = impl_;
-    cu::set_device(im->dev);
+    OnDevice on(im->dev);
     if (cols != geo_.n_embd) {
         err = "dspark: the head is " + std::to_string(cols) + " wide, the drafter " + std::to_string(geo_.n_embd);
         return false;
@@ -381,7 +393,7 @@ bool DsparkDrafter::bind_head(const void* dev, const void* host, size_t host_byt
 
 void DsparkDrafter::reset() {
     if (!impl_) return;
-    cu::set_device(impl_->dev);
+    OnDevice on(impl_->dev);
     seeded_ = 0;
 }
 
@@ -392,7 +404,7 @@ bool DsparkDrafter::seed(const float* taps, int64_t n, int64_t pos0, std::string
     }
     Impl* im = impl_;
     try {
-        cu::set_device(im->dev);
+        OnDevice on(im->dev);
         const double t0 = now_ms();
         const DsparkGeometry& g = geo_;
         const int64_t R = im->rows;
@@ -438,7 +450,7 @@ bool DsparkDrafter::draft(const float* ids, int32_t anchor, int64_t pos0, int32_
     }
     Impl* im = impl_;
     try {
-        cu::set_device(im->dev);
+        OnDevice on(im->dev);
         const double t0 = now_ms();
         const DsparkGeometry& g = geo_;
         const int R = (int)im->rows;
