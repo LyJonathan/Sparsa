@@ -103,6 +103,29 @@ class ModelCardSampling(unittest.TestCase):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")
 
+    def test_minimax_uses_its_checkpoint_generation_config(self):
+        """The card's own file: generation_config.json lines 5-6 (temperature 1.0, top_p 0.95); it names no
+        top_k and no min_p, so MiniMax's defaults must not inherit Qwen's top_k 20 or presence penalty."""
+        cfg = json.loads((ROOT / "serve/fixtures/minimax_generation_config.json").read_text(encoding="utf-8"))
+        want = {"temperature": cfg["temperature"], "top_p": cfg["top_p"]}
+        for arch in ("minimax_m3", "minimax-m3"):
+            for thinking in (True, False):
+                with self.subTest(arch=arch, thinking=thinking):
+                    self.assertEqual(model_card_sampling(arch, thinking), want)
+        self.assertNotIn("top_k", model_card_sampling("minimax_m3", True))
+        self.assertNotIn("presence_penalty", model_card_sampling("minimax_m3", True))
+
+    def test_minimax_defaults_and_the_request_still_wins(self):
+        self.svc.model_arch = "minimax_m3"
+        k = self.keys()
+        self.assertIn("temperature=1.0", k)
+        self.assertIn("top_p=0.95", k)
+        self.assertNotIn("top_k", k)
+        self.assertNotIn("penalty_present", k)
+        k = self.keys(temperature=0, top_p=0.5)
+        self.assertNotIn("temperature", k)            # explicit 0 is greedy
+        self.assertIn("top_p=0.5", k)
+
 
 if __name__ == "__main__":
     unittest.main()

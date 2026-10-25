@@ -49,6 +49,9 @@ def test_plan_is_the_minimax_format_and_starts_at_part_one(tmp_path):
     assert cfg["format"] == "minimax_m3"
     assert cfg["model_name"] == "minimax-m3.1-flash"
     assert cfg["drafting"] == "off"
+    # the server's MODEL_CARD_SAMPLING is MiniMax's one source; a Qwen-style sampling block is not copied in
+    assert "sampling" not in cfg
+    assert cfg["arch"] == "minimax_m3"
     assert cfg["args"][cfg["args"].index("--model") + 1].endswith("-00001-of-00013.gguf")
     # the measured arm: the RAM tier on, the VRAM expert slots off (auto starves prefill)
     assert "--minimax-tiers" in cfg["args"]
@@ -168,3 +171,34 @@ def test_no_api_key_on_the_lan_says_what_that_means(tmp_path, capsys):
                         "--access", "lan", "--no-api-key", "--plan"]) == 0
     assert "api_key" not in json.loads(config.read_text(encoding="utf-8"))
     assert "anyone" in capsys.readouterr().out
+
+
+def test_the_config_with_the_lan_key_is_created_owner_only(tmp_path, monkeypatch):
+    """The run settings can hold a LAN API key, so it must never be world-readable.  Capture the open mode and
+    the tightening chmod (works on Windows too, where POSIX modes do not); on POSIX also read the real mode."""
+    import os
+    import stat
+
+    path = tmp_path / "run.json"
+    real_open, opens, chmods = os.open, [], []
+    monkeypatch.setattr(sparsa.os, "open", lambda p, flags, mode=0o777: (
+        opens.append((str(p), flags, mode)), real_open(p, flags, mode))[1])
+    monkeypatch.setattr(sparsa.os, "chmod", lambda p, mode: chmods.append((str(p), mode)))
+    sparsa.write_private_json(path, {"api_key": "sk-test-secret"})
+    assert opens[0][2] == 0o600
+    assert chmods[-1] == (str(path), 0o600)
+    assert json.loads(path.read_text(encoding="utf-8"))["api_key"] == "sk-test-secret"
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_an_existing_config_is_tightened_too(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "run.json"
+    path.write_text("{}", encoding="utf-8")
+    chmods = []
+    real_chmod = os.chmod
+    monkeypatch.setattr(sparsa.os, "chmod", lambda p, mode: (chmods.append((str(p), mode)), real_chmod(p, mode))[1])
+    sparsa.write_private_json(path, {"api_key": "sk-new"})
+    assert (str(path), 0o600) in chmods

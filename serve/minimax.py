@@ -296,7 +296,10 @@ class MiniMaxOutputParser:
     """
 
     def __init__(self, thinking=True, tools=None, stream_tools=False, recover=False, declared_only=False):
-        self.state = 'reasoning' if thinking else 'content'
+        # MiniMax's generation prompt is adaptive: with thinking on, the model may still answer directly. Start in
+        # `start` and let the first real tag decide; a reply that opens with `<mm:think>` is reasoning, one that
+        # opens with anything else (or `</mm:think>`, the template's no-thinking prefix) is content.
+        self.state = 'start' if thinking else 'content'
         self.buf = ''
         self.stream_tools = stream_tools
         self.schemas = {t.get('name') for t in tools or [] if isinstance(t, dict)}
@@ -313,6 +316,23 @@ class MiniMaxOutputParser:
         self.buf = (self.buf + delta).replace(NS, '')
         out: list[Event] = []
         while self.buf:
+            if self.state == 'start':
+                lead = len(self.buf) - len(self.buf.lstrip())
+                tail = self.buf[lead:]
+                if not tail:
+                    break
+                if tail.startswith(THINK_BEGIN):
+                    self.buf = tail[len(THINK_BEGIN):]
+                    self.state = 'reasoning'
+                    continue
+                if tail.startswith(THINK_END):
+                    self.buf = self.buf[:lead] + tail[len(THINK_END):]
+                    self.state = 'content'
+                    continue
+                if THINK_BEGIN.startswith(tail) or THINK_END.startswith(tail):
+                    break                       # a tag split across deltas: wait for the rest
+                self.state = 'content'
+                continue
             if self.state in ('reasoning', 'content'):
                 tags = ((THINK_BEGIN, THINK_END, CALL_START) if self.state == 'reasoning'
                         else (THINK_END, CALL_START))
@@ -356,7 +376,9 @@ class MiniMaxOutputParser:
     def finish(self, reason=None):
         out = self.feed('')
         if self.buf:
-            if self.state in ('reasoning', 'content'):
+            if self.state == 'start':                 # only whitespace, or a tag the reply ended inside
+                out.append(Event('content', self.buf))
+            elif self.state in ('reasoning', 'content'):
                 out.append(Event(self.state, self.buf))
             else:
                 # A length limit or cancel left a partial call: do not expose protocol fragments as text.

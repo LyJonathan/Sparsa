@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -39,20 +40,140 @@ MODEL_NAME = "minimax-m3.1-flash"
 EXPECTED_PARTS = 13
 GGUF_PART = "-00001-of-"
 
-# LyJonathan/MiniMax-M3.1-Flash-GGUF: folder name -> what it is.  Kept here so `download` can name
-# the exact `hf` command without a network call.
-QUANTS = {
-    "iq1-s": ("MiniMax-M3.1-Flash-IQ1_S", "IQ1_S experts; 94.8 GB; Sparsa only; quality not measured"),
-    "iq1-m": ("MiniMax-M3.1-Flash-IQ1_M", "IQ1_M experts; 106.6 GB; top-1 47.1 %"),
-    "iq2-xxs": ("MiniMax-M3.1-Flash-IQ2_XXS", "IQ2_XXS experts; 124.5 GB; quality not measured"),
-    "iq2-kt": ("MiniMax-M3.1-Flash-IQ2_KT", "IQ2_KT experts (ik_llama.cpp's type); 123.8 GB; Sparsa only"),
-    "iq2-xs": ("MiniMax-M3.1-Flash-IQ2_XS", "IQ2_XS experts; 133.1 GB; loads in llama.cpp (patched) and Sparsa"),
-    "iq2-xs-d3": ("MiniMax-M3.1-Flash-IQ2_XS-D3", "IQ2_XS gate/up + IQ3_XXS down; 146.1 GB; measured quality"),
-    "iq2-kl": ("MiniMax-M3.1-Flash-IQ2_KL", "IQ2_KL experts; 152.7 GB; Sparsa only"),
-    "iq3-k": ("MiniMax-M3.1-Flash-IQ3_K", "IQ3_K experts; 191.2 GB; Sparsa only"),
-    "iq4-ks": ("MiniMax-M3.1-Flash-IQ4_KS", "IQ4_KS experts; 233.6 GB; Sparsa only"),
-    "nvfp4": ("MiniMax-M3.1-Flash-NVFP4", "the checkpoint's NVFP4 expert values, lossless; 246.1 GB; Sparsa only"),
-}
+# LyJonathan/MiniMax-M3.1-Flash-GGUF: the published tiers, plus the planned mixed tiers as placeholders.
+# `experts_gb` is the sum of the routed `*_exps` tensors, read from each pack's GGUF headers; `total_gb`
+# is the whole 13-part download (the published README sizes). Both use decimal GB, the unit the README
+# prints. The picker only considers `available` packs, so a placeholder can never be chosen or downloaded
+# before it exists.
+PACKS = (
+    {"key": "iq1-s", "folder": "MiniMax-M3.1-Flash-IQ1_S", "experts_gb": 83.915, "total_gb": 94.786,
+     "about": "IQ1_S experts; Sparsa and llama.cpp (patched); 44.3 % top-1, loops in practice",
+     "available": True},
+    {"key": "iq1-m", "folder": "MiniMax-M3.1-Flash-IQ1_M", "experts_gb": 95.750, "total_gb": 106.620,
+     "about": "IQ1_M experts; 47.1 % top-1", "available": True},
+    {"key": "iq2-kt", "folder": "MiniMax-M3.1-Flash-IQ2_KT", "experts_gb": 110.094, "total_gb": 123.820,
+     "about": "IQ2_KT experts (ik_llama.cpp's type); Sparsa only; 56.3 % top-1", "available": True},
+    {"key": "iq2-xxs", "folder": "MiniMax-M3.1-Flash-IQ2_XXS", "experts_gb": 110.811, "total_gb": 124.537,
+     "about": "IQ2_XXS experts; 52.0 % top-1", "available": True},
+    {"key": "iq2-xs", "folder": "MiniMax-M3.1-Flash-IQ2_XS", "experts_gb": 119.418, "total_gb": 133.143,
+     "about": "IQ2_XS experts; Sparsa and llama.cpp (patched); 46.8 % top-1 on the harder set",
+     "available": True},
+    {"key": "iq2-xs-d3", "folder": "MiniMax-M3.1-Flash-IQ2_XS-D3", "experts_gb": 132.328, "total_gb": 146.054,
+     "about": "IQ2_XS gate/up + IQ3_XXS down; 59.4 % top-1", "available": True},
+    {"key": "iq2-kl", "folder": "MiniMax-M3.1-Flash-IQ2_KL", "experts_gb": 138.963, "total_gb": 152.688,
+     "about": "IQ2_KL experts; Sparsa only; 59.8 % top-1", "available": True},
+    {"key": "iq3-k", "folder": "MiniMax-M3.1-Flash-IQ3_K", "experts_gb": 177.513, "total_gb": 191.239,
+     "about": "IQ3_K experts; Sparsa only; 69.8 % top-1", "available": True},
+    {"key": "iq4-ks", "folder": "MiniMax-M3.1-Flash-IQ4_KS", "experts_gb": 219.830, "total_gb": 233.555,
+     "about": "IQ4_KS experts; Sparsa only; 74.4 % top-1", "available": True},
+    {"key": "nvfp4", "folder": "MiniMax-M3.1-Flash-NVFP4", "experts_gb": 232.381, "total_gb": 246.107,
+     "about": "the checkpoint's NVFP4 expert values; Sparsa only; 77.3 % top-1", "available": True},
+    # Planned, not published: a mixed pack with about 100 GB of experts for a 128 GB machine, and an
+    # IQ1_S-based pack for a 96 GB machine. Kept here so the picker stays data-driven.
+    {"key": "mix-128", "folder": "MiniMax-M3.1-Flash-MIX128", "experts_gb": 100.0, "total_gb": 0.0,
+     "about": "planned mixed ~100 GB-expert pack for 128 GB RAM; not published yet", "available": False},
+    {"key": "iq1-s-96", "folder": "MiniMax-M3.1-Flash-IQ1_S-96", "experts_gb": 84.0, "total_gb": 0.0,
+     "about": "planned IQ1_S-based pack for 96 GB RAM; not published yet", "available": False},
+)
+QUANTS = {p["key"]: (p["folder"], p["about"]) for p in PACKS}
+
+# The rule from the model's GGUF README: the largest pack whose experts fit in RAM with this much to spare.
+RAM_RESERVE_GB = 10.0
+# The mmproj (1.73 GB) and the tokenizer files sit beside the pack; keep room for them on disk.
+DISK_RESERVE_GB = 2.0
+
+
+@dataclass(frozen=True)
+class Machine:
+    """What one machine offers, in the numbers people call them (a 128 GB machine reports 128.0)."""
+    ram_gb: float
+    vram_gb: tuple[float, ...]
+    free_disk_gb: float
+
+    @property
+    def gpu_count(self) -> int:
+        return len(self.vram_gb)
+
+
+def total_ram_gb() -> float:
+    """Installed RAM as the number people call it (128 GB -> 128.0)."""
+    if os.name == "nt":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullTotalPhys / (1 << 30)
+    else:
+        try:
+            return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1 << 30)
+        except (ValueError, OSError):
+            pass
+    return 0.0
+
+
+def gpu_vram_gb() -> tuple[float, ...]:
+    """Each NVIDIA card's total memory in GB, in nvidia-smi's order; empty without a card."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if out.returncode != 0:
+        return ()
+    cards = []
+    for line in out.stdout.splitlines():
+        line = line.strip().split()[0] if line.strip() else ""
+        try:
+            cards.append(float(line) / 1024.0)       # MiB -> GB
+        except ValueError:
+            continue
+    return tuple(cards)
+
+
+def free_disk_gb(path: str | os.PathLike | None = None) -> float:
+    """Free space on the volume `path` is (or will be) on; a folder that does not exist yet uses its parent."""
+    probe = Path(path or Path.cwd()).expanduser()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return shutil.disk_usage(probe).free / (1 << 30)
+    except OSError:
+        return 0.0
+
+
+def machine_specs(path: str | os.PathLike | None = None) -> Machine:
+    return Machine(total_ram_gb(), gpu_vram_gb(), free_disk_gb(path))
+
+
+def choose_pack(machine: Machine, packs=PACKS) -> dict | None:
+    """The largest available pack whose experts fit in RAM with RAM_RESERVE_GB to spare and whose download
+    fits the free disk. A pack missing either test is skipped; None when no published pack fits."""
+    best = None
+    budget = machine.ram_gb - RAM_RESERVE_GB
+    for pack in packs:
+        if not pack.get("available", False):
+            continue
+        if pack["experts_gb"] > budget:
+            continue
+        if pack["total_gb"] + DISK_RESERVE_GB > machine.free_disk_gb:
+            continue
+        if best is None or pack["total_gb"] > best["total_gb"]:
+            best = pack
+    return best
+
+
+def pick_pack(machine: Machine | None = None) -> dict | None:
+    return choose_pack(machine or machine_specs())
+
+
 MMPROJ = "mmproj-MiniMax-M3.1-Flash-F16.gguf"
 HF_REPO = "LyJonathan/MiniMax-M3.1-Flash-GGUF"
 CHECKPOINT = "MiniMaxAI/MiniMax-M3.1-Flash"
@@ -168,8 +289,23 @@ def find_mmproj(model: Path, explicit: str | None) -> Path | None:
 
 
 def build_config(args) -> dict:
-    if not args.model:
-        raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
+    if not args.model or str(args.model).strip().lower() in ("auto", "pick"):
+        machine = machine_specs(args.models_dir)
+        pack = choose_pack(machine)
+        if pack is None:
+            raise SystemExit(
+                f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
+                f"{machine.free_disk_gb:.0f} GB free disk) with {RAM_RESERVE_GB:.0f} GB of RAM to spare.\n"
+                "        `python sparsa.py pick` shows the published tiers and what they need.")
+        models_dir = Path(args.models_dir or Path.cwd() / "models").expanduser()
+        folder = models_dir / pack["folder"]
+        if not folder.is_dir():
+            raise SystemExit(
+                f"sparsa: this machine picks {pack['key']} ({pack['about']}), but {folder} is not downloaded.\n"
+                f"        python sparsa.py download {pack['key']} --dir {models_dir}")
+        say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM "
+            f"({pack['experts_gb']:.1f} GB of experts, {machine.gpu_count} GPU(s)): {folder}")
+        args.model = str(folder)
     first, parts = find_model_guf(args.model)
     engine = find_engine(args.engine)
     tokenizer = find_tokenizer(first, args.tokenizer)
@@ -228,7 +364,8 @@ def build_config(args) -> dict:
         "model_name": MODEL_NAME,
         "format": "minimax_m3",
         "arch": "minimax_m3",
-        "sampling": {"temperature": 1.0, "top_p": 0.95},
+        # Deliberately no `sampling` block: serve/server.py's MODEL_CARD_SAMPLING is the one source of
+        # MiniMax's published defaults, and a request's own fields still win over it.
         "log": str(log),
         "port": args.port,
         "drafting": "off",
@@ -263,6 +400,29 @@ def prepare_libs(engine: Path) -> None:
         os.environ["LD_LIBRARY_PATH"] = folder + ((os.pathsep + current) if current else "")
 
 
+def write_private_json(path: Path, data: dict) -> None:
+    """Write the run settings owner-only: the file can hold a LAN API key. `os.open` creates it with 0600
+    (before any bytes are written), and the chmod tightens a file left by an older version. Windows does not
+    have POSIX modes; the user profile is already private there, so a chmod failure is ignored."""
+    path = Path(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(data, indent=1) + "\n")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def cmd_serve(args) -> int:
     from strata_cli.launch import access as access_mod
 
@@ -290,7 +450,7 @@ def cmd_serve(args) -> int:
             key = key or access_mod.new_key()
             cfg["api_key"] = key
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
+    write_private_json(config_path, cfg)
     say(f"sparsa: run settings written to {config_path}")
     say(f"sparsa: engine {cfg['exe']}")
     say(f"sparsa: tokenizer {cfg['tokenizer']}")
@@ -329,7 +489,43 @@ def cmd_inspect(args) -> int:
     return subprocess.call(command, cwd=ROOT)
 
 
+def cmd_pick(args) -> int:
+    machine = machine_specs(args.models_dir)
+    pack = choose_pack(machine)
+    if args.json:
+        say(json.dumps({"machine": {"ram_gb": machine.ram_gb, "vram_gb": list(machine.vram_gb),
+                                    "free_disk_gb": machine.free_disk_gb},
+                        "pack": pack}, indent=2))
+        return 0
+    say(f"sparsa: {machine.ram_gb:.0f} GB RAM, {machine.gpu_count} GPU(s) "
+        f"({', '.join(f'{x:.0f} GB' for x in machine.vram_gb) or 'none'}), "
+        f"{machine.free_disk_gb:.0f} GB free disk")
+    say(f"sparsa: experts budget {machine.ram_gb - RAM_RESERVE_GB:.1f} GB "
+        f"(RAM minus {RAM_RESERVE_GB:.0f} GB to spare)")
+    for p in PACKS:
+        fits = p["experts_gb"] <= machine.ram_gb - RAM_RESERVE_GB
+        disk = p["total_gb"] + DISK_RESERVE_GB <= machine.free_disk_gb
+        state = "published" if p["available"] else "NOT PUBLISHED"
+        mark = "  <- pick" if pack is not None and p["key"] == pack["key"] else ""
+        say(f"  {p['key']:<10} experts {p['experts_gb']:7.1f} GB  pack {p['total_gb']:7.1f} GB  "
+            f"{'RAM ok' if fits else 'too big for RAM'}, {'disk ok' if disk else 'too big for disk'}  "
+            f"{state}{mark}")
+    if pack is None:
+        say("sparsa: no published pack fits this machine")
+    return 0
+
+
 def cmd_download(args) -> int:
+    if args.what is None:
+        machine = machine_specs(args.dir)
+        pack = choose_pack(machine)
+        if pack is None:
+            raise SystemExit(f"sparsa: no published pack fits this machine ({machine.ram_gb:.0f} GB RAM, "
+                             f"{machine.free_disk_gb:.0f} GB free disk); `python sparsa.py pick` lists the tiers")
+        say(f"sparsa: picked {pack['key']} for {machine.ram_gb:.0f} GB RAM: {pack['about']}")
+        args.what = pack["key"]
+    if args.what in QUANTS and not next(p for p in PACKS if p["key"] == args.what)["available"]:
+        raise SystemExit(f"sparsa: {args.what} is planned but not published yet; nothing to download")
     if args.what == "tokenizer":
         target = Path(args.dir).expanduser()
         target.mkdir(parents=True, exist_ok=True)
@@ -395,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="serve on the LAN without a key (anyone who can reach the port can use the model)")
         p.add_argument("--show-key", action="store_true", help="print the saved LAN API key and exit")
         p.add_argument("--plan", action="store_true", help="write/print the run settings and start nothing")
+        p.add_argument("--models-dir", help="where auto-picked packs live (default: ./models)")
         p.add_argument("--config", default=str(ROOT / "sparsa-minimax.json"), help="where the run settings go")
         p.add_argument("--log", help="engine log (default: the config's name with .log)")
         return p
@@ -407,12 +604,20 @@ def main(argv: list[str] | None = None) -> int:
     ins.add_argument("--engine")
 
     dl = sp.add_parser("download", help="download one quant folder, the tokenizer files, or the mmproj")
-    dl.add_argument("what", choices=[*QUANTS, "tokenizer", "mmproj"])
-    dl.add_argument("--dir", required=True, help="where the files go")
+    dl.add_argument("what", nargs="?", choices=[*QUANTS, "tokenizer", "mmproj"],
+                    help="what to download (omit it to pick the largest pack that fits this machine)")
+    dl.add_argument("--dir", default="models", help="where the files go (default: ./models)")
     dl.add_argument("--print-only", action="store_true", help="only print the command")
 
+    pick = sp.add_parser("pick", help="show this machine's specs and the pack it would pick")
+    pick.add_argument("--models-dir", help="where downloaded packs live (default: ./models)")
+    pick.add_argument("--json", action="store_true", help="print JSON")
+
     args = ap.parse_args(argv)
-    return {"serve": cmd_serve, "plan": cmd_plan, "inspect": cmd_inspect, "download": cmd_download}[args.command](args)
+    if not hasattr(args, "models_dir"):
+        args.models_dir = None
+    return {"serve": cmd_serve, "plan": cmd_plan, "inspect": cmd_inspect, "download": cmd_download,
+            "pick": cmd_pick}[args.command](args)
 
 
 if __name__ == "__main__":
