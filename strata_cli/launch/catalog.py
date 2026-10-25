@@ -382,7 +382,12 @@ class Catalog:
                 return int(mac.recommend_context(float(hw["ram_gb"])))
         usable = [g for g in hw.get("gpus") or [] if g.get("usable", True)]
         vram = max((float(g.get("vram_gb") or 0) for g in usable), default=12.0)
-        rec = 32768 if vram < 14 else 65536 if vram < 20 else 131072
+        # A 12 GB card pays for its context in expert slots, not in attention: the KV is f16 and per layer per
+        # device, so 32 K of it is 4.2 GiB of VRAM on the two cards and it moves the binding card's expert cache
+        # from 10/6 slots a layer at ctx 88 to 6/2 (measured, see tools/minimax/README.md P13). 16 K halves that
+        # and costs 2 slots of cache nothing; a conversation that needs more passes --max-context (or the
+        # dashboard's context control) and pays for it.
+        rec = 16384 if vram < 14 else 65536 if vram < 20 else 131072
         if usable and all(g.get("vendor") == "intel" for g in usable):
             rec = 8192 if vram < 10 else 16384 if vram < 20 else 32768       # an Arc keeps the session and the experts in the same memory
         mod = self.strata.setup_module()
@@ -390,7 +395,7 @@ class Catalog:
         if mod is not None and models[model].get("budget"):
             try:
                 if mod.unsloth_budget(model, hw.get("ram_gb") or 0.0):
-                    rec = 8192 if vram < 14 else 32768
+                    rec = 8192 if vram < 14 else 16384 if vram < 20 else 32768
             except Exception:                                  # noqa: BLE001
                 pass
         if mod is not None and hasattr(mod, "ram_ctx") and hw.get("ram_gb"):

@@ -1515,13 +1515,27 @@ and `L.vram.size() == 0`, so the allocation, the profile fill and the RAM split 
 
 | arm | max abs | KL | top1 | |
 | --- | ---: | ---: | ---: | --- |
-| all CPU (`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`) | **0.0** | 0.0 | 1.000 | identical |
-| tiers with an explicit uniform count (`--minimax-vram-slots-per-layer 4`) | **0.0** | 0.0 | 1.000 | identical |
-| tiers auto, one GPU (the placement is unchanged, so this is also 0.0) | 0.0 | 0.0 | 1.000 | identical |
+| all CPU (`--minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128`), 2 GPUs | **0.0** | 0.0 | 1.000 | identical |
+| tiers, explicit uniform count (`--minimax-vram-slots-per-layer 4`), 1 GPU | **0.0** | 0.0 | 1.000 | identical |
+| tiers, explicit uniform count 4, 2 GPUs | **0.0** | 0.0 | 1.000 | identical |
+| tiers auto, 1 GPU (one card, so the placement is the same as the old rule) | 0.0 | 0.0 | 1.000 | identical |
+| **tiers auto, 2 GPUs: old 6/6 against new 10/6** | 9.48e-01 | 2.57e-03 | 0.969 | DIFFERS |
+| control: new auto (10/6) against new all-CPU, same binary | 9.83e-01 | 4.66e-03 | 0.938 | DIFFERS |
 
-A two-arm control with *different* arguments on the same path reads KL 5.25e-03 / top-1 0.906, so the harness
-detects a difference when there is one.  With `--gpus 0,1` the auto placement differs by design (more slots on the
-roomier card), which is the P3 tier's documented non-bit-identity, not a regression.
+Two-arm controls with *different* arguments on the same path read KL 5.25e-03 / top-1 0.906, so the harness detects
+a difference when there is one.
+
+**Why the last two rows are not 0.0, and why that is the tier's existing property rather than this change.** Only
+the placement moves between the last two arms - same binary, same flags but `--minimax-vram-slots-per-layer 0` -
+and it still differs, so the *VRAM expert kernel is not bit-identical to the CPU one*. That is the P3 tier's
+documented behaviour and it is known: the device iq kernels quantize the activation with `q8_1` while the CPU path
+uses ggml's `Q8_K` (the synthetic-file gate in the P3 section records the same cause at max-abs 2.1e-2). So
+**no gate can be 0.0 across a slot-count change**; the question a slot change has to pass is KL. On the slice,
+moving to the larger per-device cache reads **KL 2.57e-03 and top-1 0.969**, against the P7b decision rule
+(top-1 drop <= 1 point *for a routing change* and KL increase <= 0.02); the top-1 drop is bigger because a
+sixth of the routes change *kernel*, not their expert. A larger VRAM cache is therefore a small numeric change
+traded for speed, exactly like any other slot count: the tiers have never been bit-identical and the flag that
+makes them so is `--minimax-vram-slots-per-layer 0`.
 
 ### Rejected: Project Maya's 20 ms pool spin (`--minimax-pool-spin-us`)
 
@@ -1546,3 +1560,19 @@ never approached. `ggml_vec_dot_iq2_xs_q8_K` asserts `nrc == 1`, and Strata's AV
 at one token (P5c), so the remaining bit-identical headroom is the SMT sibling - which the A/B above says is not
 worth taking. Project Maya's GLM lane does the *same* arithmetic at one token; its advantage there is a per-expert
 `[gate|up|down]` blob and a ~48-piece job split, neither of which changes the inner loop.
+
+### The context default is 16 K (launcher plan and the engine's unasked default)
+
+The KV is f16 and it is allocated for the whole context **per layer per device**, so it comes straight out of the
+binding card's expert slots. Measured with the new `INFO minimax-vram-slots` line on the full pack:
+
+| context | KV (f16) | slots/layer device 0 | device 1 |
+| ---: | ---: | ---: | ---: |
+| 88 | 0.01 GiB | 10 | 6 |
+| 8 192 | 1.05 GiB | 9 | 5 |
+| **16 384** | 2.11 GiB | **8** | **4** |
+| 32 768 | 4.22 GiB | 6 | 2 |
+
+`strata_cli/launch/catalog.py::max_context` recommended 32 K for a card under 14 GB and the engine capped an
+unasked context at 32 K; both are 16 K now, and `--max-context` (or the dashboard's context control) still raises
+it. The trade is explicit: +2 slots a layer on the binding card for a conversation that does not need 32 K.

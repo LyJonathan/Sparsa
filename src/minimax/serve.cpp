@@ -845,8 +845,12 @@ int run(int argc, char** argv) {
         return 0;
     }
 
-    // An unasked context stays at most 32k. --max-context is what raises it, still clamped to the model.
-    constexpr int64_t kUnaskedContext = 32768;
+    // An unasked context stays at most 16k. --max-context is what raises it, still clamped to the model.  32 K of
+    // f16 KV is 4.2 GiB on this box and it is allocated per layer per device, so it is taken straight out of the
+    // expert slots on the binding card (measured: 10/6 slots a layer at ctx 88, 6/2 at 32 K - see
+    // tools/minimax/README.md P13).  16 K halves that for conversations that do not need it, which is the common
+    // case for a model whose experts are already split between VRAM, RAM and the drive.
+    constexpr int64_t kUnaskedContext = 16384;
     int64_t ctx = meta.config.context;
     if (ctx_asked > 0) ctx = (std::min)(ctx, ctx_asked);
     else ctx = (std::min)(ctx, kUnaskedContext);
