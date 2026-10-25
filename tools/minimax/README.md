@@ -1617,3 +1617,37 @@ The assembled file passes a structural read (`1188` tensors, per-layer types as 
 at the last tensor: the source is a 13-shard pack whose `split.no`/`split.count`/`split.tensors.count` keys are
 `u16`/`i32` and describe 13 shards, and a single-file output has to drop them (or be written as 13 shards). That is
 the next step, with the G3 six-prompt gate, before the mix is a default or even a documented recipe.
+
+## The shared PC: `tools/minimax/pc_launch.py`
+
+The PC runs one memory-hungry job at a time (`pc-engine.lock`, `E:\Jon's Projects\AI\Strata Fork Minimax\`). Two
+out-of-memory crashes showed that a written rule is not enough, so this launcher makes the rule mechanical. Every
+engine run - a bench, a gate, a g3 pass - goes through it:
+
+```
+python tools/minimax/pc_launch.py --owner dspark --est-ram-gb 86 -- \
+    build/strata-minimax.exe --model <model.gguf> --serve ...
+```
+
+1. **The lock.** Plain ASCII, no BOM, `free` when unused, else `<owner> <pid> <iso-time>`; a bare name with no PID
+   (an older task's hand-written lock) counts as held. It refuses when another owner holds it with a live PID, says so
+   when the PID is stale and takes over, and takes it atomically (an `O_EXCL` sidecar `.lck` is the mutex, and the
+   lock itself is written to a temp file and renamed). A stale sidecar older than a minute is recovered, so a
+   crashed launcher cannot wedge the PC.
+2. **The RAM floor.** Available RAM comes from `GlobalMemoryStatusEx` through ctypes (no PowerShell), and the run's
+   need from `--est-ram-gb` or from the engine's own flags (`estimate_ram_gb`: pinned expert tier, dense host copy,
+   KV, prompt workspace, margin - the breakdown is printed). It refuses to start when `available - need < 10 GB`.
+3. **The watchdog.** Every 2 s, if available RAM falls under the floor, the child's whole process tree is stopped and
+   the launcher exits 4 with the reading that triggered it.
+4. **The release.** `try/finally` plus SIGINT/SIGTERM/SIGBREAK handlers put the lock back to `free`: a clean exit, a
+   child crash, Ctrl-C/Ctrl-Break and a watchdog kill all release.
+
+Exit codes: the child's own, `2` another owner holds the lock, `3` not enough RAM, `4` the watchdog stopped the run,
+`5` the lock mutex timed out, `130` interrupted. stdout and stderr are the child's (the launcher's lines are prefixed
+`[pc_launch]` on stderr) and stdin is inherited, so an engine's `GEN` protocol works unchanged.
+
+`tools/minimax/test_pc_launch.py` covers the protocol with no engine: take/release (`free` is exactly four bytes),
+the lock line's owner/pid/time and no BOM, a live owner refused, a stale PID taken over, a bare name refused, the RAM
+refusal, the estimate from engine flags, the watchdog (a scripted `--ram-source seq:20,20,3` reading, so the decision
+and the kill are exercised without eating the box), stdin passthrough, the child's exit code, two launchers where one
+wins, and the interrupt release.
