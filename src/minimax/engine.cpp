@@ -918,6 +918,8 @@ struct Engine::Impl {
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
     DevPtr pf_q32, pf_iq32;      // P13: the exact window's f32 queries (the token path's attention reads f32)
+    DevPtr win_xq;               // P13: the window's q8_1 activations, sized for the widest matrix it projects
+    size_t win_xq_bytes = 0;
     size_t pf_q32_bytes = 0, pf_iq32_bytes = 0;
     std::vector<float> pf_att_h;   // P7: device attention output when the layer's projection is on the CPU
     std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
@@ -4927,9 +4929,12 @@ struct Engine::Impl {
             std::fprintf(stderr,
                          "INFO minimax-prefill-dense=f16 (the down GEMM's activation is fp16; measured KL 1.7e-3 "
                          "against f32 on the real slice, +9%% prefill)\n");
-        if (dump_on) {
+        // The parity dump used to force the per-token path.  P13's identity gate needs the opposite: the SAME dump
+        // keys from the batched path so the two can be diffed stage by stage (STRATA_DUMP_BATCH=1 opts in).
+        static const bool dump_batch = std::getenv("STRATA_DUMP_BATCH") != nullptr;
+        if (dump_on && !dump_batch) {
             std::fprintf(stderr, "strata-minimax: --minimax-prefill-batch is off because the parity dump needs the "
-                                 "per-token path\n");
+                                 "per-token path (STRATA_DUMP_BATCH=1 keeps it on for the window diff)\n");
             return;
         }
         batch_cap = opt.prefill_batch;
@@ -5436,13 +5441,21 @@ struct Engine::Impl {
         if (!on) return false;
         if (T < 1 || T > 8) return false;
         if (!t.gpu || !t.dev.p || t.dev_f32 || !mmvq_dense_fits(t.type, t.ne0)) return false;
-        if (pf.empty() || !P().xq) return false;
         const int64_t K = t.ne0;
-        if ((size_t)T * (size_t)(K / 32) * 36 > (size_t)rows_cap * q8_1_bytes(cfg.n_embd)) return false;
-        strata::kernels::quantize_q8_1_rows(X, T, (int)K, P().xq, cu::stream_legacy());
+        // its own q8_1 buffer, sized for the widest matrix the window projects (the o_proj is qlen wide, the dense
+        // FFN's down matrix n_ff): the prompt workspace's one is only as wide as the hidden state
+        const size_t need = (size_t)T * (size_t)(K / 32) * 36 + 64;
+        if (!win_xq.p || win_xq_bytes < need) {
+            win_xq = DevPtr(cu::alloc(need));
+            win_xq_bytes = need;
+        }
+        // `quantize_q8_1_rows` is the token path's quantizer, and the multi-column kernel keeps its per-column
+        // layout bitwise equal to one column (native_mmvq_set_multi_exact, the default) - the dump gate in
+        // docs/P13_DSPARK.md checks that per stage.
+        strata::kernels::quantize_q8_1_rows(X, T, (int)K, win_xq.p, cu::stream_legacy());
         const int64_t N = nrows > 0 ? nrows : t.ne1;
         const void* w = (const uint8_t*)t.dev.p + (size_t)row0 * t.row_bytes;
-        strata::kernels::native_mmvq(t.type, w, P().xq, Y, (int)K, (int)N, T, cu::stream_legacy());
+        strata::kernels::native_mmvq(t.type, w, win_xq.p, Y, (int)K, (int)N, T, cu::stream_legacy());
         return true;
     }
 
@@ -6021,6 +6034,12 @@ struct Engine::Impl {
         std::vector<int> ids;
         std::vector<float> wts;
         pf_routes(L, logits.data(), T, ids, wts);
+        if (dumping((int64_t)(&L - layers.data()))) {
+            const int64_t li = (int64_t)(&L - layers.data());
+            dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/router_logits", logits.data(), nexp);
+            dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/router_weights_batch",
+                     wts.data(), (int)((size_t)T * (size_t)top));
+        }
         std::fill(yout, yout + (size_t)T * embd, 0.f);
         // the routed experts' outputs per (token, route), so the final sum can follow `moe()`'s order
         std::vector<float> per_route;
@@ -6460,6 +6479,13 @@ struct Engine::Impl {
             PfBuf& p = pf.empty() ? p_dummy : P();
             // ---- attention block
             const auto ta0 = pfclock::now();
+            // P13: the dump probe of a window's FIRST row, under the token path's own keys, so the two paths can be
+            // compared stage by stage (docs/P13_DSPARK.md, the same-placement identity gate).
+            const bool wdump = dumping(li) && pos0 == 0;
+            if (wdump) {
+                const std::string wpfx = "L" + std::to_string(src_layer[(size_t)li]);
+                dbuf_put(wpfx + "/residual_in", pf_h.data(), ne);
+            }
             if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && !ds_tap_out) {
                 const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
                 for (int t = t0; t < T; ++t)
@@ -6468,6 +6494,7 @@ struct Engine::Impl {
             for (int t = 0; t < T; ++t)
                 rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
             const float* hq = pf_q.data();   // [T][ne] normed input
+            if (wdump) dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_input", hq, ne);
             const auto ta1 = pfclock::now();
             // P5c: with the fused device path the projections never come back to the host: norm+rope runs on
             // the device and writes fp16 straight into the KV cache (and the MSA query buffer).
@@ -6631,6 +6658,12 @@ struct Engine::Impl {
                 // P13: the token path's attention, one row at a time: the same block selection, the same gather and
                 // the same MSA kernel that a lone token goes through, so the window's attention is its arithmetic.
                 cu::sync();
+                if (wdump) {
+                    // the window's own q after norm+rope (row 0) under the token path's key
+                    std::vector<float> q0((size_t)qlen);
+                    cu::copy_d2h(q0.data(), pf_q32.p, (size_t)qlen * sizeof(float));
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/q_after_rope", q0.data(), (int)qlen);
+                }
                 const int64_t ilen_row = (int64_t)HI * cfg.idx_dim;
                 for (int t = 0; t < T; ++t) {
                     const float* qd = (const float*)pf_q32.p + (size_t)t * (size_t)qlen;
@@ -6651,6 +6684,12 @@ struct Engine::Impl {
                         gemm_gpu(L.wo, p.a16, p.p32, p.y32, T, ne);
                     }
                     cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
+                }
+                if (wdump) {
+                    std::vector<float> core((size_t)qlen);
+                    cu::copy_d2h(core.data(), p.p32, (size_t)qlen * sizeof(float));
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_core_out", core.data(), (int)qlen);
+                    dbuf_put("L" + std::to_string(src_layer[(size_t)li]) + "/attn_out", pf_moe_h.data(), ne);
                 }
             } else if (dev_attn) {
                 // Device attention: block scores on the device, top-k on the host (as the decode path does).
@@ -6772,6 +6811,11 @@ struct Engine::Impl {
             }
             for (int t = 0; t < T; ++t)
                 for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
+            if (wdump) {
+                const std::string wpfx = "L" + std::to_string(src_layer[(size_t)li]);
+                dbuf_put(wpfx + "/moe_out", pf_moe_h.data(), ne);
+                dbuf_put(wpfx + "/layer_out", pf_h.data(), ne);
+            }
             if (!ds_tap.empty() && ds_slot[(size_t)li] >= 0 && ds_tap_out) {
                 const int t0 = T > ds_cap ? T - (int)ds_cap : 0;
                 for (int t = t0; t < T; ++t)
