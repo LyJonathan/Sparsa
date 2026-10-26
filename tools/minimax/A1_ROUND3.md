@@ -101,33 +101,29 @@ three tok/s per arm is the number.
 
 ## 4. The gates
 
-Status after the third PC turn (54000 MiB, one lock, 38.5 min):
+**Held-out set: COMPLETE for both packs (14/14 prompts, 1,792 positions each, 54,000 MiB, one turn
+apiece).**
 
-**D3 on the held-out set: COMPLETE, 14/14 prompts.**  1,792 positions, top-1 **53.46%**, KL64
-**1.4999**.  The long prompt (`long_science_darwin`, 3,034 tokens) costs one full turn on its own at
-this tier; its row is 128 positions, top-1 80.47%, KL64 0.5209.
+```
+held-out   D3   1792 pos   top-1 53.46%   KL64 1.4999
+held-out   C1   1792 pos   top-1 53.85%   KL64 1.4138
+C1 - D3                   +0.39 pts        -0.0861
+```
 
-**C1 on the held-out set: 7 of 14 prompts** (896 positions), top-1 50.78%, KL64 1.5688.  The turn's
-clock cut it at `math_probability_urn`; the seven dumps that finished are complete and the rest resume.
+C1 is **+0.39 points ahead** of D3 with a lower mean KL64 (-0.086).  That is **outside** the 0.3-point
+band on the D3-positive side, so the band's "rerun on more tokens" rule does not apply: the held-out
+gate is passed on top-1, and the KL agrees.  (The six-prompt set at 679 positions had C1 at -0.29, i.e.
+inside the band; the 1,246-position run is the more-tokens answer for that set and is still outstanding.)
 
-On the **seven prompts both packs have** (same settings, 54000 MiB):
+**Six-prompt, 1,246 positions: 3 of 6 D3 dumps done, C1 not started.**  The turn's deadline cut the D3
+arm at `multi_turn_threads`; the reference (`_local/ref_out/logits_long`) and the dumps are reusable, but
+the gate needs both arms in ONE session, so the next turn reruns both arms (`arm_session --arms
+"d3:;c1:@.../cand_c1.gguf" --ref .../logits_long`, ~2 min per prompt per arm).
 
-| pack | positions | top-1 | KL64 |
-|---|---:|---:|---:|
-| D3 | 896 | 49.22% | 1.6463 |
-| C1 | 896 | **50.78%** | **1.5688** |
-| C1 - D3 | | **+1.56 pts** | **-0.0775** |
+Turn accounting: 39.4 min wall.  C1's six shorts took 14.0 min, its long prompt 13.3 min (the same
+prompt cost D3 18 min), leaving 11.7 min for the six-prompt arm.  Peak working set 64.2 GiB; WSL held
+15.1 GB and was not touched.
 
-C1 is **ahead** of D3 on this subset by 1.56 points of top-1 with the mean KL64 lower by 0.078.  That is
-inside the 0.3-point band the gate allows, and it is on the D3-positive side, so the "within 0.3 -> more
-tokens + KL" rule applies with the more-tokens run still outstanding.  This is a 7-prompt subset, not
-the full held-out set: the remaining 7 prompts (6 short + the long one) have to finish before the
-held-out gate line is final.
-
-The pinned budget is neutral, measured: `code_lru` logits are byte-identical at 600 and 60,000 MiB
-(SHA-256 of the .npy files equal).  54,000 MiB is the tier for this turn's runs; D3's earlier dumps were
-made at 600/60,000, which that check covers.  Peak working set at 54,000 MiB: 64.2 GiB.  WSL held 9.8 GB
-throughout and was not touched.
 
 
 
@@ -258,6 +254,9 @@ instead of 679, so the six-prompt gate can be run on nearly twice the tokens wit
 * turn 3: **38.5 min wall**, one lock at 54,000 MiB: D3's two missing held-out prompts (all 14 now
   complete), then C1's first 7 held-out prompts; the driver's 39-minute deadline stopped C1 cleanly at
   `math_probability_urn` with its dumps kept.  Peak working set 64.2 GiB, WSL 9.8 GB untouched.
+* turn 4: **39.4 min wall**, 54,000 MiB: C1's six remaining held-out prompts (14.0 min) and its long
+  prompt (13.3 min) - the held-out set is complete for both packs - then the six-prompt 1,246-position
+  arm, which the clock cut after 11.7 min with 3 of 6 D3 dumps done.  Peak 64.2 GiB, WSL 15.1 GB.
 * held-out D3 scoring of the 12 complete dumps: seconds, no engine.
 
 
