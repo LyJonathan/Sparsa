@@ -115,10 +115,66 @@ band on the D3-positive side, so the band's "rerun on more tokens" rule does not
 gate is passed on top-1, and the KL agrees.  (The six-prompt set at 679 positions had C1 at -0.29, i.e.
 inside the band; the 1,246-position run is the more-tokens answer for that set and is still outstanding.)
 
-**Six-prompt, 1,246 positions: 3 of 6 D3 dumps done, C1 not started.**  The turn's deadline cut the D3
-arm at `multi_turn_threads`; the reference (`_local/ref_out/logits_long`) and the dumps are reusable, but
-the gate needs both arms in ONE session, so the next turn reruns both arms (`arm_session --arms
-"d3:;c1:@.../cand_c1.gguf" --ref .../logits_long`, ~2 min per prompt per arm).
+**Six-prompt, 1,246 positions: COMPLETE, both packs in one session** (`arm_session`, 600 MiB, the same
+tier the 679-position gate used).
+
+```
+six-prompt  D3   1246 pos   top-1 56.10%   KL64 1.1186
+six-prompt  C1   1246 pos   top-1 54.90%   KL64 1.1245
+C1 - D3                    -1.20 pts        +0.0059
+```
+
+**C1 trails D3 by 1.20 points on the longer six-prompt set** - outside the 0.3-point band on the negative
+side, so the gate's "more tokens" rule has done its job and the answer is negative: the 679-position
+-0.29 was not noise, it grows to -1.20 when the earlier positions of each prompt are scored.  The A1 gate
+(>= D3 on both sets) therefore **fails on the six-prompt set** even though it passes on the held-out set.
+
+Two attempts at 54,000 and 33,856 MiB were stopped by the launcher's watchdog: WSL held 32-34 GB and a
+21.4 GB dirty-page spike took effective RAM to 6.9 GB, under the 10 GB floor.  The completed run is at
+600 MiB (all-SSD, peak 12.1 GiB), which is also the exact tier of the 679-position line, so those two
+lines are comparable settings as well as budgets (the budget itself is proven logit-neutral).
+
+### Conditioned top-1 (PR #47's slices), per pack
+
+`top1` is against the true next token; `ref` is agreement with the reference's argmax; on-path counts
+positions where the reference itself picks the true token.
+
+**Held-out, 1,792 positions:**
+
+| slice | n | D3 top-1 | C1 top-1 | delta |
+|---|---:|---:|---:|---:|
+| all positions (gate) | 1792 | 53.46% | 53.85% | +0.39 |
+| on reference's greedy path | 550 | 78.18% | 78.91% | +0.73 |
+| on path, ref p>=0.90 | 308 | **92.21%** | **90.58%** | **-1.63** |
+| ref p>=0.99 | 215 | 83.72% | 83.26% | -0.46 |
+| ref p>=0.99 (agreement w/ ref) | 215 | 90.70% | 92.09% | +1.39 |
+
+**Six-prompt, 1,246 positions:**
+
+| slice | n | D3 | C1 | delta |
+|---|---:|---:|---:|---:|
+| all positions (gate) | 1246 | 56.10% | 54.90% | -1.20 |
+| on reference's greedy path | 241 | 83.82% | 83.40% | -0.42 |
+| on path, ref p>=0.90 | 143 | **96.50%** | **95.10%** | **-1.40** |
+| ref p>=0.99 | 138 | 73.91% | 74.64% | +0.73 |
+| ref p>=0.99 (agreement w/ ref) | 138 | 91.30% | 92.75% | +1.45 |
+
+**Six-prompt, the earlier 679 positions (re-scored with the same code):**
+
+| slice | n | D3 | C1 | delta |
+|---|---:|---:|---:|---:|
+| all positions | 679 | 58.32% | 58.03% | -0.29 |
+| on reference's greedy path | 188 | 83.51% | 81.38% | -2.13 |
+| on path, ref p>=0.90 | 109 | **95.41%** | **93.58%** | **-1.83** |
+| ref p>=0.99 | 103 | 73.79% | 73.79% | 0.00 |
+| ref p>=0.99 (agreement w/ ref) | 103 | 89.32% | 92.23% | +2.91 |
+
+The pattern is the same on all three sets: C1 is roughly level with D3 on the open-ended positions and on
+the reference's greedy path, but **1.4-1.8 points behind on the confident on-path slice** - the slice a
+generation harness scores - while it is *better* at reproducing the reference's own confident picks
+(ref p>=0.99 agreement +1.4 to +2.9).  So the 8.61 GB C1 saves cost exactly the tokens a generation loop
+would emit most confidently; that is the number a "does A1 ship" decision has to be made on.
+
 
 Turn accounting: 39.4 min wall.  C1's six shorts took 14.0 min, its long prompt 13.3 min (the same
 prompt cost D3 18 min), leaving 11.7 min for the six-prompt arm.  Peak working set 64.2 GiB; WSL held
@@ -257,6 +313,10 @@ instead of 679, so the six-prompt gate can be run on nearly twice the tokens wit
 * turn 4: **39.4 min wall**, 54,000 MiB: C1's six remaining held-out prompts (14.0 min) and its long
   prompt (13.3 min) - the held-out set is complete for both packs - then the six-prompt 1,246-position
   arm, which the clock cut after 11.7 min with 3 of 6 D3 dumps done.  Peak 64.2 GiB, WSL 15.1 GB.
+* turn 5: **~39 min wall**.  Two six-prompt attempts at 54,000 and 33,856 MiB were stopped by the
+  watchdog (WSL 32-34 GB plus a 21.4 GB dirty-page spike -> 6.9 GB effective).  The same session at
+  600 MiB (all-SSD) completed both arms: D3 12.6 min, C1 19.4 min.  Peak 12.1 GiB; WSL 34.3 GB.
 * held-out D3 scoring of the 12 complete dumps: seconds, no engine.
+* conditioned-metric re-scores of the 679 and held-out dumps with PR #47's g3: seconds, no engine.
 
 

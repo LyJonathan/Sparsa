@@ -68,7 +68,45 @@ def test_self_consistent(ref_dir, name, logits, ids):
     assert abs(r["nll_true_ref"] - r["nll_true_quant"]) < 1e-12, name
     assert abs(r["nll_true_ref"] - REF_NLL[name]) < 1e-5, (name, r["nll_true_ref"], REF_NLL[name])
     assert abs(r["top1_acc_vs_true_ref"] - REF_TOP1[name]) < 1e-5, (name, r["top1_acc_vs_true_ref"])
+    # Feeding the reference back in must also agree with it on every conditioned slice, and be a perfect top-1
+    # on the two on-path slices (there the reference's argmax is the true token).  conf99 may include confident
+    # reference errors, so only its agreement is 1.0.  This pins the slice masks: a threshold applied to the
+    # wrong array would not be 100% here.
+    for key, s in r["conditioned"].items():
+        if s["n"]:
+            assert s["top1_agreement"] == 1.0, (name, key, s)
+            if key != "conf99":
+                assert s["top1"] == 1.0, (name, key, s)
     return r
+
+
+def test_conditioned_slices():
+    """Synthetic logits: the three slices count and score the rows they say they do."""
+    vocab, n = 6, 6
+    ids = np.array([100, 100, 1, 2, 3, 4, 5], dtype=np.int64)  # start=1; rows 0..4 predict ids[2..6]
+    ref = np.full((n, vocab), -12.0, dtype=np.float64)
+    q = np.full((n, vocab), -12.0, dtype=np.float64)
+
+    ref[0, 1] = 12.0; q[0, 1] = 12.0            # on path, p ~ 1.0, quant hits
+    ref[1, 2] = 3.2; ref[1, 0] = -1.0; q[1, 2] = 3.2        # on path, p ~ 0.985, quant hits
+    ref[2, 3] = 1.001; ref[2, 0] = 1.0; q[2, 0] = 1.001     # on path, p ~ 0.50, quant misses
+    ref[3, 0] = 12.0; q[3, 0] = 12.0            # OFF path (true is 4), p ~ 1.0, confident reference error
+    ref[4, 0] = 1.001; ref[4, 2] = 1.0; q[4, 2] = 1.001     # off path, p ~ 0.50, quant misses
+    q[5, 5] = 1.0                                # last row has no target and must not be counted
+
+    c = G.conditioned_slices(ref, q, ids)
+    assert c["on_path"]["n"] == 3, c
+    assert abs(c["on_path"]["top1"] - 2 / 3) < 1e-12, c
+    assert c["on_path_conf90"]["n"] == 2, c
+    assert c["on_path_conf90"]["top1"] == 1.0, c
+    assert c["conf99"]["n"] == 2, c
+    assert c["conf99"]["top1"] == 0.5, c          # row 3 is a confident reference error, not a quant hit
+    assert c["conf99"]["top1_agreement"] == 1.0, c
+
+    # An empty slice is reported as n=0 with no rate, not as a 0% that would look like a quant failure.
+    empty = G.conditioned_slices(np.full((2, vocab), -5.0), np.full((2, vocab), -5.0), np.array([1, 2], dtype=np.int64))
+    assert all(s["n"] == 0 and np.isnan(s["top1"]) for s in empty.values()), empty
+    return c
 
 
 def test_shift_scan(ref_dir, name, logits, ids):
@@ -92,6 +130,11 @@ def main():
     if not os.path.isdir(ref):
         raise SystemExit("reference not found: %s (set G3_BASE)" % ref)
     data = dataset(base)
+    c = test_conditioned_slices()
+    print("conditioned slices on synthetic logits: on-path n=%d top1 %.2f%%, on-path p>=.90 n=%d top1 %.2f%%, "
+          "p>=.99 n=%d top1 %.2f%%" % (c["on_path"]["n"], 100 * c["on_path"]["top1"],
+                                       c["on_path_conf90"]["n"], 100 * c["on_path_conf90"]["top1"],
+                                       c["conf99"]["n"], 100 * c["conf99"]["top1"]))
     v = os.path.join(base, "ref_out", "logits", "chinese_local_llm", "logits_last128.npy")
     del v
     for name, (ref_dir, logits, ids) in data.items():
