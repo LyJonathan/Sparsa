@@ -63,6 +63,9 @@ struct Options {
     //   gptq  - GPTQ-style error feedback (gptq.hpp)
     std::string exp_method = "old";
     std::filesystem::path exp_pack;   // write this layer's expert tensors (GGUF) for --expert-source
+    std::filesystem::path exp_pack_frag;   // ... or one raw file per (kind, expert) for a resumed run
+    std::filesystem::path pack_merge;      // assemble a pack from that directory
+    int exp_start = 0;                     // first expert of the pass (a slice across turns)
     double gptq_prior = 16384.0;      // tokens' worth of the layer-wide Hessian mixed into each expert's
     double gptq_damp = 0.1;           // diagonal damping, fraction of mean(diag)
     double exp_holdout = 0.2;         // share of each expert's rows the error is measured on (never in H)

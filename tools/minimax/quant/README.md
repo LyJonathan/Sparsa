@@ -350,6 +350,8 @@ strata-mm-quant --model DIR --recipe MM-IQ2_XS --exp-layer 40 --exp-type IQ2_XXS
 
 `tools/minimax/quant/gptq_layer_session.py` runs several such packs as `--expert-source` arms back to back inside one `pc_launch` turn and prints the arms' KL64 and its delta against the base pack.
 
+A full 128-expert GPTQ pass is longer than one `pc_launch` turn, so it can be split without changing the bytes: `--exp-pack-frag DIR --exp-start N --exp-experts M` writes one raw file per (kind, expert) for experts `N..M-1`, and `--pack-merge DIR --exp-out=... --exp-pack FILE` then assembles the same GGUF from the fragments (all 128 must be present).
+
 `--gptq-selftest N` checks the blocked Cholesky, its inverse, and the block importance against a naive reference at an N x N size, then exits. Measured: `|L L^T - A|/max = 1.2e-7`, `|L L^-1 - I| = 3.5e-8`, block importance within 1e-6 of `diag(inv(inv(H_SS)))`.
 
 ## What ran on this PC

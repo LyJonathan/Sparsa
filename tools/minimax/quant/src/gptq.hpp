@@ -221,15 +221,9 @@ inline void block_factors(const float * m, int64_t n, int64_t b0, int64_t nb, st
     }
 }
 
-/// Round `rows` rows of length n (row-major f32) with error feedback. `h` is H (n x n,
-/// symmetric, row-major) and is modified. `dst` gets row_size(type, n) bytes a row.
-/// The rows of one expert share the Hessian; call once per expert.
-inline size_t round_rows(ggml_type type, float * w, int64_t rows, int64_t n, float * h, void * dst,
-                         double damp, int threads, double * out_seconds = nullptr) {
-    if (n % kBlock != 0) {
-        throw std::runtime_error("gptq: row length " + std::to_string(n) + " is not a multiple of 256");
-    }
-    const auto t_start = std::chrono::steady_clock::now();
+/// Build M = L^-1 (the lower inverse of chol(H)) from H in place, with Maya's damping.
+/// Call once per Hessian and share it between gate and up (both rows of one expert use the same H).
+inline void factor(float * h, int64_t n, double damp, int threads) {
     double mean = 0.0;
     for (int64_t i = 0; i < n; ++i) {
         mean += h[i * n + i];
@@ -251,9 +245,18 @@ inline size_t round_rows(ggml_type type, float * w, int64_t rows, int64_t n, flo
     chol_lower(h, n, threads);
     std::vector<float> m(static_cast<size_t>(n) * static_cast<size_t>(n), 0.f);
     tri_inv_lower(h, n, m.data(), threads);
-    // M = L^-1 (lower) replaces H; U = M^T is the upper factor of Hinv.
     std::memcpy(h, m.data(), m.size() * sizeof(float));
-    std::vector<float>().swap(m);
+}
+
+/// Round `rows` rows of length n (row-major f32) with error feedback, given a prepared `m` from
+/// factor(). `dst` gets row_size(type, n) bytes a row.
+inline size_t round_rows_prepared(ggml_type type, float * w, int64_t rows, int64_t n, const float * m,
+                                  void * dst, int threads, double * out_seconds = nullptr) {
+    if (n % kBlock != 0) {
+        throw std::runtime_error("gptq: row length " + std::to_string(n) + " is not a multiple of 256");
+    }
+    const auto t_start = std::chrono::steady_clock::now();
+    const float * h = m;
     const size_t rq = row_size(type, kBlock);
     const size_t row_bytes = row_size(type, n);
     std::vector<double> wss;
@@ -313,6 +316,13 @@ inline size_t round_rows(ggml_type type, float * w, int64_t rows, int64_t n, flo
         *out_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     }
     return static_cast<size_t>(rows) * row_bytes;
+}
+
+/// Convenience: factor H and round in one call (gate and up each pay their own factorisation).
+inline size_t round_rows(ggml_type type, float * w, int64_t rows, int64_t n, float * h, void * dst,
+                         double damp, int threads, double * out_seconds = nullptr) {
+    factor(h, n, damp, threads);
+    return round_rows_prepared(type, w, rows, n, h, dst, threads, out_seconds);
 }
 
 }  // namespace gptq

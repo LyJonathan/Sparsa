@@ -63,6 +63,10 @@ void usage() {
         "  --exp-method old|diag|gptq  experiment rounding: imatrix, per-expert diagonal, GPTQ feedback\n"
         "  --exp-pack FILE             experiment: also write the layer's expert tensors as a GGUF\n"
         "                              (a donor for the engine's --expert-source 30-30=FILE)\n"
+        "  --exp-pack-frag DIR         experiment: write one raw file per (kind, expert) instead,\n"
+        "                              so a pass can be split across turns\n"
+        "  --exp-start N               experiment: first expert of the pass (default 0)\n"
+        "  --pack-merge DIR            assemble the layer pack from --exp-pack-frag's directory\n"
         "  --gptq-prior N              tokens' worth of the layer-wide Hessian mixed into each expert (16384)\n"
         "  --gptq-damp X               GPTQ diagonal damping as a fraction of mean(diag) (0.1)\n"
         "  --exp-holdout X             share of each expert's rows held out of the Hessian (0.2)\n"
@@ -158,6 +162,12 @@ int main(int argc, char ** argv) {
                 opt.exp_method = val;
             } else if (take(i, argc, argv, "--exp-pack", val)) {
                 opt.exp_pack = val;
+            } else if (take(i, argc, argv, "--exp-pack-frag", val)) {
+                opt.exp_pack_frag = val;
+            } else if (take(i, argc, argv, "--pack-merge", val)) {
+                opt.pack_merge = val;
+            } else if (take(i, argc, argv, "--exp-start", val)) {
+                opt.exp_start = std::stoi(val);
             } else if (take(i, argc, argv, "--gptq-prior", val)) {
                 opt.gptq_prior = std::stod(val);
             } else if (take(i, argc, argv, "--gptq-damp", val)) {
