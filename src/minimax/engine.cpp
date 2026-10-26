@@ -2267,11 +2267,13 @@ struct Engine::Impl {
         // covers the rows_cap scratch, the expert ring and the RAM tier's staged K/V, not just the per-token buffers.
         //
         // P12: the workspace never coexists with the *decode* slots -- it is only needed while a prompt is being
-        // processed.  `--minimax-prefill-vram swap` therefore sizes the slots as if the workspace did not exist and
-        // lets the prompt pass free the slots it displaces (`pf_acquire`), re-allocating them when the prompt
-        // finishes, so a batched prompt leaves decode the decode-only slot count.  The default ("reserve") keeps the
-        // P10 rule: measured a wash on a 2 x RTX 5070 12 GB box whose slot pool is 2 experts a layer either way (see
-        // tools/minimax/README.md), so the swap stays opt-in until a placement with a real slot pool is measured.
+        // processed.  `--minimax-prefill-vram swap` (the default since the ctx-16K measurement in
+        // tools/minimax/README.md) therefore sizes the slots as if the workspace did not exist and lets the prompt
+        // pass free the slots it displaces (`pf_acquire`), re-allocating them when the prompt finishes, so a
+        // batched prompt leaves decode the decode-only slot count.  `--minimax-prefill-vram reserve` keeps the P10
+        // rule: the workspace is subtracted at startup and lives for the run.  At ctx 32768 the pool is 2 experts a
+        // layer either way and reserve was 5.4 % faster; at ctx 16384 swap is the faster default (the numbers and
+        // the slot arithmetic are in the README's P12 follow-up).
         const size_t prefill_need = tiers_gpu_possible() ? prefill_device_bytes() : 0;
         prefill_ws_bytes = prefill_need;
         const bool prefill_swap = prefill_need > 0 && opt.vram_slots_per_layer < 0 && opt.prefill_vram == "swap";

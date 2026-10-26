@@ -93,10 +93,10 @@ void usage() {
                  "                                    routed experts: int8 iq_mmvq dots (default), dequantize-once +\n"
                  "                                    FP16 tensor-core GEMM per expert, or auto (tc from 16 rows)\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
-                 "  --minimax-prefill-vram reserve|swap  reserve (default): the prompt workspace is subtracted from the\n"
-                 "                                    VRAM expert slots at startup and lives for the run (P10); swap:\n"
-                 "                                    the prompt workspace borrows the slots for the prompt and returns\n"
-                 "                                    them after it, so decode keeps the decode-only slot count\n"
+                 "  --minimax-prefill-vram swap|reserve  swap (default): the prompt workspace borrows the expert slots\n"
+                 "                                    for the prompt and returns them after it, so decode keeps the\n"
+                 "                                    decode-only slot count; reserve: the P10 rule, the workspace is\n"
+                 "                                    subtracted from the VRAM slots at startup and lives for the run\n"
                  "  --minimax-expert-prefetch N       decode: copy the next layer's N hottest missed experts ahead\n"
                  "  --minimax-ssd-chunks N            pieces one SSD expert read is split into, in flight together\n"
                  "                                    (default 1, 1-16); try 4-8 for a drive that prefers\n"
@@ -601,7 +601,7 @@ int run(int argc, char** argv) {
     std::string layer_split, gpus, kv_space;
     std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
-    std::string prefill_vram;
+    std::string prefill_vram = "swap";   // P12 follow-up: the prompt workspace borrows the decode slots
     std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
