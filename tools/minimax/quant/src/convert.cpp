@@ -11,6 +11,7 @@
 
 #include "dequant.hpp"
 #include "ggufw.hpp"
+#include "gptq.hpp"
 #include "json.hpp"
 #include "quantize.hpp"
 
@@ -2509,8 +2510,294 @@ void matvec_error(const float * w, const float * qw, int64_t n_out, int64_t n_in
     }
 }
 
+enum class ExpMethod { Old, Diag, Gptq };
+
+ExpMethod parse_exp_method(const std::string & s) {
+    if (s == "old") {
+        return ExpMethod::Old;
+    }
+    if (s == "diag") {
+        return ExpMethod::Diag;
+    }
+    if (s == "gptq") {
+        return ExpMethod::Gptq;
+    }
+    die("--exp-method must be old, diag or gptq (got '" + s + "')");
+    return ExpMethod::Old;
+}
+
+/// H += sum_rows x x^T, lower triangle only, tiled: a 128x128 tile is accumulated over every row
+/// before it is written back, so the matrix is streamed once per tile instead of once per row (the
+/// row-at-a-time form moved ~130 GB for 431 rows on layer 40 and took 30 s).
+void add_outer(float * h, int64_t n, const std::vector<const float *> & rows, int threads) {
+    if (rows.empty()) {
+        return;
+    }
+    constexpr int64_t kT = 128;
+    const int64_t nt = (n + kT - 1) / kT;
+    std::vector<std::pair<int64_t, int64_t>> tiles;
+    tiles.reserve(static_cast<size_t>(nt * (nt + 1) / 2));
+    for (int64_t ti = 0; ti < nt; ++ti) {
+        for (int64_t tj = 0; tj <= ti; ++tj) {
+            tiles.emplace_back(ti, tj);
+        }
+    }
+    std::vector<double> acc(static_cast<size_t>(kT) * static_cast<size_t>(kT));
+    gptq::parallel_for(static_cast<int64_t>(tiles.size()), threads, [&](int64_t t0, int64_t t1) {
+        std::vector<double> a(static_cast<size_t>(kT) * static_cast<size_t>(kT));
+        for (int64_t t = t0; t < t1; ++t) {
+            const int64_t ti = tiles[static_cast<size_t>(t)].first;
+            const int64_t tj = tiles[static_cast<size_t>(t)].second;
+            const int64_t i0 = ti * kT, i1 = std::min(n, i0 + kT);
+            const int64_t j0 = tj * kT, j1 = std::min(n, j0 + kT);
+            const int64_t ni = i1 - i0, nj = j1 - j0;
+            std::fill(a.begin(), a.end(), 0.0);
+            for (const float * x : rows) {
+                for (int64_t i = 0; i < ni; ++i) {
+                    const double xi = x[i0 + i];
+                    double * ar = a.data() + i * nj;
+                    for (int64_t j = 0; j < nj; ++j) {
+                        ar[j] += xi * static_cast<double>(x[j0 + j]);
+                    }
+                }
+            }
+            for (int64_t i = 0; i < ni; ++i) {
+                float * hr = h + (i0 + i) * n;
+                const double * ar = a.data() + i * nj;
+                for (int64_t j = 0; j < nj; ++j) {
+                    if (j0 + j <= i0 + i) {   // lower triangle only
+                        hr[j0 + j] += static_cast<float>(ar[j]);
+                    }
+                }
+            }
+        }
+    });
+    (void) acc;
+}
+
+/// H += scale * src (n x n), for the layer-wide prior.
+void add_scaled(float * h, const float * src, int64_t n, double scale, int threads) {
+    gptq::parallel_for(n, threads, [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            for (int64_t j = 0; j < n; ++j) {
+                h[i * n + j] += static_cast<float>(scale * static_cast<double>(src[i * n + j]));
+            }
+        }
+    });
+}
+
+/// The expert's rows from the dumps, split deterministically into fit and held-out rows:
+/// every `stride`-th row (stride = round(1/holdout), 0 = no split) is held out, so the
+/// split is spread over the sequence rather than being its tail.
+void split_holdout(const std::vector<int64_t> & all, double holdout, std::vector<int64_t> & fit,
+                   std::vector<int64_t> & held) {
+    fit.clear();
+    held.clear();
+    int stride = 0;
+    if (holdout > 0.0) {
+        stride = static_cast<int>(std::lround(1.0 / holdout));
+        if (stride < 2) {
+            stride = 2;
+        }
+    }
+    for (size_t i = 0; i < all.size(); ++i) {
+        if (stride > 0 && static_cast<int>(i) % stride == 0) {
+            held.push_back(all[i]);
+        } else {
+            fit.push_back(all[i]);
+        }
+    }
+}
+
+/// A 1-D importance vector from rows: mean x^2 per column.
+void diag_importance(const std::vector<const float *> & rows, int64_t n, std::vector<float> & out) {
+    out.assign(static_cast<size_t>(n), 1.f);
+    if (rows.empty()) {
+        return;
+    }
+    std::vector<double> ss(static_cast<size_t>(n), 0.0);
+    for (const float * x : rows) {
+        for (int64_t i = 0; i < n; ++i) {
+            ss[static_cast<size_t>(i)] += static_cast<double>(x[i]) * x[i];
+        }
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        out[static_cast<size_t>(i)] = static_cast<float>(ss[static_cast<size_t>(i)] / static_cast<double>(rows.size()));
+    }
+}
+
+void experiment_selftest(int n, int threads) {
+    std::vector<float> a(static_cast<size_t>(n) * static_cast<size_t>(n));
+    std::vector<float> ref(static_cast<size_t>(n) * static_cast<size_t>(n));
+    std::vector<float> g(static_cast<size_t>(n) * static_cast<size_t>(n), 0.f);
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j < n; ++j) {
+            const float u = static_cast<float>(std::sin(0.37 * (i + 1) * (j + 2) + 0.11 * i));
+            g[i * n + j] = u;
+        }
+    }
+    // A = G G^T / n + I (symmetric positive definite, a mild condition number)
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j < n; ++j) {
+            double s = 0.0;
+            for (int64_t k = 0; k < n; ++k) {
+                s += static_cast<double>(g[i * n + k]) * g[j * n + k];
+            }
+            ref[i * n + j] = static_cast<float>(s / n);
+            a[i * n + j] = ref[i * n + j] + (i == j ? 1.f : 0.f);
+        }
+    }
+    std::vector<float> l = a;
+    gptq::chol_lower(l.data(), n, threads);
+    // check L L^T == A
+    double worst = 0.0, scale = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j <= i; ++j) {
+            double s = 0.0;
+            for (int64_t k = 0; k <= j; ++k) {
+                s += static_cast<double>(l[i * n + k]) * l[j * n + k];
+            }
+            worst = std::max(worst, std::fabs(s - static_cast<double>(a[i * n + j])));
+            scale = std::max(scale, std::fabs(static_cast<double>(a[i * n + j])));
+        }
+    }
+    logf("selftest chol: max |L L^T - A| / max|A| = %.3e\n", worst / scale);
+    std::vector<float> l2 = l;
+    gptq::tri_inv_lower(l.data(), n, l2.data(), threads);
+    // check L * L^-1 == I
+    worst = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j <= i; ++j) {
+            double s = 0.0;
+            for (int64_t k = j; k <= i; ++k) {
+                s += static_cast<double>(l[i * n + k]) * l2[k * n + j];
+            }
+            worst = std::max(worst, std::fabs(s - (i == j ? 1.0 : 0.0)));
+        }
+    }
+    logf("selftest inverse: max |L L^-1 - I| = %.3e\n", worst);
+    // the block importance must be diag(inv(Hinv_SS)) = diag(inv(inv(H_SS))), i.e. diag(H_SS).
+    // Hinv = M^T M, so inv(Hinv_SS) = (M_SS M_SS^T)^-1 and its diagonal is what
+    // block_importance returns. Check against a naive Gauss-Jordan of that block.
+    const int64_t nb = 32;
+    std::vector<double> w;
+    std::vector<float> imp;
+    gptq::block_factors(l2.data(), n, 0, nb, w, imp);
+    std::vector<double> hss(static_cast<size_t>(nb) * static_cast<size_t>(nb), 0.0);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int64_t j = 0; j < nb; ++j) {
+            double s = 0.0;
+            for (int64_t k = 0; k < nb; ++k) {
+                s += static_cast<double>(l2[i * n + k]) * l2[j * n + k];
+            }
+            hss[i * nb + j] = s;   // Hinv_SS = M_SS M_SS^T
+        }
+    }
+    // invert hss with Gauss-Jordan
+    std::vector<double> aug(static_cast<size_t>(nb) * static_cast<size_t>(2 * nb), 0.0);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int64_t j = 0; j < nb; ++j) {
+            aug[i * 2 * nb + j] = hss[i * nb + j];
+        }
+        aug[i * 2 * nb + nb + i] = 1.0;
+    }
+    for (int64_t c = 0; c < nb; ++c) {
+        const double d = aug[c * 2 * nb + c];
+        for (int64_t j = 0; j < 2 * nb; ++j) {
+            aug[c * 2 * nb + j] /= d;
+        }
+        for (int64_t r = 0; r < nb; ++r) {
+            if (r == c) {
+                continue;
+            }
+            const double f = aug[r * 2 * nb + c];
+            for (int64_t j = 0; j < 2 * nb; ++j) {
+                aug[r * 2 * nb + j] -= f * aug[c * 2 * nb + j];
+            }
+        }
+    }
+    double mean = 0.0;
+    for (int64_t i = 0; i < nb; ++i) {
+        mean += aug[i * 2 * nb + nb + i];
+    }
+    mean /= static_cast<double>(nb);
+    double worst_imp = 0.0, ref_imp = 0.0;
+    for (int64_t i = 0; i < nb; ++i) {
+        const double want = aug[i * 2 * nb + nb + i] / mean;
+        const double got = static_cast<double>(imp[static_cast<size_t>(i)]);
+        worst_imp = std::max(worst_imp, std::fabs(got - want));
+        ref_imp = std::max(ref_imp, want);
+    }
+    logf("selftest block importance: max |imp - diag(inv(inv(H_SS)))| / max = %.3e\n", worst_imp / ref_imp);
+    logf("selftest done\n");
+}
+
+/// Assemble a layer pack from --exp-pack-frag's one-file-per-(kind, expert) directory. The
+/// fragments are the exact bytes the experiment measured, so a pass split across several PC
+/// turns (each with its own --exp-start) produces the same file as one uninterrupted run.
+void merge_layer_pack(const Options & opt, const Hyp & h) {
+    const ggml_type type = parse_type(opt.exp_type);
+    const int nexp = h.n_expert;
+    const int layer = opt.exp_layer;
+    const char * kinds[3] = {"gate", "up", "down"};
+    const char * leaves[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    const int64_t n_in[3] = {h.n_embd, h.n_embd, h.n_ff_exp};
+    const int64_t n_out[3] = {h.n_ff_exp, h.n_ff_exp, h.n_embd};
+    GgufWriter w;
+    w.alignment = 32;
+    w.open(opt.exp_pack);
+    w.add_str("general.architecture", "minimax-m3");
+    w.add_str("general.name", "MiniMax-M3.1-Flash layer " + std::to_string(layer) + " " + opt.exp_method + " " +
+                                   type_name(type));
+    w.add_str("general.baseline", "sparsa minimax gptq-iq experiment");
+    w.add_u32("general.alignment", 32);
+    w.add_u32("minimax-m3.block_count", static_cast<uint32_t>(h.n_layer));
+    w.add_u32("minimax-m3.expert_count", static_cast<uint32_t>(nexp));
+    w.add_str("minimax.quant.method", opt.exp_method);
+    w.add_f32("minimax.quant.gptq_prior", static_cast<float>(opt.gptq_prior));
+    w.add_f32("minimax.quant.gptq_damp", static_cast<float>(opt.gptq_damp));
+    w.add_f32("minimax.quant.holdout", static_cast<float>(opt.exp_holdout));
+    for (int k = 0; k < 3; ++k) {
+        TensorDesc t;
+        t.name = blk_name(layer, leaves[k]);
+        t.n_dims = 3;
+        t.ne[0] = n_in[k];
+        t.ne[1] = n_out[k];
+        t.ne[2] = nexp;
+        t.type = static_cast<uint32_t>(type);
+        t.nbytes = row_size(type, n_in[k]) * static_cast<uint64_t>(n_out[k]) * static_cast<uint64_t>(nexp);
+        w.add_tensor(std::move(t));
+    }
+    w.write_header();
+    std::vector<uint8_t> buf;
+    for (int k = 0; k < 3; ++k) {
+        const size_t want = row_size(type, n_in[k]) * static_cast<size_t>(n_out[k]);
+        for (int e = 0; e < nexp; ++e) {
+            char fb[96];
+            std::snprintf(fb, sizeof(fb), "%s-%03d.bin", kinds[k], e);
+            const fs::path fp = opt.pack_merge / fb;
+            FILE * f = std::fopen(fp.string().c_str(), "rb");
+            if (!f) {
+                die("merge: missing " + fp.string());
+            }
+            buf.resize(want);
+            const size_t got = std::fread(buf.data(), 1, want, f);
+            std::fclose(f);
+            if (got != want) {
+                die("merge: " + fp.string() + " holds " + std::to_string(got) + " bytes, expected " +
+                    std::to_string(want));
+            }
+            w.write_payload(buf.data(), got);
+        }
+        w.end_tensor();
+    }
+    w.close();
+    logf("merged layer pack %s (%d experts, %s)\n", opt.exp_pack.string().c_str(), nexp, type_name(type));
+}
+
 void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Options & opt,
                 const Imp * imp, int threads) {
+    const ExpMethod method = parse_exp_method(opt.exp_method);
     if (opt.exp_layer < 0 || opt.exp_layer >= h.n_layer) {
         die("--exp-layer is outside 0.." + std::to_string(h.n_layer - 1));
     }
@@ -2519,6 +2806,7 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
     }
     const ggml_type type = opt.exp_type.empty() ? r.experts : parse_type(opt.exp_type);
     const int nexp = opt.exp_experts > 0 ? std::min(opt.exp_experts, h.n_expert) : h.n_expert;
+    const int estart = std::max(0, std::min(opt.exp_start, nexp));
     const std::string lb = layer_base(opt.exp_layer);
     std::vector<const float *> xrows;
     std::vector<float> xdata;
@@ -2534,14 +2822,95 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         logf("experiment activations: %lld rows x %lld from %s\n", static_cast<long long>(nx),
              static_cast<long long>(ncol), opt.exp_x.string().c_str());
     }
+    if (method != ExpMethod::Old && xrows.empty()) {
+        die("--exp-method " + opt.exp_method + " needs --exp-x and --exp-dumps");
+    }
+    // Rows of a different document, scored only. Without them the score is the in-document
+    // `--exp-holdout` split; with them the Hessian can use every row of --exp-x (--exp-holdout 0).
+    std::vector<const float *> eval_xrows;
+    std::vector<float> eval_xdata;
+    if (!opt.exp_eval_x.empty()) {
+        if (opt.exp_eval_dumps.empty()) {
+            die("--exp-eval-x needs --exp-eval-dumps");
+        }
+        int64_t nx = 0, ncol = 0;
+        eval_xdata = npy_f32(opt.exp_eval_x, nx, ncol);
+        if (ncol != h.n_embd) {
+            die("--exp-eval-x has " + std::to_string(ncol) + " columns, expected " +
+                std::to_string(h.n_embd));
+        }
+        for (int64_t t = 0; t < nx; ++t) {
+            eval_xrows.push_back(eval_xdata.data() + t * ncol);
+        }
+        logf("experiment eval activations: %lld rows x %lld from %s\n", static_cast<long long>(nx),
+             static_cast<long long>(ncol), opt.exp_eval_x.string().c_str());
+    } else if (!opt.exp_eval_dumps.empty()) {
+        die("--exp-eval-dumps needs --exp-eval-x");
+    }
+    // The split is on tokens, not per expert, so the layer-wide prior cannot see a held-out token
+    // through some other expert's rows: every `1/holdout`-th row of --exp-x is held out.
+    std::vector<char> held_token(xrows.size(), 0);
+    {
+        std::vector<int64_t> all(xrows.size());
+        for (size_t i = 0; i < all.size(); ++i) {
+            all[i] = static_cast<int64_t>(i);
+        }
+        std::vector<int64_t> fit, held;
+        split_holdout(all, opt.exp_holdout, fit, held);
+        for (int64_t t : held) {
+            held_token[static_cast<size_t>(t)] = 1;
+        }
+    }
     if (imp && imp->test_only) {
         logf("WARNING: experiment uses the TEST-ONLY uniform imatrix\n");
+    }
+    logf("experiment method %s, type %s, layer %d, %d experts, holdout %.2f, prior %.0f, damp %.3f\n",
+         opt.exp_method.c_str(), type_name(type), opt.exp_layer, nexp, opt.exp_holdout, opt.gptq_prior,
+         opt.gptq_damp);
+    // The layer-wide input Hessian, the prior of a rarely routed expert: mean over every row.
+    std::vector<float> hbar;
+    if (method == ExpMethod::Gptq && !xrows.empty() && opt.gptq_prior > 0.0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<const float *> prior_rows;
+        prior_rows.reserve(xrows.size());
+        for (size_t i = 0; i < xrows.size(); ++i) {
+            if (!held_token[i]) {
+                prior_rows.push_back(xrows[i]);
+            }
+        }
+        if (prior_rows.empty()) {
+            prior_rows = xrows;
+        }
+        hbar.assign(static_cast<size_t>(h.n_embd) * static_cast<size_t>(h.n_embd), 0.f);
+        add_outer(hbar.data(), h.n_embd, prior_rows, threads);
+        const float inv = 1.f / static_cast<float>(prior_rows.size());
+        for (float & v : hbar) {
+            v *= inv;
+        }
+        logf("experiment layer Hessian (prior) built in %.1f s\n",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     const char * kinds[3] = {"gate", "up", "down"};
     const char * leaves[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
     const char * wkeys[3] = {"w1", "w3", "w2"};
     const bool is_down[3] = {false, false, true};
     std::vector<KindResult> results;
+    std::vector<std::vector<uint8_t>> pack_bytes[3];
+    // One expert's gate+up+down costs a 6144x6144 Cholesky and two triangular solves (about 4e10
+    // flops) before the quantizer runs, so the experts are the unit of parallelism in GPTQ mode:
+    // `workers` experts at a time, each with threads/workers of its own.
+    const int workers = method == ExpMethod::Gptq ? std::max(1, std::min<int>(8, threads / 6)) : 1;
+    const int wthreads = std::max(1, threads / workers);
+    if (workers > 1) {
+        logf("experiment: %d experts in parallel, %d threads each\n", workers, wthreads);
+    }
+    struct ExpStat {
+        double plain_num = 0, plain_den = 0, plain_mean = 0;
+        double wnum = 0, wden = 0, wmean = 0;
+        double onum = 0, oden = 0;
+        int64_t otok = 0, oexp = 0;
+        double qsec = 0;
+    };
     for (int k = 0; k < 3; ++k) {
         KindResult res;
         res.name = kinds[k];
@@ -2550,42 +2919,146 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         const int64_t n_out = k == 2 ? h.n_embd : h.n_ff_exp;
         const size_t row_q = row_size(type, n_in);
         const ggml_type_traits * traits = is_ikq(type) ? nullptr : ggml_get_type_traits(type);
-        const auto dequant_row = [type, traits](const void * src, float * dst, int64_t n) {
-            if (is_ikq(type)) {
-                strata::kernels::ikq::dequantize_row((int) type, src, dst, n);
-            } else if (traits && traits->to_float) {
-                traits->to_float(src, dst, n);
-            }
-        };
         if (!is_ikq(type) && (!traits || !traits->to_float)) {
             die("no dequantizer for " + std::string(type_name(type)));
         }
-        std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
-        std::vector<float> dq(f32.size());
-        std::vector<uint8_t> q(row_q * static_cast<size_t>(n_out));
-        std::vector<float> uniform_row;
-        const auto tk0 = std::chrono::steady_clock::now();
-        for (int e = 0; e < nexp; ++e) {
+        std::vector<ExpStat> st(static_cast<size_t>(nexp));
+        if (!opt.exp_pack.empty()) {
+            pack_bytes[k].resize(static_cast<size_t>(nexp));
+        }
+        auto one_expert = [&](int e) {
             const std::string base = lb + ".block_sparse_moe.experts." + std::to_string(e) + "." + wkeys[k];
             Weight w = resolve_weight(cat, base, false);
             if (w.store == Weight::Store::Missing) {
                 die("experiment: missing " + base);
             }
             bind_shape(w, n_in, n_out, base);
-            const float * im = imp ? imp->at(res.tensor, n_in, h.n_expert, e) : nullptr;
+            // this expert's rows: gate/up from the routed token list, down from the dumped hidden states
+            std::vector<const float *> fit_rows, held_rows, eval_rows;
+            std::vector<float> hidden;   // the down projection's inputs (kept alive while rows point into it)
+            std::vector<float> eval_hidden;
+            if (!is_down[k]) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "expert_%03d_token_idx.npy", e);
+                const fs::path tp = opt.exp_dumps / buf;
+                if (xrows.empty() || !fs::is_regular_file(tp)) {
+                    die(std::string("experiment: --exp-x and ") + tp.string() + " are both needed for " + kinds[k]);
+                }
+                int64_t nt = 0;
+                const std::vector<int64_t> idx = npy_i64(tp, nt);
+                for (int64_t t : idx) {
+                    if (t < 0 || t >= static_cast<int64_t>(xrows.size())) {
+                        die("token index out of range in " + tp.string());
+                    }
+                    if (held_token[static_cast<size_t>(t)]) {
+                        held_rows.push_back(xrows[static_cast<size_t>(t)]);
+                    } else {
+                        fit_rows.push_back(xrows[static_cast<size_t>(t)]);
+                    }
+                }
+                if (!eval_xrows.empty()) {
+                    char eb[64];
+                    std::snprintf(eb, sizeof(eb), "expert_%03d_token_idx.npy", e);
+                    const fs::path ep = opt.exp_eval_dumps / eb;
+                    if (fs::is_regular_file(ep)) {
+                        int64_t ne = 0;
+                        const std::vector<int64_t> eidx = npy_i64(ep, ne);
+                        for (int64_t t : eidx) {
+                            if (t < 0 || t >= static_cast<int64_t>(eval_xrows.size())) {
+                                die("eval token index out of range in " + ep.string());
+                            }
+                            eval_rows.push_back(eval_xrows[static_cast<size_t>(t)]);
+                        }
+                    }
+                }
+            } else {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "expert_%03d_hidden.npy", e);
+                const fs::path hp = opt.exp_dumps / buf;
+                if (fs::is_regular_file(hp)) {
+                    int64_t nh = 0, ncol = 0;
+                    hidden = npy_f32(hp, nh, ncol);
+                    if (ncol != n_in) {
+                        die(hp.string() + " has " + std::to_string(ncol) + " columns, expected " +
+                            std::to_string(n_in));
+                    }
+                    std::vector<int64_t> all(static_cast<size_t>(nh));
+                    for (int64_t t = 0; t < nh; ++t) {
+                        all[static_cast<size_t>(t)] = t;
+                    }
+                    std::vector<int64_t> fit, held;
+                    split_holdout(all, opt.exp_holdout, fit, held);
+                    for (int64_t t : fit) {
+                        fit_rows.push_back(hidden.data() + t * ncol);
+                    }
+                    for (int64_t t : held) {
+                        held_rows.push_back(hidden.data() + t * ncol);
+                    }
+                }
+                if (!eval_xrows.empty()) {
+                    char eb[64];
+                    std::snprintf(eb, sizeof(eb), "expert_%03d_hidden.npy", e);
+                    const fs::path ep = opt.exp_eval_dumps / eb;
+                    if (fs::is_regular_file(ep)) {
+                        int64_t nh = 0, ncol = 0;
+                        eval_hidden = npy_f32(ep, nh, ncol);
+                        if (ncol != n_in) {
+                            die(ep.string() + " has " + std::to_string(ncol) + " columns, expected " +
+                                std::to_string(n_in));
+                        }
+                        for (int64_t t = 0; t < nh; ++t) {
+                            eval_rows.push_back(eval_hidden.data() + t * ncol);
+                        }
+                    }
+                }
+            }
+            const float * im = nullptr;          // the importance the quantizer is given
+            const float * im_metric = nullptr;   // the yardstick the weighted error uses
+            std::vector<float> im_diag, hess, uniform_row;
+            const float * im_old = imp ? imp->at(res.tensor, n_in, h.n_expert, e) : nullptr;
+            if (method == ExpMethod::Old) {
+                im = im_old;
+                im_metric = im_old;
+            } else {
+                diag_importance(fit_rows, n_in, im_diag);
+                im = im_diag.data();
+                im_metric = im_old ? im_old : im_diag.data();
+            }
             if (!im) {
                 if (type_needs_imatrix(type)) {
                     die(std::string("experiment: ") + type_name(type) + " needs an imatrix");
                 }
                 uniform_row.assign(static_cast<size_t>(n_in), 1.f);
                 im = uniform_row.data();
+                im_metric = im;
             }
-            dequant_rows(w, 0, n_out, n_in, f32.data(), 0.f, threads);
+            std::vector<float> f32(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
+            std::vector<float> dq(f32.size());
+            std::vector<uint8_t> q(row_q * static_cast<size_t>(n_out));
+            dequant_rows(w, 0, n_out, n_in, f32.data(), 0.f, wthreads);
             const auto tq0 = std::chrono::steady_clock::now();
-            quantize_rows(type, f32.data(), q.data(), n_out, n_in, im, threads);
-            res.quant_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+            if (method == ExpMethod::Gptq) {
+                hess.assign(static_cast<size_t>(n_in) * static_cast<size_t>(n_in), 0.f);
+                add_outer(hess.data(), n_in, fit_rows, wthreads);
+                if (!is_down[k] && opt.gptq_prior > 0.0) {
+                    add_scaled(hess.data(), hbar.data(), n_in, opt.gptq_prior, wthreads);
+                } else if (fit_rows.empty() && !hbar.empty() && n_in == h.n_embd) {
+                    add_scaled(hess.data(), hbar.data(), n_in, 1.0, wthreads);
+                }
+                double sec = 0.0;
+                gptq::round_rows(type, f32.data(), n_out, n_in, hess.data(), q.data(), opt.gptq_damp,
+                                 wthreads, &sec);
+                logf("gptq %-4s expert %3d: %6lld fit rows, %5lld held, %5lld eval, %.1f s\n", kinds[k], e,
+                     static_cast<long long>(fit_rows.size()), static_cast<long long>(held_rows.size()),
+                     static_cast<long long>(eval_rows.size()), sec);
+            } else {
+                quantize_rows(type, f32.data(), q.data(), n_out, n_in, im, workers > 1 ? wthreads : threads);
+            }
+            st[static_cast<size_t>(e)].qsec +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
             for (int64_t row = 0; row < n_out; ++row) {
-                dequant_row(q.data() + static_cast<size_t>(row) * row_q, dq.data() + row * n_in, n_in);
+                gptq::dequant_row(type, q.data() + static_cast<size_t>(row) * row_q,
+                                  dq.data() + row * n_in, n_in);
             }
             double pnum = 0.0, pden = 0.0, wnum = 0.0, wden = 0.0, wrow = 0.0;
             int64_t wrow_n = 0;
@@ -2595,11 +3068,11 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
                 double rn = 0.0, rd = 0.0, rwn = 0.0, rwd = 0.0;
                 for (int64_t i = 0; i < n_in; ++i) {
                     const double wv = wr[i];
-                    const double d = wv - qr[i];
-                    const double iw = im[i];
-                    rn += d * d;
+                    const double dd = wv - qr[i];
+                    const double iw = im_metric[i];
+                    rn += dd * dd;
                     rd += wv * wv;
-                    rwn += iw * d * d;
+                    rwn += iw * dd * dd;
                     rwd += iw * wv * wv;
                 }
                 pnum += rn;
@@ -2611,59 +3084,108 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
                     ++wrow_n;
                 }
             }
-            res.plain_num += pnum;
-            res.plain_den += pden;
-            res.plain_mean += pden > 0.0 ? std::sqrt(pnum / pden) : 0.0;
-            res.weighted_num += wnum;
-            res.weighted_den += wden;
-            res.weighted_mean += wrow_n > 0 ? wrow / static_cast<double>(wrow_n) : 0.0;
-            ++res.experts;
-            if (!is_down[k] && !xrows.empty() && !opt.exp_dumps.empty()) {
-                char buf[64];
-                std::snprintf(buf, sizeof(buf), "expert_%03d_token_idx.npy", e);
-                const fs::path tp = opt.exp_dumps / buf;
-                if (fs::is_regular_file(tp)) {
-                    int64_t nt = 0;
-                    std::vector<int64_t> idx = npy_i64(tp, nt);
-                    std::vector<const float *> rows;
-                    rows.reserve(static_cast<size_t>(nt));
-                    for (int64_t t = 0; t < nt; ++t) {
-                        if (idx[static_cast<size_t>(t)] < 0 ||
-                            idx[static_cast<size_t>(t)] >= static_cast<int64_t>(xrows.size())) {
-                            die("token index out of range in " + tp.string());
-                        }
-                        rows.push_back(xrows[static_cast<size_t>(idx[static_cast<size_t>(t)])]);
-                    }
-                    matvec_error(f32.data(), dq.data(), n_out, n_in, rows, threads, res.out_num, res.out_den);
-                    res.out_tokens += nt;
-                    ++res.out_experts;
+            ExpStat & s = st[static_cast<size_t>(e)];
+            s.plain_num += pnum;
+            s.plain_den += pden;
+            s.plain_mean += pden > 0.0 ? std::sqrt(pnum / pden) : 0.0;
+            s.wnum += wnum;
+            s.wden += wden;
+            s.wmean += wrow_n > 0 ? wrow / static_cast<double>(wrow_n) : 0.0;
+            if (!eval_rows.empty()) {
+                matvec_error(f32.data(), dq.data(), n_out, n_in, eval_rows, wthreads, s.onum, s.oden);
+                s.otok += static_cast<int64_t>(eval_rows.size());
+                ++s.oexp;
+            } else if (!held_rows.empty()) {
+                matvec_error(f32.data(), dq.data(), n_out, n_in, held_rows, wthreads, s.onum, s.oden);
+                s.otok += static_cast<int64_t>(held_rows.size());
+                ++s.oexp;
+            }
+            if (!opt.exp_pack.empty()) {
+                pack_bytes[k][static_cast<size_t>(e)].assign(q.begin(), q.end());
+            }
+            if (!opt.exp_pack_frag.empty()) {
+                fs::create_directories(opt.exp_pack_frag);
+                char fb[96];
+                std::snprintf(fb, sizeof(fb), "%s-%03d.bin", kinds[k], e);
+                const fs::path fp = opt.exp_pack_frag / fb;
+                std::ofstream fo(fp, std::ios::binary);
+                if (!fo) {
+                    die("cannot write " + fp.string());
+                }
+                fo.write(reinterpret_cast<const char *>(q.data()), static_cast<std::streamsize>(q.size()));
+                fo.close();
+                if (!fo) {
+                    die("short write " + fp.string());
                 }
             }
-            if (is_down[k] && !opt.exp_dumps.empty()) {
-                char buf[64];
-                std::snprintf(buf, sizeof(buf), "expert_%03d_hidden.npy", e);
-                const fs::path hp = opt.exp_dumps / buf;
-                if (fs::is_regular_file(hp)) {
-                    int64_t nh = 0, ncol = 0;
-                    std::vector<float> hv = npy_f32(hp, nh, ncol);
-                    if (ncol != n_in) {
-                        die(hp.string() + " has " + std::to_string(ncol) + " columns, expected " +
-                            std::to_string(n_in));
-                    }
-                    std::vector<const float *> rows;
-                    rows.reserve(static_cast<size_t>(nh));
-                    for (int64_t t = 0; t < nh; ++t) {
-                        rows.push_back(hv.data() + t * ncol);
-                    }
-                    matvec_error(f32.data(), dq.data(), n_out, n_in, rows, threads, res.out_num, res.out_den);
-                    res.out_tokens += nh;
-                    ++res.out_experts;
-                }
+        };
+        const int64_t span = nexp - estart;
+        if (workers <= 1) {
+            for (int e = estart; e < nexp; ++e) {
+                one_expert(e);
             }
+        } else {
+            gptq::parallel_for(span, workers, [&](int64_t a, int64_t b) {
+                for (int64_t i = a; i < b; ++i) {
+                    one_expert(estart + static_cast<int>(i));
+                }
+            });
         }
-        res.quant_sec += 0.0;
-        (void)tk0;
+        for (int e = estart; e < nexp; ++e) {
+            const ExpStat & s = st[static_cast<size_t>(e)];
+            res.plain_num += s.plain_num;
+            res.plain_den += s.plain_den;
+            res.plain_mean += s.plain_mean;
+            res.weighted_num += s.wnum;
+            res.weighted_den += s.wden;
+            res.weighted_mean += s.wmean;
+            res.out_num += s.onum;
+            res.out_den += s.oden;
+            res.out_tokens += s.otok;
+            res.out_experts += s.oexp;
+            res.quant_sec += s.qsec;
+            ++res.experts;
+        }
         results.push_back(std::move(res));
+    }
+
+    if (!opt.exp_pack.empty()) {
+        const int64_t n_in[3] = {h.n_embd, h.n_embd, h.n_ff_exp};
+        const int64_t n_out[3] = {h.n_ff_exp, h.n_ff_exp, h.n_embd};
+        GgufWriter w;
+        w.alignment = 32;
+        w.open(opt.exp_pack);
+        w.add_str("general.architecture", "minimax-m3");
+        w.add_str("general.name", "MiniMax-M3.1-Flash layer " + std::to_string(opt.exp_layer) + " " +
+                                       opt.exp_method + " " + type_name(type));
+        w.add_str("general.baseline", "sparsa minimax gptq-iq experiment");
+        w.add_u32("general.alignment", 32);
+        w.add_u32("minimax-m3.block_count", static_cast<uint32_t>(h.n_layer));
+        w.add_u32("minimax-m3.expert_count", static_cast<uint32_t>(h.n_expert));
+        w.add_str("minimax.quant.method", opt.exp_method);
+        w.add_f32("minimax.quant.gptq_prior", static_cast<float>(opt.gptq_prior));
+        w.add_f32("minimax.quant.gptq_damp", static_cast<float>(opt.gptq_damp));
+        w.add_f32("minimax.quant.holdout", static_cast<float>(opt.exp_holdout));
+        for (int k = 0; k < 3; ++k) {
+            TensorDesc t;
+            t.name = blk_name(opt.exp_layer, leaves[k]);
+            t.n_dims = 3;
+            t.ne[0] = n_in[k];
+            t.ne[1] = n_out[k];
+            t.ne[2] = nexp;
+            t.type = static_cast<uint32_t>(type);
+            t.nbytes = row_size(type, n_in[k]) * static_cast<uint64_t>(n_out[k]) * static_cast<uint64_t>(nexp);
+            w.add_tensor(std::move(t));
+        }
+        w.write_header();
+        for (int k = 0; k < 3; ++k) {
+            for (const std::vector<uint8_t> & b : pack_bytes[k]) {
+                w.write_payload(b.data(), b.size());
+            }
+            w.end_tensor();
+        }
+        w.close();
+        logf("wrote layer pack %s (%d experts, %s)\n", opt.exp_pack.string().c_str(), nexp, type_name(type));
     }
 
     char line[512];
@@ -2709,6 +3231,10 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         o << "  \"imatrix_blend\": " << opt.imatrix_blend << ",\n";
         o << "  \"exp_x\": \"" << js(opt.exp_x.string()) << "\",\n";
         o << "  \"exp_dumps\": \"" << js(opt.exp_dumps.string()) << "\",\n";
+        o << "  \"exp_eval_x\": \"" << js(opt.exp_eval_x.string()) << "\",\n";
+        o << "  \"exp_eval_dumps\": \"" << js(opt.exp_eval_dumps.string()) << "\",\n";
+        o << "  \"exp_holdout\": " << opt.exp_holdout << ",\n";
+        o << "  \"exp_method\": \"" << opt.exp_method << "\",\n";
         o << "  \"kinds\": {\n";
         for (size_t i = 0; i < results.size(); ++i) {
             const KindResult & res = results[i];
@@ -2850,6 +3376,11 @@ bool need_recipe(const Options & opt) {
 
 int run(const Options & opt) {
     try {
+        if (opt.gptq_selftest > 0) {
+            const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::thread::hardware_concurrency());
+            experiment_selftest(opt.gptq_selftest, threads);
+            return 0;
+        }
         const Hyp h = load_hyp(opt.model);
         logf("MiniMax-M3.1 text  layers %d  embd %d  dense_ff %d  expert_ff %d  experts %d  dense_prefix %d  indexer_first %d\n",
              h.n_layer, h.n_embd, h.n_ff, h.n_ff_exp, h.n_expert, h.n_dense, h.idx_first);
@@ -2971,6 +3502,9 @@ int run(const Options & opt) {
         }
         if (opt.bench) {
             bench(cat, h, recipe, sel, imp, opt, threads);
+        }
+        if (!opt.pack_merge.empty()) {
+            merge_layer_pack(opt, h);
         }
         if (opt.exp_layer >= 0) {
             experiment(cat, h, recipe, opt, imp, threads);

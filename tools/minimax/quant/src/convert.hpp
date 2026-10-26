@@ -56,7 +56,24 @@ struct Options {
     std::filesystem::path exp_out;
     std::filesystem::path exp_x;
     std::filesystem::path exp_dumps;
+    // Rows from a different document, used only to measure `output_rel`: they never enter the
+    // Hessian or the per-expert diagonal, so the score is not the fit's own neighbours.
+    std::filesystem::path exp_eval_x;
+    std::filesystem::path exp_eval_dumps;
     int exp_experts = 0;  // 0 = all
+    // Rounding method of the experiment and of a layer pack:
+    //   old   - llama.cpp's imatrix rounding, the tier's own imatrix (the baseline)
+    //   diag  - llama.cpp's imatrix rounding with a per-expert diagonal built from the dumps
+    //   gptq  - GPTQ-style error feedback (gptq.hpp)
+    std::string exp_method = "old";
+    std::filesystem::path exp_pack;   // write this layer's expert tensors (GGUF) for --expert-source
+    std::filesystem::path exp_pack_frag;   // ... or one raw file per (kind, expert) for a resumed run
+    std::filesystem::path pack_merge;      // assemble a pack from that directory
+    int exp_start = 0;                     // first expert of the pass (a slice across turns)
+    double gptq_prior = 16384.0;      // tokens' worth of the layer-wide Hessian mixed into each expert's
+    double gptq_damp = 0.1;           // diagonal damping, fraction of mean(diag)
+    double exp_holdout = 0.2;         // share of each expert's rows the error is measured on (never in H)
+    int gptq_selftest = 0;            // > 0: check chol/inverse against a naive reference at this size, exit
     std::vector<std::pair<std::string, std::string>> overrides;
 };
 

@@ -59,6 +59,26 @@ Copyright (c) 2023-2024 The llama.cpp authors
 Copyright (c) 2024-2025 The ik_llama.cpp authors
 ```
 
+## Project Maya (GPTQ error-feedback rounding for the IQ types)
+
+`tools/minimax/quant/src/gptq.hpp` ports the error-feedback rounding of
+[Project Maya](https://github.com/mw00/project-maya) (Peasant Smith), commit `4615f34` (`v1.1.27`), from
+`tools/maya_quant/gptq.py` and its use in `tools/maya_quant/quantize.py`: a row is walked in 256-weight blocks
+(one superblock of every IQ type), each block is quantized by llama.cpp's own quantizer with
+`diag(inv(Hinv_SS))` normalized to mean 1 as its importance, and the block's rounding error is pushed into the
+not-yet-quantized columns through the upper Cholesky factor of the inverse Hessian (the lazy-batch GPTQ of
+Frantar et al., as Maya implements it). The Hessian is per expert, `sum w^2 x x^T` over the tokens routed to it
+plus `prior` tokens' worth of the layer-wide input Hessian, with `damp * mean(diag)` diagonal damping - the
+shrinkage and damping defaults (prior 16384, damp 0.1) are Maya's. The linear algebra (blocked Cholesky, blocked
+triangular inverse) is written for this tree and checked against a naive reference by `--gptq-selftest`; no other
+Maya source is copied.
+
+```
+MIT License
+
+Copyright (c) 2026 Peasant Smith and the Project Maya contributors
+```
+
 ## agentionai llama.cpp (trellis types, TQ2_T / TQK6 / TQK7)
 
 `third_party/ggml-tq/` holds the trellis headers of the agentionai ("Gyro") llama.cpp fork: `tq.cuh`
