@@ -211,3 +211,101 @@ run happened** - now enforced by the launcher rather than by intention. The runn
 `tools/minimax/p13_gates.sh` (slice) and
 `python tools/minimax/bench_dspark.py --doc README.md --doc-tokens 8000 --decode 1500 --temperature 0.7 --reps 3`
 (full model, sustained), plus `p13_sample_dist.py` for the sampled-distribution check.
+
+---
+
+# Round 4: the taps are the reference's, and two conventions in the engine are not
+
+Round 3 left acceptance at 0/7 with the guess that the tap/position convention was wrong. This round compared the
+engine's own tap tensors against the FP32 reference (`Strata-MiniMax/_local/ref_out/dspark_taps/`, 198 tokens,
+`layer{03,17,31,45,59}_{enter,leave}.npy`, `final_hidden.npy`, `logits_last.npy`) and read the published draft
+architecture. The tap convention is right; two *sampling* conventions are not. Nothing here was re-measured on the
+engine: `pc-engine.lock` said `maya` for this window, so the acceptance numbers below are still the old 0/7.
+
+## 1. The taps are the reference's (measured, cosine and max abs)
+
+The engine dumps (`--minimax-dump`/`--minimax-dump-layers`, `wt-stdin/dump_taps`) name layers 0-based; the
+reference's `layerNN` files are the same block, so `layer03` is the engine's `dump-L3`. Every candidate tensor in
+the block was compared against both taps, for every dumped block, and with a ±1 position shift to tell a convention
+error from a quantization difference (`tap_convention.py`):
+
+| reference tap | engine tensor | cosine | max abs |
+| --- | --- | ---: | ---: |
+| `layer03_enter` | `dump-L3/residual_in` | **0.999997** | 3.59 |
+| `layer03_leave` | `dump-L3/layer_out` | **0.999984** | 6.36 |
+| `layer17_enter` | `dump-L17/residual_in` | 0.999306 | 47.6 |
+| `layer31_enter` | `dump-L31/residual_in` | 0.992076 | 2906 |
+| `layer45_enter` | `dump-L45/residual_in` | 0.987655 | 4002 |
+| `layer59_enter` | `dump-L59/residual_in` | 0.981599 | 4186 |
+
+* The kind is **input**: `residual_in` (the block's input, before its first norm) is the reference's `enter` at
+  0.999997 early; `attn_input`, `attn_out` and `layer_out` are all further away for `enter`. `layer_out` is the
+  reference's `leave` (0.999984 at layer 3 against 0.9914 for the neighbouring block). So the engine's default
+  `STRATA_DSPARK_TAP` (input) is the reference's convention, and `=output` is the wrong one.
+* The block index is **the same 0-based number** the pack carries: `layer03`'s *leave* only matches `dump-L3`'s
+  output (0.999984) and not `dump-L2`'s (0.9914), which settles enter/leave's ambiguity (enter of block 3 is leave
+  of block 2, so only leave tells them apart).
+* No position shift helps (checked ±1: every shifted pair is worse by 10-100x in max abs), so it is not an
+  off-by-one in the capture either.
+* The residual error grows with depth (0.43s at layer 3, 33s at layer 59, concentrated in a handful of outlier
+  channels) exactly as the IQ2_XS quantization of the target does: the same run's `final_hidden` through the
+  target's own head gives `logits_last`'s argmax (200059, `<mm:think>`) with cosine 0.81, i.e. the model agrees on
+  the token but not bit for bit. This is a quantization gap, not a tap-convention gap.
+
+## 2. The block is one draft per query row, and the engine reads row j + 1 (unconfirmed static analysis)
+
+The published DSpark draft spec (`vllm.cpp` `.agents/specs/dspark-spec-decode.md`, which mirrors vLLM at
+`555967922`; NVIDIA NeMo AutoModel's `draft_minimax_m3`) states the anchor layout the shipped DSpark checkpoints
+use:
+
+```
+queries      = N = num_speculative_tokens          (sample_from_anchor=True)
+q[0]         = anchor (the last verified/bonus token id)
+q[1..]       = noise/mask token id
+prev         = anchor_id
+for i in 0..N-1:
+    bias_i   = markov_w2( markov_w1[prev] )        # [vocab]
+    logits_i = lm_head(head_hidden[i]) + bias_i
+    tok_i    = argmax(logits_i) ; prev = tok_i
+```
+
+`sample_pos = query_pos + 1` in this path (standard next-token), "against DFlash's masks-sit-at-the-predicted-
+position layout". So with `q[0]` at the position the anchor is written to, row `i`'s logits ARE draft `i`.
+
+`DsparkDrafter::draft` (`src/minimax/dspark.cpp`) instead walks `h_logits[j]` for `j = 1..block` and writes
+`drafts[j-1]`, i.e. it takes every draft from the *next* row. The verify side
+(`Impl::decode_spec`, `src/minimax/engine.cpp`) compares `ds_rows[j]` with `ds_drafts[j]`, which is the reference's
+pairing, so the two halves of the engine disagree by one row: the drafted token is the one the target would emit one
+position later. That alone is enough to reject every draft (0/7).
+
+Two more mismatches of the same kind, from the same source:
+
+* `DsparkGeometry::rows()` is `block + 1`; the anchor layout has **N = block queries** (anchor + block-1 masks), so
+  the extra 8th row is a mask position the reference never feeds — and the block attends **non-causally**, so that
+  extra row is visible to every real row. `decode_spec` also fills only `want + 1` of the 8 rows, leaving stale
+  buffer rows in the attention window.
+* The Markov bias is transposed: the engine computes `bias[v] = <w1[v], w2[prev]>` while the reference (and the
+  low-rank head's own description, "`W1` embeds the previous token into rank rows, `W2` projects to the draft
+  vocab") is `bias[v] = <w2[v], w1[prev]>`. Both matrices are `[vocab][rank]`, so the shapes do not catch it.
+
+## 3. A numpy second opinion, and why it is not a gate yet
+
+`tools/minimax/dspark_ref.py` recomputes the drafter from the checkpoint's own weights (the MXFP8/BF16 decoder
+`dspark_pack.py` uses), with the config's conventions (Gemma `1 + w` norms, per-head q/k norm, partial RoPE over 64
+of 128 dims, theta 1e7, half-split pairs, `swigluoai` 1.702/7, dense 12288 FFN, the target's `lm_head`, the rank-256
+Markov head), and scores draft `i` against the reference's `top1_all` at the anchor. Its own sanity checks pass:
+`final_hidden` through the target's head reproduces `logits_last` (cosine 1.000000, same argmax), and the checkpoint's
+matrices decode to trained-weight statistics (std 0.047-0.057, no row outliers).
+
+Its acceptance is **0 % at every convention tried** (enter/leave taps, rows 7/8, block position 0/-1, both Markov
+readings, draft row `i` and `i + 1`, 10-12 anchors each), and its row-0 logits have cosine -0.03 against the
+reference's `logits_last`, i.e. it is not merely off by a row or a bias. So the forward is still wrong somewhere
+(the context K/V path — `fc` output is ~1000x the target hidden's scale before `hidden_norm` — is the first
+suspect), and this harness is **not** yet an oracle. The engine's fix must therefore be gated on the engine's own
+acceptance, not on this script.
+
+## Status
+
+Unchanged: DSpark stays opt-in and is **pending the zero-copy lane**. The tap convention is confirmed against the
+FP32 reference; the row index, the extra mask row and the Markov transpose are named, sourced from the published
+spec, and unverified on the engine until a PC window allows the acceptance re-measure.
