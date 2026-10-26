@@ -37,8 +37,8 @@ What it does, in order:
    already free.
 
 Exit codes: 0..n = the child's own code, 2 = another owner holds the lock, 3 = not enough RAM, 4 = the watchdog
-stopped the run, 5 = the lock could not be taken (the sidecar timed out), 130 = interrupted.
-
+stopped the run, 5 = the lock could not be taken, 6 = the turn limit, 7 = the WSL VM is busy or would not stop,
+130 = interrupted.
 Stdout and stderr are the child's (the lock/RAM lines go to stderr, prefixed `[pc_launch]`), and stdin is inherited,
 so an engine's serve protocol (GEN lines on stdin) works unchanged.
 """
@@ -52,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -72,6 +73,7 @@ EXIT_NO_RAM = 3
 EXIT_WATCHDOG = 4
 EXIT_LOCK_TIMEOUT = 5
 EXIT_TURN_LIMIT = 6
+EXIT_WSL_BUSY = 7
 
 # Windows: still-running exit code of a process handle (GetExitCodeProcess -> STILL_ACTIVE)
 _STILL_ACTIVE = 259
@@ -487,6 +489,94 @@ def _flag(argv: Sequence[str], name: str) -> str | None:
     return None
 
 
+# ---- WSL: the VM holds host RAM the run needs, and a benchmark must not share the box with it
+WSL_PROC_HINTS = ("vmmem", "vmmemWSL")
+# A WSL distro boots a full systemd tree; those are the VM's own boot, not another project's work. Anything else is
+# refused: a build or a training job inside the VM is exactly what `wsl --shutdown` would kill.
+WSL_BOOT_COMMS = {"init", "init-systemd(", "systemd", "systemd-journal", "systemd-udevd", "systemd-logind",
+                  "systemd-resolve", "systemd-timesyn", "systemd-network", "systemd-userdbd", "systemd-oomd",
+                  "dbus-daemon", "polkitd", "cron", "rsyslogd", "agetty", "kmod", "multipathd", "acpid",
+                  "snapd", "unattended-upgr", "wsl-pro-servic", "jq", "sh", "bash", "ps", "sleep", "cat", "sort",
+                  "head", "tail", "grep", "sed", "awk", "env", "which", "command"}
+WSL_WORK_COMMS = {"python", "python3", "node", "deno", "bun", "cargo", "rustc", "go", "java", "make", "ninja",
+                  "cmake", "gcc", "g++", "clang", "cc", "nvcc", "ffmpeg", "jupyter", "ollama", "Rscript", "julia",
+                  "docker", "containerd-shim", "qemu-system-x86", "tmux", "screen", "git", "pip", "pip3", "npm"}
+WSL_WORK_PATHS = ("/home/", "/root/", "/mnt/", "/workspace", "/data/", "/tmp/")
+
+
+def wsl_memory_gb() -> float | None:
+    """What the WSL VM holds right now, or None when there is no WSL (or not Windows).
+
+    `vmmemWSL` is the VM's own process on Windows 11; older builds call it `vmmem`. The number is the working set,
+    which is the memory the VM has taken from the host and does not return on its own.
+    """
+    fake = os.environ.get("PC_LAUNCH_FAKE_WSL_GB")
+    if fake is not None:
+        try:
+            return float(fake)
+        except ValueError:
+            return None
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Process | Where-Object { $_.Name -like 'vmmem*' } | "
+             "Measure-Object -Property WorkingSet64 -Sum).Sum"],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+        return round(float(out) / (1024.0 ** 3), 2) if out else 0.0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _wsl_argv(wsl_exe: Sequence[str] | str, *rest: str) -> list[str]:
+    base = list(wsl_exe) if not isinstance(wsl_exe, str) else shlex.split(wsl_exe)
+    return base + list(rest)
+
+
+def wsl_foreign_processes(wsl_exe: Sequence[str] | str = "wsl.exe") -> tuple[list[str] | None, str]:
+    """The command lines of processes running inside WSL that are not the VM's own boot, or None on error.
+
+    A benchmark run is allowed to stop the VM only when nothing from another project is inside it: `wsl --shutdown`
+    would kill that work. The list is what the refusal message names.
+    """
+    try:
+        p = subprocess.run(_wsl_argv(wsl_exe, "-e", "sh", "-c",
+                                     "ps -eo pid=,comm=,args= --no-headers 2>/dev/null || ps ax -o pid=,comm=,args="),
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"could not list the processes inside WSL: {e}"
+    if p.returncode != 0:
+        return None, ("WSL did not answer (`wsl -e ps` returned " + str(p.returncode) + "): " +
+                      (p.stderr or p.stdout or "").strip()[:300])
+    rows = []
+    for line in p.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        comm = parts[1]
+        args = parts[2] if len(parts) > 2 else ""
+        if comm.startswith("[") or comm in WSL_BOOT_COMMS:
+            continue
+        # `sh -c "ps ..."` is this probe itself
+        if "ps -eo" in args or "ps ax" in args:
+            continue
+        # A user's work: a dev tool by name, or any command line that lives in a user's tree.
+        if comm in WSL_WORK_COMMS or any(path in args for path in WSL_WORK_PATHS):
+            rows.append(line.strip())
+    return rows, ""
+
+
+def wsl_shutdown(wsl_exe: Sequence[str] | str = "wsl.exe", timeout: float = 120.0) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(_wsl_argv(wsl_exe, "--shutdown"), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"wsl --shutdown failed: {e}"
+    if p.returncode != 0:
+        return False, f"wsl --shutdown returned {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}"
+    return True, ""
+
+
 def estimate_ram_gb(argv: Sequence[str], total_gb: float,
                     over_tier_gb: float = DEFAULT_OVER_TIER_GB) -> tuple[float, list[str]]:
     """A run's host-RAM need from the engine's flags, with the line that produced each part.
@@ -556,7 +646,8 @@ def calibrated_peak_gb(path: Path | None, key: str) -> float | None:
 
 
 def record_calibration(path: Path, key: str, peak_gb: float, argv: Sequence[str],
-                       formula_gb: float, estimate_gb: float) -> None:
+                       formula_gb: float, estimate_gb: float,
+                       wsl_gb: float | None = None, wsl_shutdown: bool = False) -> None:
     data = load_calibration(path)
     data[key] = {
         "model": _flag(argv, "--model") or "",
@@ -564,6 +655,8 @@ def record_calibration(path: Path, key: str, peak_gb: float, argv: Sequence[str]
         "peak_working_set_gb": round(float(peak_gb), 3),
         "formula_gb": round(float(formula_gb), 3),
         "estimate_gb": round(float(estimate_gb), 3),
+        "wsl_gb": None if wsl_gb is None else round(float(wsl_gb), 2),
+        "wsl_shutdown": bool(wsl_shutdown),
         "stamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,8 +729,8 @@ def _spawn(argv: Sequence[str]) -> subprocess.Popen:
 
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                 epilog="Exit codes: the child's own, 2 lock held, 3 not enough RAM, 4 watchdog, "
-                                        "5 lock timeout, 6 turn limit, 130 interrupted.")
+                                  epilog="Exit codes: the child's own, 2 lock held, 3 not enough RAM, 4 watchdog, "
+                                         "5 lock timeout, 6 turn limit, 7 WSL busy, 130 interrupted.")
     ap.add_argument("--owner", help="who takes the lock ('dspark', 'maya', ...)")
     ap.add_argument("--est-ram-gb", type=float, default=None,
                     help="the run's host-RAM need; without it the engine flags are read (see estimate_ram_gb)")
@@ -655,6 +748,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--record-peak", action="store_true",
                     help="record this run's child peak working set in the calibration JSON")
     ap.add_argument("--no-watchdog", action="store_true", help="do not stop the run on low RAM (not recommended)")
+    ap.add_argument("--bench", action="store_true",
+                    help="mark this as a benchmark run (the record says so; the WSL VM is only RECORDED, never "
+                         "stopped - the person using it is working inside it)")
+    ap.add_argument("--wsl", choices=["auto", "record", "shutdown"], default="auto",
+                    help="WSL handling: 'auto'/'record' (default) records the VM's working set and leaves it alone; "
+                         "'shutdown' stops it, and only when nothing is running inside - no runner in this repo "
+                         "passes it")
+    ap.add_argument("--wsl-exe", default=os.environ.get("STRATA_WSL_EXE", "wsl.exe"),
+                    help="the wsl executable (a test hook)")
     ap.add_argument("--dry-run", action="store_true", help="take the lock, check the RAM, print, release, do nothing")
     ap.add_argument("--ram-source", default="auto",
                     help="where the RAM reading comes from: 'auto' measures; 'seq:g1,g2,...' is a scripted sequence "
@@ -695,6 +797,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     child: subprocess.Popen | None = None
     stop_signals: dict[str, int | None] = {"received": None}
+    wsl_gb: float | None = None
+    subtract_wsl = False
 
     def on_signal(signum, _frame):
         # Only record the signal; the main thread does the stopping. Doing it here races with child creation:
@@ -746,6 +850,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         acquired = True
         if interrupted():
             return stop_for_signal()
+
+        # ---- WSL: RECORD ONLY. The user works inside the VM, so nothing in these tools may stop it: `wsl --shutdown`
+        # (and a vhdx compact) belongs to the person at the keyboard. Every run logs the VM's working set so a
+        # benchmark's number can be read against what the VM was holding, and `--record-peak` stores it. The stop path
+        # exists only behind an explicit `--wsl shutdown`, which no runner in this repo passes.
+        wsl_gb = wsl_memory_gb()
+        subtract_wsl = a.wsl == "shutdown"
+        if wsl_gb is not None:
+            log(f"WSL VM holds {wsl_gb:.1f} GB (recorded; the VM is never stopped by this launcher)")
+        if subtract_wsl and (wsl_gb is None or wsl_gb < 0.5):
+            # The VM is not running: probing it with `wsl -e ...` would START it.
+            log("WSL: the VM is not running; nothing to stop")
+            subtract_wsl = False
+        if subtract_wsl:
+            log("WSL: --wsl shutdown was passed explicitly; checking whether anything is running inside the VM")
+            procs, why = wsl_foreign_processes(a.wsl_exe)
+            if procs is None:
+                log(f"REFUSING: {why}; this run wants the VM stopped but cannot prove it is idle (--wsl auto to "
+                    f"record only)")
+                return EXIT_WSL_BUSY
+            if procs:
+                log(f"REFUSING: {len(procs)} process(es) are running inside WSL; `wsl --shutdown` would kill them:")
+                for line in procs[:8]:
+                    log("  " + line[:160])
+                return EXIT_WSL_BUSY
+            ok, why = wsl_shutdown(a.wsl_exe)
+            if not ok:
+                log(f"REFUSING: {why}")
+                return EXIT_WSL_BUSY
+            log("WSL: nothing was running inside the VM, so it was shut down (explicit --wsl shutdown)")
+            # Stopping the VM returns its memory through the vhdx: the writeback shows up as tens of GB of dirty
+            # pages, which the RAM check would read as unavailable.  Wait for it to drain (never with a scripted
+            # reading - that would just consume the sequence).
+            if not ram.modified_fixed:
+                for _ in range(60):
+                    if ram.modified() <= 2.0:
+                        break
+                    time.sleep(5.0)
+                if ram.modified() > 2.0:
+                    log(f"WSL: the writeback is still {ram.modified():.1f} GB of dirty pages after 5 minutes")
+            wsl_gb = wsl_memory_gb()
+
 
         total_gb, avail_gb, mod_gb = ram.total(), ram.available(), ram.modified()
         effective_gb = max(0.0, avail_gb - mod_gb)
@@ -834,7 +980,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             peak = peak_working_set_gb(handle=getattr(child, "_handle", None), pid=child.pid)
             if peak is not None:
                 try:
-                    record_calibration(calibration, cal_key, peak, cmd, formula_gb, est_gb or formula_gb)
+                    record_calibration(calibration, cal_key, peak, cmd, formula_gb, est_gb or formula_gb,
+                                       wsl_gb=wsl_gb, wsl_shutdown=subtract_wsl)
                     log(f"calibration: peak working set {peak:.1f} GB recorded in {calibration}")
                 except OSError as e:
                     log(f"calibration: could not write {calibration}: {e}")

@@ -393,5 +393,125 @@ def test_a_live_holders_mutex_is_not_stolen(tmp_path: Path):
     assert sidecar.exists(), "a live holder's mutex was removed"
 
 
+# ---- WSL: recorded on every run, never stopped by this launcher
+def fake_wsl(tmp_path: Path, ps_rows: str, shutdown_rc: int = 0) -> str:
+    """A stand-in for wsl.exe: `-e ...` prints the ps rows, `--shutdown` leaves a marker and returns shutdown_rc."""
+    script = tmp_path / "fake_wsl.py"
+    marker = tmp_path / "wsl_shutdown_ran"
+    script.write_text(
+        "import pathlib, sys\n"
+        f"marker = pathlib.Path(r'{marker}')\n"
+        "if '--shutdown' in sys.argv:\n"
+        "    marker.write_text('yes')\n"
+        f"    sys.exit({shutdown_rc})\n"
+        f"sys.stdout.write({ps_rows!r})\n",
+        encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def wsl_marker(tmp_path: Path) -> bool:
+    return (tmp_path / "wsl_shutdown_ran").exists()
+
+
+BUSY_PS = "  101 init      /sbin/init\n 2048 python    python /home/niko/work/train.py --steps 4000\n"
+IDLE_PS = ("  1 init-systemd(R /init\n  62 systemd-journal /lib/systemd/systemd-journald\n"
+           "  88 systemd-udevd /lib/systemd/systemd-udevd\n"
+           "  211 sh        sh -c ps -eo pid=,comm=,args= --no-headers\n"
+           " 1234 agetty    /sbin/agetty -o -p -- \\u --noclear tty1 linux\n")
+
+
+def test_the_vm_is_logged_on_every_run(tmp_path: Path):
+    """The person at the keyboard works inside WSL, so its figure goes in the log of every run and nothing stops it."""
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, BUSY_PS)          # busy: it must make no difference at all
+    p = run(["--owner", "dspark", "--lock", str(lock), "--bench", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('child ran')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 0, p.stderr
+    assert "child ran" in p.stdout
+    assert "WSL VM holds 19.5 GB" in p.stderr
+    assert not wsl_marker(tmp_path), "a --bench run must never stop the VM"
+
+
+def test_a_bench_run_with_a_busy_wsl_still_runs(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, BUSY_PS)
+    p = run(["--owner", "dspark", "--lock", str(lock), "--bench", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('child ran')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 0, p.stderr
+    assert "child ran" in p.stdout
+    assert not wsl_marker(tmp_path)
+    assert read(lock) == "free"
+
+
+def test_only_an_explicit_shutdown_stops_the_vm(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, IDLE_PS)
+    p = run(["--owner", "dspark", "--lock", str(lock), "--wsl", "shutdown", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('child ran')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 0, p.stderr
+    assert wsl_marker(tmp_path), p.stderr
+
+
+def test_an_explicit_shutdown_refuses_when_work_is_inside(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, BUSY_PS)
+    p = run(["--owner", "dspark", "--lock", str(lock), "--wsl", "shutdown", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('must not run')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 7, p.stderr
+    assert "must not run" not in p.stdout
+    assert "train.py" in p.stderr            # the refusal names what it found
+    assert not wsl_marker(tmp_path)
+    assert read(lock) == "free"
+
+
+def test_an_explicit_shutdown_refuses_when_wsl_will_not_stop(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, IDLE_PS, shutdown_rc=3)
+    p = run(["--owner", "dspark", "--lock", str(lock), "--wsl", "shutdown", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('must not run')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 7, p.stderr
+    assert "must not run" not in p.stdout
+    assert read(lock) == "free"
+
+
+def test_a_stopped_vm_is_never_probed_or_restarted(tmp_path: Path):
+    """A `wsl -e ps` probe starts a stopped distro; with the VM at 0 GB an explicit shutdown must not call it at all."""
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    wsl = fake_wsl(tmp_path, BUSY_PS)      # would refuse if it were consulted
+    p = run(["--owner", "dspark", "--lock", str(lock), "--wsl", "shutdown", "--wsl-exe", wsl, *LOCK_ONLY,
+             "--", *py("print('child ran')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="0"))
+    assert p.returncode == 0, p.stderr
+    assert "child ran" in p.stdout
+    assert "not running" in p.stderr
+    assert not wsl_marker(tmp_path)
+
+
+def test_the_record_carries_the_vm_figure_even_without_bench(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    cal = tmp_path / "cal.json"
+    wsl = fake_wsl(tmp_path, BUSY_PS)
+    p = run(["--owner", "dspark", "--lock", str(lock), "--calibration", str(cal),
+             "--wsl-exe", wsl, "--record-peak", *LOCK_ONLY, "--", *py("print('ran')")],
+            env=dict(os.environ, PC_LAUNCH_FAKE_WSL_GB="19.5"))
+    assert p.returncode == 0, p.stderr
+    entry = next(iter(json.loads(cal.read_text(encoding="utf-8")).values()))
+    assert entry["wsl_shutdown"] is False
+    assert entry["wsl_gb"] == 19.5
+    assert not wsl_marker(tmp_path)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
