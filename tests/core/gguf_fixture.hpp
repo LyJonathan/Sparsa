@@ -86,6 +86,7 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         else if (k.type == 2) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
         else if (k.type == 4 || k.type == 5) { const uint32_t v = (uint32_t) k.u; put(&v, 4); }
         else if (k.type == 6) put(&k.f, 4);
+        else if (k.type == 7) { const uint8_t v = (uint8_t)(k.u != 0); put(&v, 1); }
         else if (k.type == 9 && k.elem == 4) {
             put32(4);
             put64(k.arr.size());
