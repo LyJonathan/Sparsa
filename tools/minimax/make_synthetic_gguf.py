@@ -220,7 +220,12 @@ def _add_meta(w, g, weights, gguf):
     w.add_indexer_top_k(g['idx_top_k'])
     w.add_indexer_block_size(g['idx_block'])
     w.add_indexer_local_blocks(g['idx_local'])
-    w.add_indexer_first_layer(g['idx_first'])
+    # Upstream's gguf-py (what CI checks out) has the indexer keys above but not this writer method yet; the key it
+    # writes is the one the engine reads (src/minimax/config.cpp), so write it directly when the method is absent.
+    if hasattr(w, "add_indexer_first_layer"):
+        w.add_indexer_first_layer(g['idx_first'])
+    else:
+        w.add_uint32(f"{w.arch}.attention.indexer.first_layer", g['idx_first'])
     if weights == 'glorot':
         # Authoritative: the norm tensors below already contain +1. The engine must not add it again.
         w.add_bool('minimax-m3.norm.add1', False)
