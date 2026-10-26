@@ -2070,3 +2070,61 @@ that neither is trustworthy on its own: pricing by relF makes IQ1_M look cheaper
 measurements above contradict), and pricing per block cancels the type differences entirely. The allocation that is
 measured below is therefore the one the measurements do support: **gate and up from IQ2_XXS, down kept at D3** - the
 per-tensor table's cheap matrix, the measured-expensive matrix left alone - at 123.7 GB of experts.
+
+### A1's candidate: gate/up from IQ2_XXS, down left at D3
+
+The per-tensor table's one usable statement - `down` is the costly matrix to move - gives the only allocation the
+measurements support: **gate and up from IQ2_XXS, down kept at D3** on every MoE layer. Built with
+`mix_layers.py --alloc` (137.44 GB file, **123.72 GB of experts** against D3's 132.33), and checked two ways
+without an engine: `verify_alloc.py` finds all **171/171** expert tensors at the allocated pack's type *and* length,
+and **25/25** sampled expert tensors (every 7th) are **byte-identical** (SHA-256, 64 MiB reads) to the pack they were
+allocated from.
+
+**Gate, six short prompts, 679 positions, same flags, same session as D3:**
+
+| arm | experts | top-1 | KL64 | dKL64 | top-1 delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D3 | 132.33 GB | **58.32%** | 1.3332 | - | - |
+| **A1 candidate (gate/up IQ2_XXS, down D3)** | 123.72 GB | 58.03% | **1.3142** | **-0.0190** | **-0.29** |
+
+8.61 GB of experts saved for 0.29 points of top-1, with the mean KL64 *better* than D3's - and it is the only pack
+measured on this model that comes within 0.3 points of D3 at all (the all-IQ2_XXS arm is 8.10 points down, a
+5-layer IQ1_M block is 3.68). Under the gate's own rule (within 0.3 points -> rerun on more tokens and report KL
+against D3) this arm needs the longer run, and the held-out set is the panel that decides it; both are queued behind
+the shared PC's other tasks.
+
+### `output_rel` is not measurable on this box today, and why
+
+The research note's suggested fine-grained signal is `--exp-layer`'s `output_rel` (the error of `Wx` against `Qx` on
+real routed tokens). `output_rel_probe.py` implements exactly that for a *published pack's* bytes - gate/up on the
+routed-token input, down on the expert's own hidden state - using the reconstruction in `quant/exp_input.py`. It
+cannot be trusted on the dumps this box has:
+
+* the per-op dumps exist for **layers 0, 3 and 40 only** (a per-op dump is a reference forward pass), so a 57-layer
+  table is not available without a new reference run;
+* `exp_input.py` divides by zero on this checkpoint: `input_layernorm.weight` has a channel at exactly **-1.0**, i.e.
+  a norm weight of 0 after the +1 bake, which turns the whole reconstruction into NaN (that is the `nan` in every
+  `verify ...` line the tool prints);
+* with that channel masked, the fitted residual scale is still not consistent - five norm conventions x 40 scales
+  each, and the best agreement with the dumped `expert_000_gate_up` is **1.74 relative** where `exp_input.py`'s own
+  gate asks for < 5e-3. So the activations are wrong, and any `output_rel` computed on them would be fiction.
+
+What is measured - and what the allocation above is built on - is the per-tensor **plain relative Frobenius error of
+the packs' stored bytes** (`pack_sensitivity.py`, 8 sampled experts x 171 groups x 3 packs), which reproduces round
+11's layer-3 numbers exactly, together with the G3 block deltas for the block level. The calibration the research
+asked for is therefore a negative result: the weight-error proxy's block ranking does not match G3 (5% predicted
+spread against a measured -0.094..+0.121), and the activation-weighted proxy that might have is not measurable here.
+
+### The PCIe probe, measured under load
+
+The held-out run's own startup lines (pinned 256 MiB both directions, NVML sampled from a second thread during the
+transfer) give the link numbers the split and lane decisions need, and they finally separate the two slots:
+
+```
+dev=0 h2d 3.11-3.30 GB/s  d2h 3.42-3.55 GB/s  pcie_idle=gen3 x4   pcie_load=gen3 x4
+dev=1 h2d 28.20-28.39 GB/s d2h 28.03-28.61 GB/s pcie_idle=gen4 x16  pcie_load=gen4 x16
+```
+
+Device 1 is 8.5x device 0 in both directions, and the driver reports the same generation and width under load as at
+rest, so the earlier "both cards measure 3.3 GB/s" was the probe, not the slot. Any PCIe lane or split decision has
+to be priced on the 3.2 vs 28.3 GB/s pair.
