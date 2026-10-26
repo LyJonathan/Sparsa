@@ -50,8 +50,10 @@ def tokens(ids: list[int], max_new: int) -> str:
 
 
 def run(model: Path, text: str, *, from_file: bool, tmp_path: Path) -> subprocess.CompletedProcess:
+    # `--minimax-dense-layers-gpu 0` with no tiers and no layer split is the engine's all-CPU path: no device and no
+    # CUDA runtime call, so this test also runs on a machine (and in CI) with no driver.
     cmd = [EXE, '--model', str(model), '--serve', '--minimax-allow-nonstandard', '--max-context', '256',
-           '--cpu-threads', '2', '--gpus', '0']
+           '--cpu-threads', '2', '--minimax-dense-layers-gpu', '0']
     env = dict(os.environ)
     if from_file:
         ids_path = tmp_path / 'gen.txt'
@@ -91,3 +93,22 @@ def test_two_gen_lines_in_one_file(model: Path, tmp_path: Path):
     out = p.stdout.decode('utf-8', 'replace')
     assert out.count('DONE') == 2, out[-800:]
     assert len(started_tokens(p.stdout)) == 5, out[-800:]
+
+
+@pytest.mark.parametrize('n_prompt', [1, 8, 16])
+def test_a_file_and_a_pipe_agree_at_every_length(model: Path, tmp_path: Path, n_prompt: int):
+    """The same GEN line by file and by pipe, at 1, 8 and 16 prompt tokens: both must finish with the same output.
+
+    8 is the multi-token kernel's column group and 16 the row count above which the batched MoE takes the device, so
+    these are the two lengths the earlier hang was reported to split on; the test pins the reader across them.
+    """
+    ids = [3 + 17 * i for i in range(n_prompt)]
+    text = tokens(ids, 4)
+    piped = run(model, text, from_file=False, tmp_path=tmp_path)
+    filed = run(model, text, from_file=True, tmp_path=tmp_path)
+    pout = piped.stdout.decode('utf-8', 'replace')
+    fout = filed.stdout.decode('utf-8', 'replace')
+    assert 'DONE' in pout, pout[-800:]
+    assert 'DONE' in fout, fout[-800:]
+    assert len(started_tokens(piped.stdout)) == 4, pout[-800:]
+    assert started_tokens(piped.stdout) == started_tokens(filed.stdout), (pout[-400:], fout[-400:])
