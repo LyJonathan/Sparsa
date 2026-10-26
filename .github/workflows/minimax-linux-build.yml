@@ -55,8 +55,10 @@ jobs:
       - name: Serve stdin (file and pipe, 1 / 8 / 16 prompt tokens)
         run: |
           apt-get install -y --no-install-recommends python3 python3-pytest python3-numpy
-          # the synthetic test model is written with llama.cpp's gguf-py, which this job already has checked out
-          mkdir -p _baseline
-          ln -sfn "${{ github.workspace }}/llama.cpp" _baseline/llama.cpp
+          # the synthetic test model is written with llama.cpp's gguf-py, which this job already has checked out;
+          # make_synthetic_gguf looks for it under _baseline/llama.cpp/gguf-py
+          mkdir -p _baseline/llama.cpp
+          cp -r llama.cpp/gguf-py _baseline/llama.cpp/
+          ls -d _baseline/llama.cpp/gguf-py
           STRATA_MINIMAX_EXE="${{ github.workspace }}/build/strata-minimax" \
             python3 -m pytest tools/minimax/test_serve_stdin.py -q
