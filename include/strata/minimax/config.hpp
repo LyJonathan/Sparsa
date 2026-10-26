@@ -14,6 +14,7 @@
 
 namespace strata {
 class GgufFile;
+class GgufModel;
 }
 
 namespace strata::minimax {
@@ -50,7 +51,7 @@ struct Config {
     int64_t idx_top_k = 0;       ///< minimax-m3.attention.indexer.top_k (blocks)
     int64_t idx_block = 0;       ///< minimax-m3.attention.indexer.block_size
     int64_t idx_local = 0;       ///< minimax-m3.attention.indexer.local_blocks
-    int64_t idx_first_layer = 0; ///< minimax-m3.attention.indexer.first_layer
+    int64_t idx_first_layer = 0; ///< minimax-m3.attention.indexer.first_layer; inferred from the tensors when absent
 
     /// Number of routed experts on layer `i` (0 on a leading dense layer).
     int64_t experts_on(int64_t layer) const { return layer < leading_dense ? 0 : n_expert; }
@@ -61,7 +62,15 @@ struct Config {
 };
 
 /// Read a config from the metadata shard of a GGUF.  Throws std::runtime_error with the first missing/malformed key.
+/// When `attention.indexer.first_layer` is absent, it is inferred from the indexer tensors present in this one
+/// shard; use the model overload for a split file, whose metadata shard may hold no tensors at all.
 Config from_gguf(const GgufFile& g);
+
+/// Read a config from `model`'s metadata shard.  When `attention.indexer.first_layer` is absent, the first layer
+/// that actually carries `indexer.q_proj.weight` is used, across every shard (Unsloth's MiniMax GGUFs omit the key
+/// but keep the indexer on all 60 layers; defaulting to the dense prefix would run layers 0-2 without MSA).  A file
+/// with the key keeps its value.
+Config from_gguf(const GgufFile& g, const GgufModel& model);
 
 /// Cheap structural validation (positivity, divisibility, supported activation/gating).  "" when fine.
 std::string check_structure(const Config& c);

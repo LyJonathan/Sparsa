@@ -122,7 +122,7 @@ const char* tensor_class_name(TensorClass c) {
 Model load_model(const std::string& path, bool require_m3_1) {
     const GgufModel file = GgufModel::open(path);
     Model m;
-    m.config = from_gguf(file.meta());
+    m.config = from_gguf(file.meta(), file);
 
     const std::string bad = check_structure(m.config);
     if (!bad.empty()) throw std::runtime_error(path + ": " + bad);

@@ -323,6 +323,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(vram_plan_test tests/minimax/vram_plan_test.cpp)
   target_include_directories(vram_plan_test PRIVATE include)
   add_test(NAME vram_plan_test COMMAND vram_plan_test)
+
+  # MiniMax's config from a GGUF: the inferred indexer first layer and the swiglu key spellings.  config.cpp is
+  # compiled on its own (it needs only strata_artifact), so this runs without a GPU or the engine build.
+  add_executable(minimax_config_test tests/minimax/minimax_config_test.cpp src/minimax/config.cpp src/minimax/gguf.cpp)
+  target_include_directories(minimax_config_test PRIVATE include)
+  target_link_libraries(minimax_config_test PRIVATE strata_artifact)
+  add_test(NAME minimax_config_test COMMAND minimax_config_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

@@ -11,6 +11,7 @@ the routed `*_exps.weight` tensors. IQ2_XS uses ggml's quantizer with a uniform 
 
     python tools/minimax/make_synthetic_gguf.py out.gguf [--drop NAME] [--bad-shape]
     python tools/minimax/make_synthetic_gguf.py runnable.gguf --runnable [--dense-type q4_k] [--quant-experts iq2_xs]
+    python tools/minimax/make_synthetic_gguf.py unsloth-layout.gguf --omit-indexer-first-layer --swiglu-underscore
 
 Requires gguf-py from the local llama.cpp copy (see llama_baseline()).
 """
@@ -194,7 +195,7 @@ def _quantize(arr, kind, gguf_mod, exe):
     return raw, qtype
 
 
-def _add_meta(w, g, weights, gguf):
+def _add_meta(w, g, weights, gguf, omit_indexer_first_layer=False, swiglu_underscore=False):
     w.add_block_count(g['layers'])
     w.add_context_length(g['ctx'])
     w.add_embedding_length(g['hidden'])
@@ -222,10 +223,17 @@ def _add_meta(w, g, weights, gguf):
     w.add_indexer_local_blocks(g['idx_local'])
     # Upstream's gguf-py (what CI checks out) has the indexer keys above but not this writer method yet; the key it
     # writes is the one the engine reads (src/minimax/config.cpp), so write it directly when the method is absent.
-    if hasattr(w, "add_indexer_first_layer"):
-        w.add_indexer_first_layer(g['idx_first'])
-    else:
-        w.add_uint32(f"{w.arch}.attention.indexer.first_layer", g['idx_first'])
+    # `--omit-indexer-first-layer` reproduces Unsloth's layout (the key is absent, the tensors are not), which the
+    # engine now infers from the tensors.
+    if not omit_indexer_first_layer:
+        if hasattr(w, "add_indexer_first_layer"):
+            w.add_indexer_first_layer(g['idx_first'])
+        else:
+            w.add_uint32(f"{w.arch}.attention.indexer.first_layer", g['idx_first'])
+    if swiglu_underscore:
+        # llama.cpp's converter spells these with an underscore; our packs use a dot.
+        w.add_float32(f"{w.arch}.swiglu_alpha", 1.702)
+        w.add_float32(f"{w.arch}.swiglu_limit", 7.0)
     if weights == 'glorot':
         # Authoritative: the norm tensors below already contain +1. The engine must not add it again.
         w.add_bool('minimax-m3.norm.add1', False)
@@ -249,11 +257,11 @@ def _unpack_ikq(raw, kind, shape, exe):
 
 
 def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weights=None, quant_experts=None,
-          dense_type=None, pack_exe=None, deq_copy=None):
+          dense_type=None, pack_exe=None, deq_copy=None, omit_indexer_first_layer=False, swiglu_underscore=False):
     g = {**GEOMETRY, **(geometry or {})}
     gguf = llama_baseline(gguf_py)
     w = gguf.GGUFWriter(str(path), 'minimax-m3')
-    _add_meta(w, g, weights, gguf)
+    _add_meta(w, g, weights, gguf, omit_indexer_first_layer, swiglu_underscore)
     rng = np.random.default_rng(WEIGHT_SEED)
 
     if dense_type not in (None, 'f32', 'f16', 'bf16', 'q8_0', 'q6_k', 'q4_k'):
@@ -306,7 +314,7 @@ def build(path, *, drop=None, bad_shape=False, geometry=None, gguf_py=None, weig
         # The reference model: the same weights, with the ported expert formats expanded to f32.  A Python
         # forward pass can read this one (gguf-py has no codec for the ported ids).
         w2 = gguf.GGUFWriter(str(deq_copy), 'minimax-m3')
-        _add_meta(w2, g, weights, gguf)
+        _add_meta(w2, g, weights, gguf, omit_indexer_first_layer, swiglu_underscore)
         rng2 = np.random.default_rng(WEIGHT_SEED)
         for name, shape, dtype in _tensor_list(g):
             if name == drop:
@@ -352,12 +360,18 @@ def main(argv=None):
     ap.add_argument('--quant-experts', choices=('q8_0', 'iq2_xs', 'iq2_kt', 'iq3_k', 'iq4_ks', 'iq3_kt', 'iq2_kl'),
                     help='quantize routed *_exps.weight (iq2_xs and the ik_llama.cpp formats use a uniform imatrix)')
     ap.add_argument('--gguf-py', type=Path, help='path to llama.cpp/gguf-py')
+    ap.add_argument('--omit-indexer-first-layer', action='store_true',
+                    help='omit attention.indexer.first_layer (Unsloth layout: the engine infers it from the tensors)')
+    ap.add_argument('--swiglu-underscore', action='store_true',
+                    help='write swiglu_alpha / swiglu_limit (llama.cpp spelling) instead of no swiglu keys')
     a = ap.parse_args(argv)
     build(a.out, drop=a.drop, bad_shape=a.bad_shape, gguf_py=a.gguf_py,
           geometry=RUNNABLE if a.runnable else None,
           weights='glorot' if a.runnable else None,
           quant_experts=a.quant_experts,
-          dense_type=a.dense_type)
+          dense_type=a.dense_type,
+          omit_indexer_first_layer=a.omit_indexer_first_layer,
+          swiglu_underscore=a.swiglu_underscore)
     print(a.out)
     return 0
 

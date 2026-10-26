@@ -1126,7 +1126,7 @@ struct Engine::Impl {
     }
 
     explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
-        cfg = from_gguf(model.meta());
+        cfg = from_gguf(model.meta(), model);
         const std::string bad = check_structure(cfg);
         if (!bad.empty()) fail(bad);
         if (cfg.n_head % cfg.idx_heads != 0)

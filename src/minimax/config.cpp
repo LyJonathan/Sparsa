@@ -93,9 +93,20 @@ int64_t get_vocab(const GgufFile& g) {
     return get_int(g, "vocab_size", false, 0);
 }
 
-}  // namespace
+// llama.cpp's converter spells these with an underscore, our packs with a dot.  The dotted key wins when both exist,
+// so a file carrying both is read the way it always was.
+double get_real_alias(const GgufFile& g, const char* primary, const char* alias, double fallback) {
+    if (g.get(k(primary))) return get_real(g, primary, false, fallback);
+    return get_real(g, alias, false, fallback);
+}
 
-Config from_gguf(const GgufFile& g) {
+// The metadata key is authoritative.  When it is absent (Unsloth's MiniMax GGUFs omit it), the first layer that
+// actually has indexer tensors is the first MSA layer.  A file with no indexer tensors at all keeps the old
+// dense-prefix fallback, and the layout check then reports the missing tensors instead of silently running without
+// MSA.  `has_indexer(layer)` looks across the whole model, so a split file whose metadata shard has no tensors is
+// handled too.
+template <class HasIndexer>
+Config read_config(const GgufFile& g, const HasIndexer& has_indexer) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) throw std::runtime_error("missing general.architecture");
     if (arch->type != MetaType::STRING) throw std::runtime_error("general.architecture is not a string");
@@ -127,17 +138,41 @@ Config from_gguf(const GgufFile& g) {
     c.routed_scale = get_real(g, "expert_weights_scale", false, 1.0);
     c.expert_weights_norm = get_bool(g, "expert_weights_norm", false, false);
     c.gating_func = get_int(g, "expert_gating_func", true);
-    c.swiglu_alpha = get_real(g, "swiglu.alpha", false, 1.702);
-    c.swiglu_limit = get_real(g, "swiglu.limit", false, 7.0);
+    c.swiglu_alpha = get_real_alias(g, "swiglu.alpha", "swiglu_alpha", 1.702);
+    c.swiglu_limit = get_real_alias(g, "swiglu.limit", "swiglu_limit", 7.0);
 
     c.idx_heads = get_int(g, "attention.indexer.head_count", true);
     c.idx_dim = get_int(g, "attention.indexer.key_length", true);
     c.idx_top_k = get_int(g, "attention.indexer.top_k", true);
     c.idx_block = get_int(g, "attention.indexer.block_size", true);
     c.idx_local = get_int(g, "attention.indexer.local_blocks", true);
-    // llama.cpp's default when the key is absent is the dense prefix (M3's layout); M3.1 writes 0 explicitly.
-    c.idx_first_layer = get_int(g, "attention.indexer.first_layer", false, c.leading_dense);
+    if (g.get(k("attention.indexer.first_layer"))) {
+        c.idx_first_layer = get_int(g, "attention.indexer.first_layer", true);
+    } else {
+        int64_t inferred = c.leading_dense;
+        for (int64_t l = 0; l < c.n_layers; ++l) {
+            if (has_indexer(l)) {
+                inferred = l;
+                break;
+            }
+        }
+        c.idx_first_layer = inferred;
+    }
     return c;
+}
+
+}  // namespace
+
+Config from_gguf(const GgufFile& g) {
+    return read_config(g, [&g](int64_t layer) {
+        return g.find("blk." + std::to_string(layer) + ".indexer.q_proj.weight") != nullptr;
+    });
+}
+
+Config from_gguf(const GgufFile& g, const GgufModel& model) {
+    return read_config(g, [&model](int64_t layer) {
+        return model.find("blk." + std::to_string(layer) + ".indexer.q_proj.weight") != nullptr;
+    });
 }
 
 std::string check_structure(const Config& c) {
