@@ -350,3 +350,29 @@ The patch (`_dspark_anchor_layout.patch` in the worktree before this commit, now
 is `block` (anchor + block-1 masks), `decode_spec` fills every row of the block each round (the block's attention is
 non-causal, so a stale row is visible to every real row), `DsparkDrafter::draft` reads draft j from row j with
 `prev = anchor` at j = 0, and the Markov bias is `bias[v] = <markov_w2[v], markov_w1[prev]>`.
+## The layer-28 device-boundary bug (fixed before this round, described here)
+
+The failure: the first full-model speculative run died in the first batched forward, before any layer line printed
+(`STRATA_WINDOW_DEBUG=1` showed no `[window] layer` line at all), with a CUDA runtime error. It looked like a memory
+bug at layer 28.
+
+The cause is the device, not layer 28's own buffers. `DsparkDrafter` runs on the last card (`devs.back()`, device 1
+here), and its public calls (`load`, `seed`, `draft`, `reset`) used `cu::set_device(im->dev)` with no restore. CUDA's
+"current device" is thread state the engine's own placement depends on: with `--layer-split 28`, device 0 owns layers
+0..27 and device 1 owns 28..59, and the engine calls `use_layer_device(li)` to make a layer's card current before
+allocating/using that layer's buffers. A drafter call that ran *between* two such calls left device 1 current, so the
+allocations and kernel launches that followed - the boundary layer's own workspace, the KV row and the expert slots of
+the first layers on device 1 - were made in the wrong context. The first such allocation is exactly where the split
+starts, which is why it surfaced at layer 28 and not before: dev0's layers had already been served, and the boundary
+layer was the first one whose placement assumed a different current device.
+
+The fix (commit 6fbfa500, in this branch): every public entry of `DsparkDrafter` is wrapped in the RAII guard
+`OnDevice on(device)` - the constructor saves `cu::current_device()` and sets the drafter's card, the destructor puts
+the caller's device back - and `load_dspark` ends with `cu::set_device(0)` so the engine's post-load allocations start
+where they did before the drafter existed. Nothing else about the drafter changed; the fix is that it leaves the
+context as it found it.
+
+The test for it is `tools/minimax/test_dspark_full.py`: the full model at `--layer-split 28` (so the taps at 31/45/59
+are produced on device 1 while 3/17 are on device 0), 16 greedy tokens twice - plain and `--speculative 4` - asserting
+that both finish (no crash through the boundary), that the drafter loads with `dev=1` and `taps=3,17,31,45,59`, and
+that the two arms emit identical tokens.
