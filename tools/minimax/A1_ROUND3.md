@@ -175,6 +175,24 @@ generation harness scores - while it is *better* at reproducing the reference's 
 (ref p>=0.99 agreement +1.4 to +2.9).  So the 8.61 GB C1 saves cost exactly the tokens a generation loop
 would emit most confidently; that is the number a "does A1 ship" decision has to be made on.
 
+### Verdict: C1 fails the A1 gate
+
+The gate is top-1 >= D3 on **both** sets.
+
+| set | positions | D3 | C1 | delta | |
+|---|---:|---|---:|---:|---|
+| held-out 14 | 1792 | 53.46% / 1.4999 | 53.85% / 1.4138 | +0.39 / -0.086 | passes |
+| six-prompt (more tokens) | 1246 | 56.10% / 1.1186 | 54.90% / 1.1245 | **-1.20 / +0.006** | **fails** |
+| six-prompt (original) | 679 | 58.32% / 1.3332 | 58.03% / 1.3142 | -0.29 / -0.019 | inside band |
+
+C1 does not ship.  The more-tokens run the band rule asks for turned the -0.29 into -1.20, and the
+confident on-path slice is 1.4-1.8 points down on all three sets.  Two follow-up candidates are designed
+in `A1_CANDIDATES.md`: **D3-UD** (D3's experts with Unsloth's non-expert savings moved into an F32 indexer
+and IQ4_XS/IQ3_XXS protections on layers 52/58/59, 143.90 GB, a quality-up candidate) and a **RAM-fit
+mix** (IQ1_M types on 39 cheap layers only, 107.30 GB of experts / 121.0 GB file, never in 20-24 or
+52-59).  The sweep now decides which layers the second one may use.
+
+
 
 Turn accounting: 39.4 min wall.  C1's six shorts took 14.0 min, its long prompt 13.3 min (the same
 prompt cost D3 18 min), leaving 11.7 min for the six-prompt arm.  Peak working set 64.2 GiB; WSL held
