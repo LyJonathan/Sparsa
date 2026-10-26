@@ -94,7 +94,8 @@ def main():
                 time.sleep(60)
                 g = drive_gbs(a.model)
                 tries += 1
-            cmd = [sys.executable, a.launcher, "--owner", "dspark", "--max-minutes", "20", "--",
+            cmd = [sys.executable, a.launcher, "--owner", "dspark", "--max-minutes", "20",
+                   "--bench", "--record-peak", "--",
                    a.exe, "--model", a.model] + base
             env = dict(os.environ, STRATA_IQ_MT=str(mt))
             t0 = time.time()
@@ -107,7 +108,7 @@ def main():
                    "wall_s": round(wall, 1), "rc": p.returncode}
             if not done:
                 row["status"] = "failed"
-                row["tail"] = err[-3:]
+                row["tail"] = err[-3:] + ["stdout: " + l for l in p.stdout.splitlines()[-4:]]
             else:
                 f = done[0].split()
                 pms = float(f[3])
