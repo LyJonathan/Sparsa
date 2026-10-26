@@ -500,14 +500,15 @@ bool DsparkDrafter::draft(const float* ids, int32_t anchor, int64_t pos0, int32_
         const uint16_t* cb = im->h16("confidence_head.bias");
         float code[512];
         int32_t prev = anchor;
-        const int kd = (int)g.block;
-        for (int j = 1; j <= kd; ++j) {
+        const int kd = (int)im->rows;      // one draft per block row, row 0 = the anchor
+        for (int j = 0; j < kd; ++j) {
             const float* row = im->h_logits.data() + (size_t)j * (size_t)V;
             for (int64_t r = 0; r < rank; ++r)
-                code[r] = ggml_fp16_to_fp32(w2[(size_t)prev * (size_t)rank + (size_t)r]);
+                code[r] = ggml_fp16_to_fp32(w1[(size_t)prev * (size_t)rank + (size_t)r]);
             // The Markov bias only reorders tokens that are already close, so it is evaluated over the row's top
             // candidates: one scan for the cutoff, then the bias on the survivors (a full-vocab walk would read
-            // 100 MiB of markov_w1 per position).
+            // 100 MiB of markov_w2 per position).  W1 embeds the previous token into the rank space, W2 projects it
+            // back to the vocabulary: bias[v] = <markov_w2[v], markov_w1[prev]>.
             float top = -INFINITY;
             for (int64_t v = 0; v < V; ++v)
                 if (row[v] > top) top = row[v];
@@ -518,7 +519,7 @@ bool DsparkDrafter::draft(const float* ids, int32_t anchor, int64_t pos0, int32_
             float best = -INFINITY;
             int32_t pick = 0;
             for (int32_t v : im->cand) {
-                const uint16_t* wr = w1 + (size_t)v * (size_t)rank;
+                const uint16_t* wr = w2 + (size_t)v * (size_t)rank;
                 float s = row[v];
                 for (int64_t r = 0; r < rank; ++r) s += ggml_fp16_to_fp32(wr[r]) * code[r];
                 if (s > best) {
@@ -526,14 +527,14 @@ bool DsparkDrafter::draft(const float* ids, int32_t anchor, int64_t pos0, int32_
                     pick = v;
                 }
             }
-            drafts[j - 1] = pick;
+            drafts[j] = pick;
             prev = pick;
             const float* fr = im->h_fn.data() + (size_t)j * (size_t)E;
             double acc = ggml_fp16_to_fp32(cb[0]);
             for (int64_t c = 0; c < E; ++c) acc += (double)ggml_fp16_to_fp32(cw[c]) * (double)fr[c];
             for (int64_t c = 0; c < rank; ++c)
                 acc += (double)ggml_fp16_to_fp32(cw[E + c]) * (double)code[c];
-            conf[j - 1] = sigmoidf_(acc);
+            conf[j] = sigmoidf_(acc);
         }
         ms_head += now_ms() - t_gpu;
         ++rounds;

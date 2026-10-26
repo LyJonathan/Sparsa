@@ -6972,7 +6972,9 @@ struct Engine::Impl {
             if (kd_max > 0 && max_new - emitted > 1) {
                 if (!dspark_seed_to(p0, err)) fail("minimax-dspark: " + err);
                 const int want = std::min(kd_max, max_new - emitted - 1);
-                const int rows = want + 1;
+                // the block is always the pack's own size (the drafter was trained for it), and every row is written
+                // each round: the block's attention is non-causal, so a stale row is visible to every real row
+                const int rows = (int)g.rows();
                 input_row(p0, id0, ds_ids.data());
                 for (int j = 1; j < rows; ++j)
                     decode_f32(embd, embd.host + (size_t)mask_id * embd.row_bytes,

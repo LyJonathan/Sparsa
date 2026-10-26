@@ -309,3 +309,44 @@ acceptance, not on this script.
 Unchanged: DSpark stays opt-in and is **pending the zero-copy lane**. The tap convention is confirmed against the
 FP32 reference; the row index, the extra mask row and the Markov transpose are named, sourced from the published
 spec, and unverified on the engine until a PC window allows the acceptance re-measure.
+
+---
+
+# Round 5: the anchor layout fixes acceptance (0/7 -> 13/21) and DSpark is still 6.5x too slow
+
+The three deviations Round 4 named are now fixed in the engine and measured on the full model (`--dspark-model
+models/MiniMax-M3.1-Flash/dspark-q4_0.gguf --speculative 4`, 198-token chat prompt, 32 greedy tokens,
+`--max-context 16384 --gpus 0,1 --layer-split auto --minimax-prefill-batch 4096 --minimax-prefill-experts mmvq
+--cpu-threads 12 --memory-limit-mib 45000`, 2 x RTX 5070 12 GB):
+
+| | before (round 1-3) | after this round |
+| --- | ---: | ---: |
+| drafts accepted | **0 / 7** | **13 / 21 = 61.9 %** |
+| emitted tokens vs plain decode | (diverged) | **identical, all 32** |
+| ms per token | - | 2178.9 (plain decode on the same box: ~333) |
+
+```
+INFO minimax-spec rounds=19 drafts=21 accepted=13 rate=0.619 per_round=1.68 tokens=32
+     draft_ms=1689.4 verify_ms=68034.2 round_ms=69723.6 ms/token=2178.9
+INFO minimax-spec-window checked_per_verify=2.11 committed_per_verify=1.68 accepted_per_verify=1.68
+     experts_unique_per_verify=6.91 experts_one_token_sum_per_verify=8.42 experts_ratio=0.821 layers_per_verify=57.0
+```
+
+The drafter was never the problem: with the anchor layout (`q[0] = anchor`, one draft per query row, `prev` seeded
+from the anchor) and the Markov bias read the right way round, it proposes what the target accepts six times in ten.
+`experts_ratio=0.82` says the verify window does read each distinct expert once (6.91 unique against 8.42 one-token
+reads), so the block's expert dedup works too.
+
+**The cost is the window, not the draft.** 2.11 rows verified per round cost **3.58 s** of target forward
+(68034 ms / 19 rounds) against ~333 ms for one plain token - a 10.7x per-row penalty, which is the batched
+`forward_batch` path the P13 write-up has always named (per-window dequantize, per-row CPU expert decode until the
+multi-token row lands on *every* projection, per-query attention). Drafting itself is 89 ms a round.
+
+So DSpark is **not kept as a speed feature** (the gate is > 5 % faster; this is 6.5x slower) and stays opt-in and
+pending the zero-copy lane. What changed is the correctness record: the drafts are good, the greedy output is
+token-identical, and the remaining work is the verify path, which is also the zero-copy lane's subject.
+
+The patch (`_dspark_anchor_layout.patch` in the worktree before this commit, now committed): `DsparkGeometry::rows()`
+is `block` (anchor + block-1 masks), `decode_spec` fills every row of the block each round (the block's attention is
+non-causal, so a stale row is visible to every real row), `DsparkDrafter::draft` reads draft j from row j with
+`prev = anchor` at j = 0, and the Markov bias is `bias[v] = <markov_w2[v], markov_w1[prev]>`.

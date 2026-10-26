@@ -7,11 +7,14 @@
 //             the drafter knows about the past, and each of its 5 layers turns it into one K/V row of that layer's
 //             ring.  There is no autoregressive KV of drafted tokens: the ring holds committed positions only, so a
 //             rejected draft leaves nothing to roll back.
-//   block     one forward pass of `block_size + 1` rows - the last committed token then `block_size` mask tokens
+//   block     one forward pass of `block_size` rows - the last committed token then `block_size - 1` mask tokens
 //             (dspark_mask_token_id) - with full (non-causal) attention inside the block over the ring plus the
-//             block's own keys.  Row j is at position p0 + j and its hidden state predicts the token at p0 + j.
+//             block's own keys.  Row j is at position p0 + j and its logits predict the token at p0 + j + 1 (the
+//             anchor layout's standard next-token shift), so draft j is row j's argmax.  The layout is the published
+//             one (`queries = N = num_speculative_tokens`, `q[0] = anchor`, `q[1..] = noise`) and NOT DFlash's
+//             masks-sit-at-the-predicted-position shift.
 //   head      the target's own lm_head (the checkpoint carries no head of its own) plus a rank-256 Markov bias
-//             logits[v] += <markov_w1[v], markov_w2[prev]> that couples the block's rows into a chain, and a
+//             logits[v] += <markov_w2[v], markov_w1[prev]> that couples the block's rows into a chain, and a
 //             sigmoid confidence head per row.
 //
 // The engine only ever uses these tokens as a proposal: the target's own forward pass verifies them (greedy argmax,
@@ -46,8 +49,9 @@ struct DsparkGeometry {
     double limit = 7.0;
     bool norm_add1 = true;    ///< use_gemma_norm: the norm weights are applied as (1 + w)
     std::vector<int64_t> taps;///< dspark_target_layer_ids
-    /// Block rows per round: the anchor plus one per draft.
-    int64_t rows() const { return block + 1; }
+    /// Block rows per round: the anchor is row 0 and every draft is one row, so a round of `block` drafts is
+    /// `block` rows (the DSpark anchor layout: `queries = N`, `q[0] = anchor`, `q[1..] = noise`).
+    int64_t rows() const { return block; }
     /// Values of one tap row: every tapped layer's residual, concatenated.
     int64_t tap_width() const { return (int64_t)taps.size() * n_embd; }
 };
