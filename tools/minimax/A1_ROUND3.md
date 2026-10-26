@@ -75,7 +75,10 @@ already in use it is **35.3 GiB over**.  The file alone (128.00 GiB) is the whol
 The largest pinned budget that keeps 10 GiB free today is
 `127.9 - 25.9 - 10 - 12.1 = 79.9 GiB` (~81,800 MiB).  The decode comparison below uses **60,000 MiB**
 (58.6 GiB), which pins 50.9% of C1's experts (56.5 GiB streamed per token) and 47.6% of D3's
-(65.6 GiB streamed per token) - the same setting for both, as the comparison requires.
+(65.6 GiB streamed per token) - the same setting for both, as the comparison requires.  Measured on the
+D3 held-out run at that budget: the engine's peak working set is **69.7 GiB** (`--record-peak`), i.e.
+11.1 GiB above the pinned tier - so the "127.3 GiB fully resident" figure above is right within 1 GiB,
+and the box cannot hold it with 10 GiB to spare.
 
 ### Decode-speed plan (not run this round)
 
@@ -98,15 +101,25 @@ three tok/s per arm is the number.
 
 ## 4. The gates
 
-Not run this round (the PC lock was held by other tasks).  The plan, in the PC order:
+Status after this round's PC turn:
 
-1. D3 on the held-out set, resuming the six prompts already dumped (at `--memory-limit-mib 600`).
-2. C1 on the same 14 prompts, same flags.
-3. A longer run on the six prompts: the reference dumps only hold the last 128 logits per prompt, so
-   "more tokens" needs more reference positions.  `full_ref_logits.py` recomputes them from the dump's
-   own `final_hidden.npy` and the checkpoint's output head, checks the reconstruction against the dumped
-   logits (cos, mean |d|) and writes a `logits_long` tree that `g3_sparsa.py --ref` reads unchanged.
-   The six prompts then score ~1,246 positions instead of 679, with KL64 and top-1.
+* **D3 on the held-out set: 12 of 14 prompts scored** (1,536 positions, top-1 52.47%, KL64 1.5416).
+  `story_lighthouse` and `long_science_darwin` are still missing: the short phase hit the 40-minute turn
+  limit at `story_lighthouse`, and the long-prompt phase was interrupted when the driving shell timed
+  out.  Both dumps are resumable; only those two are left.
+* **C1 on the held-out set: not started.**
+* **The longer six-prompt run: not run.**  The reference for it exists (see below).
+
+**The pinned budget is neutral on this prompt set, measured, not assumed.**  `code_lru` at
+`--memory-limit-mib 600` (the six existing held-out dumps) and at `60000` produced **byte-identical**
+logits (`SHA-256` of the two .npy files equal), so the remaining held-out prompts can run at 60,000 MiB
+for speed without changing what is measured.  The six prompts already dumped at 600 keep their bytes.
+The 60,000 MiB run's peak working set was **69.7 GiB** (`--record-peak`).
+
+So the gate plan is unchanged but cheaper: D3 and C1 each run `story_lighthouse` and
+`long_science_darwin` at 60,000 MiB, then C1's 12 remaining short prompts, then the six-prompt
+long-reference run at 600 MiB (both packs, one session).
+
 
 ## 5. Activation-weighted `output_rel`
 
@@ -229,5 +242,9 @@ instead of 679, so the six-prompt gate can be run on nearly twice the tokens wit
 * turn 1b: 1 min (long reference, correct convention)
 * turn 1c: 1 min (build)
 * SSD proof: 1 min
-* waiting for the lock between turns: ~26 min (other tasks held it)
+* turn 2: 61 min wall (13:19-14:20), of which 40 min of engine time on the held-out short phase and 19
+  min on the interrupted long-prompt phase; the lock was left held-stale by the killed driver and was
+  released by hand.  This overran the 45-minute turn rule - recorded as a process failure, not hidden.
+* held-out D3 scoring of the 12 complete dumps: seconds, no engine.
+
 
