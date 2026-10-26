@@ -60,6 +60,13 @@ void usage() {
         "  --exp-layer N               experiment: quantize every expert of MoE layer N\n"
         "  --exp-type TYPE             experiment expert type (default: recipe experts)\n"
         "  --exp-out FILE              experiment JSON report\n"
+        "  --exp-method old|diag|gptq  experiment rounding: imatrix, per-expert diagonal, GPTQ feedback\n"
+        "  --exp-pack FILE             experiment: also write the layer's expert tensors as a GGUF\n"
+        "                              (a donor for the engine's --expert-source 30-30=FILE)\n"
+        "  --gptq-prior N              tokens' worth of the layer-wide Hessian mixed into each expert (16384)\n"
+        "  --gptq-damp X               GPTQ diagonal damping as a fraction of mean(diag) (0.1)\n"
+        "  --exp-holdout X             share of each expert's rows held out of the Hessian (0.2)\n"
+        "  --gptq-selftest N           check the Cholesky/inverse against a naive reference and exit\n"
         "  --exp-x FILE.npy            experiment: routed-expert input [tokens, n_embd]\n"
         "  --exp-dumps DIR             experiment: dump dir with expert_XXX_hidden/token_idx.npy\n"
         "  --exp-experts N             experiment: limit to the first N experts (default all)\n"
@@ -147,6 +154,18 @@ int main(int argc, char ** argv) {
                 opt.exp_dumps = val;
             } else if (take(i, argc, argv, "--exp-experts", val)) {
                 opt.exp_experts = std::stoi(val);
+            } else if (take(i, argc, argv, "--exp-method", val)) {
+                opt.exp_method = val;
+            } else if (take(i, argc, argv, "--exp-pack", val)) {
+                opt.exp_pack = val;
+            } else if (take(i, argc, argv, "--gptq-prior", val)) {
+                opt.gptq_prior = std::stod(val);
+            } else if (take(i, argc, argv, "--gptq-damp", val)) {
+                opt.gptq_damp = std::stod(val);
+            } else if (take(i, argc, argv, "--exp-holdout", val)) {
+                opt.exp_holdout = std::stod(val);
+            } else if (take(i, argc, argv, "--gptq-selftest", val)) {
+                opt.gptq_selftest = std::stoi(val);
             } else if (take(i, argc, argv, "--write-test-imatrix", val)) {
                 opt.write_imatrix = val;
             } else if (take(i, argc, argv, "--max-layers", val)) {
