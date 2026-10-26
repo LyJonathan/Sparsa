@@ -2576,6 +2576,75 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     return msg
 
 
+class EngineVision:
+    """Pictures read by the engine itself (the MiniMax engine has the ViT in its own mmproj).
+
+    One normalized image file per picture; `encode()` returns (file, image tokens) like Vision.encode, but the
+    number comes from the checkpoint's smart_resize (28-pixel blocks, at most 672x672) rather than an encoder
+    process.  The engine replaces the prompt's image tokens with its own projections, so no embeddings file is
+    written here.
+    """
+
+    def __init__(self, cfg: dict):
+        self.dir = Vision.work_dir()
+        self.max_tokens = int(cfg.get("max_tokens") or 576)
+        self.cache: dict[str, tuple[Path, int]] = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def tokens_for(width: int, height: int, max_pixels: int = 451584) -> int:
+        factor = 28
+        h = max(factor, round(height / factor) * factor)
+        w = max(factor, round(width / factor) * factor)
+        if h * w > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h = max(factor, math.floor((height / beta) / factor) * factor)
+            w = max(factor, math.floor((width / beta) / factor) * factor)
+        elif h * w < 4 * 28 * 28:
+            beta = math.sqrt((4 * 28 * 28) / (height * width))
+            h = math.ceil((height * beta) / factor) * factor
+            w = math.ceil((width * beta) / factor) * factor
+        return (h // 14) * (w // 14) // 4
+
+    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+        raw = source if isinstance(source, bytes) else Vision.load(source)
+        data = Vision.normalize(raw)
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            if key in self.cache:
+                return self.cache[key]
+            try:
+                import io
+                from PIL import Image
+                with Image.open(io.BytesIO(data)) as im:
+                    tokens = self.tokens_for(im.width, im.height)
+            except Exception as e:  # noqa: BLE001 - a picture the decoder cannot size is refused with its reason
+                raise ValueError(f"the image could not be read ({e})") from None
+            if self.max_tokens and tokens > self.max_tokens:
+                raise ValueError(f"the image becomes {tokens} image tokens, over the limit of {self.max_tokens}")
+            self.dir.mkdir(parents=True, exist_ok=True)
+            path = self.dir / f"{key}.img"
+            path.write_bytes(data)
+            self.cache[key] = (path, tokens)
+            for old in list(self.cache):
+                if len(self.cache) <= 64:
+                    break
+                if str(self.cache[old][0]) not in {str(p) for p in keep}:
+                    self.cache.pop(old)[0].unlink(missing_ok=True)
+            return self.cache[key]
+
+    def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
+        out = []
+        for src in sources:
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
+            out.append(self.encode(src, keep=[p for p, _ in out]))
+        return out
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -3094,7 +3163,7 @@ def engine_args(cfg: dict) -> list[str]:
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
     # (only when the config has no reserve of its own).
-    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args and cfg["vision"].get("engine") is not True:
         args.append("--vision")
         note = "added --vision"
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
@@ -3792,12 +3861,13 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True, format: str = "qwen"):
+                 fit_max_tokens: bool = True, format: str = "qwen", engine_vision: EngineVision | None = None):
         if format not in ("qwen", "minimax_m3"):
             raise ValueError(f"unknown model format {format!r}")
         self.format = format
         self.minimax = format == "minimax_m3"
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.engine_vision = engine_vision            # pictures the engine encodes itself (MiniMax)
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4749,7 +4819,7 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
+                why = "this server has no image encoder" if self.vision is None and self.engine_vision is None else None
                 if why is None:
                     src = item["source"]
                     try:
@@ -4760,8 +4830,11 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                            if self.engine_vision is not None:
+                                self.engine_vision.encode(src)
+                            else:
+                                self._vision_up()     # an elastic encoder is not running until a picture needs it
+                                self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
@@ -4790,11 +4863,15 @@ class Service:
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
-            if self.vision is None:
+            if self.vision is None and self.engine_vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            if self.minimax or self.engine_vision is not None:
+                pad_text, start_text, literal_text = ']<]image[>[', ']<]start of image[>[', ']<]image[>['
+            else:
+                pad_text, start_text, literal_text = IMAGE_PAD, VISION_START, IMAGE_PAD
+            pad = self.tok.encode(pad_text, parse_special=True)[0]
+            start = self.tok.encode(start_text, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):
@@ -4808,16 +4885,19 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self._vision_up()
-                try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
-                finally:
-                    self.last_image_at = time.time()
-            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
-            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+                if self.engine_vision is not None:
+                    encoded = self.engine_vision.encode_all(images, cancel)
+                else:
+                    self._vision_up()
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self.last_image_at = time.time()
+            # one image token per picture -> one per image token.  Only the markers the template writes for an
+            # image (right after the start token) are images: the same text inside a message (an agent reading
+            # these docs, #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+            literal = self.tok.encode(literal_text, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
@@ -4864,16 +4944,24 @@ class Service:
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
         if images:
-            # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
-            # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
-            # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
-            # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
-            # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
-            # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
-            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            if self.engine_vision is not None:
+                # The engine reads the picture files itself (its own mmproj).  "img=" keeps the GENI head's
+                # shape; the paths come from a directory whose name has no space (Vision.work_dir).
+                self.embeddings.path = "img=" + ",".join(str(p) for p, _ in encoded)
+                self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
+            else:
+                # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses
+                # the request: one refused after it (the engine starting, no room) left it in the vision directory
+                # for good, one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never
+                # starts.
+                combined = combined_embeddings_path(self.vision.dir,
+                                                    sum(Path(p).stat().st_size for p, _ in encoded))
+                self.embeddings.path = combined         # first, so a half-written one is found as well
+                # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+                # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded
+                # again (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+                self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
+                write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -4957,7 +5045,7 @@ class Service:
         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
         then nothing else would.  The handler calls this when a request is done."""
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
-        if path is not None:
+        if path is not None and not path.startswith("img="):
             Path(path).unlink(missing_ok=True)
 
     def _note(self, n, evs, st=None, rate=None):
@@ -5520,7 +5608,7 @@ class Service:
                 event = {"stop": "finished", "length": "finished", "cancel": "cancelled",
                          "disconnect": "disconnected", "timeout": "timeout", "error": "error"}.get(finish, "error")
                 self._terminal_event_locked(request_id, event, finish)
-            if emb:
+            if emb and not str(emb).startswith("img="):
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
@@ -7970,7 +8058,11 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "minimax-m3": "minimax-m3.1-flash"}
+                      "minimax-m3": "minimax-m3.1-flash", "minimax_m3": "minimax-m3.1-flash"}
+
+# The GGUF architecture is "minimax-m3"; the server's format and sparsa.py's config spell it "minimax_m3".
+# Both names must find MiniMax's own card, never another family's.
+MODEL_ARCH_ALIASES = {"minimax-m3": "minimax_m3"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -7983,11 +8075,16 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # MiniMax-M3.1-Flash: generation_config.json carries one set (temperature 1.0, top_p 0.95); the card does not
+    # split thinking from answering, so both states use it
+    "minimax_m3": {"thinking": {"temperature": 1.0, "top_p": 0.95},
+                   "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
 
 
 def model_card_sampling(arch, thinking) -> dict:
     """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+    arch = MODEL_ARCH_ALIASES.get(arch, arch) if arch else None
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
@@ -8172,8 +8269,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if model_format not in ("qwen", "minimax_m3"):
         ap.error(f"unknown model format {model_format!r} (expected \"qwen\" or \"minimax_m3\")")
     minimax = model_format == "minimax_m3"
-    if minimax and cfg.get("vision"):
-        ap.error("MiniMax-M3.1 vision is not implemented in this server yet")
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:
@@ -8273,6 +8368,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    engine_vision = None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -8290,22 +8386,30 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
-            print("the vision encoder starts with the first picture (elastic) ..." if elastic else
-                  "loading the vision encoder ..." if not lazy else
-                  "vision encoder unloaded; it starts with the model ...", flush=True)
-            # relative paths are the config's cwd's, as for the engine below
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
-            if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
-                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
-                vcfg["elastic"] = False
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+            if cfg["vision"].get("engine") is True:
+                # MiniMax: the engine owns the ViT (its own mmproj); no encoder process to start.
+                print("the engine reads pictures itself (mmproj) ...", flush=True)
+                vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                            if k == "mmproj" and isinstance(v, str) and not os.path.isabs(v) else v)
+                        for k, v in cfg["vision"].items()}
+                engine_vision = EngineVision(vcfg)
+            else:
+                elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+                print("the vision encoder starts with the first picture (elastic) ..." if elastic else
+                      "loading the vision encoder ..." if not lazy else
+                      "vision encoder unloaded; it starts with the model ...", flush=True)
+                # relative paths are the config's cwd's, as for the engine below
+                vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                            if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                        for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
+                if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
+                    vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
+                if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+                    print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+                          "encoder its VRAM): the encoder starts with the model instead", flush=True)
+                    vcfg["elastic"] = False
+                vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -8370,7 +8474,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc = Service(engine, tok, template,
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults, format=model_format,
-                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False),
+                  engine_vision=engine_vision)
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
     svc.max_queue = max_queue

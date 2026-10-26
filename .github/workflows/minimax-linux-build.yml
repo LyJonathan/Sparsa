@@ -1,0 +1,54 @@
+name: MiniMax Linux build
+
+# Compile and link strata-minimax on Ubuntu with CUDA. Build only: no GPU, no model, no tests that need either.
+# The CUDA devel image carries nvcc; the runner has no driver, which a build does not need.
+
+on:
+  pull_request:
+    branches:
+      - feat/minimax-engine
+      - main
+      - sync/**
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'include/**'
+      - 'src/**'
+      - 'third_party/**'
+      - 'tools/minimax/build_linux.sh'
+      - 'tools/minimax/CMakeLists.txt'
+      - '.github/workflows/minimax-linux-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    timeout-minutes: 75
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+      STRATA_CUDA_ARCHS: '75'
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake git ninja-build
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: llama.cpp (ggml) at the pinned commit
+        run: |
+          git init -q llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C llama.cpp checkout -q FETCH_HEAD
+      - name: Build strata-minimax
+        env:
+          STRATA_GGML_DIR: ${{ github.workspace }}/llama.cpp
+        run: |
+          sh tools/minimax/build_linux.sh
+          test -x build/strata-minimax

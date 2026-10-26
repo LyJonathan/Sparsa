@@ -88,6 +88,10 @@ node_modules/
 # MiniMax work: local llama.cpp baseline build, reference venv, dumps (never committed)
 /_baseline/
 /_local/
+/_ref/
+# sparsa.py's generated run settings and engine log
+/sparsa-*.json
+/sparsa-*.log
 # secrets must never be committed
 .env
 .env.*

@@ -38,14 +38,19 @@ def _write_tokenizer(directory):
     for word in ("hello", " world", "hi"):
         add(word)
 
-    added = ["]~b]", "[e~[", "]~!b[", "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>", NS]
+    added = ["]~b]", "[e~[", "]~!b[", "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>", NS,
+             ']<]image[>[', ']<]start of image[>[', ']<]end of image[>[']
     added = [(text, next_id + i) for i, text in enumerate(added)]
     data = {
         "version": "1.0",
         "added_tokens": [{"id": i, "content": t, "special": True, "single_word": False, "lstrip": False,
                           "rstrip": False, "normalized": False} for t, i in added],
-        "normalizer": None,
-        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
+        # The released tokenizer.json's shape: NFC, and a Split that keeps only its matches before ByteLevel.
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "behavior": "Removed", "invert": True,
+             "pattern": {"Regex": r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"}},
+            {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]},
         "post_processor": None,
         "decoder": {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
         "model": {"type": "BPE", "vocab": vocab, "merges": merges, "unk_token": None, "byte_fallback": False},
@@ -75,6 +80,12 @@ def test_tokenizer_added_tokens(tok):
     assert tok.encode("[e~[", parse_special=True) == [tok.ids["[e~["]]
     assert tok.encode("]~b]", parse_special=True) == [tok.ids["]~b]"]]
     assert tok.encode(NS + "<mm:think>", parse_special=True) == [tok.ids[NS], tok.ids["<mm:think>"]]
+
+
+def test_tokenizer_normalizes_to_nfc(tok):
+    """The released tokenizer.json normalizes to NFC, so a decomposed prompt is the composed prompt's ids."""
+    assert tok.encode("e\u0301", parse_special=True) == tok.encode("\u00e9", parse_special=True)
+    assert tok.decode(tok.encode("e\u0301", parse_special=True)) == "\u00e9"
 
 
 def test_template_renders_roles_thinking_and_generation_prompt():
@@ -122,6 +133,15 @@ def test_parser_reasoning_then_content_across_deltas():
     assert not any(e.kind == "tool_call" for e in events)
 
 
+def test_parser_strips_the_namespace_token_from_text():
+    parser = MiniMaxOutputParser(thinking=False)
+    events = []
+    for ch in f"hello {NS}world":
+        events += parser.feed(ch)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "content") == "hello world"
+
+
 def test_parser_tool_call_with_namespace_and_param_types():
     text = (f"<mm:think>t</mm:think>I will call.\n{CALL_START}\n{NS}<invoke name=\"get_weather\">\n"
             f"{NS}<city>Paris</city>\n{NS}<days>2</days>\n{NS}<flags><item>a</item><item>b</item></flags>\n"
@@ -164,3 +184,30 @@ def test_parser_thinking_disabled_starts_in_content():
     events = parser.feed("answer") + parser.finish()
     assert [(e.kind, e.text) for e in events] == [("content", "answer")]
     assert THINK_END not in "".join(e.text for e in events)
+
+
+def test_parser_adaptive_direct_answer_is_content_not_reasoning():
+    """The generation prompt is adaptive: with thinking on the model may answer without opening a think block."""
+    parser = MiniMaxOutputParser(thinking=True)
+    events = parser.feed("the answer") + parser.finish()
+    assert [(e.kind, e.text) for e in events] == [("content", "the answer")]
+
+
+def test_parser_adaptive_no_thinking_prefix_is_content():
+    parser = MiniMaxOutputParser(thinking=True)
+    events = []
+    for ch in "</mm:think>the answer":
+        events += parser.feed(ch)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "content") == "the answer"
+    assert not any(e.kind == "reasoning" for e in events)
+
+
+def test_parser_adaptive_think_tag_split_across_deltas():
+    parser = MiniMaxOutputParser(thinking=True)
+    events = []
+    for piece in ("<mm:", "thi", "nk>plan", "</mm:think>", "answer"):
+        events += parser.feed(piece)
+    events += parser.finish()
+    assert "".join(e.text for e in events if e.kind == "reasoning") == "plan"
+    assert "".join(e.text for e in events if e.kind == "content") == "answer"

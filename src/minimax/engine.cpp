@@ -3250,8 +3250,10 @@ struct Engine::Impl {
             }
             const auto t0 = std::chrono::steady_clock::now();
             size_t bytes = 0;
+#if defined(_WIN32)
             std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
             ranges.reserve(jobs.size() * 3);
+#endif
             for (const Job& j : jobs) {
                 const Layer& L = *j.L;
                 const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,

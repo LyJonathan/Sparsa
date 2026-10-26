@@ -19,14 +19,20 @@ What it does, in order:
 2. REFUSES TO START IF THE RAM WILL NOT FIT: effective available RAM (available physical minus modified/dirty
    file-cache pages, from PDH `\Memory\Modified Page List Bytes` on Windows or `/proc/meminfo` on Linux)
    minus the run's estimate must stay at or above `--min-free-gb` (default 10). The estimate is `--est-ram-gb`,
-   or `estimate_ram_gb()` reading the engine's own flags (pinned expert budget, dense host copy, KV, prefill
-   workspace, margin); the breakdown and both RAM numbers are printed.
+   or `estimate_ram_gb()` reading the engine's own flags: pinned expert budget + dense host copy + KV + prefill
+   workspace + the measured over-tier working set (7 GiB default, `--over-tier-gb`). `--memory-limit-mib` caps
+   only the pinned tier, not the process. The breakdown and both RAM numbers are printed.
+   `--record-peak` records the child's `PeakWorkingSetSize` in a small JSON (default
+   `<lock>.calibration.json`). A later run with the same model+flags takes `max(formula, last peak)`; the JSON is
+   read automatically, `--calibration` names another file.
 3. WATCHES the child: every `--poll` seconds (default 2), if effective RAM falls below `--min-free-gb` it stops
    the child's whole process tree and exits 4 with the available, modified and effective readings that triggered it.
    `--max-minutes` is the turn limit: at the limit the launcher stops the same child tree, releases the lock and
    exits 6, so the next task in the queue can take the PC.
-4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM handlers put the lock back to `free` - on a clean exit, a child
-   crash, Ctrl-C, or a watchdog kill.
+4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM/SIGBREAK handlers put the lock back to `free` - on a clean
+   exit, a child crash, Ctrl-C/Ctrl-Break, or a watchdog kill. The handlers only record the signal; the main loop
+   stops the child tree, so an interrupt that lands while the child is being created cannot orphan it with the lock
+   already free.
 
 Exit codes: 0..n = the child's own code, 2 = another owner holds the lock, 3 = not enough RAM, 4 = the watchdog
 stopped the run, 5 = the lock could not be taken (the sidecar timed out), 130 = interrupted.
@@ -40,6 +46,8 @@ import argparse
 import ctypes
 import datetime
 import errno
+import hashlib
+import json
 import os
 import re
 import signal
@@ -51,6 +59,9 @@ from typing import Iterable, Sequence
 
 DEFAULT_LOCK = Path(r"E:\Jon's Projects\AI\Strata Fork Minimax\pc-engine.lock")
 DEFAULT_MIN_FREE_GB = 10.0
+# DSpark's held-out measurement: the working set above the pinned tier was ~6.6 GiB (mmap residency of the
+# model, workspace, buffers). 7 GiB is the default; --over-tier-gb overrides it.
+DEFAULT_OVER_TIER_GB = 7.0
 LOCK_FREE = b"free"
 
 # ---- exit codes the callers (and the tests) rely on
@@ -454,13 +465,15 @@ def _flag(argv: Sequence[str], name: str) -> str | None:
     return None
 
 
-def estimate_ram_gb(argv: Sequence[str], total_gb: float) -> tuple[float, list[str]]:
+def estimate_ram_gb(argv: Sequence[str], total_gb: float,
+                    over_tier_gb: float = DEFAULT_OVER_TIER_GB) -> tuple[float, list[str]]:
     """A run's host-RAM need from the engine's flags, with the line that produced each part.
 
     The parts are the ones that actually hold memory on this box: the pinned expert tier (`--memory-limit-mib`, or
     `--minimax-ram-experts-per-layer x 57 x 14.6 MB`), a host copy of the dense weights when they are not on a card
     (`--minimax-dense-layers-gpu 0`), the KV cache when it is not in VRAM (`--max-context x 135 KB`), the batched
-    prompt workspace, and a fixed margin for the process and the driver.
+    prompt workspace, and the measured working set above the pinned tier (~6.6 GiB: mmap residency of the model,
+    workspace and buffers). `--memory-limit-mib` caps only the pinned tier, so this overhead is separate.
     """
     parts: list[str] = []
     limit = _flag(argv, "--memory-limit-mib")
@@ -469,7 +482,6 @@ def estimate_ram_gb(argv: Sequence[str], total_gb: float) -> tuple[float, list[s
     ctx = _flag(argv, "--max-context") or _flag(argv, "--ctx")
     kv_space = _flag(argv, "--minimax-kv") or _flag(argv, "--kv-space") or "auto"
     batch = _flag(argv, "--minimax-prefill-batch") or _flag(argv, "--minimax-batch")
-    headroom = _flag(argv, "--minimax-ram-headroom-mib")
 
     pinned = 0.0
     if limit:
@@ -493,9 +505,91 @@ def estimate_ram_gb(argv: Sequence[str], total_gb: float) -> tuple[float, list[s
         kv = 0.1
     ws = 0.7 if batch and int(batch) >= 1024 else 0.1
     parts.append(f"prefill workspace {ws:.1f} GB (--minimax-prefill-batch {batch or '0'})")
-    margin = 1.5 + (float(headroom) / 1024.0 if headroom else 0.0)
-    parts.append(f"margin {margin:.1f} GB (process + driver)")
-    return pinned + dense + kv + ws + margin, parts
+    parts.append(f"over-tier resident {over_tier_gb:.1f} GB (mmap/workspace/buffers; --over-tier-gb)")
+    return pinned + dense + kv + ws + over_tier_gb, parts
+
+
+# ---- calibration: the child's peak working set, keyed by the child's model + flags
+def calibration_key(argv: Sequence[str]) -> str:
+    payload = "\0".join(str(x) for x in argv)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def load_calibration(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def calibrated_peak_gb(path: Path | None, key: str) -> float | None:
+    if path is None:
+        return None
+    entry = load_calibration(path).get(key)
+    try:
+        return float(entry["peak_working_set_gb"]) if entry else None
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def record_calibration(path: Path, key: str, peak_gb: float, argv: Sequence[str],
+                       formula_gb: float, estimate_gb: float) -> None:
+    data = load_calibration(path)
+    data[key] = {
+        "model": _flag(argv, "--model") or "",
+        "flags": list(argv),
+        "peak_working_set_gb": round(float(peak_gb), 3),
+        "formula_gb": round(float(formula_gb), 3),
+        "estimate_gb": round(float(estimate_gb), 3),
+        "stamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t)]
+
+
+def peak_working_set_gb(handle=None, pid: int | None = None) -> float | None:
+    """The child's Windows PeakWorkingSetSize, or a best-effort child max on POSIX. A test hook can inject it."""
+    fake = os.environ.get("PC_LAUNCH_FAKE_PEAK_GB")
+    if fake:
+        try:
+            return float(fake)
+        except ValueError:
+            pass
+    if sys.platform == "win32":
+        own = False
+        if handle is None and pid:
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            own = bool(handle)
+        if not handle:
+            return None
+        try:
+            counters = _PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(counters)
+            if not ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return None
+            return counters.PeakWorkingSetSize / (1024.0 ** 3)
+        finally:
+            if own:
+                ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        # Linux reports KiB, macOS bytes.
+        return usage / (1024.0 ** 2) if sys.platform.startswith("linux") else usage / (1024.0 ** 3)
+    except (ImportError, OSError):
+        return None
 
 
 # ============================================================================================== the child
@@ -533,6 +627,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--poll", type=float, default=2.0, help="the watchdog's interval in seconds (default 2)")
     ap.add_argument("--max-minutes", type=float, default=None,
                     help="stop the child cleanly after this many minutes and release the lock (turn limit)")
+    ap.add_argument("--over-tier-gb", type=float, default=DEFAULT_OVER_TIER_GB,
+                    help="measured host working set above the pinned tier (default %(default)s GB)")
+    ap.add_argument("--calibration", help="calibration JSON (default: <lock>.calibration.json)")
+    ap.add_argument("--record-peak", action="store_true",
+                    help="record this run's child peak working set in the calibration JSON")
     ap.add_argument("--no-watchdog", action="store_true", help="do not stop the run on low RAM (not recommended)")
     ap.add_argument("--dry-run", action="store_true", help="take the lock, check the RAM, print, release, do nothing")
     ap.add_argument("--ram-source", default="auto",
@@ -545,6 +644,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- the command to run")
     a = ap.parse_args(argv)
     lock = Path(a.lock)
+    calibration = Path(a.calibration) if a.calibration else lock.with_name(lock.name + ".calibration.json")
 
     if a.who:
         state = read_lock(lock)
@@ -566,26 +666,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     cmd = [c for c in a.cmd if c != "--"]
     if not cmd:
         ap.error("a command is required after --")
-
-    try:
-        was = acquire(lock, a.owner, a.lock_timeout)
-    except LockBusy as e:
-        log(f"REFUSING: the lock is {e.state.describe()}")
-        log("another task is using the PC; take your turn when it writes 'free'")
-        return EXIT_LOCK_HELD
-    except TimeoutError as e:
-        log(f"REFUSING: {e}")
-        return EXIT_LOCK_TIMEOUT
+    cal_key = calibration_key(cmd)
+    formula_gb = est_gb = None
 
     child: subprocess.Popen | None = None
-    stop_signals = {"received": False}
+    stop_signals: dict[str, int | None] = {"received": None}
 
     def on_signal(signum, _frame):
-        stop_signals["received"] = True
-        if child is not None and child.poll() is None:
-            log(f"signal {signum}: stopping the child tree")
-            _kill_tree(child.pid)
-        raise SystemExit(130)
+        # Only record the signal; the main thread does the stopping. Doing it here races with child creation:
+        # CreateProcess makes the OS process a moment before `child` is bound, and a handler that ran in that window
+        # saw `child is None`, so it skipped the kill, released the lock and exited 130 while the engine kept
+        # running - a free lock with a job still holding the PC (and, under a test, the inherited stdout/stderr
+        # pipes). A handler that also raised could interrupt lock writing the same way.
+        stop_signals["received"] = signum
 
     old_handlers = {}
     sigs = [signal.SIGINT, signal.SIGTERM]
@@ -593,11 +686,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         sigs.append(signal.SIGBREAK)   # Windows' Ctrl-Break / CTRL_BREAK_EVENT
     for sig in sigs:
         try:
+            # Installed before the lock is taken, so an interrupt during the RAM check cannot leave it held.
             old_handlers[sig] = signal.signal(sig, on_signal)
         except (ValueError, OSError):
             pass
 
+    def interrupted() -> bool:
+        return stop_signals["received"] is not None
+
+    def stop_for_signal() -> int:
+        """Stop the child tree (if any) and return 130; the caller's `finally` puts the lock back to free."""
+        signum = stop_signals["received"]
+        if child is not None and child.poll() is None:
+            log(f"signal {signum}: stopping the child tree")
+            _kill_tree(child.pid)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log(f"signal {signum}: the child tree did not exit within 10s")
+        else:
+            log(f"signal {signum}: stopping before the child started")
+        return 130
+
+    acquired = False
     try:
+        try:
+            acquire(lock, a.owner, a.lock_timeout)
+        except LockBusy as e:
+            log(f"REFUSING: the lock is {e.state.describe()}")
+            log("another task is using the PC; take your turn when it writes 'free'")
+            return EXIT_LOCK_HELD
+        except TimeoutError as e:
+            log(f"REFUSING: {e}")
+            return EXIT_LOCK_TIMEOUT
+        acquired = True
+        if interrupted():
+            return stop_for_signal()
+
         total_gb, avail_gb, mod_gb = ram.total(), ram.available(), ram.modified()
         effective_gb = max(0.0, avail_gb - mod_gb)
         if ram.fixed:
@@ -605,13 +730,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ram.modified_fixed:
             log(f"dirty-page reading is scripted (--modified-source {a.modified_source})")
         if a.est_ram_gb is not None:
-            est, parts = a.est_ram_gb, [f"estimate given on the command line ({a.est_ram_gb:.1f} GB)"]
+            formula, parts = a.est_ram_gb, [f"estimate given on the command line ({a.est_ram_gb:.1f} GB)"]
         else:
-            est, parts = estimate_ram_gb(cmd, total_gb)
+            formula, parts = estimate_ram_gb(cmd, total_gb, a.over_tier_gb)
+        peak_gb = calibrated_peak_gb(calibration, cal_key)
+        if peak_gb is not None:
+            parts.append(f"calibrated peak {peak_gb:.1f} GB for the same model+flags (last recorded run)")
+        est = max(formula, peak_gb or 0.0)
+        formula_gb, est_gb = formula, est
         for p in parts:
             log("  " + p)
         log(f"RAM: {avail_gb:.1f} GB available of {total_gb:.1f} GB, {mod_gb:.1f} GB in modified (dirty) pages "
-            f"-> {effective_gb:.1f} GB effective; this run needs about {est:.1f} GB")
+            f"-> {effective_gb:.1f} GB effective; formula {formula:.1f} GB, using {est:.1f} GB")
         left = effective_gb - est
         if left < a.min_free_gb:
             log(f"REFUSING: {left:.1f} GB would be left, under the {a.min_free_gb:.0f} GB floor "
@@ -624,12 +754,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             log("dry run: not starting the command")
             return 0
 
+        if interrupted():
+            return stop_for_signal()
+
         log("starting: " + " ".join(cmd))
         t0 = time.monotonic()
         turn_deadline = t0 + a.max_minutes * 60.0 if a.max_minutes and a.max_minutes > 0 else None
         child = _spawn(cmd)
         next_tree = 0.0
         while True:
+            if interrupted():
+                return stop_for_signal()
             if time.monotonic() >= next_tree:
                 try:
                     write_lock_tree(lock, a.owner, os.getpid(), process_tree(child.pid))
@@ -637,9 +772,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     log(f"could not record the child tree in the lock: {e}")
                 next_tree = time.monotonic() + 10.0
             try:
-                rc = child.wait(timeout=a.poll)
+                # Short enough that a Ctrl-C is acted on in well under a second, long enough not to spin.
+                rc = child.wait(timeout=min(a.poll, 0.25))
                 break
             except subprocess.TimeoutExpired:
+                if interrupted():
+                    return stop_for_signal()
                 if turn_deadline is not None and time.monotonic() >= turn_deadline:
                     log(f"TURN LIMIT: {a.max_minutes:.1f} minutes reached; stopping pid {child.pid} and its children, "
                         "then releasing the lock for the next task")
@@ -649,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except subprocess.TimeoutExpired:
                         pass
                     return EXIT_TURN_LIMIT
-                if a.no_watchdog or stop_signals["received"]:
+                if a.no_watchdog:
                     continue
                 now_gb, dirty_gb = ram.available(), ram.modified()
                 effective_now = max(0.0, now_gb - dirty_gb)
@@ -668,7 +806,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if child is not None and child.poll() is None:
             log("stopping the child tree (the launcher is leaving)")
             _kill_tree(child.pid)
-        release(lock, a.owner)
+        if child is not None and a.record_peak and formula_gb is not None:
+            peak = peak_working_set_gb(handle=getattr(child, "_handle", None), pid=child.pid)
+            if peak is not None:
+                try:
+                    record_calibration(calibration, cal_key, peak, cmd, formula_gb, est_gb or formula_gb)
+                    log(f"calibration: peak working set {peak:.1f} GB recorded in {calibration}")
+                except OSError as e:
+                    log(f"calibration: could not write {calibration}: {e}")
+        if acquired:
+            release(lock, a.owner)
         for sig, h in old_handlers.items():
             try:
                 signal.signal(sig, h)
