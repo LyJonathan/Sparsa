@@ -7,6 +7,12 @@ of `compare.py` (KL64, full-vocab KL, top-1 agreement, NLL against the true next
 token) so the numbers are directly comparable; the ppl pass mirrors
 `run_g3_d3.py` + `score_d3.py` (ppl_text_hf.bin, the reference's exact ids).
 
+The gate stays teacher-forced top-1 and KL64.  Three extra slices are reported
+next to it for comparison with a generation harness: top-1 on the reference's
+own greedy path (`argmax(ref) == true next`), on path and ref p(argmax) >= 0.90,
+and at ref p(argmax) >= 0.99.  They are extra report lines; nothing above is
+recomputed from them.
+
 Prompt set: by default the **6 short prompts** - chinese_local_llm, code_lru,
 math_bakery, multi_turn_threads, prose_moe, tool_weather - are scored. The two
 long ones (long_code_stdlib at 5,536 tokens and long_prose_austen at 4,093) are
@@ -65,6 +71,51 @@ def log_softmax(x):
     return z - np.log(np.exp(z).sum(-1, keepdims=True))
 
 
+def conditioned_slices(ref, quant, ids):
+    """The extra slices that make this benchmark comparable to a generation harness.
+
+    The gate is teacher-forced top-1 on every prompt position, where most positions are open-ended and the
+    reference itself picks the true next token only a quarter of the time.  A generation harness instead
+    scores tokens the reference itself produced, which are on its own greedy path and mostly confident.
+    These three slices approximate that, and are reported next to the gate (never instead of it):
+
+      on_path          argmax(ref) == the true next token ("on the reference's greedy path")
+      on_path_conf90   on_path and ref p(argmax) >= 0.90
+      conf99           ref p(argmax) >= 0.99 (also includes a confident wrong reference, hence both top-1
+                       against the true token and agreement with the reference are returned)
+
+    `ids` are the prompt's token ids; row i predicts ids[len(ids) - n + i + 1], as `score_prompt`.
+    """
+    ref = np.asarray(ref, dtype=np.float64)
+    q = np.asarray(quant, dtype=np.float64)
+    ids = np.asarray(ids).astype(np.int64)
+    n = ref.shape[0]
+    lp = log_softmax(ref)
+    p = np.exp(lp)
+    top1_ref = ref.argmax(-1)
+    top1_q = q.argmax(-1)
+    start = len(ids) - n
+    tgt = np.array([ids[start + i + 1] if start + i + 1 < len(ids) else -1 for i in range(n)])
+    valid = tgt >= 0
+    ref_p = p[np.arange(n), np.clip(top1_ref, 0, None)]
+    agree = top1_ref == top1_q
+    on_path = valid & (top1_ref == tgt)
+
+    def sliced(mask):
+        count = int(mask.sum())
+        if count == 0:
+            return {"n": 0, "top1": float("nan"), "top1_agreement": float("nan")}
+        return {"n": count,
+                "top1": float((top1_q[mask] == tgt[mask]).mean()),
+                "top1_agreement": float(agree[mask].mean())}
+
+    return {
+        "on_path": sliced(on_path),
+        "on_path_conf90": sliced(on_path & (ref_p >= 0.90)),
+        "conf99": sliced(valid & (ref_p >= 0.99)),
+    }
+
+
 def score_prompt(name, ref_dir, quant_logits, ids):
     """compare.py's `score`, with the quant logits already loaded (fp32 npy)."""
     ref = np.load(os.path.join(ref_dir, name, "logits_last128.npy")).astype(np.float64)
@@ -110,6 +161,7 @@ def score_prompt(name, ref_dir, quant_logits, ids):
         "top1_acc_vs_true_quant": float((top1_q[valid] == tgt[valid]).mean()) if valid.any() else float("nan"),
         "nll_true_ref": float(nll_ref.mean()) if len(nll_ref) else float("nan"),
         "nll_true_quant": float(nll_q.mean()) if len(nll_q) else float("nan"),
+        "conditioned": conditioned_slices(ref, q, ids),
         "_kl64": kl64,
         "_klv": kl_vocab,
     }
@@ -119,6 +171,21 @@ def overall(rows):
     k64 = np.concatenate([r["_kl64"] for r in rows])
     kv = np.concatenate([r["_klv"] for r in rows])
     n = len(k64)
+    conditioned = {}
+    for key in ("on_path", "on_path_conf90", "conf99"):
+        count = sum(r["conditioned"][key]["n"] for r in rows)
+        if count == 0:
+            conditioned[key] = {"n": 0, "top1": float("nan"), "top1_agreement": float("nan")}
+            continue
+        # weighted by the slice's own n, not by the prompt's positions: a prompt with no position in a slice
+        # must not pull that slice's mean toward its own rate.
+        conditioned[key] = {
+            "n": int(count),
+            "top1": float(sum(r["conditioned"][key]["top1"] * r["conditioned"][key]["n"]
+                              for r in rows if r["conditioned"][key]["n"]) / count),
+            "top1_agreement": float(sum(r["conditioned"][key]["top1_agreement"] * r["conditioned"][key]["n"]
+                                        for r in rows if r["conditioned"][key]["n"]) / count),
+        }
     return {
         "positions": int(n),
         "kl64_mean": float(k64.mean()),
@@ -133,6 +200,7 @@ def overall(rows):
         "top1_acc_vs_true_quant": float(np.sum([r["top1_acc_vs_true_quant"] * r["positions"] for r in rows]) / n),
         "nll_true_ref": float(np.sum([r["nll_true_ref"] * r["positions"] for r in rows]) / n),
         "nll_true_quant": float(np.sum([r["nll_true_quant"] * r["positions"] for r in rows]) / n),
+        "conditioned": conditioned,
     }
 
 
@@ -260,13 +328,34 @@ def write_md(path, res):
     L.append(f"| mean NLL vs true next (ref) | {o['nll_true_ref']:.4f} |")
     L.append(f"| mean NLL vs true next (quant) | {o['nll_true_quant']:.4f} |")
     L.append("")
+    c = o.get("conditioned")
+    if c:
+        L.append("### Conditioned top-1 (extra; the gate above stays the gate)\n")
+        L.append("The prompt set is mostly open-ended, so the reference itself picks the true next token on only "
+                 "about a quarter of the positions. A generation harness instead scores tokens the reference "
+                 "produced. These slices approximate that; `top1` is against the true next token, "
+                 "`top1 = ref` is agreement with the reference's argmax (identical on the two on-path rows).\n")
+        L.append("| slice | n | top-1 vs true next | top-1 = ref |")
+        L.append("|---|---:|---:|---:|")
+        for key, label in (("on_path", "on the reference's greedy path (ref argmax == true next)"),
+                           ("on_path_conf90", "on path and ref p(argmax) >= 0.90"),
+                           ("conf99", "ref p(argmax) >= 0.99 (includes confident reference errors)")):
+            s = c[key]
+            if s["n"]:
+                L.append(f"| {label} | {s['n']} | {100*s['top1']:.2f}% | {100*s['top1_agreement']:.2f}% |")
+            else:
+                L.append(f"| {label} | 0 | - | - |")
+        L.append("")
     L.append("## Per prompt\n")
-    L.append("| prompt | pos | KL64 | p99 | max | KLvocab | top1 | NLL quant | s |")
-    L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    L.append("| prompt | pos | KL64 | p99 | max | KLvocab | top1 | on-path top1 (n) | p>=.99 top1 (n) | NLL quant | s |")
+    L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in res["per_prompt"]:
+        c = r.get("conditioned")
+        onpath = f"{100*c['on_path']['top1']:.1f}% ({c['on_path']['n']})" if c and c["on_path"]["n"] else "-"
+        conf = f"{100*c['conf99']['top1']:.1f}% ({c['conf99']['n']})" if c and c["conf99"]["n"] else "-"
         L.append(f"| {r['prompt']} | {r['positions']} | {r['kl64_mean']:.4f} | {r['kl64_p99']:.4f} | "
                  f"{r['kl64_max']:.4f} | {r['kl_vocab_mean']:.4f} | {100*r['top1_agreement']:.1f}% | "
-                 f"{r['nll_true_quant']:.4f} | {r['seconds']:.1f} |")
+                 f"{onpath} | {conf} | {r['nll_true_quant']:.4f} | {r['seconds']:.1f} |")
     L.append("")
     L.append("## Plain-text perplexity (2,048 reference ids, 2,047 scored positions)\n")
     if p:
@@ -321,6 +410,9 @@ def main():
     ap.add_argument("--only-ppl", action="store_true", help="skip the 8 prompt passes")
     ap.add_argument("--rescore", action="store_true",
                     help="only rescore existing dumps (never start the engine)")
+    ap.add_argument("--dumps-dir", default=None,
+                    help="score the dumps in this directory instead of <out>/dumps; with --rescore this "
+                         "re-scores an earlier run in place, with no engine and no copy")
     ap.add_argument("--allow-partial", action="store_true",
                     help="skip a prompt that has no complete dump instead of running the engine for it; "
                          "the results carry a `skipped` list. For the long prompts whose host-attention "
@@ -361,7 +453,7 @@ def main():
     ids_dir = args.ids or os.path.join(repo, "_local", "g3_iq2xs", "ids")
     tier = args.tier or os.path.basename(os.path.dirname(os.path.abspath(args.model)))
     out = os.path.abspath(args.out)
-    dumps = os.path.join(out, "dumps")
+    dumps = os.path.abspath(args.dumps_dir) if args.dumps_dir else os.path.join(out, "dumps")
     logs = os.path.join(out, "logs")
     for d in (out, dumps, logs):
         os.makedirs(d, exist_ok=True)
@@ -453,7 +545,10 @@ def main():
             r["seconds"] = dt
             res["per_prompt"].append(r)
             print(f"{name:20s} T={r['positions']:4d} KL64 {r['kl64_mean']:.4f} p99 {r['kl64_p99']:.4f} "
-                  f"top1 {100*r['top1_agreement']:.1f}%  (KLvocab {r['kl_vocab_mean']:.4f})", flush=True)
+                  f"top1 {100*r['top1_agreement']:.1f}%  (KLvocab {r['kl_vocab_mean']:.4f}, "
+                  f"on-path {100*r['conditioned']['on_path']['top1']:.1f}% n={r['conditioned']['on_path']['n']}, "
+                  f"p>=.99 {100*r['conditioned']['conf99']['top1']:.1f}% n={r['conditioned']['conf99']['n']})",
+                  flush=True)
 
     if res["per_prompt"]:
         res["overall"] = overall(res["per_prompt"])
