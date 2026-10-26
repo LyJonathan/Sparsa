@@ -54,6 +54,6 @@ jobs:
           test -x build/strata-minimax
       - name: Serve stdin (file and pipe, 1 / 8 / 16 prompt tokens)
         run: |
-          apt-get install -y --no-install-recommends python3 python3-pytest
+          apt-get install -y --no-install-recommends python3 python3-pytest python3-numpy
           STRATA_MINIMAX_EXE="${{ github.workspace }}/build/strata-minimax" \
             python3 -m pytest tools/minimax/test_serve_stdin.py -q
