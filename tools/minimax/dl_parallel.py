@@ -86,7 +86,10 @@ def fetch(path: str, size: int, dest_dir: str, retries: int = 5) -> tuple[str, b
         if size and have >= size:
             break
         cmd = ['curl.exe' if os.name == 'nt' else 'curl', '-L', '-C', '-', '--retry', '5', '--retry-delay', '3',
-               '--silent', '--show-error', '-o', part, url]
+               '--silent', '--show-error', '-o', part, url,
+               # a stalled connection must not wedge a thread forever: abort an attempt that averages under
+               # 1 KiB/s for a minute, and cap the whole attempt at an hour
+               '--speed-time', '60', '--speed-limit', '1024', '--max-time', '3600']
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 and not (size and os.path.exists(part) and os.path.getsize(part) >= size):
             print(f'  {leaf}: curl rc {r.returncode} (attempt {attempt + 1}) {r.stderr.strip()[:160]}', flush=True)
@@ -128,6 +131,15 @@ def main(argv=None) -> int:
         leaf = os.path.basename(path)
         final = os.path.join(dest_dir, leaf)
         want = tables.get(path) or tables.get(leaf)
+        stamp = final + '.sha256'
+        if want and os.path.exists(stamp) and os.path.exists(final):
+            # a shard verified on an earlier pass is not hashed again: 124 GB re-read per resume is most of a
+            # PC turn
+            try:
+                if open(stamp, encoding='utf-8').read().strip() == want:
+                    return leaf, True, 'verified earlier'
+            except OSError:
+                pass
         if not args.verify_only and not (os.path.exists(final) and size and os.path.getsize(final) == size):
             leaf, ok, why = fetch(path, size, dest_dir)
             if not ok:
@@ -140,7 +152,10 @@ def main(argv=None) -> int:
             return leaf, True, 'no hash published'
         t = time.time()
         got = sha256(final)
-        return leaf, got == want, f'sha256 {"ok" if got == want else "MISMATCH"} in {time.time() - t:.0f}s'
+        ok = got == want
+        if ok:
+            open(stamp, 'w', encoding='utf-8').write(want)
+        return leaf, ok, f'sha256 {"ok" if ok else "MISMATCH"} in {time.time() - t:.0f}s'
 
     bad = 0
     t0 = time.time()

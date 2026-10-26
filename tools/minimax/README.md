@@ -2021,3 +2021,52 @@ quality number below is comparable with the round-9 baseline because the bytes a
 per-prompt dumps after a time limit, and prints one table whose deltas are against the session's first arm. Its per-GB
 column uses the packs' own tensor tables - a MoE layer of experts is 2,321,547,264 B in D3 and 1,679,818,752 B in
 IQ1_M, i.e. **0.6417 GB saved per layer**, not the 0.688 the old driver guessed.
+
+### The block sweep, the published tiers, and what the error proxy can and cannot rank
+
+Three more six-prompt arms, same session shape and flags as round 12 (`--memory-limit-mib 600`, 679 positions):
+
+| arm | experts | top-1 | KL64 | dKL64 vs D3 | top-1 delta | GB saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| D3 | 132.33 GB | **58.32%** | **1.3332** | - | - | - |
+| layers 3-7 from IQ1_M | 129.12 | 57.44% | **1.2393** | -0.0939 | -0.88 | 3.21 |
+| layers 20-24 from IQ1_M | 129.12 | 54.64% | 1.4542 | **+0.1210** | **-3.68** | 3.21 |
+| **every expert from IQ2_XXS** | 110.81 | 50.22% | 1.8592 | **+0.5260** | **-8.10** | 21.52 |
+
+So the loss is extremely uneven across the model (the same 3.21 GB costs 0.88 points in layers 3-7 and 3.68 in
+layers 20-24), and the published middle tier is not the safe compromise the round-4 arithmetic assumed: **all of
+IQ2_XXS costs 8.10 points of top-1 for 21.5 GB**, which is worse per gigabyte than the 25-layer IQ1_M mix that was
+rejected at 3.1 points for 16 GB. Nothing measured so far passes the gate (top-1 >= D3), and the cheapest measured
+downgrade (3.21 GB) already costs 0.88 points.
+
+**The per-tensor error table does not rank blocks.** `tools/minimax/pack_sensitivity.py` reports, per expert tensor,
+the relative Frobenius error of a published pack's stored bytes against the source checkpoint (`models/MiniMax-M3.1-Flash`,
+per-expert NVFP4 `weight_packed`/`weight_scale`/`weight_global_scale`), reproducing round 11's layer-3 numbers
+(D3 0.3234/0.3234/0.2043, IQ1_M 0.4997/0.5001/0.3720 on gate/up/down at 2 experts):
+
+| | gate | up | down | GB/layer | relF vs D3, per GB saved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D3 (IQ2_XS / IQ3_XXS) | 0.3090 | 0.3090 | 0.2077 | 2.3215 | - |
+| IQ2_XXS (IQ2_XXS / IQ2_XS) | 0.3517 | 0.3518 | 0.3347 | 1.9440 | +0.043 / +0.127 |
+| IQ1_M (IQ1_M / IQ2_XXS) | 0.4701 | 0.4703 | 0.3775 | 1.6798 | +0.161 / +0.170 |
+
+Summed over the 15 tensors of each measured block it predicts 2.552 (3-7), 2.423 (20-24) and 2.440 (44-48) - a 5%
+spread - while the measured KL64 deltas are -0.094 and +0.121. **The prediction is flat where the measurement is
+not, and its order is inverted at the top.** The reason is visible in the table: every layer's error rises by nearly
+the same amount, so the quantity that decides a block's cost is not in the weight error at all. The table is still
+the right instrument for the one thing it does describe - that `down` is the expensive matrix to move (1.82x its
+own error against 1.52x for gate/up) - so the allocation below uses G3 for the block level and the table only for
+the within-layer split.
+
+**The IQ2_XXS tier was completed and verified** (`tools/minimax/dl_parallel.py`, six connections, resumable, one
+`--allow-partial`-free pass, and every shard renamed into place only after its SHA-256 matched the repo's
+`SHA256SUMS`): 13/13 shards, 124.5 GB. The first run wedged on one shard because `curl` had no timeout; the fix is
+`--speed-time 60 --speed-limit 1024 --max-time 3600`, and a verified shard leaves a `.sha256` stamp so a resume does
+not re-hash 124 GB.
+
+**The exact-budget allocation** (`tools/minimax/a1_dp.py`, 171 groups x 3 options, 1 MiB units, exact against brute
+force in `test_a1_dp.py`) needs a cost per (group, type). Two ways of building it were tried and the honest result is
+that neither is trustworthy on its own: pricing by relF makes IQ1_M look cheaper per byte than IQ2_XXS (which the
+measurements above contradict), and pricing per block cancels the type differences entirely. The allocation that is
+measured below is therefore the one the measurements do support: **gate and up from IQ2_XXS, down kept at D3** - the
+per-tensor table's cheap matrix, the measured-expensive matrix left alone - at 123.7 GB of experts.

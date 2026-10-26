@@ -111,6 +111,9 @@ def main(argv=None) -> int:
     ap.add_argument('--ref', default=r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\ref_out\logits")
     ap.add_argument('--ids', default=r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\g3_iq2xs\ids")
     ap.add_argument('--memory-limit-mib', default='80000')
+    ap.add_argument('--gb-per-layer', type=float, default=GB_PER_LAYER,
+                    help=f'GB of experts a layer saves against the base (default {GB_PER_LAYER} for the IQ1_M '
+                         f'pack; the IQ2_XXS pack is 0.3775)')
     ap.add_argument('--timeout', type=float, default=2400.0, help='per arm, seconds')
     ap.add_argument('--skip-done', action='store_true', default=True,
                     help='an arm whose results.json already covers these prompts is not rerun')
@@ -161,7 +164,7 @@ def main(argv=None) -> int:
             print('out of session budget; stopping here', flush=True)
             break
 
-    print('\n' + summary(out_root, arms, wanted), flush=True)
+    print('\n' + summary(out_root, arms, wanted, args.gb_per_layer), flush=True)
     return 0
 
 
@@ -173,7 +176,8 @@ def layers_of(what: str) -> list[int]:
     return list(range(int(lo), int(hi or lo) + 1))
 
 
-def summary(out_root: Path, arms: list[tuple[str, str]], wanted: set[str]) -> str:
+def summary(out_root: Path, arms: list[tuple[str, str]], wanted: set[str],
+            gb_per_layer: float = GB_PER_LAYER) -> str:
     rows = []
     for name, what in arms:
         d = scored(out_root / name, wanted)
@@ -184,7 +188,7 @@ def summary(out_root: Path, arms: list[tuple[str, str]], wanted: set[str]) -> st
         rows.append({'arm': name, 'layers': layers_of(what), 'positions': o['positions'],
                      'top1': round(100.0 * o['top1_agreement'], 2),
                      'kl64': round(o['kl64_mean'], 4),
-                     'gb_saved': round(nlayers * GB_PER_LAYER, 2) if nlayers else 0.0})
+                     'gb_saved': round(nlayers * gb_per_layer, 2) if nlayers else 0.0})
     if not rows:
         return 'no arm produced a complete result'
     base_row = rows[0]
