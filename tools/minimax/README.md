@@ -1972,3 +1972,52 @@ The 15 are exactly the block: layers 3-7 x {gate, up, down}. `verify_pack.py` no
 identical resolution, for a `--serve` against a `--minimax-eval` log) and `--expect-moved N` (require exactly N
 tensors to move), because a base arm and an `--expert-source` arm are *supposed* to differ - comparing them as if they
 were the same configuration was the last false failure.
+
+### Round 12: the +1.90-point block is a two-prompt artifact, and the RAM budget moves no logits
+
+**Step 1's verdict, D3 against D3-with-layers-3-7-from-IQ1_M, back to back in one PC turn**, same build, same flags
+(`--vram-slots 0 --layer-split auto --cpu-threads 12 --memory-limit-mib 600`), same reference logits, 679 positions
+of the six short prompts:
+
+| arm | positions | top-1 | KL64 |
+| --- | ---: | ---: | ---: |
+| D3 | 679 | **58.32%** | 1.3332 |
+| D3, layers 3-7's experts from IQ1_M | 679 | 57.44% | **1.2393** |
+| delta | | **-0.88 points** | -0.0939 |
+
+The two-prompt subset that produced the anomaly is reproducing itself inside this run - `code_lru` 27.2% -> 29.8%
+and `chinese_local_llm` 57.7% -> 58.8% - while the other four prompts lose more than that:
+
+| prompt | pos | D3 top-1 | block top-1 | D3 KL64 | block KL64 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| chinese_local_llm | 97 | 57.7% | **58.8%** | 0.7302 | **0.7127** |
+| code_lru | 114 | 27.2% | **29.8%** | 4.3799 | **3.7326** |
+| math_bakery | 128 | **60.9%** | 58.6% | **0.6764** | 0.7053 |
+| multi_turn_threads | 128 | **70.3%** | 66.4% | **0.6455** | 0.6492 |
+| prose_moe | 84 | 56.0% | **58.3%** | **0.7627** | 0.8121 |
+| tool_weather | 128 | **73.4%** | 70.3% | **0.7957** | 0.8222 |
+
+So the block really does improve those two prompts (and the mean KL64, because `code_lru`'s 4.38 dominates the mean),
+and the "+1.90 points" the subset reported was those two prompts' gain with the other four unmeasured. **A block's
+delta is not a property of the block; it is a property of the block on a prompt set**, and the six-prompt set is the
+smallest one that keeps a prompt from being the whole story. The sweep's ranking therefore uses all six, and the
+held-out set confirms the final candidate.
+
+**The pinned-RAM budget does not change the logits.** The same prompt at `--memory-limit-mib` 80000 (the round-9
+sweep), 60000, 50000 and 600 (every expert on the NVMe) produces a **byte-identical** logits dump:
+
+```
+chinese_local_llm.npy  sha256 6A8DA4AF3F6FC3A8...  80000 = 60000 = 50000 = 600
+code_lru.npy           sha256 C58891512F6C...      80000 = 50000
+```
+
+That is what let the whole A1 programme run at all on a shared box: `--memory-limit-mib 600` puts every expert on the
+SSD tier, the process peaks at **12.1 GiB working set** (the engine reports its own `peak=`), and a six-prompt arm
+costs 7-16 minutes instead of failing the launcher's floor whenever the other task's 24 GB job is resident. Every
+quality number below is comparable with the round-9 baseline because the bytes are the same bytes.
+
+**`tools/minimax/arm_session.py`** is the driver that makes "one turn, several arms" possible: it runs the arms as one
+`pc_launch` child (one lock, one page-cache state), keeps one output directory per arm so `g3_sparsa.py` resumes
+per-prompt dumps after a time limit, and prints one table whose deltas are against the session's first arm. Its per-GB
+column uses the packs' own tensor tables - a MoE layer of experts is 2,321,547,264 B in D3 and 1,679,818,752 B in
+IQ1_M, i.e. **0.6417 GB saved per layer**, not the 0.688 the old driver guessed.

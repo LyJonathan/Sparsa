@@ -22,6 +22,8 @@ keys is exactly where a silent bug would live.
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import struct
 import sys
 from pathlib import Path
@@ -163,6 +165,10 @@ def main(argv=None) -> int:
     ap.add_argument('--cold-layers', help='explicit MoE layers to take from the cold pack, "35,36,37" (overrides '
                                           '--cold-frac/--order), which is how a sensitivity sweep names one block')
     ap.add_argument('--profile', help='STRP profile: its per-layer routing mass orders the cold layers')
+    ap.add_argument('--alloc', help='JSON from a1_dp.py: take each expert tensor from the pack its row names '
+                                    '(per layer AND projection; needs --pack)')
+    ap.add_argument('--pack', action='append', default=[],
+                    help='label=glob, repeatable: the packs --alloc may name (the label must match the JSON)')
     ap.add_argument('--dry-run', action='store_true', help='print the plan and the sizes, write nothing')
     a = ap.parse_args(argv)
 
@@ -180,6 +186,28 @@ def main(argv=None) -> int:
     if missing:
         print(f'note: {len(missing)} tensors exist only in the hot pack (kept from hot)', flush=True)
 
+    # a per-tensor allocation (57 layers x 3 projections) from a1_dp.py: each expert tensor comes from the pack its
+    # row names.  This is the only way to express a GGUF-level assignment: one tensor carries one ggml type, so the
+    # allocation cannot be finer than (layer, projection) and cannot be coarser either.
+    alloc_packs: dict[str, dict] = {}
+    alloc: dict[tuple[int, str], str] = {}
+    if a.alloc:
+        role_leaf = {'gate': 'ffn_gate_exps.weight', 'up': 'ffn_up_exps.weight', 'down': 'ffn_down_exps.weight'}
+        for spec in a.pack:
+            label, _, pattern = spec.partition('=')
+            first = Path(sorted(glob.glob(pattern))[0] if any(c in pattern for c in '*?') else pattern)
+            alloc_packs[label] = index_pack(first, gguf)
+            print(f'alloc pack {label}: {first.name}: {len(alloc_packs[label])} tensors')
+        if not alloc_packs:
+            raise SystemExit('--alloc needs at least one --pack label=glob')
+        j = json.loads(Path(a.alloc).read_text(encoding='utf-8'))
+        for r in j['rows']:
+            alloc[(int(r['layer']), role_leaf[r['role']])] = r['pack']
+        unknown = {lab for lab in alloc.values() if lab not in alloc_packs}
+        if unknown:
+            raise SystemExit(f'--alloc names packs with no --pack: {sorted(unknown)}')
+        print(f'alloc: {len(alloc)} expert tensors assigned')
+
     def layer_bytes(idx, li):
         return sum(idx[n][4] for n in idx if n.startswith(f'blk.{li}.') and n.endswith('_exps.weight'))
 
@@ -193,7 +221,10 @@ def main(argv=None) -> int:
         rank = sorted(moe_layers)
     else:
         rank = sorted(moe_layers, key=lambda li: (mass[li], -li))
-    if a.cold_layers:
+    if alloc:
+        # every expert tensor comes from its own row; no layer-level sets are in play
+        cold_layers, mid_layers, n_cold, n_mid = set(), set(), 0, 0
+    elif a.cold_layers:
         cold_layers = {int(x) for x in a.cold_layers.replace(' ', '').split(',') if x != ''}
         unknown = cold_layers - set(moe_layers)
         if unknown:
@@ -206,9 +237,17 @@ def main(argv=None) -> int:
     n_mid = max(0, min(len(moe_layers) - n_cold, int(round(a.mid_frac * len(moe_layers))))) if a.mid else 0
     mid_layers = set(rank[n_cold:n_cold + n_mid]) if n_mid else set()
 
-    def src_idx(li):
+    def src_idx(li, leaf=''):
+        if alloc and leaf:
+            lab = alloc.get((li, leaf))
+            if lab:
+                return alloc_packs[lab]
         return cold if li in cold_layers else (mid if li in mid_layers else hot)
     expert_total = sum(layer_bytes(src_idx(li), li) for li in moe_layers)
+    if alloc:
+        expert_total = sum(sum(src_idx(li, leaf)[f'blk.{li}.{leaf}'][4] for leaf in
+                               ('ffn_gate_exps.weight', 'ffn_up_exps.weight', 'ffn_down_exps.weight'))
+                           for li in moe_layers)
     other_total = sum(v[4] for k, v in hot.items() if not k.endswith('_exps.weight'))
     mass_cold = 100.0 * sum(mass[li] for li in cold_layers) / max(1e-9, sum(mass.values())) if a.profile else 0.0
     print(f'MoE layers {len(moe_layers)}, {n_cold} coldest ({100.0 * n_cold / len(moe_layers):.1f}%, '
@@ -233,7 +272,12 @@ def main(argv=None) -> int:
         li = int(name.split('.')[1]) if name.startswith('blk.') else -1
         use_cold = name.endswith('_exps.weight') and li in cold_layers
         use_mid = name.endswith('_exps.weight') and li in mid_layers
-        src = (cold if use_cold else mid if use_mid else hot).get(name) or hot[name]
+        if alloc and name.endswith('_exps.weight'):
+            leaf = name.split('.', 2)[2]
+            src = alloc_packs[alloc[(li, leaf)]].get(name) or hot[name]
+            use_cold = alloc[(li, leaf)] != 'd3'
+        else:
+            src = (cold if use_cold else mid if use_mid else hot).get(name) or hot[name]
         path, qtype, shape, offset, nbytes = src
         infos += pack_str(name)
         infos += struct.pack('<I', len(shape))
