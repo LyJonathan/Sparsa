@@ -29,8 +29,10 @@ What it does, in order:
    the child's whole process tree and exits 4 with the available, modified and effective readings that triggered it.
    `--max-minutes` is the turn limit: at the limit the launcher stops the same child tree, releases the lock and
    exits 6, so the next task in the queue can take the PC.
-4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM handlers put the lock back to `free` - on a clean exit, a child
-   crash, Ctrl-C, or a watchdog kill.
+4. ALWAYS RELEASES: `try/finally` plus SIGINT/SIGTERM/SIGBREAK handlers put the lock back to `free` - on a clean
+   exit, a child crash, Ctrl-C/Ctrl-Break, or a watchdog kill. The handlers only record the signal; the main loop
+   stops the child tree, so an interrupt that lands while the child is being created cannot orphan it with the lock
+   already free.
 
 Exit codes: 0..n = the child's own code, 2 = another owner holds the lock, 3 = not enough RAM, 4 = the watchdog
 stopped the run, 5 = the lock could not be taken (the sidecar timed out), 130 = interrupted.
@@ -667,25 +669,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     cal_key = calibration_key(cmd)
     formula_gb = est_gb = None
 
-    try:
-        was = acquire(lock, a.owner, a.lock_timeout)
-    except LockBusy as e:
-        log(f"REFUSING: the lock is {e.state.describe()}")
-        log("another task is using the PC; take your turn when it writes 'free'")
-        return EXIT_LOCK_HELD
-    except TimeoutError as e:
-        log(f"REFUSING: {e}")
-        return EXIT_LOCK_TIMEOUT
-
     child: subprocess.Popen | None = None
-    stop_signals = {"received": False}
+    stop_signals: dict[str, int | None] = {"received": None}
 
     def on_signal(signum, _frame):
-        stop_signals["received"] = True
-        if child is not None and child.poll() is None:
-            log(f"signal {signum}: stopping the child tree")
-            _kill_tree(child.pid)
-        raise SystemExit(130)
+        # Only record the signal; the main thread does the stopping. Doing it here races with child creation:
+        # CreateProcess makes the OS process a moment before `child` is bound, and a handler that ran in that window
+        # saw `child is None`, so it skipped the kill, released the lock and exited 130 while the engine kept
+        # running - a free lock with a job still holding the PC (and, under a test, the inherited stdout/stderr
+        # pipes). A handler that also raised could interrupt lock writing the same way.
+        stop_signals["received"] = signum
 
     old_handlers = {}
     sigs = [signal.SIGINT, signal.SIGTERM]
@@ -693,11 +686,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         sigs.append(signal.SIGBREAK)   # Windows' Ctrl-Break / CTRL_BREAK_EVENT
     for sig in sigs:
         try:
+            # Installed before the lock is taken, so an interrupt during the RAM check cannot leave it held.
             old_handlers[sig] = signal.signal(sig, on_signal)
         except (ValueError, OSError):
             pass
 
+    def interrupted() -> bool:
+        return stop_signals["received"] is not None
+
+    def stop_for_signal() -> int:
+        """Stop the child tree (if any) and return 130; the caller's `finally` puts the lock back to free."""
+        signum = stop_signals["received"]
+        if child is not None and child.poll() is None:
+            log(f"signal {signum}: stopping the child tree")
+            _kill_tree(child.pid)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log(f"signal {signum}: the child tree did not exit within 10s")
+        else:
+            log(f"signal {signum}: stopping before the child started")
+        return 130
+
+    acquired = False
     try:
+        try:
+            acquire(lock, a.owner, a.lock_timeout)
+        except LockBusy as e:
+            log(f"REFUSING: the lock is {e.state.describe()}")
+            log("another task is using the PC; take your turn when it writes 'free'")
+            return EXIT_LOCK_HELD
+        except TimeoutError as e:
+            log(f"REFUSING: {e}")
+            return EXIT_LOCK_TIMEOUT
+        acquired = True
+        if interrupted():
+            return stop_for_signal()
+
         total_gb, avail_gb, mod_gb = ram.total(), ram.available(), ram.modified()
         effective_gb = max(0.0, avail_gb - mod_gb)
         if ram.fixed:
@@ -729,12 +754,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             log("dry run: not starting the command")
             return 0
 
+        if interrupted():
+            return stop_for_signal()
+
         log("starting: " + " ".join(cmd))
         t0 = time.monotonic()
         turn_deadline = t0 + a.max_minutes * 60.0 if a.max_minutes and a.max_minutes > 0 else None
         child = _spawn(cmd)
         next_tree = 0.0
         while True:
+            if interrupted():
+                return stop_for_signal()
             if time.monotonic() >= next_tree:
                 try:
                     write_lock_tree(lock, a.owner, os.getpid(), process_tree(child.pid))
@@ -742,9 +772,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     log(f"could not record the child tree in the lock: {e}")
                 next_tree = time.monotonic() + 10.0
             try:
-                rc = child.wait(timeout=a.poll)
+                # Short enough that a Ctrl-C is acted on in well under a second, long enough not to spin.
+                rc = child.wait(timeout=min(a.poll, 0.25))
                 break
             except subprocess.TimeoutExpired:
+                if interrupted():
+                    return stop_for_signal()
                 if turn_deadline is not None and time.monotonic() >= turn_deadline:
                     log(f"TURN LIMIT: {a.max_minutes:.1f} minutes reached; stopping pid {child.pid} and its children, "
                         "then releasing the lock for the next task")
@@ -754,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except subprocess.TimeoutExpired:
                         pass
                     return EXIT_TURN_LIMIT
-                if a.no_watchdog or stop_signals["received"]:
+                if a.no_watchdog:
                     continue
                 now_gb, dirty_gb = ram.available(), ram.modified()
                 effective_now = max(0.0, now_gb - dirty_gb)
@@ -781,7 +814,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     log(f"calibration: peak working set {peak:.1f} GB recorded in {calibration}")
                 except OSError as e:
                     log(f"calibration: could not write {calibration}: {e}")
-        release(lock, a.owner)
+        if acquired:
+            release(lock, a.owner)
         for sig, h in old_handlers.items():
             try:
                 signal.signal(sig, h)

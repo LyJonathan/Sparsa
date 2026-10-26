@@ -190,6 +190,10 @@ def test_interrupt_releases(tmp_path: Path):
 
     Windows has no SIGINT for another process: the launcher handles SIGBREAK and the test sends CTRL_BREAK_EVENT to
     its process group, which is what Ctrl-Break does.  Elsewhere it is a plain SIGINT.
+
+    The child sleeps 30s and inherits this process's stdout/stderr pipes, so an orphaned child keeps `communicate`
+    blocked for the rest of that sleep.  The elapsed-time check is what catches that: the run must return promptly,
+    not merely end after the child would have exited by itself.
     """
     lock = tmp_path / "pc-engine.lock"
     lock.write_bytes(b"free")
@@ -206,8 +210,14 @@ def test_interrupt_releases(tmp_path: Path):
             os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
         else:
             proc.send_signal(signal.SIGINT)
+        t0 = time.monotonic()
         out, err = proc.communicate(timeout=60)
-        assert "stopping the child tree" in err or "child exited" in err
+        elapsed = time.monotonic() - t0
+        assert proc.returncode == 130, err
+        # "before the child started" is legitimate: the interrupt may beat the spawn, which is exactly the race.
+        assert ("stopping the child tree" in err or "child exited" in err
+                or "stopping before the child started" in err), err
+        assert elapsed < 15, f"the launcher took {elapsed:.1f}s: the child was left running\n{err}"
     finally:
         if proc.poll() is None:
             proc.kill()
