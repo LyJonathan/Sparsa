@@ -594,6 +594,7 @@ int run(int argc, char** argv) {
     int vram_slots = -1, ram_experts = -1, vram_reserve_mib = 700, memory_limit_mib = 0, ram_headroom_mib = 0;
     int pool_spin_us = 0;
     bool stats = false, verify_tensors = false;
+    int verify_ssd_hash = 0;
     int verify_mod = 1, verify_rem = 0;
     bool verify_exit = false;
     float pcie_share = 0.f;
@@ -689,6 +690,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-verify-mod") verify_mod = std::atoi(next().c_str());
         else if (a == "--minimax-verify-rem") verify_rem = std::atoi(next().c_str());
         else if (a == "--minimax-verify-exit") verify_exit = true;
+        else if (a == "--minimax-verify-ssd-hash") verify_ssd_hash = std::atoi(next().c_str());
         else if (a == "--minimax-pcie-share") pcie_share = (float)std::atof(next().c_str());
         else if (a == "--expert-source") expert_source.push_back(next());
         else if (a == "--minimax-stats-per-layer") { stats_per_layer = true; stats = true; }
@@ -891,6 +893,7 @@ int run(int argc, char** argv) {
     opt.verify_mod = verify_mod;
     opt.verify_rem = verify_rem;
     opt.verify_exit = verify_exit;
+    opt.verify_ssd_hash = verify_ssd_hash;
     opt.pcie_share = pcie_share;
     opt.expert_source = expert_source;
     opt.stats_per_layer = stats_per_layer;

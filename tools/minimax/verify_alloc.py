@@ -1,28 +1,51 @@
-"""Structural check of the built candidate: every expert tensor's type and length comes from the pack the
-allocation named, and the total is the allocation's total."""
+"""Structural + byte proof of a built candidate: every expert tensor's type and length comes from the pack the
+allocation named, and (with `--all`, the default) every expert tensor's SHA-256 equals the same byte range of its
+source pack.
+
+    python tools/minimax/verify_alloc.py --pack _local/a1/cand_c1.gguf --alloc alloc_c1.json \
+        --packs d3='D:\\hf-d3\\...\\*-00001-of-*' --packs iq2xxs='D:\\hf-iq2xxs\\...'
+
+`--every N` samples instead (the old default was every 7th); `--every 1` and `--all` check all 171 tensors.
+`--threads` hashes several tensors at once; the disk read is the limit on this box.
+"""
+from __future__ import annotations
+
+import argparse
 import glob
 import hashlib
 import json
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-from gguf import GGUFReader
-
-C1 = r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\a1\cand_c1.gguf"
-PACKS = {'d3': r'D:\hf-d3\IQ2_XS-D3\MiniMax-M3.1-Flash-IQ2_XS-D3-*.gguf',
-         'iq2xxs': r'D:\hf-iq2xxs\MiniMax-M3.1-Flash-IQ2_XXS\MiniMax-M3.1-Flash-IQ2_XXS-*.gguf'}
-alloc = json.load(open(r"C:\Users\admin\AppData\Local\Temp\alloc_c1.json"))['rows']
-want = {(r['layer'], r['role']): r['pack'] for r in alloc}
-leaf_role = {'ffn_gate_exps.weight': 'gate', 'ffn_up_exps.weight': 'up', 'ffn_down_exps.weight': 'down'}
+ROLE = {'ffn_gate_exps.weight': 'gate', 'ffn_up_exps.weight': 'up', 'ffn_down_exps.weight': 'down'}
 
 
-def table(pattern):
+def llama_gguf():
+    for cand in (Path('C:/llm/llama-pinned-3cf/gguf-py'), Path('third_party/llama.cpp/gguf-py')):
+        if cand.exists():
+            sys.path.insert(0, str(cand))
+    import gguf
+    return gguf
+
+
+def pack_table(gguf, pattern: str) -> dict:
+    """{tensor name: (type, n_bytes, file, data offset)} over every shard of a pack."""
     out = {}
-    for f in sorted(glob.glob(pattern)):
-        for t in GGUFReader(f).tensors:
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise SystemExit(f'no pack files match {pattern!r}')
+    for f in files:
+        r = gguf.GGUFReader(str(f))
+        for t in r.tensors:
             out.setdefault(t.name, (int(t.tensor_type), int(t.n_bytes), f, int(t.data_offset)))
-    return out
+        del r
+    return out, files
 
 
-def sha(path, off, n, chunk=64 << 20):
+def sha_range(path: str, off: int, n: int, chunk: int = 64 << 20) -> str:
     h = hashlib.sha256()
     with open(path, 'rb') as fh:
         fh.seek(off)
@@ -30,48 +53,90 @@ def sha(path, off, n, chunk=64 << 20):
         while left:
             b = fh.read(min(chunk, left))
             if not b:
-                break
+                raise SystemExit(f'short read from {path} at {off}')
             h.update(b)
             left -= len(b)
     return h.hexdigest()
 
 
-packs = {k: table(p) for k, p in PACKS.items()}
-r = GGUFReader(C1)
-bad = 0
-expert_bytes = 0
-for t in r.tensors:
-    name = t.name
-    if not name.endswith('_exps.weight'):
-        continue
-    L, leaf = int(name.split('.')[1]), name.split('.', 2)[2]
-    role = leaf_role[leaf]
-    lab = want[(L, role)]
-    ref = packs[lab].get(name)
-    got = (int(t.tensor_type), int(t.n_bytes))
-    expert_bytes += int(t.n_bytes)
-    if ref is not None and ref[:2] != got:
-        bad += 1
-        print(f'MISMATCH {name}: built {got} expected {ref} ({lab})')
-print(f'{171 - bad}/171 expert tensors match the allocation pack (type and length)')
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--pack', default=r"E:\Jon's Projects\AI\Strata Fork Minimax\Strata-MiniMax\_local\a1\cand_c1.gguf")
+    ap.add_argument('--alloc', default=os.path.join(os.environ.get('TEMP', r'C:\Users\admin\AppData\Local\Temp'),
+                                                    'alloc_c1.json'))
+    ap.add_argument('--packs', action='append', required=True, metavar='LABEL=GLOB',
+                    help='a source pack the allocation names (repeatable)')
+    ap.add_argument('--all', action='store_true', help='hash every expert tensor (default unless --every is given)')
+    ap.add_argument('--every', type=int, default=0, help='sample every N-th expert tensor (0 = all)')
+    ap.add_argument('--threads', type=int, default=4, help='tensors hashed concurrently')
+    ap.add_argument('--out', default=None, help='write the per-tensor result as JSON')
+    a = ap.parse_args(argv)
 
-every = int(__import__('os').environ.get('VERIFY_EVERY', '0'))
-if every:
-    import os
-    checked = ok = 0
-    for i, t in enumerate([x for x in r.tensors if x.name.endswith('_exps.weight')]):
-        if i % every:
-            continue
+    gguf = llama_gguf()
+    alloc = json.loads(Path(a.alloc).read_text(encoding='utf-8'))['rows']
+    want = {(int(r['layer']), r['role']): r['pack'] for r in alloc}
+    labels = [s.partition('=')[0] for s in a.packs]
+    packs = {}
+    for spec in a.packs:
+        label, _, pattern = spec.partition('=')
+        packs[label], files = pack_table(gguf, pattern)
+        print(f'{label}: {len(files)} shard(s), {len(packs[label])} tensors from {pattern}', flush=True)
+
+    started = time.time()
+    r = gguf.GGUFReader(a.pack)
+    experts = [t for t in r.tensors if t.name.endswith('_exps.weight')]
+    bad = []
+
+    def check(t):
         name = t.name
-        L, leaf = int(name.split('.')[1]), name.split('.', 2)[2]
-        lab = want[(L, leaf_role[leaf])]
-        _, _, src, src_off = packs[lab][name]
-        a = sha(C1, int(t.data_offset), int(t.n_bytes))
-        b = sha(src, src_off, int(t.n_bytes))
-        checked += 1
-        ok += int(a == b)
-        if a != b:
-            print(f'BYTES DIFFER {name} vs {lab} {os.path.basename(str(src))}')
-    print(f'byte check: {ok}/{checked} sampled expert tensors identical to their allocated pack')
-print(f'experts {expert_bytes / 1e9:.2f} GB, file {sum(t.n_bytes for t in r.tensors) / 1e9:.2f} GB, '
-      f'{len(r.tensors)} tensors')
+        layer = int(name.split('.')[1])
+        role = ROLE[name.split('.', 2)[2]]
+        label = want[(layer, role)]
+        ref = packs[label].get(name)
+        got = (int(t.tensor_type), int(t.n_bytes))
+        if ref is None:
+            return {'name': name, 'pack': label, 'ok': False, 'why': 'missing from its source pack'}
+        if ref[:2] != got:
+            return {'name': name, 'pack': label, 'ok': False,
+                    'why': f'type/length {got} != {ref[:2]} in {label}'}
+        return {'name': name, 'pack': label, 'ok': True, 'type': got[0], 'bytes': got[1],
+                'src': ref[2], 'src_off': ref[3], 'offset': int(t.data_offset)}
+
+    rows = [check(t) for t in experts]
+    structural = sum(1 for x in rows if x['ok'])
+    print(f'{structural}/{len(rows)} expert tensors match the allocation pack (type and length)', flush=True)
+
+    step = 1 if a.all or not a.every else a.every
+    todo = [x for i, x in enumerate(rows) if x['ok'] and i % step == 0]
+
+    def digest(x):
+        return x['name'], sha_range(a.pack, x['offset'], x['bytes']), sha_range(x['src'], x['src_off'], x['bytes'])
+
+    ok = 0
+    with ThreadPoolExecutor(max_workers=max(1, a.threads)) as ex:
+        for name, built, src in ex.map(digest, todo):
+            if built == src:
+                ok += 1
+            else:
+                x = next(y for y in todo if y['name'] == name)
+                bad.append({'name': name, 'pack': x['pack'], 'why': 'SHA-256 differs from the source pack'})
+                print(f'BYTES DIFFER {name} vs {x["pack"]} {os.path.basename(x["src"])}', flush=True)
+
+    expert_gb = sum(x['bytes'] for x in rows) / 1e9
+    file_gb = sum(int(t.n_bytes) for t in r.tensors) / 1e9
+    print(f'byte check: {ok}/{len(todo)} expert tensors identical (SHA-256) to the pack they were allocated from'
+          + (f' - {len(bad)} DIFFER' if bad else ''), flush=True)
+    print(f'experts {expert_gb:.2f} GB, file {file_gb:.2f} GB, {len(r.tensors)} tensors, '
+          f'{time.time() - started:.0f}s', flush=True)
+    if a.out:
+        Path(a.out).write_text(json.dumps({'pack': a.pack, 'allocation': a.alloc, 'rows': rows,
+                                           'bad': bad, 'checked': len(todo), 'identical': ok,
+                                           'expert_gb': round(expert_gb, 3), 'file_gb': round(file_gb, 3)},
+                                          indent=1), encoding='utf-8')
+    good = structural == len(rows) and ok == len(todo) and not bad
+    print('PROOF', 'PASS' if good else 'FAIL')
+    return 0 if good else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

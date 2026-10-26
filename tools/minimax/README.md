@@ -2128,3 +2128,33 @@ dev=1 h2d 28.20-28.39 GB/s d2h 28.03-28.61 GB/s pcie_idle=gen4 x16  pcie_load=ge
 Device 1 is 8.5x device 0 in both directions, and the driver reports the same generation and width under load as at
 rest, so the earlier "both cards measure 3.3 GB/s" was the probe, not the slot. Any PCIe lane or split decision has
 to be priced on the 3.2 vs 28.3 GB/s pair.
+
+### Round 8: the SSD tier's returned bytes, all 171 expert tensors, and C1's fit
+
+**`--minimax-verify-ssd-hash K`** SHA-256s the bytes an unbuffered expert read just delivered, one
+`INFO minimax-ssd-hash <tensor> <expert> <bytes> <sha256> <shard> <file>` line per (tensor, expert), at
+most K per tensor, and prints a known-answer line for `sha256("abc")` first. It is opt-in and costs
+nothing on a normal run. `test_ssd_source_hash.py` forces every expert onto the SSD tier (600 MiB,
+`prefill=batch`) and runs two arms - the base pack, and layers 3-7 from the IQ1_M donor - then compares
+every line with the SHA-256 of the same range read straight from the pack. Measured: 342 reads over 171
+tensors, 171/171 per arm, the 15 moved tensors resolving to IQ1_M and hashing to IQ1_M, two negative
+controls (arms disagree on the moved block; the next expert's range differs). The token path's queued
+prefetch reads are not instrumented; they share the same file list.
+
+**`verify_alloc.py` now checks all 171 expert tensors by default** (it sampled 25). On C1:
+`171/171 identical (SHA-256)` in 416 s, experts 123.72 GB, file 137.44 GB.
+
+**`output_rel` is measurable after all.** The blocker was `input_layernorm.weight`'s exactly -1 channel
+(a norm weight of 0 after the bake), which made the residual reconstruction divide by zero. Masked, the
+same reconstruction the GPTQ pilot uses reproduces the dumped expert outputs, and `output_rel_probe.py`
+scores a published pack's stored bytes on the tokens each expert was routed. Layer 3/40, all three roles,
+the pack order is D3 < IQ2_XXS < IQ1_M and down moves worst (1.9x against 1.5x for gate/up). See
+`A1_ROUND3.md`.
+
+**`full_ref_logits.py`** extends the reference's last-128 logits to the whole prompt from the dump's own
+post-norm `final_hidden.npy` and the checkpoint's BF16 `lm_head` (cos 1.0002-1.0004, mean |d| 0.0000 on
+the overlap). `_local/ref_out/logits_long` holds 1,246 positions for the six prompts instead of 679, so a
+longer gate still has KL64.
+
+**`bench_p6_ssd.py --arm-model`** lets two arms be two different packs in one interleaved session (the
+candidate against its baseline), and `arm_session.py --ppl` adds the 2,048-token pass.

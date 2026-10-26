@@ -51,6 +51,9 @@ struct EngineOptions {
     int verify_mod = 1;             ///< --minimax-verify-mod: hash every M-th tensor (the proof is taken in chunks)
     int verify_rem = 0;             ///< --minimax-verify-rem: ... starting at this remainder
     bool verify_exit = false;       ///< --minimax-verify-exit: stop right after the resolution list
+    int verify_ssd_hash = 0;        ///< --minimax-verify-ssd-hash K: SHA-256 the bytes the SSD tier RETURNS, for the
+                                    ///< first K distinct experts of every expert tensor (0 = off; the proof that the
+                                    ///< read path resolved the right file, not just the right offset)
     std::vector<std::string> expert_source;  ///< --expert-source lo-hi=<pack>: read those layers' expert tensors
                                              ///< from that pack instead of the file being run (a sweep candidate
                                              ///< without writing a second 130 GB GGUF)

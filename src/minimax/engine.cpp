@@ -8,6 +8,7 @@
 
 #include "strata/kernels/cpu/iqk_quants.hpp"
 #include "strata/kernels/iqk_types.hpp"
+#include "strata/core/sha256.hpp"
 
 #include "cuda_ops.hpp"
 #include "strata/minimax/vision.hpp"
@@ -952,6 +953,11 @@ struct Engine::Impl {
     int64_t tok_pcie = 0;
     int verify_mod = 1, verify_rem = 0;
     bool verify_exit = false;
+    // --minimax-verify-ssd-hash K: one SHA-256 line per (tensor, expert) the SSD tier delivered, for the first K
+    // experts of each tensor.  This hashes the BYTES THE TIER RETURNED, so a source mix is proven at the read path,
+    // not only at the resolution table.
+    int verify_ssd_hash = 0;
+    std::map<std::string, int> ssd_hash_n;
     int vram_per_layer = 0;
     int ram_per_layer = 0;
     int moe_layers = 0;
@@ -1186,6 +1192,7 @@ struct Engine::Impl {
         verify_mod = opt.verify_mod > 0 ? opt.verify_mod : 1;
         verify_rem = opt.verify_rem;
         verify_exit = opt.verify_exit;
+        verify_ssd_hash = opt.verify_ssd_hash;
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
@@ -1508,6 +1515,38 @@ struct Engine::Impl {
     static std::string base_leaf_name(const std::string& path) {
         const size_t at = path.find_last_of("/\\");
         return at == std::string::npos ? path : path.substr(at + 1);
+    }
+
+    /// The leaf name of the file behind a flat `ssd_files` index: the base pack's shards first, then each
+    /// --expert-source pack's, in the order open_alt_packs recorded.
+    std::string flat_leaf(size_t shard) const {
+        if (shard < model.size()) return base_leaf_name(model.shard(shard).path());
+        for (size_t i = 0; i < alt_packs.size() && i < alt_shard_base.size(); ++i) {
+            const size_t base = alt_shard_base[i];
+            if (shard >= base && shard < base + alt_packs[i].model->size())
+                return base_leaf_name(alt_packs[i].model->shard(shard - base).path());
+        }
+        return std::string("?");
+    }
+
+    /// --minimax-verify-ssd-hash K: SHA-256 the bytes a tier just delivered for one expert role.  One line per
+    /// (tensor, expert) pair, at most K per tensor, so a proof costs a few seconds of hashing even on a 60-layer run.
+    void ssd_hash_taken(const Tensor& t, int64_t expert, const uint8_t* bytes) {
+        if (verify_ssd_hash <= 0) return;
+        static bool selftested = false;
+        if (!selftested) {
+            // known-answer check for the hash itself, so a wrong SHA-256 cannot make the proof pass
+            selftested = true;
+            std::fprintf(stderr, "INFO minimax-ssd-hash-selftest abc %s%c",
+                         strata::core::sha256_hex("abc", 3).c_str(), 10);
+        }
+        int& n = ssd_hash_n[t.name];
+        if (n >= verify_ssd_hash) return;
+        ++n;
+        const size_t len = (size_t)(t.bytes / (size_t)t.ne2);
+        const std::string hex = strata::core::sha256_hex(bytes, len);
+        std::fprintf(stderr, "INFO minimax-ssd-hash %s %lld %zu %s %zu %s%c", t.name.c_str(), (long long)expert, len,
+                     hex.c_str(), t.shard, flat_leaf(t.shard).c_str(), 10);
     }
 
     void load_tensors() {
@@ -3477,6 +3516,7 @@ struct Engine::Impl {
                              t.name.c_str(), (long long)expert, bad, (unsigned long long)off,
                              (unsigned long long)aoff);
         }
+        ssd_hash_taken(t, expert, dst);
     }
 
     void ssd_read_expert(const Layer& L, int64_t expert, uint8_t* stage) {
@@ -3582,6 +3622,7 @@ struct Engine::Impl {
             err = "minimax SSD read: timed out";
             return false;
         }
+        for (int r = 0; r < 3; ++r) ssd_hash_taken(*ts[r], expert, out[r]);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
         return true;

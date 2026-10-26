@@ -77,11 +77,13 @@ def arm_cmd(a, base: Path, cold: Path | None, arm_dir: Path, prompts: str) -> li
         # the engine parses `--expert-source LO-HI=<first shard>` as two tokens
         extra += ['--engine-arg=--expert-source', f'--engine-arg={what}={cold}']
     cmd = [sys.executable, '-u', str(G3), '--model', str(model), '--out', str(arm_dir),
-           '--tier', a[0], '--ref', a_ref, '--ids', a_ids, '--no-ppl',
+           '--tier', a[0], '--ref', a_ref, '--ids', a_ids,
            '--memory-limit-mib', a_mem, '--prompts', prompts,
            '--gpus', SWEEP['gpus'], '--vram-slots', SWEEP['vram_slots'],
            '--layer-split', SWEEP['layer_split'], '--cpu-threads', SWEEP['cpu_threads'],
            '--max-context', SWEEP['max_context']]
+    if not a_ppl:
+        cmd.append('--no-ppl')
     return cmd + extra
 
 
@@ -100,7 +102,7 @@ def scored(arm_dir: Path, wanted: set[str]) -> dict | None:
 
 
 def main(argv=None) -> int:
-    global a_ref, a_ids, a_mem
+    global a_ref, a_ids, a_mem, a_ppl
     ap = argparse.ArgumentParser()
     ap.add_argument('--arms', required=True, help='name:spec;... (spec "" = base, "3-7" = --expert-source, '
                                                  '"@path" = a file arm)')
@@ -115,12 +117,16 @@ def main(argv=None) -> int:
                     help=f'GB of experts a layer saves against the base (default {GB_PER_LAYER} for the IQ1_M '
                          f'pack; the IQ2_XXS pack is 0.3775)')
     ap.add_argument('--timeout', type=float, default=2400.0, help='per arm, seconds')
+    ap.add_argument('--ppl', action='store_true',
+                    help='also run the 2,048-token ppl pass per arm (more tokens than the last-128 dumps; the '
+                         'reference has no logits for it, so it reports PPL and top-1 vs the true next token, not KL64)')
     ap.add_argument('--skip-done', action='store_true', default=True,
                     help='an arm whose results.json already covers these prompts is not rerun')
     ap.add_argument('--redo', action='store_true', help='rerun every arm even when its results are complete')
     args = ap.parse_args(argv)
 
     a_ref, a_ids, a_mem = args.ref, args.ids, str(args.memory_limit_mib)
+    a_ppl = bool(args.ppl)
     base = Path(args.base)
     cold = Path(args.cold) if args.cold else None
     out_root = Path(args.out)
@@ -185,23 +191,28 @@ def summary(out_root: Path, arms: list[tuple[str, str]], wanted: set[str],
             continue
         o = d['overall']
         nlayers = len(layers_of(what))
+        p = d.get('ppl') or {}
         rows.append({'arm': name, 'layers': layers_of(what), 'positions': o['positions'],
                      'top1': round(100.0 * o['top1_agreement'], 2),
                      'kl64': round(o['kl64_mean'], 4),
+                     'ppl': round(p['ppl'], 3) if p.get('ppl') else None,
+                     'ppl_top1': round(100.0 * p['top1_acc_vs_true'], 2) if p.get('top1_acc_vs_true') else None,
                      'gb_saved': round(nlayers * gb_per_layer, 2) if nlayers else 0.0})
     if not rows:
         return 'no arm produced a complete result'
     base_row = rows[0]
-    lines = ['| arm | positions | top-1 | KL64 | dKL64 | top-1 delta | GB saved | dKL64/GB |',
-             '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    lines = ['| arm | positions | top-1 | KL64 | dKL64 | top-1 delta | ppl | ppl top-1 | GB saved | dKL64/GB |',
+             '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for r in rows:
         r['dkl64'] = round(r['kl64'] - base_row['kl64'], 4)
         r['top1_delta'] = round(r['top1'] - base_row['top1'], 2)
         per = (r['dkl64'] / r['gb_saved']) if r['gb_saved'] else None
         r['dkl64_per_gb'] = round(per, 4) if per is not None else None
+        ppl_s = '' if r['ppl'] is None else f"{r['ppl']:.3f}"
+        pplt1_s = '' if r['ppl_top1'] is None else f"{r['ppl_top1']:.1f}%"
         lines.append(f"| {r['arm']} | {r['positions']} | {r['top1']:.2f}% | {r['kl64']:.4f} | "
-                     f"{r['dkl64']:+.4f} | {r['top1_delta']:+.2f} | {r['gb_saved']:.2f} | "
-                     f"{'' if per is None else f'{per:+.4f}'} |")
+                     f"{r['dkl64']:+.4f} | {r['top1_delta']:+.2f} | {ppl_s} | {pplt1_s} | "
+                     f"{r['gb_saved']:.2f} | {'' if per is None else f'{per:+.4f}'} |")
     (out_root / 'summary.json').write_text(json.dumps(rows, indent=1), encoding='utf-8')
     return '\n'.join(lines)
 
