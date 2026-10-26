@@ -336,5 +336,62 @@ def test_over_tier_flag_reaches_the_estimate(tmp_path: Path):
     assert "over-tier resident 11.0 GB" in p.stderr
 
 
+# ---- a dead owner and a dead holder's mutex: `--who` must say so, and the launcher must recover
+DEAD_PID = 999999          # nothing on this box; PIDs are recycled long before this one
+
+
+def test_who_reports_a_dead_owner_as_stale(tmp_path: Path):
+    """`--who` used to print state=held for a lock whose PID was gone, so a wait loop spun on a dead owner.
+
+    The launcher's own acquire path has always treated that PID as stale; --who now says the same thing.
+    """
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_text(f"dspark {DEAD_PID} 2026-10-26T15:39:18+01:00\ntree 4242\n", encoding="ascii")
+    who = run(["--who", "--lock", str(lock)], timeout=30)
+    assert who.returncode == 0, who.stderr
+    assert "state=stale" in who.stdout, who.stdout
+    assert f"pid={DEAD_PID}" in who.stdout
+    assert "the next launcher takes the lock over" in who.stdout
+    assert "state=held" not in who.stdout
+
+
+def test_who_reports_a_live_owner_as_held(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_text(f"dspark {os.getpid()} 2026-10-26T15:39:18+01:00\n", encoding="ascii")
+    who = run(["--who", "--lock", str(lock)], timeout=30)
+    assert who.returncode == 0, who.stderr
+    assert "state=held" in who.stdout, who.stdout
+
+
+def test_a_dead_holders_mutex_is_recovered_at_once(tmp_path: Path):
+    """A killed launcher leaves `pc-engine.lock.lck`; waiting for the age rule wedged the PC for 60 s, then exit 5.
+
+    The sidecar records the holder's PID, so a PID that is gone is recovered immediately, whatever its age.
+    """
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    sidecar = tmp_path / "pc-engine.lock.lck"
+    sidecar.write_text(f"{DEAD_PID} {time.time()}", encoding="ascii")   # fresh mtime: the age rule would not fire
+    p = run(["--owner", "dspark", "--lock", str(lock), *LOCK_ONLY, "--", *py("print('child ran')")])
+    assert p.returncode == 0, p.stderr
+    assert "child ran" in p.stdout
+    assert f"holder pid {DEAD_PID} is gone" in p.stderr, p.stderr
+    assert not sidecar.exists()
+    assert read(lock) == "free"
+
+
+def test_a_live_holders_mutex_is_not_stolen(tmp_path: Path):
+    """The sidecar protects a real read-modify-write: a holder that is alive must not be unlinked."""
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    sidecar = tmp_path / "pc-engine.lock.lck"
+    sidecar.write_text(f"{os.getpid()} {time.time()}", encoding="ascii")
+    p = run(["--owner", "dspark", "--lock", str(lock), "--lock-timeout", "1", *LOCK_ONLY,
+             "--", *py("print('must not run')")])
+    assert p.returncode == 5, p.stderr
+    assert "must not run" not in p.stdout
+    assert sidecar.exists(), "a live holder's mutex was removed"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

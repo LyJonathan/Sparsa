@@ -12,10 +12,12 @@ What it does, in order:
 1. TAKES THE LOCK (`pc-engine.lock`, plain ASCII, no BOM) and refuses if another owner holds it with a live PID.
      - the file is `free` when unused, else `<owner> <pid> <iso-time>` followed by a `tree <pids...>` line
        recording the child process tree it started; a bare name with no PID (an older task's hand-written
-       lock) counts as held. `--who` prints both, so a task can check before touching any process;
+       lock) counts as held. `--who` prints both and says `state=stale` when the recorded PID is gone, so a task can
+       check before touching any process;
      - a PID that is no longer running is STALE: the launcher says so and takes over;
      - it is taken atomically: a sidecar `pc-engine.lock.lck` created with O_EXCL is the mutex, and the lock itself is
-       written to a temp file and renamed over (so a reader never sees a half-written lock).
+       written to a temp file and renamed over (so a reader never sees a half-written lock). The sidecar records the
+       holder's PID, so a mutex left by a killed launcher is recovered at once instead of after the 60 s age rule.
 2. REFUSES TO START IF THE RAM WILL NOT FIT: effective available RAM (available physical minus modified/dirty
    file-cache pages, from PDH `\Memory\Modified Page List Bytes` on Windows or `/proc/meminfo` on Linux)
    minus the run's estimate must stay at or above `--min-free-gb` (default 10). The estimate is `--est-ram-gb`,
@@ -377,6 +379,15 @@ class LockBusy(RuntimeError):
         self.state = state
 
 
+def mutex_holder(path: Path) -> int | None:
+    """The PID a sidecar mutex records, or None when it says nothing usable."""
+    try:
+        raw = path.read_text(encoding="ascii", errors="replace").split()
+        return int(raw[0]) if raw else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class lock_guard:
     """The sidecar mutex around the read-modify-write of the lock (O_EXCL, stale sidecars recovered)."""
 
@@ -394,7 +405,18 @@ class lock_guard:
                 os.write(self.fd, f"{os.getpid()} {time.time()}".encode("ascii"))
                 return self
             except FileExistsError:
-                # a crashed holder leaves the sidecar behind: age it out instead of wedging the PC
+                # A crashed holder leaves the sidecar behind. The sidecar records its PID, so a holder that is gone is
+                # recovered at once; the age rule below only covers a sidecar with no usable PID in it (an older
+                # format, or a half-written one) - waiting 60 s for the clock made a killed launcher wedge the PC for
+                # that long and then fail with exit 5.
+                holder = mutex_holder(self.path)
+                if holder is not None and not pid_alive(holder):
+                    log(f"removing a stale lock mutex {self.path.name} (holder pid {holder} is gone)")
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
                 try:
                     age = time.time() - self.path.stat().st_mtime
                 except FileNotFoundError:
@@ -648,8 +670,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if a.who:
         state = read_lock(lock)
-        print(f"owner={state.owner} pid={state.pid or 0} stamp={state.stamp or '-'} "
-              f"state={'free' if state.free else 'held'}")
+        shown = "free" if state.free else ("stale" if state.stale else "held")
+        print(f"owner={state.owner} pid={state.pid or 0} stamp={state.stamp or '-'} state={shown}")
+        if state.stale:
+            print("the owner's PID is gone, so the next launcher takes the lock over")
         if not state.free:
             print("tree=" + " ".join(str(x) for x in state.tree))
             for pid in state.tree:
