@@ -8,6 +8,7 @@ floor, the watchdog, stdin passthrough and the "no BOM, plain ASCII" rule.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -30,9 +31,10 @@ def py(code: str) -> list[str]:
     return [sys.executable, "-c", code]
 
 
-def run(args: list[str], stdin: str | None = None, timeout: float = 60) -> subprocess.CompletedProcess:
+def run(args: list[str], stdin: str | None = None, timeout: float = 60,
+        env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(LAUNCH), *args], input=stdin, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
 def read(lock: Path) -> str:
@@ -120,10 +122,14 @@ def test_estimate_reads_the_engine_flags():
     est, parts = pc_launch.estimate_ram_gb(
         ["build/strata-minimax.exe", "--model", "m.gguf", "--memory-limit-mib", "86000", "--max-context", "4096",
          "--minimax-kv", "ram", "--minimax-prefill-batch", "4096"], 128.0)
-    assert abs(est - (86000 / 1024 + 2.0 + 4096 * pc_launch.KV_GB_PER_TOKEN + 0.7 + 1.5)) < 1e-6, parts
+    assert abs(est - (86000 / 1024 + 2.0 + 4096 * pc_launch.KV_GB_PER_TOKEN + 0.7 + 7.0)) < 1e-6, parts
     assert any("pinned expert tier 84.0 GB" in p for p in parts)
+    assert any("over-tier resident 7.0 GB" in p for p in parts)
     est2, _ = pc_launch.estimate_ram_gb(["x", "--minimax-ram-experts-per-layer", "40"], 128.0)
     assert est2 > 40 * 57 * pc_launch.EXPERT_GB
+    est3, parts3 = pc_launch.estimate_ram_gb(
+        ["x", "--memory-limit-mib", "86000", "--minimax-dense-layers-gpu", "0"], 128.0, over_tier_gb=10.0)
+    assert abs(est3 - (86000 / 1024 + 12.0 + 0.1 + 0.1 + 10.0)) < 1e-6, parts3
 
 
 def test_watchdog_stops_the_run(tmp_path: Path):
@@ -278,6 +284,46 @@ def test_turn_limit_stops_the_child_and_releases(tmp_path: Path):
     assert p.returncode == 6, p.stderr
     assert "TURN LIMIT" in p.stderr
     assert read(lock) == "free"
+
+
+def test_calibration_records_peak_and_later_estimates_use_it(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    cal = tmp_path / "calibration.json"
+    child = py("import time; time.sleep(0.5)")
+    env = dict(os.environ, PC_LAUNCH_FAKE_PEAK_GB="20")
+    base = ["--owner", "dspark", "--lock", str(lock), "--calibration", str(cal),
+            "--ram-source", "seq:100", "--modified-source", "seq:0", "--est-ram-gb", "1"]
+    p = run([*base, "--record-peak", "--", *child], env=env)
+    assert p.returncode == 0, p.stderr
+    assert "peak working set 20.0 GB" in p.stderr
+    data = json.loads(cal.read_text(encoding="utf-8"))
+    assert len(data) == 1 and next(iter(data.values()))["peak_working_set_gb"] == 20.0
+
+    # Same child model+flags, a dry run with 25 GB effective: formula 1 GB, calibrated 20 GB -> 5 GB left < 10.
+    p2 = run(["--owner", "dspark", "--lock", str(lock), "--calibration", str(cal),
+              "--ram-source", "seq:25", "--modified-source", "seq:0", "--est-ram-gb", "1",
+              "--min-free-gb", "10", "--dry-run", "--", *child])
+    assert p2.returncode == 3, p2.stderr
+    assert "calibrated peak 20.0 GB" in p2.stderr
+    assert "formula 1.0 GB, using 20.0 GB" in p2.stderr
+
+    # 30 GB effective leaves exactly the 10 GB floor: the calibrated estimate now lets it through.
+    p3 = run(["--owner", "dspark", "--lock", str(lock), "--calibration", str(cal),
+              "--ram-source", "seq:30", "--modified-source", "seq:0", "--est-ram-gb", "1",
+              "--min-free-gb", "10", "--dry-run", "--", *child])
+    assert p3.returncode == 0, p3.stderr
+    assert "formula 1.0 GB, using 20.0 GB" in p3.stderr
+
+
+def test_over_tier_flag_reaches_the_estimate(tmp_path: Path):
+    lock = tmp_path / "pc-engine.lock"
+    lock.write_bytes(b"free")
+    p = run(["--owner", "dspark", "--lock", str(lock), "--over-tier-gb", "11",
+             "--ram-source", "seq:100", "--modified-source", "seq:0", "--dry-run", "--",
+             *py("print('no')"), "--model", "m.gguf", "--memory-limit-mib", "40960"])
+    assert p.returncode == 0, p.stderr
+    assert "over-tier resident 11.0 GB" in p.stderr
 
 
 if __name__ == "__main__":
