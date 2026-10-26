@@ -2825,6 +2825,28 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
     if (method != ExpMethod::Old && xrows.empty()) {
         die("--exp-method " + opt.exp_method + " needs --exp-x and --exp-dumps");
     }
+    // Rows of a different document, scored only. Without them the score is the in-document
+    // `--exp-holdout` split; with them the Hessian can use every row of --exp-x (--exp-holdout 0).
+    std::vector<const float *> eval_xrows;
+    std::vector<float> eval_xdata;
+    if (!opt.exp_eval_x.empty()) {
+        if (opt.exp_eval_dumps.empty()) {
+            die("--exp-eval-x needs --exp-eval-dumps");
+        }
+        int64_t nx = 0, ncol = 0;
+        eval_xdata = npy_f32(opt.exp_eval_x, nx, ncol);
+        if (ncol != h.n_embd) {
+            die("--exp-eval-x has " + std::to_string(ncol) + " columns, expected " +
+                std::to_string(h.n_embd));
+        }
+        for (int64_t t = 0; t < nx; ++t) {
+            eval_xrows.push_back(eval_xdata.data() + t * ncol);
+        }
+        logf("experiment eval activations: %lld rows x %lld from %s\n", static_cast<long long>(nx),
+             static_cast<long long>(ncol), opt.exp_eval_x.string().c_str());
+    } else if (!opt.exp_eval_dumps.empty()) {
+        die("--exp-eval-dumps needs --exp-eval-x");
+    }
     // The split is on tokens, not per expert, so the layer-wide prior cannot see a held-out token
     // through some other expert's rows: every `1/holdout`-th row of --exp-x is held out.
     std::vector<char> held_token(xrows.size(), 0);
@@ -2912,8 +2934,9 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
             }
             bind_shape(w, n_in, n_out, base);
             // this expert's rows: gate/up from the routed token list, down from the dumped hidden states
-            std::vector<const float *> fit_rows, held_rows;
+            std::vector<const float *> fit_rows, held_rows, eval_rows;
             std::vector<float> hidden;   // the down projection's inputs (kept alive while rows point into it)
+            std::vector<float> eval_hidden;
             if (!is_down[k]) {
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "expert_%03d_token_idx.npy", e);
@@ -2931,6 +2954,21 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
                         held_rows.push_back(xrows[static_cast<size_t>(t)]);
                     } else {
                         fit_rows.push_back(xrows[static_cast<size_t>(t)]);
+                    }
+                }
+                if (!eval_xrows.empty()) {
+                    char eb[64];
+                    std::snprintf(eb, sizeof(eb), "expert_%03d_token_idx.npy", e);
+                    const fs::path ep = opt.exp_eval_dumps / eb;
+                    if (fs::is_regular_file(ep)) {
+                        int64_t ne = 0;
+                        const std::vector<int64_t> eidx = npy_i64(ep, ne);
+                        for (int64_t t : eidx) {
+                            if (t < 0 || t >= static_cast<int64_t>(eval_xrows.size())) {
+                                die("eval token index out of range in " + ep.string());
+                            }
+                            eval_rows.push_back(eval_xrows[static_cast<size_t>(t)]);
+                        }
                     }
                 }
             } else {
@@ -2955,6 +2993,22 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
                     }
                     for (int64_t t : held) {
                         held_rows.push_back(hidden.data() + t * ncol);
+                    }
+                }
+                if (!eval_xrows.empty()) {
+                    char eb[64];
+                    std::snprintf(eb, sizeof(eb), "expert_%03d_hidden.npy", e);
+                    const fs::path ep = opt.exp_eval_dumps / eb;
+                    if (fs::is_regular_file(ep)) {
+                        int64_t nh = 0, ncol = 0;
+                        eval_hidden = npy_f32(ep, nh, ncol);
+                        if (ncol != n_in) {
+                            die(ep.string() + " has " + std::to_string(ncol) + " columns, expected " +
+                                std::to_string(n_in));
+                        }
+                        for (int64_t t = 0; t < nh; ++t) {
+                            eval_rows.push_back(eval_hidden.data() + t * ncol);
+                        }
                     }
                 }
             }
@@ -2994,8 +3048,9 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
                 double sec = 0.0;
                 gptq::round_rows(type, f32.data(), n_out, n_in, hess.data(), q.data(), opt.gptq_damp,
                                  wthreads, &sec);
-                logf("gptq %-4s expert %3d: %6lld fit rows, %5lld held, %.1f s\n", kinds[k], e,
-                     static_cast<long long>(fit_rows.size()), static_cast<long long>(held_rows.size()), sec);
+                logf("gptq %-4s expert %3d: %6lld fit rows, %5lld held, %5lld eval, %.1f s\n", kinds[k], e,
+                     static_cast<long long>(fit_rows.size()), static_cast<long long>(held_rows.size()),
+                     static_cast<long long>(eval_rows.size()), sec);
             } else {
                 quantize_rows(type, f32.data(), q.data(), n_out, n_in, im, workers > 1 ? wthreads : threads);
             }
@@ -3036,7 +3091,11 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
             s.wnum += wnum;
             s.wden += wden;
             s.wmean += wrow_n > 0 ? wrow / static_cast<double>(wrow_n) : 0.0;
-            if (!held_rows.empty()) {
+            if (!eval_rows.empty()) {
+                matvec_error(f32.data(), dq.data(), n_out, n_in, eval_rows, wthreads, s.onum, s.oden);
+                s.otok += static_cast<int64_t>(eval_rows.size());
+                ++s.oexp;
+            } else if (!held_rows.empty()) {
                 matvec_error(f32.data(), dq.data(), n_out, n_in, held_rows, wthreads, s.onum, s.oden);
                 s.otok += static_cast<int64_t>(held_rows.size());
                 ++s.oexp;
@@ -3172,6 +3231,10 @@ void experiment(const Catalog & cat, const Hyp & h, const Recipe & r, const Opti
         o << "  \"imatrix_blend\": " << opt.imatrix_blend << ",\n";
         o << "  \"exp_x\": \"" << js(opt.exp_x.string()) << "\",\n";
         o << "  \"exp_dumps\": \"" << js(opt.exp_dumps.string()) << "\",\n";
+        o << "  \"exp_eval_x\": \"" << js(opt.exp_eval_x.string()) << "\",\n";
+        o << "  \"exp_eval_dumps\": \"" << js(opt.exp_eval_dumps.string()) << "\",\n";
+        o << "  \"exp_holdout\": " << opt.exp_holdout << ",\n";
+        o << "  \"exp_method\": \"" << opt.exp_method << "\",\n";
         o << "  \"kinds\": {\n";
         for (size_t i = 0; i < results.size(); ++i) {
             const KindResult & res = results[i];

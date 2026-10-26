@@ -56,6 +56,10 @@ struct Options {
     std::filesystem::path exp_out;
     std::filesystem::path exp_x;
     std::filesystem::path exp_dumps;
+    // Rows from a different document, used only to measure `output_rel`: they never enter the
+    // Hessian or the per-expert diagonal, so the score is not the fit's own neighbours.
+    std::filesystem::path exp_eval_x;
+    std::filesystem::path exp_eval_dumps;
     int exp_experts = 0;  // 0 = all
     // Rounding method of the experiment and of a layer pack:
     //   old   - llama.cpp's imatrix rounding, the tier's own imatrix (the baseline)

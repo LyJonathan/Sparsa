@@ -73,6 +73,8 @@ void usage() {
         "  --gptq-selftest N           check the Cholesky/inverse against a naive reference and exit\n"
         "  --exp-x FILE.npy            experiment: routed-expert input [tokens, n_embd]\n"
         "  --exp-dumps DIR             experiment: dump dir with expert_XXX_hidden/token_idx.npy\n"
+        "  --exp-eval-x FILE.npy       experiment: rows of a DIFFERENT document, scored only (never in H)\n"
+        "  --exp-eval-dumps DIR        experiment: its dump dir (expert_XXX_token_idx / _hidden)\n"
         "  --exp-experts N             experiment: limit to the first N experts (default all)\n"
         "  --nvfp4-check               report whether expert scales fold into GGML_TYPE_NVFP4\n"
         "  --mmproj OUT.gguf           F16 vision projector via llama.cpp (skips if shards are absent)\n"
@@ -156,6 +158,10 @@ int main(int argc, char ** argv) {
                 opt.exp_x = val;
             } else if (take(i, argc, argv, "--exp-dumps", val)) {
                 opt.exp_dumps = val;
+            } else if (take(i, argc, argv, "--exp-eval-x", val)) {
+                opt.exp_eval_x = val;
+            } else if (take(i, argc, argv, "--exp-eval-dumps", val)) {
+                opt.exp_eval_dumps = val;
             } else if (take(i, argc, argv, "--exp-experts", val)) {
                 opt.exp_experts = std::stoi(val);
             } else if (take(i, argc, argv, "--exp-method", val)) {

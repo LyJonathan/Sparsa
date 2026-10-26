@@ -338,7 +338,9 @@ The same experiment also runs the two later rounding methods, so the three can b
 * `diag`: llama.cpp's imatrix rounding with a per-expert diagonal `mean x^2` built from this layer's routed tokens (Maya's imatrix, but without the Hessian).
 * `gptq`: GPTQ-style error feedback (`src/gptq.hpp`, ported from Project Maya, see `THIRD_PARTY_NOTICES.md`). Each expert's gate and up share one Hessian, `H = sum_t w_t^2 x_t x_t^T + prior * Hbar`, where `Hbar` is the layer-wide input Hessian; `--gptq-prior` (default 16384) is how many tokens' worth of it are mixed in, `--gptq-damp` (default 0.1) lifts the diagonal by that fraction of its mean. Rows are walked in 256-value blocks, each block is quantized by ggml with `diag(inv(Hinv_SS))` as its importance, and its error is pushed into the remaining columns. Down keeps its own Hessian, built from the dumped hidden states.
 
-`--exp-holdout X` (default 0.2) keeps every `1/X`-th of each expert's rows out of the Hessian and out of the diagonal, and measures `output_rel` on those rows only - without it, GPTQ is scored on the very tokens it was fitted to. `--exp-experts N` still limits the pass.
+`--exp-holdout X` (default 0.2) keeps every `1/X`-th *token* out of the Hessian, the diagonal and the layer-wide prior, and measures `output_rel` on those rows only - without it, GPTQ is scored on the very tokens it was fitted to. `--exp-experts N` still limits the pass.
+
+That is still a holdout inside one document, which measures interpolation. `--exp-eval-x FILE --exp-eval-dumps DIR` take the rows of a *different* document and score on them only, so the fit side can use its whole document (`--exp-holdout 0`); `tools/minimax/quant/HELDOUT_CAPTURE.md` has the capture that produces them.
 
 `--exp-pack FILE` writes the layer's three expert tensors as a small GGUF (one `blk.N.ffn_{gate,up,down}_exps.weight`, the layer's type, the attributes `minimax.quant.*`), which is what the engine's `--expert-source N-N=FILE` reads:
 
@@ -350,7 +352,7 @@ strata-mm-quant --model DIR --recipe MM-IQ2_XS --exp-layer 40 --exp-type IQ2_XXS
 
 `tools/minimax/quant/gptq_layer_session.py` runs several such packs as `--expert-source` arms back to back inside one `pc_launch` turn and prints the arms' KL64 and its delta against the base pack.
 
-A full 128-expert GPTQ pass is longer than one `pc_launch` turn, so it can be split without changing the bytes: `--exp-pack-frag DIR --exp-start N --exp-experts M` writes one raw file per (kind, expert) for experts `N..M-1`, and `--pack-merge DIR --exp-out=... --exp-pack FILE` then assembles the same GGUF from the fragments (all 128 must be present).
+A full 128-expert GPTQ pass is longer than one `pc_launch` turn, so it can be split without changing the bytes: `--exp-pack-frag DIR --exp-start N --exp-experts M` writes one raw file per (kind, expert) for experts `N..M-1`, and `--pack-merge DIR --exp-pack FILE` then assembles the same GGUF from the fragments (all 128 must be present). `HELDOUT_CAPTURE.md` gives the per-layer commands and the fragment layout.
 
 `--gptq-selftest N` checks the blocked Cholesky, its inverse, and the block importance against a naive reference at an N x N size, then exits. Measured: `|L L^T - A|/max = 1.2e-7`, `|L L^-1 - I| = 3.5e-8`, block importance within 1e-6 of `diag(inv(inv(H_SS)))`.
 
