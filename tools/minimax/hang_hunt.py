@@ -109,13 +109,22 @@ def run_once(exe: Path, model: Path, ids: Path, mt: int, out: Path, launcher: Pa
             "evidence": evidence}
 
 
+def default_ids() -> Path:
+    """The gate's id file: beside this tool, or the copy the DSpark gates keep in the dspark worktree."""
+    here = HERE / "p13_ids.txt"
+    if here.exists():
+        return here
+    alt = HERE.parents[1].parent / "wt-dspark" / "tools" / "minimax" / "p13_ids.txt"
+    return alt if alt.exists() else here
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--mt", default="both", choices=["both", "1", "0"])
     ap.add_argument("--exe", default=str(DEFAULT_EXE))
     ap.add_argument("--model", default=str(DEFAULT_MODEL))
-    ap.add_argument("--ids", default=str(DEFAULT_IDS))
+    ap.add_argument("--ids", default=str(default_ids()))
     ap.add_argument("--launcher", default=str(LAUNCH))
     ap.add_argument("--tokens", type=int, default=30)
     ap.add_argument("--watchdog", type=float, default=120.0)
