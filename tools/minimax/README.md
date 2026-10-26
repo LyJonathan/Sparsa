@@ -1483,6 +1483,41 @@ is not a bigger workspace but a cheaper admission: the compulsory fill is three 
 default stream, which wait behind the layer's queued GPU work, while `prefetch_for` already knows how to enqueue
 the same bytes on the side stream.
 
+### P12 follow-up: at ctx 16384 the default is `swap` (measured)
+
+The paragraph above was measured at **ctx 32768**, where the KV takes most of the card and the automatic slot pool is
+2 experts a layer with or without the workspace - so the workspace cost nothing to keep and its 5.4 % admission cost
+decided the comparison. At **ctx 16384** the pool is real, and the workspace's 1560 MiB/device is the whole
+difference between 5/1 and 8/4 slots a layer.
+
+Three arms, interleaved, three reps each, one fresh process per rep, every start through `pc_launch.py`, drive probed
+before each rep (2.1-3.0 GB/s here): `reserve` (the old default), `swap` (the new one) and
+`--minimax-prefill-batch 0` (no workspace at all - the fastest decode shape, at the price of a token-at-a-time
+prompt). 249-token real-text prompt, 256 greedy tokens, `--max-context 16384 --gpus 0,1 --layer-split auto
+--minimax-prefill-batch 4096 --minimax-prefill-experts mmvq --cpu-threads 12 --memory-limit-mib 45000` on
+2 x RTX 5070 12 GB / Ryzen 9 5900X / 128 GB DDR4-3200. The tier is 45000, not 86000: the box had 73.8 GB of available
+RAM (the WSL VM held 25.5 GB), where the launcher's 10 GB floor refuses 86000 outright and stopped every 54000 rep.
+
+| arm | slots/layer dev0/dev1 | decode tok/s (median, range) | prompt s | end-to-end s | cpu_ram ms | SSD MB/token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `reserve` | **5 / 1** | 2.83 (1.06-2.96) | 24.1 | 219.6 (161-312) | 147.0 | 463 |
+| **`swap`** | **8 / 4** | **3.00 (2.20-3.01)** | 24.1 | **154.9 (153-185)** | 145.9 | 433 |
+| `--minimax-prefill-batch 0` | 8 / 4 | 2.85 (2.16-2.95) | 228.5 (140-385) | 394.0 (275-518) | 81.1 | 993 |
+
+`swap` beat `reserve` end-to-end in all three interleaved rounds (161.0 -> 153.2 s, 311.8 -> 154.9 s, 219.6 -> 185.4 s)
+and its decode is at or above the no-workspace arm's (+5.3 % on the medians), so it is the default now. The box was
+noisy (another task held it between rounds; `reserve`'s 1.06 tok/s rep and `swap`'s 2.20 tok/s rep are the
+contaminated ones), which is why the ranges are wide - the pairwise order is what carries the claim.
+
+**The slot arithmetic.** 1560 MiB/device of workspace against ~15 MB per expert and ~30 MoE layers per card is
+1560 / (30 x 15) ~ 3.3 expert slots a layer, which is exactly the 5 -> 8 (dev0) and 1 -> 4 (dev1) shift above. dev1
+starts 4 slots lower because it owns `lm_head` (upstream's last-card rule, +1.0 GB of Q6_K).
+
+`--minimax-prefill-batch 0` decodes no faster than `swap` (its 81 ms `cpu_ram` is the smaller workspace, and it pays
+993 MB/token of expert reads for it against 433), so there is nothing to gain from giving up the batched prompt: its
+228 s prompt is the whole cost.
+
+
 
 ## P13: the VRAM slot count is per device (and two measured negatives)
 
