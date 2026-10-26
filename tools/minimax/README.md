@@ -1631,6 +1631,44 @@ at the last tensor: the source is a 13-shard pack whose `split.no`/`split.count`
 `u16`/`i32` and describe 13 shards, and a single-file output has to drop them (or be written as 13 shards). That is
 the next step, with the G3 six-prompt gate, before the mix is a default or even a documented recipe.
 
+### A1, continued: the mixed pack loads, runs +54%, and one path still refuses it
+
+`mix_layers.py` now writes a single-file GGUF the engine's reader accepts (`1188` tensors, `split.*` dropped,
+`kv_count` re-emitted, and the data block aligned on its **absolute** position - the key/value block ended 8 bytes
+into an alignment boundary on this pack, and aligning the info block's length instead of the file's position put the
+data 8 bytes past the table, which every tensor then read shifted). Audited tensor by tensor with gguf-py: `token_embd`,
+`blk.0.attn_norm`, `blk.30.ffn_gate_exps` (D3 shard 7), `blk.59.ffn_gate_exps` (IQ1_M shard 13) and `blk.59.attn_norm`
+(D3 shard 13) are **byte-identical** to their source packs.
+
+**Measured, serve path, 3 interleaved reps, ctx 16384, auto slots, profile mm3-d3.bin** (D3 at the same settings
+below for the phase comparison):
+
+| | D3 | MIX | |
+| --- | ---: | ---: | --- |
+| decode tok/s | 3.56 | **5.50** | +54% |
+| `--minimax-profile-time` total | 226.2 | **163.5** | -63 ms |
+| `cpu_ram` | 113.4 | 94.9 | fewer RAM experts |
+| `ssd_wait` | 18.6 | **2.2** | |
+| `cpu_ssd` | 9.4 | 0.9 | |
+| `admit` | 11.9 | 1.2 | |
+| ssd/token | 13.4 | **2.8** (43 MB) | the goal was 0 |
+| ssd MB/token | 231 | 43 | |
+
+The RAM tier sized itself to 100.0 GiB / 6753 experts (118.5 a layer), so 543 of 7296 experts still come off the
+drive; `--memory-limit-mib` above ~101 GiB leaves under 10 GiB free on this 128 GB box, so 2.8 a token is the floor
+for the 25-cold-layer pack as assembled.
+
+**Blocked on the gate:** `--minimax-eval` (the G3 harness's path) fails on this file with *"norm weights look
+un-baked (mean -8.6e11)"* - `decide_norm()`'s heuristic on `output_norm.weight` + `blk.0.attn_norm.weight`, both of
+which are byte-identical to the source, and the same binary loads the same file and decodes correctly in the serve
+path. `--minimax-allow-nonstandard` would pass it but that also tells the engine the norms are not +1-baked, which
+is wrong for this pack, so it is not a fix. **Root cause found in round 4: the gate opened the pack while
+`mix_layers.py` was still writing it** - the engine read a partial file. On the finished file the eval path reports
+`INFO minimax-norm mean=1.264317`, the same number the D3 pack reports and the same one the serve path reports, and
+`--minimax-eval` produces logits. Round 4 adds that line permanently: it is the engine's own proof that it resolved
+`output_norm.weight` and `blk.0.attn_norm.weight` to the right bytes, and comparing it between `--serve` and
+`--minimax-eval` is how a loader difference between the two paths would show up.
+
 ## The shared PC: `tools/minimax/pc_launch.py`
 
 The PC runs one memory-hungry job at a time (`pc-engine.lock`, `E:\Jon's Projects\AI\Strata Fork Minimax\`). Two
@@ -1664,3 +1702,459 @@ the lock line's owner/pid/time and no BOM, a live owner refused, a stale PID tak
 refusal, the estimate from engine flags, the watchdog (a scripted `--ram-source seq:20,20,3` reading, so the decision
 and the kill are exercised without eating the box), stdin passthrough, the child's exit code, two launchers where one
 wins, and the interrupt release.
+
+### Round 4: the loader proof, and the A1 gate says IQ1_M is too lossy
+
+**The eval-path refusal was not a loader bug.** On the finished pack both entry points print the same line -
+`INFO minimax-norm mean=1.264317 over output_norm+blk.0.attn_norm (12288 values)` - and it is the same number the D3
+pack reports, so `--serve` and `--minimax-eval` resolve those tensors to identical bytes. The round-3 gate had opened
+the pack while `mix_layers.py` was still writing it. That line is now printed always, for exactly this reason.
+
+**The byte proof is mechanical now.** `--minimax-verify-tensors` prints `name bytes fnv1a-64` for every tensor the
+engine resolved; `--minimax-verify-mod M --minimax-verify-rem R` hashes every M-th one, because a whole pass faults
+the pack's 130 GB through the mapping and trips the launcher's RAM floor on a 128 GB box. `tools/minimax/verify_pack.py`
+compares those against the donor packs (a mixed pack holds one tensor *name* from more than one donor, so it picks the
+donor whose byte length matches what the engine read). Sample of the mixed pack, both a hot layer and a cold one:
+**6/6 identical to a donor** (`output_norm`, `blk.0.attn_norm`, `blk.59.attn_norm`, `blk.0.attn_q`, and
+`blk.35`/`blk.59` `ffn_gate_exps` - the cold ones read 528,482,304 B, the IQ1_M size, not D3's 698,351,616 B).
+
+**G3, six short prompts, the mixed pack against D3 in the same session and flags** (`--vram-slots 0`, all-CPU, so
+placement cannot be the difference; `--memory-limit-mib 96000`; 679 positions, two runs of three prompts):
+
+| arm | positions | top-1 | KL64 |
+| --- | ---: | ---: | ---: |
+| D3 (default) | 679 | **58.47%** | 1.328 |
+| **MIX, 25 of 57 MoE layers at IQ1_M (116.3 GB)** | 679 | **55.39%** | 1.453 |
+| - first half (chinese_local_llm, code_lru, math_bakery) | 339 | 47.49% (D3 48.9%) | 1.986 |
+| - second half (multi_turn_threads, prose_moe, tool_weather) | 340 | 63.24% (D3 67.9%) | 0.978 |
+
+**The gate fails: -3.1 points of top-1 against the default, and 4.0 below the 59.4% bar.** IQ1_M on 44% of the MoE
+layers - 40.5% of the profile's routing mass - is simply too lossy for this model, whatever it buys in speed (5.50
+tok/s against 3.56, ssd/token 2.8 against 13.4). The arithmetic for the next attempt: the honest middle band is
+**IQ2_XXS** (1,246 MB a layer against IQ1_M's 1,680 and D3's 2,322), so 25 IQ1_M + 25 IQ2_XXS would be 104.9 GB and
+lose less than half of what IQ1_M loses at the same size. That needs the published IQ2_XXS tier downloaded (~119 GB
+at this link's ~26 MB/s, so a job of its own), which is what round 4's remaining time did not cover.
+
+### The copy-all rule (Strata 0.2.6 / Maya v1.1.27 `--mmap-experts auto`), ported
+
+`init_tiers` now takes the whole tail when it fits with room to spare, instead of the profile's hottest part:
+
+```
+can = min(available - headroom, commit_room)          (commit_room = ullAvailPageFile on Windows)
+if (every expert left off the GPUs) + 8 GiB <= can:  pin all of them, at load
+```
+
+Maya's rule is all-or-none on purpose - "a PART copied cost decode speed on 32 / 64 GB of RAM" - because a partial
+tier still sends the rest to the drive every token while paying for the copies (their #339: +22% on 4 x V100 with
+504 GB, ~2x on a 20 GB Ada, +23% on 4 x 3090 with 126 GB). The 8 GiB spare is also what keeps this engine's own RAM
+floor satisfiable. It only fires when `--memory-limit-mib` is not given, so an operator's budget still wins.
+
+### Round 7: the loader proof's mechanism, the link log, and the first sweep block
+
+**Loader proof (`--minimax-verify-tensors`) does no hashing and touches no pages.** It prints, per resolved tensor,
+`name shard offset bytes type`, then `--minimax-verify-exit` returns 0 straight away - so a proof costs seconds and a
+few MB of RAM instead of faulting 130 GB through the mapping (which is what tripped the 10 GB floor in round 4).
+`tools/minimax/verify_pack.py` takes those lines from **both** entry points, streams each range in 64 MiB buffered
+reads and SHA-256s it, compares with the donor tensor of the same name *and length* (a mixed pack holds one name from
+two donors), and cross-checks that `--serve` and `--minimax-eval` resolved every tensor to the same shard, offset and
+length. Its modulo filter had an off-by-one (`at % mod != rem + 1`) that reported `total=0`; fixed, and the report also
+has to add each shard's data start, since a split GGUF stores a tensor at `data_start(shard) + offset` while the
+engine reports the offset inside its shard.
+
+**Measured on a 13-shard pack, all 1188 tensors, both entry points** (`--minimax-verify-exit`, so each run is a few
+seconds and a few MB):
+
+```
+     serve: 1188/1188 tensors identical to a donor
+      eval: resolution against the first log: 0 tensors only here, 0 resolved differently
+      eval: 1188/1188 tensors identical to a donor
+PROOF PASS - SHA-256 of every tensor, streamed in 64 MiB reads, and every log resolving every tensor the same way
+```
+
+**`INFO minimax-link dev=N h2d=X GB/s pcie=genG xW`** at startup: the driver's own generation and width (NVML loaded
+at run time, so nothing links against it) beside this process's measured host-to-device rate. CUDA reports what the
+*card* can do, not what the slot gives it - device 0 measured 6.4 GB/s against device 1's 21.9 on this box - so a
+split or a PCIe expert lane has to be priced on both.
+
+**The sweep driver** (`tools/minimax/sweep_blocks.py`) swaps one block of consecutive MoE layers to a cold donor,
+gates it with the same all-CPU harness, records loss-per-GB, and deletes the candidate pack after its run.
+`mix_layers.py --cold-layers 36,37,38,39,40` names a block, which is how a sweep candidate is built without touching
+the fraction/order heuristics.
+
+First measured block, subset gate (chinese_local_llm + code_lru, 211 positions, `--memory-limit-mib 80000`):
+
+| block | layers | GB saved | top-1 | KL64 | D3 on the same subset |
+| --- | --- | ---: | ---: | ---: | --- |
+| 3-7 | 5 | 3.44 | **43.13%** | 2.344 | 41.69% / 2.686 |
+
+The earliest block is **+1.4 points** better than the baseline on that subset - free gigabytes, and the reason a
+per-block sweep is the right instrument: *where* the bits go matters more than how many. The remaining blocks were
+lost to the round's I/O contention (a concurrent IQ2_XXS download raised the page-cache floor until the watchdog
+stopped two gates) and to the lock going to the other task; they are the first thing the next round re-runs.
+
+`--memory-limit-mib 80000` is now the sweep's budget (77 GB free before the run, per the launcher's own line), and
+the download is paused rather than run beside a gate.
+
+### Round 8: the zero-copy PCIe lane (written, not yet measured)
+
+Maya #476's design, ported: `--minimax-pcie-share f` takes `f` of each layer's RAM-tier experts and hands them to the
+GPU expert path with the **device address of their pinned bytes** as the base, instead of a VRAM slot.
+
+* `cu::host_register_mapped` registers the `PinnedArena` range with `cudaHostRegisterMapped | Portable` and returns
+  `cudaHostGetDevicePointer`'s device view (`cuda_ops.cu`). A 100 GB range does not always register; a refusal leaves
+  the lane off with `INFO minimax-pcie-lane off: the driver refused to map the … RAM tier`.
+* `gpu_experts_begin` takes an optional `alt` vector aligned with `exps`: nullptr keeps the VRAM slot, anything else
+  is read in place. The blob layout is already `[gate | up | down]` in the arena, the same as a VRAM slot, so no
+  repacking.
+* The token path marks the chosen routes out of the CPU pass and appends them to the GPU list, so the combine and the
+  ordering are unchanged; `INFO minimax-stats … pcie=N` counts them per token.
+
+Not measured yet: the share has to be set from the two links' measured rates (the startup `INFO minimax-link` line
+gives them), and the whole-token A/B that keeps the lane only when it is >3% faster is still to be written.
+
+### Round 9: D3's baseline on the sweep's own flags, the link log's first reading, and two bugs in --expert-source
+
+**The baseline is measured with exactly the blocks' flags** (`--vram-slots 0 --memory-limit-mib 80000
+--layer-split auto --cpu-threads 12`, same six prompts, same reference logits, same build):
+
+| arm | prompt set | positions | top-1 | KL64 |
+| --- | --- | ---: | ---: | ---: |
+| D3 | subset (chinese_local_llm + code_lru) | 211 | 41.23% | **2.7021** |
+| D3 | all six | 679 | 58.32% | **1.3332** |
+
+That supersedes the 58.47%/1.328 taken at `--memory-limit-mib 104000`; the deltas a block is ranked by are against
+these two numbers.
+
+**The KL anomaly is not reproduced by the flag path yet, and the flag has two bugs.** `--expert-source 3-7=<IQ1_M>`
+(the round-9 answer to "don't write a 100+ GB file per block") resolves an expert tensor from an alternate pack
+through the same `GgufModel` lookup, and it reaches the model - but the run then dies with *"minimax SSD read: short
+read at 5897672192"*: the **SSD tier** still resolves its file by shard index against the **base** pack's file list,
+so a layer whose bytes live in the alternate pack is read from the wrong file. Until the SSD path is source-aware
+(the next fix), a block gate has to run with those experts resident - `--memory-limit-mib` large enough to hold them,
+which is exactly what the earlier file-based block did.
+
+That also means the earlier file-based `3-7` row (KL64 2.344 against D3's 2.686) has not been re-derived, and per the
+round-9 rule it is **not** used for ranking until it is.
+
+**`INFO minimax-link` first reading, under load:**
+
+```
+INFO minimax-link dev=0 h2d=3.29 GB/s pcie=gen3 x4
+INFO minimax-link dev=1 h2d=3.28 GB/s pcie=gen4 x16
+```
+
+NVML reports device 0 at **gen3 x4** - matching the ~3.5 GB/s ceiling the round-9 note derived - and device 1 at
+gen4 x16, but *both* measure ~3.3 GB/s, so the probe is not separating them: a 32 MiB pageable copy per call is
+probably limited by the copy engine's staging rather than by the link. The probe needs pinned source memory and a
+larger transfer before its number is used to split work between the lanes.
+
+### Round 10: the SSD tier is source-aware; the link probe is two-directional and sampled under load
+
+**Every tier now opens the tensor's own file.** `--expert-source` folds each alternate pack's shards into ONE flat
+`ssd_files` list (the base pack's shards, then each alternate's), and `try_must` maps a tensor's shard into that list
+at resolution time. The SSD read, the prefetch and the pin-time fill therefore open the file the bytes actually live
+in, with no per-tier knowledge of where a tensor came from. The bug that made the first attempt die with
+*"minimax SSD read: short read"* was exactly this, and a second one (**an out-of-bounds read of the shard-base vector,
+which is now filled at open time rather than by the later SSD block - an access violation right after `decide_norm`**)
+came with it.
+
+`tools/minimax/test_expert_source.py` forces layers 3-7 onto the SSD tier with a tiny `--memory-limit-mib`, runs the
+base arm and the `--expert-source` arm, and checks (a) both arms run, (b) every tensor in both arms hashes to a donor,
+(c) the block's expert tensors resolve to the donor's file.
+
+**The link probe is two-directional and samples NVML from a second thread during the transfer.** An idle card drops
+its link generation, so a reading taken between transfers describes the idle state: `INFO minimax-link` now prints
+`h2d`, `d2h`, `pcie_idle` and `pcie_load` per card, where `pcie_load` is the highest generation/width the driver
+reported while the 256 MiB pinned copies were running.
+
+**Correction, in this doc as well as the code:** the 6.4 GB/s figure the split probe reported for device 0 was a
+measurement error. Device 0's real rate is **3.3 GB/s**, which matches NVML's **gen3 x4** - and the earlier probe
+(pageable source, default stream) read ~3.3 GB/s on *both* cards, which is the driver's staging rate and cannot tell
+the two slots apart. Only the pinned 256 MiB probe's two directions are used from now on.
+
+### The KL anomaly is real, and it is a quant-versus-quant difference
+
+Round 8's file-based block read `--expert-source`-free and said block 3-7 was 0.34 KL64 *better* than D3; round 9
+could not re-derive it because `--expert-source` was broken. It is now fixed and the pair was re-run **back to back in
+one turn, same flags, same reference logits, same build** (subset of two prompts, 211 positions, `--vram-slots 0
+--memory-limit-mib 80000 --layer-split auto --cpu-threads 12`, reference SHA-256 `4f25e1a7be140715` in both runs):
+
+| arm | top-1 | KL64 |
+| --- | ---: | ---: |
+| D3 | 41.23% | 2.7021 |
+| D3 with layers 3-7's experts from IQ1_M | **43.13%** | **2.3443** |
+| delta | **+1.90 points** | **-0.3578** |
+
+So the effect reproduces on an independent path (a pack built by copying whole layers, and an override that reads
+those layers from another pack without writing a file), which rules out the file build as the cause. The leading
+explanation is that it is genuine: the two packs were quantized from the same checkpoint with **different imatrices**,
+and on these two prompts IQ1_M's is the better one, so "fewer bits" is not the same as "more error" here. Two
+consequences, both of which the sweep has to respect:
+
+* a block's KL delta is a statement about **that prompt set**, not about quantisation in general - hence the rule that
+  the ranking is validated on all six prompts (and, when it lands, on the held-out set);
+* a negative delta (a block that *helps*) is not evidence that more blocks will keep helping. The candidate has to be
+  measured as a whole mix, never by adding block deltas up.
+
+`tools/minimax/test_expert_source.py` is the check that the block's bytes really are the donor's: it forces every
+layer onto the SSD tier with a tiny `--memory-limit-mib` and hashes what the engine resolved, per tensor, against the
+donors. It has not been run yet - it is the first thing the next turn does, before the sweep uses any block number.
+
+### The imatrix explanation is rejected: IQ1_M reconstructs these layers *worse*, not better
+
+Engine-free, CPU only, no lock. Per tensor, two experts each, dequantized with `gguf.quants.dequantize` from both
+packs and compared with the source checkpoint's NVFP4 weights (`models/MiniMax-M3.1-Flash`, decoded with the E2M1
+table and the global-scale divisor).  `relF` is ‖q − s‖ / ‖s‖.
+
+| layer | matrix | D3 type | IQ1_M type | relF D3 | relF IQ1_M |
+| ---: | --- | --- | --- | ---: | ---: |
+| 3 | gate/up | IQ2_XS | IQ1_M | **0.324 / 0.324** | 0.501 / 0.501 |
+| 3 | down | IQ3_XXS | IQ2_XXS | **0.208** | 0.377 |
+| 30 | gate/up | IQ2_XS | IQ1_M | **0.307 / 0.307** | 0.465 / 0.465 |
+| 30 | down | IQ3_XXS | IQ2_XXS | **0.198** | 0.364 |
+| 55 | gate/up | IQ2_XS | IQ1_M | **0.308 / 0.308** | 0.468 / 0.468 |
+| 55 | down | IQ3_XXS | IQ2_XXS | **0.225** | 0.411 |
+
+D3 is closer to the source on **every** tensor sampled, in the block (layers 3-7), the middle (30) and the tail (55),
+by 1.5-1.8x. So "IQ1_M's imatrix fits these prompts better" does not explain the +1.90 points / −0.358 KL64 the block
+gate measured - and the two packs do not even record a `quantize.imatrix.*` key, so which imatrix each used cannot be
+checked from the files at all (both carry only `general.quantization_version` and `strata.indexer_quant`). The
+imatrix-weighted column of the check fell back to uniform weights for these shapes (`in_sum2`'s expert axis did not
+line up with the dequantized tensor's column axis), so it is not yet an independent number; the plain Frobenius
+column is.
+
+What that leaves: the block's *logits* gain is not a better weight reconstruction, so it is either error cancellation
+against the FP32 reference on a 211-position subset or a property of those two prompts. The decisive test is the one
+ordered next: block 3-7 on **all six** prompts against D3 in the same session.
+
+### Round 11 status: the SSD fix works, the hash checker still mis-matches shards
+
+* **The `--expert-source` SSD path works.** `test_expert_source.py` ran both all-SSD arms (`--memory-limit-mib 600`,
+  every expert on the drive) to completion - `base: rc 0`, `alt: rc 0` - where the same shape of run previously died
+  with *"minimax SSD read: short read"*. Layer 3-7's bytes are now read from the alternate pack.
+* **`verify_pack.py` still fails on a multi-shard pack**, and the failure is in the checker, not the engine: a later
+  shard's data block can start at a few KiB (shard 2 of the D3 pack at **5120 B**), the engine reports an **absolute**
+  offset in the resolved file (confirmed against gguf-py: `blk.4.attn_k` at 53507072 in both), and the checker's
+  file/donor matching then picks the wrong side for tensors whose *size* coincides across the two donor packs. It
+  needs to match on (leaf, size) and fall back to the leaf's own donor, not the first donor whose length agrees.
+* The 6-prompt block gate (block 3-7 against D3, same session) is the next turn's first job, then the sweep.
+
+### The byte checker, fixed and given a negative control
+
+Three faults, all in `verify_pack.py`, none in the engine:
+
+1. **The flat file list double-counted the base pack.** The engine's shard index runs over ONE list - the base pack's
+   shards, then each `--expert-source` pack's - and `--donor` usually repeats the base pack (it *is* a donor), so
+   index 13 landed on the base pack's second shard instead of the first alternate pack's. The base pack is now
+   dropped from the donor-shard list when building it.
+2. **Donors were matched by byte length alone.** Two packs can give a tensor the same length, so the check hashed the
+   wrong side. It now passes when the engine's bytes equal **any** length-matching donor's copy, which is the right
+   rule for a mixed pack (each name comes from exactly one donor).
+3. **The reported `leaf` is not the tensor's shard file** for a base tensor - it is the file the run was pointed at.
+   The shard index alone names the file; `leaf` is kept as a cross-check only.
+
+And the checker now has a **negative control** (`--selftest`): it copies the first log with **one tensor's offset
+moved by 4096 bytes** and requires the comparison to fail. On the cropped logs used for this work it reads
+`base: 5/6, 1 differ` / `selftest PASS (a moved offset was caught)`, i.e. the checker can distinguish a wrong byte
+from a right one.
+
+**Full N/N, both all-SSD arms, all 1188 tensors** (regenerated with this build, `--memory-limit-mib 600` so every
+expert goes through the drive, `--vram-slots 0`):
+
+```
+      base: 1188/1188 tensors identical to a donor
+       alt: resolution against the first log: 0 tensors only here, 15 resolved differently
+       alt: 1188/1188 tensors identical to a donor
+PROOF PASS - SHA-256 of every tensor, streamed in 64 MiB reads, and every log resolving every tensor the same way
+```
+
+The 15 are exactly the block: layers 3-7 x {gate, up, down}. `verify_pack.py` now takes `--same-config` (require
+identical resolution, for a `--serve` against a `--minimax-eval` log) and `--expect-moved N` (require exactly N
+tensors to move), because a base arm and an `--expert-source` arm are *supposed* to differ - comparing them as if they
+were the same configuration was the last false failure.
+
+### Round 12: the +1.90-point block is a two-prompt artifact, and the RAM budget moves no logits
+
+**Step 1's verdict, D3 against D3-with-layers-3-7-from-IQ1_M, back to back in one PC turn**, same build, same flags
+(`--vram-slots 0 --layer-split auto --cpu-threads 12 --memory-limit-mib 600`), same reference logits, 679 positions
+of the six short prompts:
+
+| arm | positions | top-1 | KL64 |
+| --- | ---: | ---: | ---: |
+| D3 | 679 | **58.32%** | 1.3332 |
+| D3, layers 3-7's experts from IQ1_M | 679 | 57.44% | **1.2393** |
+| delta | | **-0.88 points** | -0.0939 |
+
+The two-prompt subset that produced the anomaly is reproducing itself inside this run - `code_lru` 27.2% -> 29.8%
+and `chinese_local_llm` 57.7% -> 58.8% - while the other four prompts lose more than that:
+
+| prompt | pos | D3 top-1 | block top-1 | D3 KL64 | block KL64 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| chinese_local_llm | 97 | 57.7% | **58.8%** | 0.7302 | **0.7127** |
+| code_lru | 114 | 27.2% | **29.8%** | 4.3799 | **3.7326** |
+| math_bakery | 128 | **60.9%** | 58.6% | **0.6764** | 0.7053 |
+| multi_turn_threads | 128 | **70.3%** | 66.4% | **0.6455** | 0.6492 |
+| prose_moe | 84 | 56.0% | **58.3%** | **0.7627** | 0.8121 |
+| tool_weather | 128 | **73.4%** | 70.3% | **0.7957** | 0.8222 |
+
+So the block really does improve those two prompts (and the mean KL64, because `code_lru`'s 4.38 dominates the mean),
+and the "+1.90 points" the subset reported was those two prompts' gain with the other four unmeasured. **A block's
+delta is not a property of the block; it is a property of the block on a prompt set**, and the six-prompt set is the
+smallest one that keeps a prompt from being the whole story. The sweep's ranking therefore uses all six, and the
+held-out set confirms the final candidate.
+
+**The pinned-RAM budget does not change the logits.** The same prompt at `--memory-limit-mib` 80000 (the round-9
+sweep), 60000, 50000 and 600 (every expert on the NVMe) produces a **byte-identical** logits dump:
+
+```
+chinese_local_llm.npy  sha256 6A8DA4AF3F6FC3A8...  80000 = 60000 = 50000 = 600
+code_lru.npy           sha256 C58891512F6C...      80000 = 50000
+```
+
+That is what let the whole A1 programme run at all on a shared box: `--memory-limit-mib 600` puts every expert on the
+SSD tier, the process peaks at **12.1 GiB working set** (the engine reports its own `peak=`), and a six-prompt arm
+costs 7-16 minutes instead of failing the launcher's floor whenever the other task's 24 GB job is resident. Every
+quality number below is comparable with the round-9 baseline because the bytes are the same bytes.
+
+**`tools/minimax/arm_session.py`** is the driver that makes "one turn, several arms" possible: it runs the arms as one
+`pc_launch` child (one lock, one page-cache state), keeps one output directory per arm so `g3_sparsa.py` resumes
+per-prompt dumps after a time limit, and prints one table whose deltas are against the session's first arm. Its per-GB
+column uses the packs' own tensor tables - a MoE layer of experts is 2,321,547,264 B in D3 and 1,679,818,752 B in
+IQ1_M, i.e. **0.6417 GB saved per layer**, not the 0.688 the old driver guessed.
+
+### The block sweep, the published tiers, and what the error proxy can and cannot rank
+
+Three more six-prompt arms, same session shape and flags as round 12 (`--memory-limit-mib 600`, 679 positions):
+
+| arm | experts | top-1 | KL64 | dKL64 vs D3 | top-1 delta | GB saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| D3 | 132.33 GB | **58.32%** | **1.3332** | - | - | - |
+| layers 3-7 from IQ1_M | 129.12 | 57.44% | **1.2393** | -0.0939 | -0.88 | 3.21 |
+| layers 20-24 from IQ1_M | 129.12 | 54.64% | 1.4542 | **+0.1210** | **-3.68** | 3.21 |
+| **every expert from IQ2_XXS** | 110.81 | 50.22% | 1.8592 | **+0.5260** | **-8.10** | 21.52 |
+
+So the loss is extremely uneven across the model (the same 3.21 GB costs 0.88 points in layers 3-7 and 3.68 in
+layers 20-24), and the published middle tier is not the safe compromise the round-4 arithmetic assumed: **all of
+IQ2_XXS costs 8.10 points of top-1 for 21.5 GB**, which is worse per gigabyte than the 25-layer IQ1_M mix that was
+rejected at 3.1 points for 16 GB. Nothing measured so far passes the gate (top-1 >= D3), and the cheapest measured
+downgrade (3.21 GB) already costs 0.88 points.
+
+**The per-tensor error table does not rank blocks.** `tools/minimax/pack_sensitivity.py` reports, per expert tensor,
+the relative Frobenius error of a published pack's stored bytes against the source checkpoint (`models/MiniMax-M3.1-Flash`,
+per-expert NVFP4 `weight_packed`/`weight_scale`/`weight_global_scale`), reproducing round 11's layer-3 numbers
+(D3 0.3234/0.3234/0.2043, IQ1_M 0.4997/0.5001/0.3720 on gate/up/down at 2 experts):
+
+| | gate | up | down | GB/layer | relF vs D3, per GB saved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D3 (IQ2_XS / IQ3_XXS) | 0.3090 | 0.3090 | 0.2077 | 2.3215 | - |
+| IQ2_XXS (IQ2_XXS / IQ2_XS) | 0.3517 | 0.3518 | 0.3347 | 1.9440 | +0.043 / +0.127 |
+| IQ1_M (IQ1_M / IQ2_XXS) | 0.4701 | 0.4703 | 0.3775 | 1.6798 | +0.161 / +0.170 |
+
+Summed over the 15 tensors of each measured block it predicts 2.552 (3-7), 2.423 (20-24) and 2.440 (44-48) - a 5%
+spread - while the measured KL64 deltas are -0.094 and +0.121. **The prediction is flat where the measurement is
+not, and its order is inverted at the top.** The reason is visible in the table: every layer's error rises by nearly
+the same amount, so the quantity that decides a block's cost is not in the weight error at all. The table is still
+the right instrument for the one thing it does describe - that `down` is the expensive matrix to move (1.82x its
+own error against 1.52x for gate/up) - so the allocation below uses G3 for the block level and the table only for
+the within-layer split.
+
+**The IQ2_XXS tier was completed and verified** (`tools/minimax/dl_parallel.py`, six connections, resumable, one
+`--allow-partial`-free pass, and every shard renamed into place only after its SHA-256 matched the repo's
+`SHA256SUMS`): 13/13 shards, 124.5 GB. The first run wedged on one shard because `curl` had no timeout; the fix is
+`--speed-time 60 --speed-limit 1024 --max-time 3600`, and a verified shard leaves a `.sha256` stamp so a resume does
+not re-hash 124 GB.
+
+**The exact-budget allocation** (`tools/minimax/a1_dp.py`, 171 groups x 3 options, 1 MiB units, exact against brute
+force in `test_a1_dp.py`) needs a cost per (group, type). Two ways of building it were tried and the honest result is
+that neither is trustworthy on its own: pricing by relF makes IQ1_M look cheaper per byte than IQ2_XXS (which the
+measurements above contradict), and pricing per block cancels the type differences entirely. The allocation that is
+measured below is therefore the one the measurements do support: **gate and up from IQ2_XXS, down kept at D3** - the
+per-tensor table's cheap matrix, the measured-expensive matrix left alone - at 123.7 GB of experts.
+
+### A1's candidate: gate/up from IQ2_XXS, down left at D3
+
+The per-tensor table's one usable statement - `down` is the costly matrix to move - gives the only allocation the
+measurements support: **gate and up from IQ2_XXS, down kept at D3** on every MoE layer. Built with
+`mix_layers.py --alloc` (137.44 GB file, **123.72 GB of experts** against D3's 132.33), and checked two ways
+without an engine: `verify_alloc.py` finds all **171/171** expert tensors at the allocated pack's type *and* length,
+and **25/25** sampled expert tensors (every 7th) are **byte-identical** (SHA-256, 64 MiB reads) to the pack they were
+allocated from.
+
+**Gate, six short prompts, 679 positions, same flags, same session as D3:**
+
+| arm | experts | top-1 | KL64 | dKL64 | top-1 delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D3 | 132.33 GB | **58.32%** | 1.3332 | - | - |
+| **A1 candidate (gate/up IQ2_XXS, down D3)** | 123.72 GB | 58.03% | **1.3142** | **-0.0190** | **-0.29** |
+
+8.61 GB of experts saved for 0.29 points of top-1, with the mean KL64 *better* than D3's - and it is the only pack
+measured on this model that comes within 0.3 points of D3 at all (the all-IQ2_XXS arm is 8.10 points down, a
+5-layer IQ1_M block is 3.68). Under the gate's own rule (within 0.3 points -> rerun on more tokens and report KL
+against D3) this arm needs the longer run, and the held-out set is the panel that decides it; both are queued behind
+the shared PC's other tasks.
+
+### `output_rel` is not measurable on this box today, and why
+
+The research note's suggested fine-grained signal is `--exp-layer`'s `output_rel` (the error of `Wx` against `Qx` on
+real routed tokens). `output_rel_probe.py` implements exactly that for a *published pack's* bytes - gate/up on the
+routed-token input, down on the expert's own hidden state - using the reconstruction in `quant/exp_input.py`. It
+cannot be trusted on the dumps this box has:
+
+* the per-op dumps exist for **layers 0, 3 and 40 only** (a per-op dump is a reference forward pass), so a 57-layer
+  table is not available without a new reference run;
+* `exp_input.py` divides by zero on this checkpoint: `input_layernorm.weight` has a channel at exactly **-1.0**, i.e.
+  a norm weight of 0 after the +1 bake, which turns the whole reconstruction into NaN (that is the `nan` in every
+  `verify ...` line the tool prints);
+* with that channel masked, the fitted residual scale is still not consistent - five norm conventions x 40 scales
+  each, and the best agreement with the dumped `expert_000_gate_up` is **1.74 relative** where `exp_input.py`'s own
+  gate asks for < 5e-3. So the activations are wrong, and any `output_rel` computed on them would be fiction.
+
+What is measured - and what the allocation above is built on - is the per-tensor **plain relative Frobenius error of
+the packs' stored bytes** (`pack_sensitivity.py`, 8 sampled experts x 171 groups x 3 packs), which reproduces round
+11's layer-3 numbers exactly, together with the G3 block deltas for the block level. The calibration the research
+asked for is therefore a negative result: the weight-error proxy's block ranking does not match G3 (5% predicted
+spread against a measured -0.094..+0.121), and the activation-weighted proxy that might have is not measurable here.
+
+### The PCIe probe, measured under load
+
+The held-out run's own startup lines (pinned 256 MiB both directions, NVML sampled from a second thread during the
+transfer) give the link numbers the split and lane decisions need, and they finally separate the two slots:
+
+```
+dev=0 h2d 3.11-3.30 GB/s  d2h 3.42-3.55 GB/s  pcie_idle=gen3 x4   pcie_load=gen3 x4
+dev=1 h2d 28.20-28.39 GB/s d2h 28.03-28.61 GB/s pcie_idle=gen4 x16  pcie_load=gen4 x16
+```
+
+Device 1 is 8.5x device 0 in both directions, and the driver reports the same generation and width under load as at
+rest, so the earlier "both cards measure 3.3 GB/s" was the probe, not the slot. Any PCIe lane or split decision has
+to be priced on the 3.2 vs 28.3 GB/s pair.
+
+### Round 8: the SSD tier's returned bytes, all 171 expert tensors, and C1's fit
+
+**`--minimax-verify-ssd-hash K`** SHA-256s the bytes an unbuffered expert read just delivered, one
+`INFO minimax-ssd-hash <tensor> <expert> <bytes> <sha256> <shard> <file>` line per (tensor, expert), at
+most K per tensor, and prints a known-answer line for `sha256("abc")` first. It is opt-in and costs
+nothing on a normal run. `test_ssd_source_hash.py` forces every expert onto the SSD tier (600 MiB,
+`prefill=batch`) and runs two arms - the base pack, and layers 3-7 from the IQ1_M donor - then compares
+every line with the SHA-256 of the same range read straight from the pack. Measured: 342 reads over 171
+tensors, 171/171 per arm, the 15 moved tensors resolving to IQ1_M and hashing to IQ1_M, two negative
+controls (arms disagree on the moved block; the next expert's range differs). The token path's queued
+prefetch reads are not instrumented; they share the same file list.
+
+**`verify_alloc.py` now checks all 171 expert tensors by default** (it sampled 25). On C1:
+`171/171 identical (SHA-256)` in 416 s, experts 123.72 GB, file 137.44 GB.
+
+**`output_rel` is measurable after all.** The blocker was `input_layernorm.weight`'s exactly -1 channel
+(a norm weight of 0 after the bake), which made the residual reconstruction divide by zero. Masked, the
+same reconstruction the GPTQ pilot uses reproduces the dumped expert outputs, and `output_rel_probe.py`
+scores a published pack's stored bytes on the tokens each expert was routed. Layer 3/40, all three roles,
+the pack order is D3 < IQ2_XXS < IQ1_M and down moves worst (1.9x against 1.5x for gate/up). See
+`A1_ROUND3.md`.
+
+**`full_ref_logits.py`** extends the reference's last-128 logits to the whole prompt from the dump's own
+post-norm `final_hidden.npy` and the checkpoint's BF16 `lm_head` (cos 1.0002-1.0004, mean |d| 0.0000 on
+the overlap). `_local/ref_out/logits_long` holds 1,246 positions for the six prompts instead of 679, so a
+longer gate still has KL64.
+
+**`bench_p6_ssd.py --arm-model`** lets two arms be two different packs in one interleaved session (the
+candidate against its baseline), and `arm_session.py --ppl` adds the 2,048-token pass.

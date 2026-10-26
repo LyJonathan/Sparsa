@@ -8,6 +8,7 @@
 
 #include "strata/kernels/cpu/iqk_quants.hpp"
 #include "strata/kernels/iqk_types.hpp"
+#include "strata/core/sha256.hpp"
 
 #include "cuda_ops.hpp"
 #include "strata/minimax/vision.hpp"
@@ -479,6 +480,16 @@ size_t host_available_bytes() {
 
 // Can this process back `bytes` of new host memory?  Windows counts commit against RAM + pagefile; elsewhere shape
 // it from the available memory.  Used to size the long-context KV cache before touching any page.
+// A symbol from a run-time-loaded library (NVML): nullptr when the library or the symbol is not there, so every
+// caller keeps working on a box without it.
+void* resolve_symbol(void* lib, const char* name) {
+#if defined(_WIN32)
+    return lib ? (void*)GetProcAddress((HMODULE)lib, name) : nullptr;
+#else
+    return lib ? dlsym(lib, name) : nullptr;
+#endif
+}
+
 bool host_commit_ok(size_t bytes) {
 #if defined(_WIN32)
     MEMORYSTATUSEX mem{};
@@ -913,6 +924,40 @@ struct Engine::Impl {
     // ---- P3 expert tiers
     bool tiers_on = false;
     bool tiers_gpu = false;         // a VRAM tier exists (CUDA is up even when dense layers are CPU)
+    bool verify_tensors = false;    // --minimax-verify-tensors: one digest line per tensor the engine resolved
+    // P15 (A3, Maya #476): the zero-copy PCIe lane.  `ram_dev_base` is the device view of the pinned RAM tier after
+    // `cudaHostRegisterMapped`; when it exists, a share of each layer's RAM-tier experts is computed by the GPU
+    // reading them in place.  0 share = off, and a failed registration leaves it off with a line saying so.
+    // P16: --expert-source lo-hi=<pack>.  One model per range, kept open for the run.
+    struct AltPack {
+        int lo = 0, hi = 0;
+        std::string path;
+        std::unique_ptr<GgufModel> model;
+    };
+    std::vector<AltPack> alt_packs;
+    /// The leaf name of the file a tensor is resolved from (the base pack or an --expert-source).
+    const char* src_leaf(const std::string& name) {
+        if (name.rfind("blk.", 0) == 0 && name.find("_exps.weight") != std::string::npos) {
+            const int li = std::atoi(name.c_str() + 4);
+            for (const AltPack& a : alt_packs)
+                if (a.model != nullptr && li >= a.lo && li <= a.hi && a.model->find(name, nullptr) != nullptr)
+                    return alt_pack_leaf[(size_t)(&a - alt_packs.data())].c_str();
+        }
+        return base_leaf.c_str();
+    }
+    std::string opt_model_path;
+    std::vector<std::string> alt_pack_leaf;
+    std::string base_leaf;
+    float pcie_share = 0.f;
+    void* ram_dev_base = nullptr;
+    int64_t tok_pcie = 0;
+    int verify_mod = 1, verify_rem = 0;
+    bool verify_exit = false;
+    // --minimax-verify-ssd-hash K: one SHA-256 line per (tensor, expert) the SSD tier delivered, for the first K
+    // experts of each tensor.  This hashes the BYTES THE TIER RETURNED, so a source mix is proven at the read path,
+    // not only at the resolution table.
+    int verify_ssd_hash = 0;
+    std::map<std::string, int> ssd_hash_n;
     int vram_per_layer = 0;
     int ram_per_layer = 0;
     int moe_layers = 0;
@@ -921,6 +966,7 @@ struct Engine::Impl {
     std::unique_ptr<strata::core::PinnedArena> ram_arena;
     uint64_t ram_bytes = 0;
     std::vector<std::unique_ptr<strata::platform::DirectFile>> ssd_files;
+    std::vector<size_t> alt_shard_base;   // P16: first ssd_files index of each --expert-source pack
     uint8_t* ssd_stage = nullptr;
     size_t ssd_stage_bytes = 0;
     void* ssd_tmp = nullptr;
@@ -948,6 +994,7 @@ struct Engine::Impl {
 
     struct TokenStats {
         int64_t vram = 0, ram = 0, ssd = 0, ssd_bytes = 0, skipped = 0, ssd_mapped = 0;
+        int64_t pcie = 0;   // P15: experts the GPU read in place out of the pinned RAM tier this token
     };
     TokenStats tok_stats;
     TokenStats total_stats;
@@ -1125,7 +1172,8 @@ struct Engine::Impl {
         rb_picks += top;
     }
 
-    explicit Impl(const std::string& path, const EngineOptions& o) : opt(o), model(GgufModel::open(path)) {
+    explicit Impl(const std::string& path, const EngineOptions& o)
+        : opt(o), opt_model_path(path), model(GgufModel::open(path)) {
         cfg = from_gguf(model.meta());
         const std::string bad = check_structure(cfg);
         if (!bad.empty()) fail(bad);
@@ -1139,6 +1187,12 @@ struct Engine::Impl {
         scale_routed = (float)cfg.routed_scale;
         renorm = cfg.expert_weights_norm;
         dense_mmvq = opt.dense_mmvq != "off";
+        verify_tensors = opt.verify_tensors;
+        pcie_share = std::max(0.f, std::min(1.f, opt.pcie_share));
+        verify_mod = opt.verify_mod > 0 ? opt.verify_mod : 1;
+        verify_rem = opt.verify_rem;
+        verify_exit = opt.verify_exit;
+        verify_ssd_hash = opt.verify_ssd_hash;
         gpu_norm_rope = opt.gpu_normrope != "off";
         expert_resident = opt.expert_resident != "off";
         expert_skip = opt.expert_skip > 0.f ? opt.expert_skip : 0.f;
@@ -1193,7 +1247,9 @@ struct Engine::Impl {
         tok_graph.assign((size_t)cfg.n_layers, nullptr);
 
         ggml_cpu_init();
+        open_alt_packs();
         load_tensors();
+        if (verify_tensors) verify_all_tensors();
         decide_norm();
         build_layers();
         read_eos();
@@ -1252,6 +1308,7 @@ struct Engine::Impl {
         // The row/col limits are also the CPU gemv guard. Device buffers exist only when a layer can be uploaded.
         size_workspace();
         if (!cpu_only) alloc_workspace();
+        if (!cpu_only) log_links();
         place_weights();
         if (!cpu_only && kv_mode != 0) alloc_device_kv();
         if (opt.tiers || opt.expert_resident == "all") {
@@ -1326,7 +1383,24 @@ struct Engine::Impl {
 
     bool try_must(const std::string& name, Tensor& t) {
         size_t shard = 0;
-        const TensorInfo* info = model.find(name, &shard);
+        // P16: `--expert-source 3-7=<pack>` - an expert tensor whose layer is in the range is read from that pack
+        // instead of the file being run, so a quality sweep over layer blocks needs no second 130 GB GGUF: the
+        // base pack supplies everything else and the alternate supplies those layers' `ffn_*_exps` tensors.  The
+        // lookup is the same GgufModel one the base uses, so the bytes are the donor's own, unmoved.
+        const GgufModel* src = &model;
+        int alt_at = -1;
+        if (!alt_packs.empty() && name.rfind("blk.", 0) == 0 && name.find("_exps.weight") != std::string::npos) {
+            const int li = std::atoi(name.c_str() + 4);
+            for (size_t i = 0; i < alt_packs.size(); ++i) {
+                if (alt_packs[i].model == nullptr) continue;
+                if (li < alt_packs[i].lo || li > alt_packs[i].hi) continue;
+                if (alt_packs[i].model->find(name, nullptr) == nullptr) continue;
+                src = alt_packs[i].model.get();
+                alt_at = (int)i;
+                break;
+            }
+        }
+        const TensorInfo* info = src->find(name, &shard);
         if (!info) return false;
         t.name = name;
         t.type = (int)info->type;
@@ -1341,11 +1415,11 @@ struct Engine::Impl {
         t.ne1 = info->shape.size() > 1 ? (int64_t)info->shape[1] : 1;
         t.ne2 = info->shape.size() > 2 ? (int64_t)info->shape[2] : 1;
         if (info->shape.size() > 3) fail(name + " has more than 3 dimensions");
-        if (!model.in_bounds(*info, shard))
+        if (!src->in_bounds(*info, shard))
             fail(name + ": has an unknown type or lies past the end of its shard");
-        t.host = model.shard(shard).tensor_data(*info);
-        t.shard = shard;
-        t.file_offset = model.shard(shard).data_start() + info->offset;
+        t.host = src->shard(shard).tensor_data(*info);
+        t.shard = alt_at >= 0 ? alt_shard_base[(size_t)alt_at] + shard : shard;
+        t.file_offset = src->shard(shard).data_start() + info->offset;
         t.bytes = tensor_payload_bytes(*info);
         if (strata::kernels::ikq::is_iqk_type(t.type)) {
             // An ik_llama.cpp format ported into the engine: ggml has no ids for these, so the geometry and
@@ -1406,11 +1480,111 @@ struct Engine::Impl {
         return w;
     }
 
+    void open_alt_packs() {
+        // P16: `--expert-source 3-7=D:\...gguf` (repeatable).  Opened here, once, and kept for the run; a range with
+        // no pack or a pack that will not open is refused by name, because a silent fallback would measure the base
+        // file and call it a block.
+        for (const std::string& spec : opt.expert_source) {
+            const auto eq = spec.find('=');
+            if (eq == std::string::npos) fail("--expert-source needs lo-hi=path (got '" + spec + "')");
+            const std::string range = spec.substr(0, eq);
+            const std::string path = spec.substr(eq + 1);
+            AltPack a;
+            a.path = path;
+            const auto dash = range.find('-');
+            a.lo = std::atoi(range.c_str());
+            a.hi = dash == std::string::npos ? a.lo : std::atoi(range.c_str() + dash + 1);
+            if (a.hi < a.lo) std::swap(a.lo, a.hi);
+            a.model = std::make_unique<GgufModel>(GgufModel::open(path));
+            std::fprintf(stderr, "INFO minimax-expert-source layers %d-%d from %s%c", a.lo, a.hi, path.c_str(), 10);
+            alt_packs.push_back(std::move(a));
+        }
+        for (const AltPack& a : alt_packs) alt_pack_leaf.push_back(base_leaf_name(a.path));
+        base_leaf = base_leaf_name(opt_model_path);
+        // The flat file list is the base pack's shards and then each alternate pack's, in this order.  This has to be
+        // known HERE, because try_must maps a tensor's shard into that list from the first tensor it resolves - an
+        // empty or late-filled vector was an out-of-bounds read (an access violation right after decide_norm).
+        alt_shard_base.clear();
+        size_t at = model.size();
+        for (const AltPack& a : alt_packs) {
+            alt_shard_base.push_back(at);
+            at += a.model->size();
+        }
+    }
+
+    static std::string base_leaf_name(const std::string& path) {
+        const size_t at = path.find_last_of("/\\");
+        return at == std::string::npos ? path : path.substr(at + 1);
+    }
+
+    /// The leaf name of the file behind a flat `ssd_files` index: the base pack's shards first, then each
+    /// --expert-source pack's, in the order open_alt_packs recorded.
+    std::string flat_leaf(size_t shard) const {
+        if (shard < model.size()) return base_leaf_name(model.shard(shard).path());
+        for (size_t i = 0; i < alt_packs.size() && i < alt_shard_base.size(); ++i) {
+            const size_t base = alt_shard_base[i];
+            if (shard >= base && shard < base + alt_packs[i].model->size())
+                return base_leaf_name(alt_packs[i].model->shard(shard - base).path());
+        }
+        return std::string("?");
+    }
+
+    /// --minimax-verify-ssd-hash K: SHA-256 the bytes a tier just delivered for one expert role.  One line per
+    /// (tensor, expert) pair, at most K per tensor, so a proof costs a few seconds of hashing even on a 60-layer run.
+    void ssd_hash_taken(const Tensor& t, int64_t expert, const uint8_t* bytes) {
+        if (verify_ssd_hash <= 0) return;
+        static bool selftested = false;
+        if (!selftested) {
+            // known-answer check for the hash itself, so a wrong SHA-256 cannot make the proof pass
+            selftested = true;
+            std::fprintf(stderr, "INFO minimax-ssd-hash-selftest abc %s%c",
+                         strata::core::sha256_hex("abc", 3).c_str(), 10);
+        }
+        int& n = ssd_hash_n[t.name];
+        if (n >= verify_ssd_hash) return;
+        ++n;
+        const size_t len = (size_t)(t.bytes / (size_t)t.ne2);
+        const std::string hex = strata::core::sha256_hex(bytes, len);
+        std::fprintf(stderr, "INFO minimax-ssd-hash %s %lld %zu %s %zu %s%c", t.name.c_str(), (long long)expert, len,
+                     hex.c_str(), t.shard, flat_leaf(t.shard).c_str(), 10);
+    }
+
     void load_tensors() {
         embd = must("token_embd.weight");
         output = must("output.weight");
         if (embd.ne0 != cfg.n_embd || embd.ne1 != cfg.n_vocab) fail("token_embd.weight has an unexpected shape");
         if (output.ne0 != cfg.n_embd || output.ne1 != cfg.n_vocab) fail("output.weight has an unexpected shape");
+    }
+
+    /// --minimax-verify-tensors: print the resolution of every tensor - name, shard index, byte offset inside the
+    /// file, byte length, ggml type - and nothing else.  No hashing and no page touching: a whole pass over this
+    /// pack's 130 GB of mappings trips the 10 GB RAM floor, and `tools/minimax/verify_pack.py` can stream the ranges
+    /// from the file with bounded reads and SHA-256 them itself.  `--minimax-verify-exit` stops right after the list
+    /// (exit 0) so a proof costs seconds.  This is also the serve-versus-eval comparison: the two entry points must
+    /// resolve every tensor to the same shard, offset and length.
+    void verify_all_tensors() {
+        size_t n = 0, at = 0;
+        std::vector<std::string> names;
+        for (size_t si = 0; si < model.size(); ++si)
+            for (const TensorInfo& r : model.shard(si).tensors()) names.push_back(r.name);
+        for (const std::string& name : names) {
+            if ((++at % (size_t)verify_mod) != (size_t)verify_rem) continue;
+            // resolved the way the engine reads it - so an --expert-source tensor reports ITS file and its absolute
+            // offset in it, not the base pack's entry of the same name
+            Tensor t;
+            if (!try_must(name, t)) continue;
+            std::fprintf(stderr, "INFO minimax-verify %s %zu %llu %llu %d %s%c", name.c_str(), t.shard,
+                         (unsigned long long)t.file_offset, (unsigned long long)t.bytes, t.type,
+                         src_leaf(name), 10);
+            ++n;
+        }
+        std::fprintf(stderr, "INFO minimax-verify total=%zu of %zu (mod %d rem %d)%c", n, at, verify_mod, verify_rem,
+                     10);
+        if (verify_exit) {
+            std::fprintf(stderr, "INFO minimax-verify exit after resolution%c", 10);
+            std::fflush(stderr);
+            std::exit(0);
+        }
     }
 
     void decide_norm() {
@@ -1423,6 +1597,12 @@ struct Engine::Impl {
         for (float v : a) sum += v;
         for (float v : b) sum += v;
         const double mean = sum / (double)(a.size() + b.size());
+        // Printed always: the mean over `output_norm.weight` and `blk.0.attn_norm.weight` is the engine's own proof
+        // that it resolved those two tensors to the right bytes, and comparing the line between `--serve` and
+        // `--minimax-eval` is how a loader difference between the two paths shows up (round 3's A1 pack lost a day
+        // to a gate that opened the pack while it was still being written; the mean is what would have said so).
+        std::fprintf(stderr, "INFO minimax-norm mean=%.6f over output_norm+blk.0.attn_norm (%lld values)%c",
+                     mean, (long long)(a.size() + b.size()), 10);
         const MetaValue* key = model.meta().get("minimax-m3.norm.add1");
         if (key) {
             if (key->type != MetaType::BOOL)
@@ -2093,6 +2273,170 @@ struct Engine::Impl {
         return c;
     }
 
+    /// Measured host->device rate for one device, GB/s: eight 32 MiB copies of a hot buffer, best of three rounds.
+    /// This is the number a split has to respect on a box whose cards sit on different links (device 0 here is
+    /// PCIe 3.0 x4 against device 1's 4.0 x16), and it is measured rather than read from the topology because a
+    /// runtime "Gen4 x16" on a card in an x4 slot reports the card, not the slot.  0 when it cannot be measured.
+    double h2d_gbs(int dev) {
+        // P16: 256 MiB from PINNED memory on the device's own stream, median of five.  The old probe copied 8 x 32 MiB
+        // from a std::vector (pageable) on the default stream and measured ~3.3 GB/s on both cards - the driver's
+        // staging rate - which cannot tell a gen3 x4 slot from a gen4 x16 one, the single distinction a PCIe lane or
+        // a split needs.
+        return cu::host_to_device_gbs(dev, size_t{256} << 20, 5);
+    }
+
+    /// The PCIe link each card is really on: the driver's own generation and width for the device (NVML, loaded at
+    /// run time so the engine does not link against it) plus this process's measured host->device rate.  A card in an
+    /// x4 slot reports the card's capability through CUDA, not the slot's, so the driver figure and the measured rate
+    /// together are what a split or a PCIe expert lane has to be priced on - and on this box they disagree by 3x
+    /// (device 0 measured 6.4 GB/s against device 1's 21.9).  Nothing here changes behaviour: it is the log the
+    /// decision is made from.
+    void log_links() {
+        struct Nvml {
+            void* lib = nullptr;
+            int (*init)() = nullptr;
+            int (*byIndex)(unsigned, void**) = nullptr;
+            int (*gen)(void*, unsigned*) = nullptr;
+            int (*width)(void*, unsigned*) = nullptr;
+            bool ok = false;
+        } nv;
+#if defined(_WIN32)
+        nv.lib = (void*)LoadLibraryA("nvml.dll");
+        if (!nv.lib) nv.lib = (void*)LoadLibraryA("C:/Program Files/NVIDIA Corporation/NVSMI/nvml.dll");
+#else
+        nv.lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+#endif
+        if (nv.lib) {
+            nv.init = (int (*)())resolve_symbol(nv.lib, "nvmlInit_v2");
+            nv.byIndex = (int (*)(unsigned, void**))resolve_symbol(nv.lib, "nvmlDeviceGetHandleByIndex_v2");
+            nv.gen = (int (*)(void*, unsigned*))resolve_symbol(nv.lib, "nvmlDeviceGetCurrPcieLinkGeneration");
+            nv.width = (int (*)(void*, unsigned*))resolve_symbol(nv.lib, "nvmlDeviceGetCurrPcieLinkWidth");
+            nv.ok = nv.init && nv.byIndex && nv.gen && nv.width && nv.init() == 0;
+        }
+        const auto link_now = [&](int dev, unsigned* g, unsigned* w) {
+            *g = 0;
+            *w = 0;
+            if (!nv.ok) return;
+            void* h = nullptr;
+            if (nv.byIndex((unsigned)dev, &h) != 0) return;
+            if (nv.gen(h, g) != 0) *g = 0;
+            if (nv.width(h, w) != 0) *w = 0;
+        };
+        for (size_t d = 0; d < devs.size(); ++d) {
+            const int dev = (int)devs[d];
+            unsigned idle_g = 0, idle_w = 0;
+            link_now(dev, &idle_g, &idle_w);
+            // Sample the driver's CURRENT link from a second thread WHILE the transfers run: an idle card drops its
+            // link generation, so a reading taken between transfers describes the idle state, not the slot.
+            std::atomic<bool> stop{false};
+            std::atomic<unsigned> load_g{0}, load_w{0};
+            std::thread sampler([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    unsigned g = 0, w = 0;
+                    link_now(dev, &g, &w);
+                    if (g > load_g.load(std::memory_order_relaxed)) load_g.store(g, std::memory_order_relaxed);
+                    if (w > load_w.load(std::memory_order_relaxed)) load_w.store(w, std::memory_order_relaxed);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            });
+            const double up = h2d_gbs(dev);
+            const double down = cu::device_to_host_gbs(dev, size_t{256} << 20, 5);
+            stop.store(true);
+            sampler.join();
+            std::fprintf(stderr,
+                         "INFO minimax-link dev=%d h2d=%.2f GB/s d2h=%.2f GB/s pcie_idle=%s pcie_load=%s%c", dev, up,
+                         down,
+                         idle_g ? (std::string("gen") + std::to_string(idle_g) + " x" + std::to_string(idle_w)).c_str()
+                                : "unknown",
+                         load_g.load() ? (std::string("gen") + std::to_string(load_g.load()) + " x" +
+                                          std::to_string(load_w.load())).c_str()
+                                       : "unknown",
+                         10);
+        }
+#if defined(_WIN32)
+        if (nv.lib) FreeLibrary((HMODULE)nv.lib);
+#else
+        if (nv.lib) dlclose(nv.lib);
+#endif
+    }
+
+    /// P13b: the split point, chosen where the arithmetic is exact.  `choose_split_and_kv` prices the layers by their
+    /// bytes alone, before this engine's own work buffers, MSA scratch and fixed allocations exist, so it cannot see
+    /// how many expert slots a card will really have - and the slot count is what the cache is worth.  Here the
+    /// workspace is already allocated, so `cu::mem_on(dev).free_bytes` is the truth.  For every 2-way split point K
+    /// (the last device also pays `lm_head`) this computes each card's slot count the way the allocator will, turns
+    /// it into the share of routes the cache can serve (a linear coverage curve fitted to this box's measurements:
+    /// 26.9% of routes at 6 slots a layer against the model's 13.4%, so ~4.5% a slot up to saturation), and keeps the
+    /// best.  A card on a slower link gets fewer layers when two candidates are within 3%: the misses it serves are
+    /// streamed over that link.  Returns the split point, or 0 for "leave the assignment alone".
+    int best_split_2way(const std::vector<size_t>& cost, size_t out_b, const size_t reserve) {
+        if (devs.size() != 2 || opt.dense_layers_gpu < 0 || !opt.layer_split.empty()) return 0;
+        std::vector<size_t> free_b(2, 0);
+        for (size_t d = 0; d < 2; ++d) {
+            const cu::MemInfo mi = cu::mem_on(devs[d]);
+            free_b[d] = mi.free_bytes > reserve ? mi.free_bytes - reserve : 0;
+        }
+        if (free_b[0] == 0 || free_b[1] == 0) return 0;
+        const int top = (int)cfg.n_expert;
+        const auto score_of = [&](int k) -> double {
+            double sc = 0.0;
+            for (int d = 0; d < 2; ++d) {
+                size_t spend = d + 1 == 2 ? out_b : 0;
+                size_t ex = 0;
+                int moe = 0;
+                for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                    const bool mine = d == 0 ? i < k : i >= k;
+                    if (!mine) continue;
+                    spend += cost[(size_t)i] + (kv_mode == 1 ? kv_layer_bytes() : 0);
+                    if (layers[(size_t)i].moe) {
+                        ++moe;
+                        ex += layers[(size_t)i].expert_bytes;
+                    }
+                }
+                if (moe <= 0 || ex == 0 || spend >= free_b[(size_t)d]) continue;
+                int sl = (int)((free_b[(size_t)d] - spend) / ex);
+                if (sl > top) sl = top;
+                double cover = 0.0448 * (double)sl;
+                if (cover > 1.0) cover = 1.0;
+                sc += (double)moe * cover;
+            }
+            return sc;
+        };
+        int cur = 0;
+        for (int64_t i = 0; i < cfg.n_layers; ++i) cur += layer_dev[(size_t)i] == 0 ? 1 : 0;
+        double best = score_of(cur);
+        int best_k = cur;
+        double slow = 1.0;
+        std::vector<double> gbs(2, 0.0);
+        for (size_t d = 0; d < 2; ++d) gbs[d] = h2d_gbs((int)d);
+        if (gbs[0] > 0.0 && gbs[1] > 0.0) slow = (gbs[0] < gbs[1] ? 0 : 1) == 0 ? 1.0 : 1.0;
+        const int slower = (gbs[0] > 0.0 && gbs[1] > 0.0) ? (gbs[0] < gbs[1] ? 0 : 1) : -1;
+        for (int k = 1; k < (int)cfg.n_layers; ++k) {
+            const double sc = score_of(k);
+            const bool better = sc > best * 1.03;
+            const bool tie = sc > best * 0.97;
+            int cur_slow = 0, cand_slow = 0;
+            for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                if (!layers[(size_t)i].moe) continue;
+                if (slower >= 0 && ((i < cur && slower == 0) || (i >= cur && slower == 1))) ++cur_slow;
+                if (slower >= 0 && ((i < k && slower == 0) || (i >= k && slower == 1))) ++cand_slow;
+            }
+            if (better || (tie && cand_slow < cur_slow)) {
+                best = sc;
+                best_k = k;
+            }
+        }
+        (void)slow;
+        std::fprintf(stderr, "INFO minimax-split probe: h2d %.1f / %.1f GB/s, %d/%d layers covers %.3f of the routes",
+                     gbs[0], gbs[1], cur, (int)cfg.n_layers - cur, score_of(cur));
+        if (best_k == cur) {
+            std::fprintf(stderr, " (kept)%c", 10);
+            return 0;
+        }
+        std::fprintf(stderr, " ; %d/%d covers %.3f (keeping it)%c", best_k, (int)cfg.n_layers - best_k, best, 10);
+        return best_k;
+    }
+
     void place_weights() {
         if (opt.dense_layers_gpu == 0) {
             dense_gpu = 0;
@@ -2104,6 +2448,16 @@ struct Engine::Impl {
         const size_t out_b = gpu_bytes(output);
         const size_t reserve = (size_t)(opt.vram_reserve_mib > 0 ? opt.vram_reserve_mib : 0) << 20;
         const bool automatic = opt.dense_layers_gpu < 0;
+        // P13b: re-decide the 2-way split here, where the workspace is allocated and the free VRAM is exact.
+        if (devs.size() == 2 && automatic && opt.layer_split.empty() && opt.dense_layers_gpu != 0) {
+            const int k = best_split_2way(cost, out_b, reserve);
+            if (k > 0) {
+                for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                    layer_dev[(size_t)i] = i < k ? 0 : 1;
+                    layers[(size_t)i].dev = layer_dev[(size_t)i];
+                }
+            }
+        }
         int N = -1;
         if (devs.size() > 1 || !automatic) {
             // P4 split (or an explicit count): every layer up to the count goes on its own device.  The split
@@ -2431,6 +2785,44 @@ struct Engine::Impl {
             const size_t free_now = avail > headroom / 2 ? avail - headroom / 2 : 0;
             ram_budget = std::min(room, free_now);
         }
+        // P14 (Strata 0.2.6 / Project Maya v1.1.27 `--mmap-experts auto`): when EVERY expert left on the CPU fits
+        // in RAM with kCopyAllSpare to spare, take them all, and take them at load.  Maya's rule is all-or-none on
+        // purpose - "a PART copied cost decode speed on 32 / 64 GB of RAM" - because a partial tier still sends the
+        // rest to the drive every token while paying for the copies; with the tail gone the SSD leaves the decode
+        // entirely (their #339: +22% on 4x V100 with 504 GB, ~2x on a 20 GB Ada, +23% on 4x 3090 with 126 GB).
+        // The room is the same two figures Maya uses: the OS's available memory less the headroom, and - on Windows,
+        // where the pages are committed memory - what the commit limit can still back (RAM + page file).
+        constexpr size_t kCopyAllSpare = size_t{8} << 30;
+        bool ram_copy_all = false;
+        if (opt.memory_limit_mib <= 0 && !ram_inplace && !profile.empty()) {
+            size_t all_left = 0;
+            for (const Layer& L : layers) {
+                if (!L.moe) continue;
+                int in_vram = (int)L.vram.size();          // the per-device slot count, filled above
+                if (in_vram > (int)cfg.n_expert) in_vram = (int)cfg.n_expert;
+                all_left += (size_t)((int)cfg.n_expert - in_vram) * L.expert_bytes;
+            }
+            const size_t avail_room = avail > headroom ? avail - headroom : 0;
+#if defined(_WIN32)
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+            const size_t commit_room = GlobalMemoryStatusEx(&ms) ? (size_t)ms.ullAvailPageFile : SIZE_MAX;
+#else
+            const size_t commit_room = SIZE_MAX;
+#endif
+            const size_t can = std::min(avail_room, commit_room);
+            if (all_left + kCopyAllSpare <= can) {
+                ram_budget = all_left;
+                ram_copy_all = true;
+                std::fprintf(stderr,
+                             "INFO minimax-ram-tier copy-all: every expert left off the GPUs is %.1f GiB "
+                             "and %.1f GiB is usable (spare %.1f GiB >= 8 GiB), so the whole tail is pinned "
+                             "at load%c",
+                             (double)all_left / 1073741824.0, (double)can / 1073741824.0,
+                             (double)(can - all_left) / 1073741824.0, 10);
+            }
+        }
+        (void)ram_copy_all;   // the effect is in ram_budget; the fills below spend it
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
         // more slots than a cold one.  With a uniform count the layer budgets ignore the routing profile entirely;
         // the profile mass of MiniMax's layers is not uniform, so a proportional split holds more of the routes in
@@ -2582,12 +2974,28 @@ struct Engine::Impl {
         //
         // P9: this comes before the profile-driven fill, because with `--minimax-prefill-read direct` (implied by a
         // --memory-limit-mib budget) the pinned arena is filled through these files rather than through the mapping.
+        // P16: the list covers the base pack's shards and then every --expert-source pack's, so `t.shard` alone
+        // still names the file a tensor's bytes live in.  Every tier that opens a file by shard index - the SSD
+        // read, the prefetch, the PIN-time fill through these files - therefore reads the *tensor's own* file with
+        // no per-tier knowledge of where it came from.
+        ssd_files.clear();
         ssd_files.resize(model.size());
         for (size_t s = 0; s < model.size(); ++s) {
             ssd_files[s] = std::make_unique<strata::platform::DirectFile>();
             std::string err;
             if (!ssd_files[s]->open(model.shard(s).path(), err))
                 fail("minimax SSD tier: " + err);
+        }
+        for (size_t ai = 0; ai < alt_packs.size(); ++ai) {
+            const GgufModel& am = *alt_packs[ai].model;
+            if (alt_shard_base[ai] != ssd_files.size())
+                fail("internal: the alternate pack's shard base does not match the file list order");
+            for (size_t s = 0; s < am.size(); ++s) {
+                auto f = std::make_unique<strata::platform::DirectFile>();
+                std::string err;
+                if (!f->open(am.shard(s).path(), err)) fail("minimax SSD tier (alternate pack): " + err);
+                ssd_files.push_back(std::move(f));
+            }
         }
         // One staging slot per routed entry: several selected experts of one layer may be SSD misses, and their
         // byte slices have to stay alive together until the combine.
@@ -2620,6 +3028,19 @@ struct Engine::Impl {
                 for (int s = 0; s < L.ram_n && at < (int)order.size(); ++s, ++at)
                     ram_fill(L, s, order[(size_t)at].second);
             }
+        }
+
+        // P15: the RAM tier's device view, for the zero-copy PCIe lane.  A 100 GB range does not always register;
+        // when it does not, the lane stays off and says so rather than failing the run.
+        if (pcie_share > 0.f && !ram_inplace && ram_arena && ram_arena->valid() && ram_bytes > 0) {
+            ram_dev_base = cu::host_register_mapped(ram_arena->data(), (size_t)ram_bytes);
+            if (ram_dev_base == nullptr)
+                std::fprintf(stderr, "INFO minimax-pcie-lane off: the driver refused to map the %.1f GiB RAM tier "
+                                     "(cudaHostRegister failed)%c", (double)ram_bytes / 1073741824.0, 10);
+            else
+                std::fprintf(stderr, "INFO minimax-pcie-lane on: %.1f GiB of the RAM tier is device-mapped, share "
+                                     "%.2f of each layer's RAM experts%c", (double)ram_bytes / 1073741824.0,
+                             (double)pcie_share, 10);
         }
 
         // ---- SSD staging buffers for the token path (the files and ssd_tmp were opened above, before the fill).
@@ -2693,9 +3114,25 @@ struct Engine::Impl {
                 d = base + 2 * L.expert_gu;
             }
         }
-        cu::copy_h2d(p, g, L.expert_gu);
-        cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
-        cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
+        // P13c (A3, step 1): the three copies go on the layer's side stream instead of the default one.  Every
+        // consumer of a VRAM expert slot is a kernel this engine enqueues on `W().side` (`gpu_experts_begin`) or a
+        // later copy on the same stream (`vram_swap`, `prefetch_for`), so the slot's bytes are ordered before their
+        // first reader either way and the *same bytes land in the same slot* - bit-identical by construction.  What
+        // changes is that the copies no longer wait behind the layer's already-queued GPU work, which on the
+        // compulsory-admission path (no profile, first use of an expert) was three synchronous round trips on the
+        // critical path of the layer that needs them.  A synchronous barrier is kept when no side stream exists yet
+        // (the fill at startup, where there is nothing to overlap with).
+        const bool async = W().side != nullptr && tokens_seen > 0;
+        if (async) {
+            cu::copy_h2d_async(p, g, L.expert_gu, W().side);
+            cu::copy_h2d_async(p + L.expert_gu, u, L.expert_gu, W().side);
+        }
+        if (!async) {
+            cu::copy_h2d(p, g, L.expert_gu);
+            cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
+        }
+        if (async) cu::copy_h2d_async(p + 2 * L.expert_gu, d, L.expert_down, W().side);
+        else cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
     }
@@ -3079,6 +3516,7 @@ struct Engine::Impl {
                              t.name.c_str(), (long long)expert, bad, (unsigned long long)off,
                              (unsigned long long)aoff);
         }
+        ssd_hash_taken(t, expert, dst);
     }
 
     void ssd_read_expert(const Layer& L, int64_t expert, uint8_t* stage) {
@@ -3184,6 +3622,7 @@ struct Engine::Impl {
             err = "minimax SSD read: timed out";
             return false;
         }
+        for (int r = 0; r < 3; ++r) ssd_hash_taken(*ts[r], expert, out[r]);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
         return true;
@@ -3379,7 +3818,11 @@ struct Engine::Impl {
 
     // ---- P5b: the routed experts of one layer, GPU part.  The int8 kernels run on the side stream so the CPU
     // experts of the same token are computed while the GPU works; `finish` joins the stream and copies the rows back.
-    bool gpu_experts_begin(const Layer& L, const std::vector<int>& exps, const float* in) {
+    // `alt` (optional, same length as `exps`): the DEVICE address to read expert i from instead of its VRAM slot.
+    // That is the zero-copy PCIe lane - the entry is the device view of the pinned RAM tier, so the kernel reads the
+    // expert where it already lives and nothing is staged.  nullptr entries keep the VRAM slot.
+    bool gpu_experts_begin(const Layer& L, const std::vector<int>& exps, const float* in,
+                           const std::vector<const void*>* alt = nullptr) {
         const int k = (int)exps.size();
         if (k == 0) return false;
         use_device_index(L.dev);
@@ -3388,8 +3831,12 @@ struct Engine::Impl {
         for (int i = 0; i < k; ++i) {
             const int e = exps[(size_t)i];
             const int slot = L.vram_of[(size_t)e];
-            if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
-            const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+            const uint8_t* base = nullptr;
+            if (alt != nullptr && (*alt)[(size_t)i] != nullptr) base = (const uint8_t*)(*alt)[(size_t)i];
+            else {
+                if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
+                base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+            }
             gp[(size_t)i] = base;
             up[(size_t)i] = base + L.expert_gu;
             dp[(size_t)i] = base + 2 * L.expert_gu;
@@ -3720,11 +4167,39 @@ struct Engine::Impl {
             prof.pick += pms(t_ph);
             t_ph = std::chrono::steady_clock::now();
         }
+        // P15: the zero-copy PCIe lane.  `pcie_share` of this layer's RAM-tier experts join the GPU list, each with
+        // the device address of its pinned bytes as its base - so the kernel reads it over PCIe in place, with no
+        // staging copy, while the CPU lane computes the rest.  The share is a measured knob (both lanes should finish
+        // together).  `alt` stays aligned with `gpu_e`: nullptr keeps a VRAM slot, anything else is an in-place read.
+        std::vector<const void*> alt;
+        if (pcie_share > 0.f && ram_dev_base != nullptr) {
+            const int want = (int)std::lround((double)pcie_share * (double)top);
+            int taken = 0;
+            alt.assign(gpu_e.size(), nullptr);          // the VRAM-resident ones classified before this point
+            for (int j = 0; j < top && taken < want; ++j) {
+                if (w[(size_t)j] == 0.f) continue;
+                const int e = order[(size_t)j];
+                if (L.vram_of[(size_t)e] >= 0) continue;
+                const int rs = L.ram_of[(size_t)e];
+                if (rs < 0 || rs >= L.ram_n) continue;   // not in the RAM tier: the SSD path keeps it
+                for (auto& c : cpu)
+                    if (c.e == e && !c.ssd) {
+                        c.ssd = true;                    // taken off the CPU pass (the flag only routes the pass)
+                        alt.push_back((const void*)((const uint8_t*)ram_dev_base + L.ram_off +
+                                                    (uint64_t)rs * L.expert_bytes));
+                        gpu_e.push_back(e);
+                        ++taken;
+                        ++tok_pcie;
+                        break;
+                    }
+            }
+            if ((size_t)taken == 0) alt.clear();
+        }
         std::vector<float> gpu_out;
         bool gpu_async = false;
         if (!gpu_e.empty()) {
             use_device_index(L.dev);
-            gpu_async = gpu_experts_begin(L, gpu_e, in);
+            gpu_async = gpu_experts_begin(L, gpu_e, in, alt.size() == gpu_e.size() ? &alt : nullptr);
         }
         if (pt) {
             prof.gpu_begin += pms(t_ph);
@@ -5590,6 +6065,7 @@ struct Engine::Impl {
         const int64_t pos = n_past;
         cur_pos = pos;
         tok_stats = TokenStats{};
+        tok_pcie = 0;
         ssd_wait_ms = 0.0;
         decay_usage();
         const bool pt = opt.profile_time;

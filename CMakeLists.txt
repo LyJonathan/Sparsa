@@ -811,7 +811,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/minimax/serve.cpp
     src/minimax/engine.cpp
     src/minimax/vision.cpp
-    src/minimax/cuda_ops.cu)
+    src/minimax/cuda_ops.cu
+    src/core/sha256.cpp)
   target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                              PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_minimax PUBLIC strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}

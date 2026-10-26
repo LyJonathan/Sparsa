@@ -56,7 +56,7 @@ def read_ids(path: str) -> list[int]:
     return [int(x) for x in raw.decode('utf-8', 'replace').replace(',', ' ').split() if x.lstrip('-').isdigit()]
 
 
-NUM = ('vram', 'ram', 'ssd', 'ssd_bytes', 'skipped', 'swaps', 'token')
+NUM = ('vram', 'ram', 'ssd', 'ssd_bytes', 'skipped', 'swaps', 'pcie', 'token')
 
 
 def parse_line(line: str) -> dict | None:
@@ -180,6 +180,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', action='append', required=True)
     ap.add_argument('--label', action='append', default=[])
+    ap.add_argument('--arm-model', action='append', default=[],
+                    help='the pack for one arm, in --exe order (repeatable; default: --model).  A candidate and its '
+                         'baseline are different files measured in the same session.')
     ap.add_argument('--arm-args', action='append', default=[],
                     help='extra engine args for one arm, in --exe order (repeatable, spaces allowed)')
     ap.add_argument('--model', required=True)
@@ -201,6 +204,9 @@ def main() -> int:
     arm_args = [x.split() if x else [] for x in a.arm_args]
     while len(arm_args) < len(a.exe):
         arm_args.append([])
+    models = list(a.arm_model)
+    while len(models) < len(a.exe):
+        models.append(a.model)
     source = read_ids(a.ids) if a.ids else synth_ids(256, a.seed)
     if a.ids:
         print(f'prompt text: {a.ids} ({len(source)} tokens)')
@@ -208,10 +214,10 @@ def main() -> int:
 
     results: dict[str, list[dict]] = {label: [] for label in labels}
     for rnd in range(a.rounds):
-        for exe, label in zip(a.exe, labels):
+        for k, (exe, label) in enumerate(zip(a.exe, labels)):
             print(f'round {rnd}: {label}', flush=True)
-            results[label].append(run_arm(exe, a.model, ctx, a.prompt, a.decode, a.reps, source,
-                                          extra + arm_args[labels.index(label)], a.timeout))
+            results[label].append(run_arm(exe, models[k], ctx, a.prompt, a.decode, a.reps, source,
+                                          extra + arm_args[k], a.timeout))
 
     print()
     head = (f'{"arm":>12} | {"round":>5} | {"decode tok/s":>12} | {"ms/tok":>7} | {"ssd/tok":>8} | '

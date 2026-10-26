@@ -47,6 +47,18 @@ struct EngineOptions {
                                     ///< is the tier and the CPU lane reads the mapping (nothing is copied)
     bool adaptive = true;           ///< decayed-count VRAM swaps and the SSD-miss LRU in the RAM tier
     bool stats = false;             ///< per-token tier counters on stderr
+    bool verify_tensors = false;    ///< --minimax-verify-tensors: name/size/FNV-1a of every tensor the engine resolved
+    int verify_mod = 1;             ///< --minimax-verify-mod: hash every M-th tensor (the proof is taken in chunks)
+    int verify_rem = 0;             ///< --minimax-verify-rem: ... starting at this remainder
+    bool verify_exit = false;       ///< --minimax-verify-exit: stop right after the resolution list
+    int verify_ssd_hash = 0;        ///< --minimax-verify-ssd-hash K: SHA-256 the bytes the SSD tier RETURNS, for the
+                                    ///< first K distinct experts of every expert tensor (0 = off; the proof that the
+                                    ///< read path resolved the right file, not just the right offset)
+    std::vector<std::string> expert_source;  ///< --expert-source lo-hi=<pack>: read those layers' expert tensors
+                                             ///< from that pack instead of the file being run (a sweep candidate
+                                             ///< without writing a second 130 GB GGUF)
+    float pcie_share = 0.f;         ///< --minimax-pcie-share: share of each layer's RAM-tier experts the GPU reads
+                                    ///< in place out of the mapped RAM tier (0 = off)
     bool stats_per_layer = false;   ///< one counters line per layer as a token runs
     bool profile_time = false;      ///< P8: one line per decode token with the wall time of every phase of it
 

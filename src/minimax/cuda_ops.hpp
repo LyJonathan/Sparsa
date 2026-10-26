@@ -16,6 +16,18 @@ MemInfo mem();
 void* alloc(size_t bytes);
 void dealloc(void* p);
 void copy_h2d(void* dst, const void* src, size_t bytes);
+/// Register `bytes` of host memory as a mapped (zero-copy) range and return the device address that reads it, or
+/// nullptr when the driver refuses (a range that large may not register).  Project Maya's PCIe lane (#476): the GPU
+/// expert kernels then read a pinned RAM-tier expert *in place*, crossing PCIe once and using no CPU cores.
+/// Measured host->device rate for `dev`, GB/s: `bytes` copied from PINNED host memory on a stream of that device's
+/// own, `rounds` times, and the MEDIAN reported.  Pinned source matters - a pageable copy measures the driver's
+/// staging buffer (~3.3 GB/s on both cards here, whichever slot they are in) rather than the link.
+double host_to_device_gbs(int dev, size_t bytes, int rounds);
+/// The same for device->host (pinned destination).  Both directions matter: an expert lane streams *up* while an
+/// attention readback streams *down*, and a slot can report a different rate each way.
+double device_to_host_gbs(int dev, size_t bytes, int rounds);
+void* host_register_mapped(void* host, size_t bytes);
+void host_unregister_mapped(void* host);
 void copy_d2h(void* dst, const void* src, size_t bytes);
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
 void copy_d2d(void* dst, const void* src, size_t bytes);
