@@ -153,4 +153,21 @@ python tools/minimax/pc_launch.py --owner heldout -- \
 
 `--ref` is discovered by `os.listdir`, so it must contain exactly the held-out
 prompt directories (plus `meta.json`/`timings.json`, which are files and are
-skipped).  `RESULTS.md` in `_local/g3_heldout/` holds the numbers.
+skipped).  `run_d3.py` wraps the three phases (short prompts, the long prompt
+alone, then an aggregate rescore) behind the PC lock and resumes where it
+stopped; `RESULTS.md` in `_local/g3_heldout/` holds the numbers.
+
+### Measured on the shared PC (2026-10-26)
+
+The engine's real host footprint at `--memory-limit-mib 80000` is about **80 GB**,
+not the launcher's 72-82 GB estimate: with 89 GB available the run was allowed
+(looking like 17 GB would be left) and then pulled available RAM down to 9 GB, so
+`pc_launch`'s watchdog stopped it under the 10 GB floor - four times, on the
+first prompt, before any dump was written.  `--memory-limit-mib 70000` did not
+help: the pinned budget is not a cap on the process's total, so the footprint
+stayed ~80 GB.
+
+Consequence: this gate needs a PC with **>= 92 GB available**, i.e. a genuinely
+idle box.  While another task keeps ~40 GB of host-pinned buffers resident, no
+amount of retrying gets the run past the watchdog.  Wait for `free` in
+`pc-engine.lock` *and* >= 92 GB available, then run `run_d3.py`.

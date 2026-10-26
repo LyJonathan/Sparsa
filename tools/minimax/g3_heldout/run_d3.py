@@ -55,8 +55,8 @@ def local_root() -> Path:
         return sibling
     return here
 LONG = "long_science_darwin"
-SWEEP_FLAGS = ["--vram-slots", "0", "--memory-limit-mib", "80000",
-               "--layer-split", "auto", "--cpu-threads", "12"]
+# The sweep's flags (the A1-mix recipe is scored with exactly these).
+SWEEP_FLAGS = ["--vram-slots", "0", "--layer-split", "auto", "--cpu-threads", "12"]
 EXIT_LOCK_HELD, EXIT_NO_RAM = 2, 3
 
 
@@ -71,11 +71,13 @@ def phase_cmd(args, prompts: list[str], tag: str) -> list[str]:
     g3 = [sys.executable, str(REPO / "tools" / "minimax" / "g3_sparsa.py"),
           "--model", args.model, "--out", args.out, "--tier", args.tier,
           "--ref", args.ref, "--ids", args.ids, "--no-ppl",
+          "--memory-limit-mib", str(args.memory_limit_mib),
           "--prompts", ",".join(prompts), *SWEEP_FLAGS]
     if args.rescore:
         g3.append("--rescore")
-    elif tag != "aggregate":
-        g3.append("--allow-partial")
+    # deliberately no --allow-partial: that flag means "score only prompts that
+    # already have a complete dump", which would skip everything on a first run.
+    # Without it each phase runs whatever is missing and reuses what is there.
     return [sys.executable, str(REPO / "tools" / "minimax" / "pc_launch.py"),
             "--owner", args.owner, "--max-minutes", str(args.max_minutes),
             "--", *g3]
@@ -113,6 +115,10 @@ def main():
     ap.add_argument("--ref", default=str(local_root() / "ref_out" / "heldout"))
     ap.add_argument("--ids", default=str(local_root() / "g3_heldout" / "ids"))
     ap.add_argument("--out", default=str(local_root() / "g3_heldout" / "iq2xs-d3"))
+    ap.add_argument("--memory-limit-mib", type=int, default=80000,
+                    help="pinned expert budget; 80000 is the sweep setting. Lower it only when the shared PC "
+                         "has less free RAM than the launcher's 10 GB floor allows - it changes speed, "
+                         "not the logits")
     ap.add_argument("--owner", default="heldout")
     ap.add_argument("--max-minutes", type=float, default=45.0, help="pc_launch turn limit per attempt")
     ap.add_argument("--max-wait", type=float, default=60.0, help="minutes to wait for each phase's turn")
