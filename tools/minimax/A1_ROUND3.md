@@ -101,24 +101,34 @@ three tok/s per arm is the number.
 
 ## 4. The gates
 
-Status after this round's PC turn:
+Status after the third PC turn (54000 MiB, one lock, 38.5 min):
 
-* **D3 on the held-out set: 12 of 14 prompts scored** (1,536 positions, top-1 52.47%, KL64 1.5416).
-  `story_lighthouse` and `long_science_darwin` are still missing: the short phase hit the 40-minute turn
-  limit at `story_lighthouse`, and the long-prompt phase was interrupted when the driving shell timed
-  out.  Both dumps are resumable; only those two are left.
-* **C1 on the held-out set: not started.**
-* **The longer six-prompt run: not run.**  The reference for it exists (see below).
+**D3 on the held-out set: COMPLETE, 14/14 prompts.**  1,792 positions, top-1 **53.46%**, KL64
+**1.4999**.  The long prompt (`long_science_darwin`, 3,034 tokens) costs one full turn on its own at
+this tier; its row is 128 positions, top-1 80.47%, KL64 0.5209.
 
-**The pinned budget is neutral on this prompt set, measured, not assumed.**  `code_lru` at
-`--memory-limit-mib 600` (the six existing held-out dumps) and at `60000` produced **byte-identical**
-logits (`SHA-256` of the two .npy files equal), so the remaining held-out prompts can run at 60,000 MiB
-for speed without changing what is measured.  The six prompts already dumped at 600 keep their bytes.
-The 60,000 MiB run's peak working set was **69.7 GiB** (`--record-peak`).
+**C1 on the held-out set: 7 of 14 prompts** (896 positions), top-1 50.78%, KL64 1.5688.  The turn's
+clock cut it at `math_probability_urn`; the seven dumps that finished are complete and the rest resume.
 
-So the gate plan is unchanged but cheaper: D3 and C1 each run `story_lighthouse` and
-`long_science_darwin` at 60,000 MiB, then C1's 12 remaining short prompts, then the six-prompt
-long-reference run at 600 MiB (both packs, one session).
+On the **seven prompts both packs have** (same settings, 54000 MiB):
+
+| pack | positions | top-1 | KL64 |
+|---|---:|---:|---:|
+| D3 | 896 | 49.22% | 1.6463 |
+| C1 | 896 | **50.78%** | **1.5688** |
+| C1 - D3 | | **+1.56 pts** | **-0.0775** |
+
+C1 is **ahead** of D3 on this subset by 1.56 points of top-1 with the mean KL64 lower by 0.078.  That is
+inside the 0.3-point band the gate allows, and it is on the D3-positive side, so the "within 0.3 -> more
+tokens + KL" rule applies with the more-tokens run still outstanding.  This is a 7-prompt subset, not
+the full held-out set: the remaining 7 prompts (6 short + the long one) have to finish before the
+held-out gate line is final.
+
+The pinned budget is neutral, measured: `code_lru` logits are byte-identical at 600 and 60,000 MiB
+(SHA-256 of the .npy files equal).  54,000 MiB is the tier for this turn's runs; D3's earlier dumps were
+made at 600/60,000, which that check covers.  Peak working set at 54,000 MiB: 64.2 GiB.  WSL held 9.8 GB
+throughout and was not touched.
+
 
 
 ## 5. Activation-weighted `output_rel`
@@ -245,6 +255,9 @@ instead of 679, so the six-prompt gate can be run on nearly twice the tokens wit
 * turn 2: 61 min wall (13:19-14:20), of which 40 min of engine time on the held-out short phase and 19
   min on the interrupted long-prompt phase; the lock was left held-stale by the killed driver and was
   released by hand.  This overran the 45-minute turn rule - recorded as a process failure, not hidden.
+* turn 3: **38.5 min wall**, one lock at 54,000 MiB: D3's two missing held-out prompts (all 14 now
+  complete), then C1's first 7 held-out prompts; the driver's 39-minute deadline stopped C1 cleanly at
+  `math_probability_urn` with its dumps kept.  Peak working set 64.2 GiB, WSL 9.8 GB untouched.
 * held-out D3 scoring of the 12 complete dumps: seconds, no engine.
 
 
