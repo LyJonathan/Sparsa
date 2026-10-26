@@ -25,7 +25,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import pc_dump  # noqa: E402
 
 ROOT = HERE.parents[1]
 LAUNCH = HERE / "pc_launch.py"
@@ -36,6 +35,25 @@ SLICE_ARGS = ("--max-context 1024 --minimax-allow-nonstandard --gpus 0 --minimax
               "--minimax-tiers --minimax-vram-slots-per-layer 0 --minimax-ram-experts-per-layer 128 "
               "--minimax-kv vram --cpu-threads 12 --memory-limit-mib 40000 --minimax-prefill-experts cpu "
               "--minimax-prefill-batch 8").split()
+
+
+def stack_evidence(pid: int, dump_dir: Path, tag: str) -> list[str]:
+    """Every dbghelp call runs in its own process: StackWalk64 can fault on a JIT frame, and a fault there must not
+    take the harness down with it."""
+    tool = [sys.executable, str(HERE / "pc_dump.py")]
+    out = []
+    st = subprocess.run(tool + ["stacks", "--pid", str(pid)], capture_output=True, text=True, timeout=120)
+    out.append("stacks" + ("" if st.returncode == 0 else f" (rc={st.returncode})") + ":\n" + (st.stdout or st.stderr)[-4000:])
+    dmp = dump_dir / f"hung_{tag}.dmp"
+    du = subprocess.run(tool + ["dump", "--pid", str(pid), "--out", str(dmp)], capture_output=True, text=True,
+                        timeout=120)
+    out.append("dump: " + (du.stdout.strip() or du.stderr.strip())[-400:])
+    if dmp.exists():
+        rd = subprocess.run(tool + ["read", str(dmp)], capture_output=True, text=True, timeout=120)
+        out.append("dump read:\n" + (rd.stdout or rd.stderr)[-4000:])
+    sa = subprocess.run(tool + ["sample", "--pid", str(pid)], capture_output=True, text=True, timeout=60)
+    out.append("sample:\n" + (sa.stdout or sa.stderr)[-1500:])
+    return out
 
 
 def lock_available(launcher: Path) -> bool:
@@ -78,15 +96,11 @@ def run_once(exe: Path, model: Path, ids: Path, mt: int, out: Path, launcher: Pa
         elapsed = time.time() - t0
         pid = engine_pid(marker)
         if elapsed >= stack_at and not stacks_taken and pid:
-            evidence.append("stacks:\n" + "\n".join(pc_dump.live_stacks(pid, exe_dir=str(exe.parent))))
+            evidence.extend(stack_evidence(pid, dump_dir, f"mt{mt}_{int(elapsed)}s"))
             stacks_taken = True
-        if elapsed >= stack_at and int(elapsed) % 10 == 0 and pid:
-            dmp = dump_dir / f"hung_mt{mt}_{int(elapsed)}s.dmp"
-            ok, msg = pc_dump.write_dump(pid, dmp)
-            evidence.append(("dump: " + msg) if ok else ("dump failed: " + msg))
         if elapsed >= watchdog:
             if pid:
-                evidence.append("sample:\n" + pc_dump.sample(pid))
+                evidence.extend(stack_evidence(pid, dump_dir, f"mt{mt}_final"))
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True)
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
             proc.communicate()
