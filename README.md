@@ -1,6 +1,6 @@
 # Sparsa
 
-**EXPERIMENTAL.** This project is no longer under active development as of 2026-10-26.
+**EXPERIMENTAL.** Development has slowed down but the project is still active.
 
 Sparsa is a fork of [Strata](https://github.com/Niko1221/Strata) that runs **MiniMax-M3.1-Flash** on a
 normal PC: one or two NVIDIA cards, system RAM, and the SSD for the experts that do not fit. The model
@@ -95,6 +95,12 @@ tier is drive-bound, so read these as "half a minute for a chat message".
 - **Vision.** Images only, no video; the encoder is CPU fp32 and takes 64-80 s per 640x480 image.
 - **Tool calls** use MiniMax's XML form and are parsed whole, so arguments are not streamed.
 - **CI** is a Linux build only (no GPU, no model).
+
+## Contributing
+
+PRs that improve Sparsa are welcome, for example the open CPU-expert prompt stall, speed, or a
+measured tier's quality: see [issues](https://github.com/LyJonathan/Sparsa/issues) and
+[pull requests](https://github.com/LyJonathan/Sparsa/pulls).
 
 ## Upstream Strata
 
