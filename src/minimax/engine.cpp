@@ -3532,29 +3532,28 @@ struct Engine::Impl {
         strata::kernels::quantize_q8_1_rows((const float*)w.sh_x.p, 1, embd, w.sh_xq.p, w.shs);
         strata::kernels::native_mmvq(L.gate.type, L.gate.dev.p, w.sh_xq.p, (float*)w.sh_g.p, embd, ff, 1, w.shs);
         strata::kernels::native_mmvq(L.up.type, L.up.dev.p, w.sh_xq.p, (float*)w.sh_u.p, embd, ff, 1, w.shs);
+        // P17: the SwiGLU and the down projection go on the same stream, so the whole shared MLP hides behind the CPU
+        // lane; it used to wait for the lane, then round-trip gate/up through the host for a host SwiGLU (~7 ms a
+        // token on rig-2).
+        cu::swiglu_rows_f32((const float*)w.sh_g.p, (const float*)w.sh_u.p, (float*)w.sh_h.p, 1, ff, alpha, limit,
+                            w.shs);
+        strata::kernels::quantize_q8_1_rows((const float*)w.sh_h.p, 1, ff, w.sh_hq.p, w.shs);
+        strata::kernels::native_mmvq(L.down.type, L.down.dev.p, w.sh_hq.p, (float*)w.sh_y.p, ff, embd, 1, w.shs);
+        cu::copy_d2h_async(w.sh_pin, w.sh_y.p, (size_t)embd * sizeof(float), w.shs);
         sh_pending = true;
         sh_ff = ff;
         return true;
     }
 
     bool shared_finish(const Layer& L, std::vector<float>& out) {
+        (void)L;
         if (!sh_pending) return false;
         sh_pending = false;
         Work& w = W();
         const int embd = (int)cfg.n_embd;
-        const int ff = sh_ff;
-        if ((int)ff_g.size() < ff || (int)ff_u.size() < ff || (int)ff_h.size() < ff) return false;
         cu::stream_sync(w.shs);
-        cu::copy_d2h(ff_g.data(), w.sh_g.p, (size_t)ff * sizeof(float));
-        cu::copy_d2h(ff_u.data(), w.sh_u.p, (size_t)ff * sizeof(float));
-        for (int i = 0; i < ff; ++i) ff_h[(size_t)i] = swigluoai(ff_g[(size_t)i], ff_u[(size_t)i], alpha, limit);
-        std::memcpy(w.sh_pin, ff_h.data(), (size_t)ff * sizeof(float));
-        cu::copy_h2d_async(w.sh_h.p, w.sh_pin, (size_t)ff * sizeof(float), w.shs);
-        strata::kernels::quantize_q8_1_rows((const float*)w.sh_h.p, 1, ff, w.sh_hq.p, w.shs);
-        strata::kernels::native_mmvq(L.down.type, L.down.dev.p, w.sh_hq.p, (float*)w.sh_y.p, ff, embd, 1, w.shs);
         out.resize((size_t)embd);
-        cu::copy_d2h_async(out.data(), w.sh_y.p, (size_t)embd * sizeof(float), w.shs);
-        cu::stream_sync(w.shs);
+        std::memcpy(out.data(), w.sh_pin, (size_t)embd * sizeof(float));
         return true;
     }
 
