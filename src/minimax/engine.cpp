@@ -5355,6 +5355,13 @@ struct Engine::Impl {
                 // P14: the prompt pass can leave the card with less than it borrowed (cuBLAS and the allocator keep
                 // some of it), and a throw here killed the server after its first prompt.  Keep what fits.
                 void* p = nullptr;
+                // Stop at the reserve: kernels and cuBLAS still allocate during decode, and a card refilled to
+                // the last byte failed its next launch (quantize_q8_1_rows: out of memory).
+                const size_t keep = (size_t)std::max(opt.vram_reserve_mib, 256) << 20;
+                if (cu::mem_on(devs[(size_t)L.dev]).free_bytes < L.expert_bytes + keep) {
+                    lost += ws_taken[li] - s;
+                    break;
+                }
                 try {
                     p = cu::alloc(L.expert_bytes);
                 } catch (const std::exception&) {
