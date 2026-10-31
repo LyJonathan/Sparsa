@@ -27,6 +27,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -754,7 +755,9 @@ struct Engine::Impl {
     // ---- P4: devices, layer ownership, KV placement
     std::vector<int> devs;           // CUDA ordinals in use, in order
     std::vector<int> layer_dev;      // [n_layers] index into devs
-    int cur = 0;                     // index into devs of the current CUDA device
+    // Index into devs of the current CUDA device.  Per thread, like the CUDA device itself (P29: the prompt pass
+    // runs one layer's experts on two cards from two threads).
+    static inline thread_local int cur = 0;
     int kv_mode = 0;                 // 0 host (CPU attention), 1 VRAM, 2 pinned RAM + indexer keys in VRAM
     int64_t kv_row_bytes = 0;        // one token's K (or V) bytes: n_head_kv * head_dim * 2
     int64_t ik_row_bytes = 0;
@@ -853,6 +856,7 @@ struct Engine::Impl {
     // for the expert stream, so its layers hand the routed experts to the widest link; router and shared expert
     // stay on the layer's card.  Resolved by a bandwidth probe on the first prompt.
     std::vector<int> pf_xdev;
+    std::map<int, std::vector<void*>> pf_disk_pin;   // P27: pinned read-ahead slots for a chunk's SSD experts, per device
     std::vector<double> pf_link_gbs;   // P16: measured pinned host -> device rate per device index (GB/s)
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
@@ -2371,9 +2375,13 @@ struct Engine::Impl {
                              "workspace before sizing expert slots\n",
                              (double)prefill_need / 1048576.0, (int)std::min<int64_t>(opt.prefill_batch, ctx));
         }
+        // P28: auto sizing is per card.  The old minimum over cards left a card with room (rig-2: GPU0 3.9-4.4 GB
+        // free) at the slot count of the fullest one, often 0.
+        std::vector<int> q_dev(devs.size(), q);
         if (q < 0) {
-            q = (int)cfg.n_expert;
+            q = 0;
             for (size_t d = 0; d < devs.size(); ++d) {
+                q_dev[d] = 0;
                 if (dev_moe[d] <= 0) continue;
                 // dev_budget is already free - reserve; the plan takes the batched-prefill workspace out before it
                 // counts slots -- except in the swap mode, where the prompt pass takes the slots back for the
@@ -2381,12 +2389,13 @@ struct Engine::Impl {
                 // init_prefill shrinks the batch to whatever room that count left, as before.
                 const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_swap ? 0 : prefill_need,
                                                         max_expert_bytes, (int)dev_moe[d], (int)cfg.n_expert, -1);
-                if (pl.slots < q) q = pl.slots;
+                q_dev[d] = std::max(0, std::min(pl.slots, (int)cfg.n_expert));
+                q = std::max(q, q_dev[d]);
             }
-            if (q < 0) q = 0;
         }
         if (q < 0) q = 0;
         if (q > cfg.n_expert) q = (int)cfg.n_expert;
+        for (int& qd : q_dev) qd = std::max(0, std::min(qd, q));
         if (q > 0) {
             if (!tiers_gpu_possible())
                 fail("--minimax-vram-slots-per-layer needs a CUDA device (dense_layers_gpu=0 still starts CUDA "
@@ -2395,10 +2404,10 @@ struct Engine::Impl {
                 size_t need = 0;
                 for (int64_t i = 0; i < cfg.n_layers; ++i) {
                     const Layer& L = layers[(size_t)i];
-                    if (L.moe && layer_dev[(size_t)i] == (int)d) need += (size_t)q * L.expert_bytes;
+                    if (L.moe && layer_dev[(size_t)i] == (int)d) need += (size_t)q_dev[d] * L.expert_bytes;
                 }
                 if (need > dev_budget[d]) {
-                    fail("the VRAM expert tier asked for " + std::to_string(q) + " slots per layer (" +
+                    fail("the VRAM expert tier asked for " + std::to_string(q_dev[d]) + " slots per layer (" +
                          std::to_string(need / (1024 * 1024)) + " MiB on device " +
                          std::to_string(devs[d]) + ") but only " +
                          std::to_string(dev_budget[d] / (1024 * 1024)) +
@@ -2410,8 +2419,9 @@ struct Engine::Impl {
             for (Layer& L : layers) {
                 if (!L.moe) continue;
                 use_device_index(L.dev);
-                L.vram.reserve((size_t)q);
-                for (int s = 0; s < q; ++s) {
+                const int ql = q_dev[(size_t)L.dev];
+                L.vram.reserve((size_t)ql);
+                for (int s = 0; s < ql; ++s) {
                     Layer::VramSlot slot;
                     slot.mem = DevPtr(cu::alloc(L.expert_bytes));
                     L.vram.push_back(std::move(slot));
@@ -2432,6 +2442,11 @@ struct Engine::Impl {
         }
         vram_per_layer = q;
         tiers_gpu = q > 0;
+        if (q > 0 && devs.size() > 1) {
+            std::string per;
+            for (size_t d = 0; d < q_dev.size(); ++d) per += (d ? "," : "") + std::to_string(q_dev[d]);
+            std::fprintf(stderr, "INFO minimax-vram-slots per-device=%s\n", per.c_str());
+        }
         for (Layer& L : layers)
             if (L.moe) L.vram_of.assign((size_t)cfg.n_expert, kNotResident);
 
@@ -2506,7 +2521,7 @@ struct Engine::Impl {
                 if (!L.moe) continue;
                 const int s = seen[(size_t)(pl + cfg.leading_dense)]++;
                 const int nn = ram_n[(size_t)(pl + cfg.leading_dense)];
-                if (s < vram_per_layer) continue;   // the profile's top q per layer went to VRAM
+                if (s < (int)L.vram.size()) continue;   // the profile's top q per layer went to VRAM
                 if (nn >= cap) continue;
                 if (spent + L.expert_bytes > ram_budget) break;
                 ram_n[(size_t)(pl + cfg.leading_dense)] = nn + 1;
@@ -2666,7 +2681,7 @@ struct Engine::Impl {
                 }
                 std::sort(order.begin(), order.end());
                 int at = 0;
-                for (int s = 0; s < vram_per_layer && at < (int)order.size(); ++s, ++at)
+                for (int s = 0; s < (int)L.vram.size() && at < (int)order.size(); ++s, ++at)
                     vram_fill(L, s, order[(size_t)at].second);
                 for (int s = 0; s < L.ram_n && at < (int)order.size(); ++s, ++at)
                     ram_fill(L, s, order[(size_t)at].second);
@@ -3169,7 +3184,7 @@ struct Engine::Impl {
     // each `slot + P().role_off[r]` are 4 KiB aligned; a file offset is not, so `out[r]` is the byte the role starts
     // at inside its window.  Returns false with `err` set on a failed or short read.
     bool ssd_read_roles_direct(const Layer& L, int64_t expert, uint8_t* slot, const uint8_t* out[3],
-                               std::string& err) {
+                               std::string& err, const size_t* role_off = nullptr) {
         const Tensor* ts[3] = {&L.egate, &L.eup, &L.edown};
         const size_t A = strata::platform::DirectFile::alignment();
         strata::platform::DirectFile* files[3] = {nullptr, nullptr, nullptr};
@@ -3183,7 +3198,7 @@ struct Engine::Impl {
             const uint64_t aoff = off & ~(uint64_t)(A - 1);
             const uint64_t aend = (off + len + A - 1) & ~(uint64_t)(A - 1);
             const uint32_t alen = (uint32_t)(aend - aoff);
-            uint8_t* dst = slot + pf[(size_t)cur].role_off[r];
+            uint8_t* dst = slot + (role_off ? role_off[r] : pf[(size_t)cur].role_off[r]);
             if (((uintptr_t)dst & (uintptr_t)(A - 1)) != 0) {
                 err = "the pinned expert slot is not 4 KiB aligned";
                 return false;
@@ -6195,7 +6210,22 @@ struct Engine::Impl {
         // below stay on the layer's own.
         const int own = cur;
         if (pf_xdev.empty()) resolve_pf_xdev();
-        const int xd = pf_xdev[(size_t)own];
+        // P29: when a layer's experts go to the other card for its faster link (P16), the layer's own card still
+        // holds that layer's VRAM-slot experts.  With STRATA_PF_DUAL_MIN tokens or more in the chunk (default 512;
+        // 0 = off) the own card computes those itself, and the shared expert, while the other card streams and
+        // computes the rest; otherwise the slot experts would be streamed (or read from the SSD, since the RAM tier
+        // leaves them out).  Giving the slow card a share of the streamed experts as well measured slower on rig-2
+        // (4 K prompt 153 vs 161 tok/s): its 2.9 GB/s link and the second host thread cost more than they saved.
+        static const int dual_min = [] {
+            const char* e = std::getenv("STRATA_PF_DUAL_MIN");
+            return e ? std::atoi(e) : 512;
+        }();
+        const int other = devs.size() == 2 ? 1 - own : -1;
+        const bool dual = dual_min > 0 && other >= 0 && T >= dual_min && prefill_direct && !ram_inplace &&
+                          pf.size() == 2 && pf[(size_t)own].ring && pf[(size_t)other].ring &&
+                          pf_xdev[(size_t)own] == other && !L.vram.empty();
+        if (dual) pf_disk_pin[own], pf_disk_pin[other];   // both entries exist before the two threads look them up
+        const int xd = dual ? own : pf_xdev[(size_t)own];
         const bool remote = xd != own;
         const float* xin = hdev;   // the routed experts' input, on the card that runs them
         if (remote) {
@@ -6204,7 +6234,6 @@ struct Engine::Impl {
             cu::copy_h2d(r.p32, hhost, (size_t)T * embd * sizeof(float));
             xin = r.p32;
         }
-        PfBuf& p = P();
         // A slot on the layer's own card is not reachable from the expert card: stream that expert too.
         auto slot_of = [&](int e) { return remote || L.vram_of.empty() ? -1 : L.vram_of[(size_t)e]; };
         std::vector<int> ids;
@@ -6323,6 +6352,16 @@ struct Engine::Impl {
             }
         } cpu_join{cpu_thr};
 
+        // P27: the groups run VRAM-slot experts first, then the pinned RAM tier, then the SSD misses (each tier in
+        // expert order).  The SSD reads go to a reader thread from the start of the layer, so they overlap the RAM
+        // tier's copies instead of stalling the copy queue one read at a time on this thread.
+        auto tier_of = [&](int e) {
+            if (slot_of(e) >= 0) return 0;
+            return (!ram_inplace && L.ram_n > 0 && L.ram_of[(size_t)e] >= 0) ? 1 : 2;
+        };
+        std::stable_sort(pf_entries.begin(), pf_entries.end(),
+                         [&](const PfEntry& a, const PfEntry& b) { return tier_of(a.expert) < tier_of(b.expert); });
+
         // Per projection, not per expert: the IQ2_XS pack has IQ2_XS gate/up and a Q2_0/IQ4_NL/F32 down, and MM-NVFP4
         // has its own type.  `gu_iq` / `d_iq` pick the int8 kernel or the dequantize-to-fp16 + cuBLAS fallback.
         const bool gu_iq = iq_expert_type(L.egate.type) && cfg.n_embd % 32 == 0;
@@ -6333,323 +6372,474 @@ struct Engine::Impl {
         const bool tc_gu_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(gt) && tc_expert_type(L.eup.type) &&
                               (cfg.n_embd % 256) == 0;
         const bool tc_d_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(dt) && (cfg.n_ff_exp % 256) == 0;
-        bool zero = true;
-        std::vector<int32_t> row_t((size_t)rows_cap);
-        std::vector<float> row_w((size_t)rows_cap);
+        auto& own_slot_of = slot_of;
+        // One card's share of the routed experts, run on the calling thread's current device; `yout_host` gets that
+        // card's (unscaled) sum over `ents`.
+        auto run_side = [&](std::vector<PfEntry>& ents, const float* xin, bool own_slots, float* yout_host) {
+            PfBuf& p = P();
+            auto slot_of = [&](int e) { return own_slots ? own_slot_of(e) : -1; };
+            bool zero = true;
+            // STRATA_MM_GPU_TIME: device-busy time of each expert group's gate/up and down halves (timed events).
+            static const bool gpu_time = std::getenv("STRATA_MM_GPU_TIME") != nullptr;
+            struct GEv { void* a; void* b; void* c; int nt; };
+            std::vector<GEv> gpu_evs;
+            std::vector<int32_t> row_t((size_t)rows_cap);
+            std::vector<float> row_w((size_t)rows_cap);
 
-        // ---- P5b: the staged expert ring.  The chunk's route entries are already sorted by expert, so each
-        // expert's bytes are read once per chunk either way; what changes here is that the read is spread over the
-        // CPU pool and the H2D copy of expert i+1 rides the copy stream while expert i's GEMMs run on the main
-        // stream.  One slot (P5a) serialized read -> copy -> compute for all 128 experts of a chunk.
-        struct Grp {
-            int e;
-            size_t at, end;
-        };
-        std::vector<Grp> grps;
-        for (size_t q = 0; q < pf_entries.size();) {
-            const int e = pf_entries[q].expert;
-            size_t end = q;
-            while (end < pf_entries.size() && pf_entries[end].expert == e) ++end;
-            grps.push_back({e, q, end});
-            q = end;
-        }
-        const int ring_n = p.ring_n > 0 ? p.ring_n : 1;
-        const int lookahead = ring_n - 1;   // slots filled before the one being computed
+            // ---- P5b: the staged expert ring.  The chunk's route entries are already sorted by expert, so each
+            // expert's bytes are read once per chunk either way; what changes here is that the read is spread over the
+            // CPU pool and the H2D copy of expert i+1 rides the copy stream while expert i's GEMMs run on the main
+            // stream.  One slot (P5a) serialized read -> copy -> compute for all 128 experts of a chunk.
+            struct Grp {
+                int e;
+                size_t at, end;
+            };
+            std::vector<Grp> grps;
+            for (size_t q = 0; q < ents.size();) {
+                const int e = ents[q].expert;
+                size_t end = q;
+                while (end < ents.size() && ents[end].expert == e) ++end;
+                grps.push_back({e, q, end});
+                q = end;
+            }
+            const int ring_n = p.ring_n > 0 ? p.ring_n : 1;
+            const int lookahead = ring_n - 1;   // slots filled before the one being computed
 
-        // One expert's [gate|up|down] into `dst`, split over the pool.  The three matrices are contiguous in the
-        // destination, so this is a flat list of copies: 8 pieces of >=1 MiB each keep every core on the mmap
-        // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
-        auto read_expert = [&](int e, uint8_t* dst) {
-            const size_t gu = L.expert_gu, dn = L.expert_down;
-            // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
-            // to ignore the tier and re-fault every page of every expert once per chunk.
-            const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
-            const uint8_t* base = rs >= 0 && !ram_inplace ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
-            const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
-                                     base ? base + gu : L.eup.host + (size_t)e * gu,
-                                     base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
-            const size_t off[3] = {p.role_off[0], p.role_off[1], p.role_off[2]};
-            const size_t len[3] = {gu, gu, dn};
-            // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
-            // 4 per thread per matrix lands on ~60 KiB each at MiniMax's expert size.
-            const int pieces = 4 * (threads > 0 ? threads : 4);
-            pool.run(pieces * 3, [&](int a, int b) {
-                for (int i = a; i < b; ++i) {
-                    const int m = i / pieces, c = i % pieces;
-                    const size_t p0 = len[m] * (size_t)c / (size_t)pieces;
-                    const size_t p1 = len[m] * (size_t)(c + 1) / (size_t)pieces;
-                    if (p1 > p0) std::memcpy(dst + off[m] + p0, src[m] + p0, p1 - p0);
+            // One expert's [gate|up|down] into `dst`, split over the pool.  The three matrices are contiguous in the
+            // destination, so this is a flat list of copies: 8 pieces of >=1 MiB each keep every core on the mmap
+            // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
+            auto read_expert = [&](int e, uint8_t* dst) {
+                const size_t gu = L.expert_gu, dn = L.expert_down;
+                // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
+                // to ignore the tier and re-fault every page of every expert once per chunk.
+                const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
+                const uint8_t* base = rs >= 0 && !ram_inplace ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
+                const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
+                                         base ? base + gu : L.eup.host + (size_t)e * gu,
+                                         base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
+                const size_t off[3] = {p.role_off[0], p.role_off[1], p.role_off[2]};
+                const size_t len[3] = {gu, gu, dn};
+                // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
+                // 4 per thread per matrix lands on ~60 KiB each at MiniMax's expert size.
+                const int pieces = 4 * (threads > 0 ? threads : 4);
+                pool.run(pieces * 3, [&](int a, int b) {
+                    for (int i = a; i < b; ++i) {
+                        const int m = i / pieces, c = i % pieces;
+                        const size_t p0 = len[m] * (size_t)c / (size_t)pieces;
+                        const size_t p1 = len[m] * (size_t)(c + 1) / (size_t)pieces;
+                        if (p1 > p0) std::memcpy(dst + off[m] + p0, src[m] + p0, p1 - p0);
+                    }
+                });
+            };
+            // Stage streamed expert `si` (its index among the streamed groups) into slot si % ring_n.
+            std::vector<int> streamed;   // group index of each streamed expert, in order
+            for (size_t i = 0; i < grps.size(); ++i) {
+                if (slot_of(grps[i].e) < 0) streamed.push_back((int)i);
+            }
+            // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
+            double t_disk = 0;                 // STRATA_MM_TIME: the direct-read side alone (the drive's rate)
+            int64_t disk_bytes = 0;
+            // P27: the SSD read-ahead (see the tier order above).  Up to STRATA_PF_DISK_AHEAD experts (default 48) get
+            // a pinned slot of their own; any beyond that are read on this thread as before.
+            static const int disk_ahead = [] {
+                const char* e = std::getenv("STRATA_PF_DISK_AHEAD");
+                return e ? std::max(0, std::atoi(e)) : 48;
+            }();
+            std::vector<int> disk_k(streamed.size(), -1);
+            std::vector<int> disk_si;
+            if (prefill_direct && !ssd_files.empty() && disk_ahead > 0) {
+                for (size_t si = 0; si < streamed.size() && (int)disk_si.size() < disk_ahead; ++si)
+                    if (tier_of(grps[(size_t)streamed[si]].e) == 2) {
+                        disk_k[si] = (int)disk_si.size();
+                        disk_si.push_back((int)si);
+                    }
+            }
+            std::vector<void*>& dpin = pf_disk_pin[cur];
+            while (dpin.size() < disk_si.size()) dpin.push_back(cu::host_alloc(p.pin_slot_bytes));
+            std::vector<std::array<const uint8_t*, 3>> disk_src(disk_si.size());
+            std::mutex disk_mu;
+            std::condition_variable disk_cv;
+            int disk_done = 0;
+            std::string disk_err;
+            std::thread disk_thr;
+            if (!disk_si.empty()) {
+                const size_t roff[3] = {p.role_off[0], p.role_off[1], p.role_off[2]};
+                disk_thr = std::thread([&, roff0 = roff[0], roff1 = roff[1], roff2 = roff[2]] {
+                    const size_t ro[3] = {roff0, roff1, roff2};
+                    const auto td0 = std::chrono::steady_clock::now();
+                    for (size_t k = 0; k < disk_si.size(); ++k) {
+                        std::string err;
+                        const uint8_t* out[3] = {nullptr, nullptr, nullptr};
+                        const int e = grps[(size_t)streamed[(size_t)disk_si[k]]].e;
+                        const bool ok = ssd_read_roles_direct(L, e, (uint8_t*)dpin[k], out, err, ro);
+                        std::lock_guard<std::mutex> lk(disk_mu);
+                        if (!ok) {
+                            disk_err = err.empty() ? "SSD read failed" : err;
+                            disk_cv.notify_all();
+                            return;
+                        }
+                        disk_src[k] = {out[0], out[1], out[2]};
+                        disk_done = (int)k + 1;
+                        disk_bytes += (int64_t)L.expert_bytes;
+                        t_disk = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                        disk_cv.notify_all();
+                    }
+                });
+            }
+            Joiner disk_join{disk_thr};
+            auto stage_si = [&](int si) {
+                const int slot = si % ring_n;
+                const Grp& g = grps[(size_t)streamed[(size_t)si]];
+                cu::event_sync(p.ev_comp[(size_t)slot]);
+                uint8_t* pin = (uint8_t*)p.pin_v[(size_t)slot];
+                const uint8_t* src[3] = {nullptr, nullptr, nullptr};
+                // P10: a RAM-tier expert is copied from the pinned arena; only a real miss is read unbuffered.  The old
+                // `if (prefill_direct)` branch read every streamed expert from the file, including the ones the tier had
+                // already pinned -- the SSD path replaced the faster RAM one for no reason.
+                const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)g.e] : -1;
+                if (disk_k[(size_t)si] >= 0) {
+                    const int k = disk_k[(size_t)si];
+                    std::unique_lock<std::mutex> lk(disk_mu);
+                    disk_cv.wait(lk, [&] { return disk_done > k || !disk_err.empty(); });
+                    if (disk_done <= k) fail("batched prefill: " + disk_err);
+                    for (int r = 0; r < 3; ++r) src[r] = disk_src[(size_t)k][(size_t)r];
+                } else if (rs >= 0) {
+                    // The pinned tier already holds the bytes in kernel order: copy the three roles from there, no
+                    // staging copy.
+                    const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
+                    src[0] = base;
+                    src[1] = base + L.expert_gu;
+                    src[2] = base + 2 * L.expert_gu;
+                } else if (prefill_direct && !ssd_files.empty()) {
+                    const auto td0 = std::chrono::steady_clock::now();
+                    std::string err;
+                    if (!ssd_read_roles_direct(L, g.e, pin, src, err))
+                        fail("batched prefill: " + err);
+                    t_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                    disk_bytes += (int64_t)L.expert_bytes;
+                } else {
+                    read_expert(g.e, pin);
+                    src[0] = pin + p.role_off[0];
+                    src[1] = pin + p.role_off[1];
+                    src[2] = pin + p.role_off[2];
                 }
-            });
-        };
-        // Stage streamed expert `si` (its index among the streamed groups) into slot si % ring_n.
-        std::vector<int> streamed;   // group index of each streamed expert, in order
-        for (size_t i = 0; i < grps.size(); ++i) {
-            if (slot_of(grps[i].e) < 0) streamed.push_back((int)i);
-        }
-        // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
-        double t_disk = 0;                 // STRATA_MM_TIME: the direct-read side alone (the drive's rate)
-        int64_t disk_bytes = 0;
-        auto stage_si = [&](int si) {
-            const int slot = si % ring_n;
-            const Grp& g = grps[(size_t)streamed[(size_t)si]];
-            cu::event_sync(p.ev_comp[(size_t)slot]);
-            uint8_t* pin = (uint8_t*)p.pin_v[(size_t)slot];
-            const uint8_t* src[3] = {nullptr, nullptr, nullptr};
-            // P10: a RAM-tier expert is copied from the pinned arena; only a real miss is read unbuffered.  The old
-            // `if (prefill_direct)` branch read every streamed expert from the file, including the ones the tier had
-            // already pinned -- the SSD path replaced the faster RAM one for no reason.
-            const int rs = (!ram_inplace && L.ram_n > 0) ? L.ram_of[(size_t)g.e] : -1;
-            if (rs >= 0) {
-                // The pinned tier already holds the bytes in kernel order: copy the three roles from there, no
-                // staging copy.
-                const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
-                src[0] = base;
-                src[1] = base + L.expert_gu;
-                src[2] = base + 2 * L.expert_gu;
-            } else if (prefill_direct && !ssd_files.empty()) {
-                const auto td0 = std::chrono::steady_clock::now();
-                std::string err;
-                if (!ssd_read_roles_direct(L, g.e, pin, src, err))
-                    fail("batched prefill: " + err);
-                t_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
-                disk_bytes += (int64_t)L.expert_bytes;
-            } else {
-                read_expert(g.e, pin);
-                src[0] = pin + p.role_off[0];
-                src[1] = pin + p.role_off[1];
-                src[2] = pin + p.role_off[2];
-            }
-            uint8_t* dst = (uint8_t*)p.ring_v[(size_t)slot];
-            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
-            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
-            for (int r = 0; r < 3; ++r) cu::copy_h2d_async(dst + off[r], src[r], len[r], p.copy_stream);
-            cu::event_record(p.ev_copy[(size_t)slot], p.copy_stream);
-        };
-        int primed = 0;
-        double t_read = 0, t_copywait = 0;   // STRATA_MM_TIME: the two sides of the staged ring
-        auto pump = [&](int upto) {
-            while (primed < upto && primed < (int)streamed.size()) {
-                const auto t0 = std::chrono::steady_clock::now();
-                stage_si(primed);
-                t_read += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                ++primed;
-            }
-        };
-        if (ring_n > 1 && !streamed.empty()) pump(std::min<int>(ring_n - 1, (int)streamed.size()));
-
-        size_t at = 0;
-        int n_vram = 0, n_ram = 0, n_disk = 0, n_tc = 0;
-        while (at < pf_entries.size()) {
-            const int e = pf_entries[at].expert;
-            size_t end = at;
-            while (end < pf_entries.size() && pf_entries[end].expert == e) ++end;
-            const uint8_t* sg;
-            const uint8_t* su;
-            const uint8_t* sd;
-            const int slot = slot_of(e);
-            if (slot >= 0) ++n_vram;
-            else if (!ram_inplace && L.ram_n > 0 && L.ram_of[(size_t)e] >= 0) ++n_ram;
-            else ++n_disk;
-            int ring_slot = -1;
-            if (slot >= 0) {
-                const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
-                sg = base;
-                su = base + L.expert_gu;
-                sd = base + 2 * L.expert_gu;
-            } else {
-                if (!p.ring) fail("batched prefill: no expert streaming buffer");
-                // This group's index among the streamed ones is its position in `streamed`; the pipeline keeps
-                // `primed` at least one slot ahead, so waiting here only costs when the copy is the slow side.
-                size_t si = 0;
-                while (si < streamed.size() && grps[(size_t)streamed[si]].at != at) ++si;
-                if (si >= streamed.size()) fail("internal: streamed expert is not in the order list");
-                pump((int)si + 1);
-                ring_slot = (int)si % ring_n;
-                {
+                uint8_t* dst = (uint8_t*)p.ring_v[(size_t)slot];
+                const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+                const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+                for (int r = 0; r < 3; ++r) cu::copy_h2d_async(dst + off[r], src[r], len[r], p.copy_stream);
+                cu::event_record(p.ev_copy[(size_t)slot], p.copy_stream);
+            };
+            int primed = 0;
+            double t_read = 0, t_copywait = 0;   // STRATA_MM_TIME: the two sides of the staged ring
+            auto pump = [&](int upto) {
+                while (primed < upto && primed < (int)streamed.size()) {
                     const auto t0 = std::chrono::steady_clock::now();
-                    cu::event_sync(p.ev_copy[(size_t)ring_slot]);
-                    t_copywait +=
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    stage_si(primed);
+                    t_read += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    ++primed;
                 }
-                uint8_t* dst = (uint8_t*)p.ring_v[(size_t)ring_slot];
-                sg = dst;
-                su = dst + L.expert_gu;
-                sd = dst + 2 * L.expert_gu;
-                pump((int)si + 1 + lookahead);
-            }
-            for (size_t a = at; a < end; a += (size_t)rows_cap) {
-                const int nt = (int)std::min<size_t>(end - a, (size_t)rows_cap);
-                for (int i = 0; i < nt; ++i) {
-                    row_t[(size_t)i] = pf_entries[a + (size_t)i].tid;
-                    row_w[(size_t)i] = pf_entries[a + (size_t)i].w;
-                }
-                cu::copy_h2d(p.d_rows.p, row_t.data(), (size_t)nt * sizeof(int32_t));
-                cu::copy_h2d(p.d_ent_row.p, row_t.data(), (size_t)nt * sizeof(int32_t));
-                cu::copy_h2d(p.d_ent_w.p, row_w.data(), (size_t)nt * sizeof(float));
-                const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
-                const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
-                const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
-                const bool tc_gu = tc_gu_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
-                const bool tc_d = tc_d_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
-                if (tc_gu && a == at) ++n_tc;
-                if (tc_gu) {
-                    cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
-                    gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
-                    gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
-                } else if (gu_iq) {
-                    cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
-                    strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
-                    strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
-                    strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
-                } else if (prefill_dense_f32) {
-                    cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
-                    gemm_expert_gpu(gt, sg, L.egate.row_bytes, nullptr, p.gx32, p.gy, nt, ff, embd);
-                    gemm_expert_gpu(gt, su, L.egate.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
+            };
+            if (ring_n > 1 && !streamed.empty()) pump(std::min<int>(ring_n - 1, (int)streamed.size()));
+
+            size_t at = 0;
+            int n_vram = 0, n_ram = 0, n_disk = 0, n_tc = 0;
+            while (at < ents.size()) {
+                const int e = ents[at].expert;
+                size_t end = at;
+                while (end < ents.size() && ents[end].expert == e) ++end;
+                const uint8_t* sg;
+                const uint8_t* su;
+                const uint8_t* sd;
+                const int slot = slot_of(e);
+                if (slot >= 0) ++n_vram;
+                else if (!ram_inplace && L.ram_n > 0 && L.ram_of[(size_t)e] >= 0) ++n_ram;
+                else ++n_disk;
+                int ring_slot = -1;
+                if (slot >= 0) {
+                    const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
+                    sg = base;
+                    su = base + L.expert_gu;
+                    sd = base + 2 * L.expert_gu;
                 } else {
-                    cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
-                    gemm_expert_gpu(gt, sg, L.egate.row_bytes, p.gx, nullptr, p.gy, nt, ff, embd);
-                    gemm_expert_gpu(gt, su, L.egate.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
-                }
-                if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
-                if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
-                cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
-                if (tc_d) {
-                    cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
-                    gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
-                } else if (d_iq) {
-                    strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
-                    strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
-                } else if (prefill_dense_f32) {
-                    gemm_expert_gpu(dt, sd, L.edown.row_bytes, nullptr, p.gh32, p.gd, nt, embd, ff);
-                } else {
-                    cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
-                    gemm_expert_gpu(dt, sd, L.edown.row_bytes, p.gh, nullptr, p.gd, nt, embd, ff);
-                }
-                if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
-                cu::moe_combine_rows(p.gd, (const int32_t*)p.d_ent_row.p, (const float*)p.d_ent_w.p, nt, embd, p.sh,
-                                     T, zero, nullptr);
-                zero = false;
-                // STRATA_MM_TC_CHECK=<layer>: for the first 4 expert groups of that layer, run the group through
-                // both the tensor-core path and the int8 mmvq path and compare each to an fp64 CPU reference made
-                // from the same (dequantized) weights.  Diagnostic only; it overwrites the group scratch after the
-                // combine above has been enqueued.
-                static const long tc_check = [] {
-                    const char* e = std::getenv("STRATA_MM_TC_CHECK");
-                    return e ? std::atol(e) : -1L;
-                }();
-                static int tc_checked = 0;
-                if (tc_check >= 0 && (long)(&L - layers.data()) == tc_check && a == at && tc_checked < 4 &&
-                    tc_gu_ok && tc_d_ok && gu_iq && d_iq) {
-                    ++tc_checked;
-                    const int r = std::min(nt, 4);
-                    std::vector<uint8_t> wb(2 * L.expert_gu + (size_t)L.edown.row_bytes * embd);
-                    cu::sync();
-                    cu::copy_d2h(wb.data(), sg, L.expert_gu);
-                    cu::copy_d2h(wb.data() + L.expert_gu, su, L.expert_gu);
-                    cu::copy_d2h(wb.data() + 2 * L.expert_gu, sd, (size_t)L.edown.row_bytes * embd);
-                    auto deq = [&](int type, const uint8_t* src, size_t rb, int n, int k) {
-                        std::vector<float> w((size_t)n * k);
-                        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type)type);
-                        for (int i = 0; i < n; ++i) tt->to_float(src + (size_t)i * rb, w.data() + (size_t)i * k, k);
-                        return w;
-                    };
-                    const auto Wg = deq(gt, wb.data(), L.egate.row_bytes, ff, embd);
-                    const auto Wu = deq(L.eup.type, wb.data() + L.expert_gu, L.eup.row_bytes, ff, embd);
-                    const auto Wd = deq(dt, wb.data() + 2 * L.expert_gu, L.edown.row_bytes, embd, ff);
-                    std::vector<double> ref((size_t)r * embd);
-                    std::vector<double> hh((size_t)ff);
-                    for (int i = 0; i < r; ++i) {
-                        const float* x = hhost + (size_t)row_t[(size_t)i] * embd;
-                        for (int j = 0; j < ff; ++j) {
-                            double g = 0, u = 0;
-                            for (int k = 0; k < embd; ++k) {
-                                g += (double)Wg[(size_t)j * embd + k] * x[k];
-                                u += (double)Wu[(size_t)j * embd + k] * x[k];
-                            }
-                            hh[(size_t)j] = swigluoai((float)(g * fg), (float)(u * fu), alpha, limit);
-                        }
-                        for (int c = 0; c < embd; ++c) {
-                            double y = 0;
-                            for (int j = 0; j < ff; ++j) y += (double)Wd[(size_t)c * ff + j] * hh[(size_t)j];
-                            ref[(size_t)i * embd + c] = y * fd;
-                        }
+                    if (!p.ring) fail("batched prefill: no expert streaming buffer");
+                    // This group's index among the streamed ones is its position in `streamed`; the pipeline keeps
+                    // `primed` at least one slot ahead, so waiting here only costs when the copy is the slow side.
+                    size_t si = 0;
+                    while (si < streamed.size() && grps[(size_t)streamed[si]].at != at) ++si;
+                    if (si >= streamed.size()) fail("internal: streamed expert is not in the order list");
+                    pump((int)si + 1);
+                    ring_slot = (int)si % ring_n;
+                    {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        cu::event_sync(p.ev_copy[(size_t)ring_slot]);
+                        t_copywait +=
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     }
-                    for (int mode = 0; mode < 2; ++mode) {
-                        if (mode == 1) {
-                            cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
-                            gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
-                            gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
-                        } else {
-                            cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
-                            strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
-                            strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
-                            strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
-                        }
-                        if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
-                        if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
-                        cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
-                        if (mode == 1) {
-                            cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
-                            gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
-                        } else {
-                            strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
-                            strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
-                        }
-                        if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
-                        std::vector<float> got((size_t)r * embd);
+                    uint8_t* dst = (uint8_t*)p.ring_v[(size_t)ring_slot];
+                    sg = dst;
+                    su = dst + L.expert_gu;
+                    sd = dst + 2 * L.expert_gu;
+                    pump((int)si + 1 + lookahead);
+                }
+                for (size_t a = at; a < end; a += (size_t)rows_cap) {
+                    const int nt = (int)std::min<size_t>(end - a, (size_t)rows_cap);
+                    for (int i = 0; i < nt; ++i) {
+                        row_t[(size_t)i] = ents[a + (size_t)i].tid;
+                        row_w[(size_t)i] = ents[a + (size_t)i].w;
+                    }
+                    cu::copy_h2d(p.d_rows.p, row_t.data(), (size_t)nt * sizeof(int32_t));
+                    cu::copy_h2d(p.d_ent_row.p, row_t.data(), (size_t)nt * sizeof(int32_t));
+                    cu::copy_h2d(p.d_ent_w.p, row_w.data(), (size_t)nt * sizeof(float));
+                    const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
+                    const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
+                    const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
+                    const bool tc_gu = tc_gu_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
+                    const bool tc_d = tc_d_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
+                    if (tc_gu && a == at) ++n_tc;
+                    void* gev[3] = {nullptr, nullptr, nullptr};
+                    if (gpu_time) {
+                        for (auto& ev : gev) ev = cu::event_create_timed();
+                        cu::event_record(gev[0], nullptr);
+                    }
+                    if (tc_gu) {
+                        cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                        gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
+                        gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
+                    } else if (gu_iq) {
+                        cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                        strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
+                        strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
+                        strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
+                    } else if (prefill_dense_f32) {
+                        cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                        gemm_expert_gpu(gt, sg, L.egate.row_bytes, nullptr, p.gx32, p.gy, nt, ff, embd);
+                        gemm_expert_gpu(gt, su, L.egate.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
+                    } else {
+                        cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                        gemm_expert_gpu(gt, sg, L.egate.row_bytes, p.gx, nullptr, p.gy, nt, ff, embd);
+                        gemm_expert_gpu(gt, su, L.egate.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
+                    }
+                    if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
+                    if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
+                    cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
+                    if (gpu_time) cu::event_record(gev[1], nullptr);
+                    if (tc_d) {
+                        cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
+                        gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
+                    } else if (d_iq) {
+                        strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
+                        strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
+                    } else if (prefill_dense_f32) {
+                        gemm_expert_gpu(dt, sd, L.edown.row_bytes, nullptr, p.gh32, p.gd, nt, embd, ff);
+                    } else {
+                        cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
+                        gemm_expert_gpu(dt, sd, L.edown.row_bytes, p.gh, nullptr, p.gd, nt, embd, ff);
+                    }
+                    if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
+                    cu::moe_combine_rows(p.gd, (const int32_t*)p.d_ent_row.p, (const float*)p.d_ent_w.p, nt, embd, p.sh,
+                                         T, zero, nullptr);
+                    zero = false;
+                    if (gpu_time) {
+                        cu::event_record(gev[2], nullptr);
+                        gpu_evs.push_back({gev[0], gev[1], gev[2], nt});
+                    }
+                    // STRATA_MM_TC_CHECK=<layer>: for the first 4 expert groups of that layer, run the group through
+                    // both the tensor-core path and the int8 mmvq path and compare each to an fp64 CPU reference made
+                    // from the same (dequantized) weights.  Diagnostic only; it overwrites the group scratch after the
+                    // combine above has been enqueued.
+                    static const long tc_check = [] {
+                        const char* e = std::getenv("STRATA_MM_TC_CHECK");
+                        return e ? std::atol(e) : -1L;
+                    }();
+                    static int tc_checked = 0;
+                    if (tc_check >= 0 && (long)(&L - layers.data()) == tc_check && a == at && tc_checked < 4 &&
+                        tc_gu_ok && tc_d_ok && gu_iq && d_iq) {
+                        ++tc_checked;
+                        const int r = std::min(nt, 4);
+                        std::vector<uint8_t> wb(2 * L.expert_gu + (size_t)L.edown.row_bytes * embd);
                         cu::sync();
-                        cu::copy_d2h(got.data(), p.gd, got.size() * sizeof(float));
-                        double num = 0, den = 0, dot = 0, nr = 0, ng = 0, mx = 0;
-                        for (size_t q = 0; q < got.size(); ++q) {
-                            const double d = got[q] - ref[q];
-                            num += d * d;
-                            den += ref[q] * ref[q];
-                            dot += got[q] * ref[q];
-                            ng += (double)got[q] * got[q];
-                            mx = std::max(mx, std::fabs(d));
+                        cu::copy_d2h(wb.data(), sg, L.expert_gu);
+                        cu::copy_d2h(wb.data() + L.expert_gu, su, L.expert_gu);
+                        cu::copy_d2h(wb.data() + 2 * L.expert_gu, sd, (size_t)L.edown.row_bytes * embd);
+                        auto deq = [&](int type, const uint8_t* src, size_t rb, int n, int k) {
+                            std::vector<float> w((size_t)n * k);
+                            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type)type);
+                            for (int i = 0; i < n; ++i) tt->to_float(src + (size_t)i * rb, w.data() + (size_t)i * k, k);
+                            return w;
+                        };
+                        const auto Wg = deq(gt, wb.data(), L.egate.row_bytes, ff, embd);
+                        const auto Wu = deq(L.eup.type, wb.data() + L.expert_gu, L.eup.row_bytes, ff, embd);
+                        const auto Wd = deq(dt, wb.data() + 2 * L.expert_gu, L.edown.row_bytes, embd, ff);
+                        std::vector<double> ref((size_t)r * embd);
+                        std::vector<double> hh((size_t)ff);
+                        for (int i = 0; i < r; ++i) {
+                            const float* x = hhost + (size_t)row_t[(size_t)i] * embd;
+                            for (int j = 0; j < ff; ++j) {
+                                double g = 0, u = 0;
+                                for (int k = 0; k < embd; ++k) {
+                                    g += (double)Wg[(size_t)j * embd + k] * x[k];
+                                    u += (double)Wu[(size_t)j * embd + k] * x[k];
+                                }
+                                hh[(size_t)j] = swigluoai((float)(g * fg), (float)(u * fu), alpha, limit);
+                            }
+                            for (int c = 0; c < embd; ++c) {
+                                double y = 0;
+                                for (int j = 0; j < ff; ++j) y += (double)Wd[(size_t)c * ff + j] * hh[(size_t)j];
+                                ref[(size_t)i * embd + c] = y * fd;
+                            }
                         }
-                        nr = den;
-                        std::fprintf(stderr,
-                                     "INFO tc-check layer=%ld expert=%d rows=%d types=%d/%d/%d path=%s rel_l2=%.3e "
-                                     "cos=%.8f max_abs=%.3e ref_rms=%.3e\n",
-                                     tc_check, e, nt, gt, L.eup.type, dt, mode ? "tc" : "mmvq",
-                                     std::sqrt(num / std::max(den, 1e-30)), dot / std::sqrt(std::max(nr * ng, 1e-60)),
-                                     mx, std::sqrt(den / (double)got.size()));
+                        for (int mode = 0; mode < 2; ++mode) {
+                            if (mode == 1) {
+                                cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                                gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
+                                gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
+                            } else {
+                                cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                                strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
+                                strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
+                                strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
+                            }
+                            if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
+                            if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
+                            cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
+                            if (mode == 1) {
+                                cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
+                                gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
+                            } else {
+                                strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
+                                strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
+                            }
+                            if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
+                            std::vector<float> got((size_t)r * embd);
+                            cu::sync();
+                            cu::copy_d2h(got.data(), p.gd, got.size() * sizeof(float));
+                            double num = 0, den = 0, dot = 0, nr = 0, ng = 0, mx = 0;
+                            for (size_t q = 0; q < got.size(); ++q) {
+                                const double d = got[q] - ref[q];
+                                num += d * d;
+                                den += ref[q] * ref[q];
+                                dot += got[q] * ref[q];
+                                ng += (double)got[q] * got[q];
+                                mx = std::max(mx, std::fabs(d));
+                            }
+                            nr = den;
+                            std::fprintf(stderr,
+                                         "INFO tc-check layer=%ld expert=%d rows=%d types=%d/%d/%d path=%s rel_l2=%.3e "
+                                         "cos=%.8f max_abs=%.3e ref_rms=%.3e\n",
+                                         tc_check, e, nt, gt, L.eup.type, dt, mode ? "tc" : "mmvq",
+                                         std::sqrt(num / std::max(den, 1e-30)), dot / std::sqrt(std::max(nr * ng, 1e-60)),
+                                         mx, std::sqrt(den / (double)got.size()));
+                        }
                     }
                 }
+                // The slot is free for a new copy once everything the main stream enqueued for it has run.
+                if (ring_slot >= 0 && p.ev_comp.size() > (size_t)ring_slot)
+                    cu::event_record(p.ev_comp[(size_t)ring_slot], nullptr);
+                at = end;
             }
-            // The slot is free for a new copy once everything the main stream enqueued for it has run.
-            if (ring_slot >= 0 && p.ev_comp.size() > (size_t)ring_slot)
-                cu::event_record(p.ev_comp[(size_t)ring_slot], nullptr);
-            at = end;
+            if (std::getenv("STRATA_MM_TIME"))
+                std::fprintf(stderr,
+                             "INFO batch-ring read=%.1f copywait=%.1f disk_ms=%.1f disk_mb=%.1f disk_gbs=%.2f ms "
+                             "experts=%zu vram=%d ram=%d disk=%d tc=%d\n",
+                             t_read, t_copywait, t_disk, (double)disk_bytes / 1048576.0,
+                             t_disk > 0.0 ? (double)disk_bytes / (t_disk * 1.0e6) : 0.0, streamed.size(), n_vram, n_ram,
+                             n_disk, n_tc);
+            cu::sync();
+            if (gpu_time && !gpu_evs.empty()) {
+                double gu_ms = 0, d_ms = 0;
+                long rows = 0;
+                for (const GEv& g : gpu_evs) {
+                    gu_ms += cu::event_elapsed_ms(g.a, g.b);
+                    d_ms += cu::event_elapsed_ms(g.b, g.c);
+                    rows += g.nt;
+                    cu::event_destroy(g.a);
+                    cu::event_destroy(g.b);
+                    cu::event_destroy(g.c);
+                }
+                std::fprintf(stderr, "INFO batch-gpu groups=%zu rows=%ld gu_ms=%.1f down_ms=%.1f embd=%d ff=%d nexp=%d top=%d\n",
+                             gpu_evs.size(), rows, gu_ms, d_ms, embd, ff, nexp, top);
+            }
+            if (zero) std::fill(yout_host, yout_host + (size_t)T * embd, 0.f);   // every route went to the CPU
+            else cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
+        };
+        std::vector<float> yb_part, sh_out;   // the other card's routed part (P29) and the shared expert
+        bool shared_done = false;
+        auto run_shared = [&] {
+            if (L.have_shared) shared_batch_gpu(L, hdev, h16, T, sh_out);
+            shared_done = true;
+        };
+        if (!dual) {
+            run_side(pf_entries, xin, true, yout_host);
+        } else {
+            std::vector<signed char> side((size_t)nexp, 1);
+            for (int e = 0; e < nexp; ++e)
+                if (tier_of(e) == 0) side[(size_t)e] = 0;
+            std::vector<PfEntry> ea, eb2;
+            for (const PfEntry& en : pf_entries) (side[(size_t)en.expert] == 0 ? ea : eb2).push_back(en);
+            if (!eb2.empty()) yb_part.assign((size_t)T * embd, 0.f);
+            std::exception_ptr berr;
+            double b_ms = 0;
+            using dclock = std::chrono::steady_clock;
+            std::thread bt;
+            if (!eb2.empty())
+                bt = std::thread([&] {
+                    try {
+                        const auto tb0 = dclock::now();
+                        use_device_index(other);
+                        PfBuf& r = P();
+                        cu::copy_h2d(r.p32, hhost, (size_t)T * embd * sizeof(float));
+                        run_side(eb2, r.p32, false, yb_part.data());
+                        b_ms = std::chrono::duration<double, std::milli>(dclock::now() - tb0).count();
+                    } catch (...) {
+                        berr = std::current_exception();
+                    }
+                });
+            Joiner bjoin{bt};
+            const auto ta0 = dclock::now();
+            if (!ea.empty()) run_side(ea, hdev, true, yout_host);
+            else std::fill(yout_host, yout_host + (size_t)T * embd, 0.f);
+            run_shared();
+            const double a_ms = std::chrono::duration<double, std::milli>(dclock::now() - ta0).count();
+            if (bt.joinable()) bt.join();
+            if (berr) std::rethrow_exception(berr);
+            if (std::getenv("STRATA_MM_TIME"))
+                std::fprintf(stderr, "INFO batch-dual own=%zu other=%zu wall own=%.0f other=%.0f\n",
+                             ea.size(), eb2.size(), a_ms, b_ms);
         }
-        if (std::getenv("STRATA_MM_TIME"))
-            std::fprintf(stderr,
-                         "INFO batch-ring read=%.1f copywait=%.1f disk_ms=%.1f disk_mb=%.1f disk_gbs=%.2f ms "
-                         "experts=%zu vram=%d ram=%d disk=%d tc=%d\n",
-                         t_read, t_copywait, t_disk, (double)disk_bytes / 1048576.0,
-                         t_disk > 0.0 ? (double)disk_bytes / (t_disk * 1.0e6) : 0.0, streamed.size(), n_vram, n_ram,
-                         n_disk, n_tc);
-        cu::sync();
-        if (zero) std::fill(yout_host, yout_host + (size_t)T * embd, 0.f);   // every route went to the CPU
-        else cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         if (remote) use_device_index(own);
+        if (!shared_done) run_shared();
         if (cpu_thr.joinable()) {
             const auto tj = std::chrono::steady_clock::now();
             cpu_thr.join();
             if (cpu_err) std::rethrow_exception(cpu_err);
-            for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] += ycpu[i];
             if (std::getenv("STRATA_MM_TIME"))
                 std::fprintf(stderr, "INFO batch-cpu experts=%zu cpu_ms=%.1f join_wait_ms=%.1f\n", cpu_exp.size(),
                              cpu_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tj).count());
         }
-        for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;
-        if (L.have_shared) {
+        // y = (routed [+ the other card's part] [+ the CPU's part]) * scale + shared, one parallel pass.
+        const float* add_b = yb_part.empty() ? nullptr : yb_part.data();
+        const float* add_c = ycpu.empty() ? nullptr : ycpu.data();
+        const float* add_s = sh_out.empty() ? nullptr : sh_out.data();
+        pool.run(T, [&](int a, int b) {
+            for (size_t i = (size_t)a * embd; i < (size_t)b * embd; ++i) {
+                float y = yout_host[i];
+                if (add_b) y += add_b[i];
+                if (add_c) y += add_c[i];
+                y *= scale_routed;
+                if (add_s) y += add_s[i];
+                yout_host[i] = y;
+            }
+        });
+    }
+
+    // The shared expert of `moe_batch_gpu`, on the layer's own card, into `sh` (unscaled, [T][embd]).
+    void shared_batch_gpu(const Layer& L, const float* hdev, const uint16_t* h16, int T, std::vector<float>& sh) {
+        const int embd = (int)cfg.n_embd;
+        {
             // The shared expert is a plain 1-head dense MLP: run it through the batched projection path.
             PfBuf& q = P();
             const int sff = (int)L.gate.ne1;
-            std::vector<float> sh((size_t)T * embd);
+            sh.resize((size_t)T * embd);
             // gate into y32, up into p32, swiglu to gh, down to gd, in row chunks of rows_cap
             for (int c = 0; c < T; c += (int)q.rows_cap) {
                 const int nt = std::min<int>((int)q.rows_cap, T - c);
@@ -6664,7 +6854,6 @@ struct Engine::Impl {
                 }
                 cu::copy_d2h(sh.data() + (size_t)c * embd, q.gd, (size_t)nt * embd * sizeof(float));
             }
-            for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] += sh[i];
         }
     }
 
@@ -6724,8 +6913,10 @@ struct Engine::Impl {
             PfBuf& p = pf.empty() ? p_dummy : P();
             // ---- attention block
             const auto ta0 = pfclock::now();
-            for (int t = 0; t < T; ++t)
-                rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
+            pool.run(T, [&](int a, int b) {
+                for (int t = a; t < b; ++t)
+                    rms(pf_h.data() + (size_t)t * ne, L.attn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
+            });
             const float* hq = pf_q.data();   // [T][ne] normed input
             const auto ta1 = pfclock::now();
             // P5c: with the fused device path the projections never come back to the host: norm+rope runs on
@@ -6935,13 +7126,16 @@ struct Engine::Impl {
                 }
                 gemm_cpu(L.wo, pf_dense_h.data(), T, qlen, pf_moe_h.data(), ne);
             }
-            for (int t = 0; t < T; ++t)
-                for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
+            pool.run(T, [&](int a, int b) {
+                for (size_t i = (size_t)a * ne; i < (size_t)b * ne; ++i) pf_h[i] += pf_moe_h[i];
+            });
 
             const auto t_ffn = pfclock::now();
             // ---- FFN block
-            for (int t = 0; t < T; ++t)
-                rms(pf_h.data() + (size_t)t * ne, L.ffn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
+            pool.run(T, [&](int a, int b) {
+                for (int t = a; t < b; ++t)
+                    rms(pf_h.data() + (size_t)t * ne, L.ffn_norm.data(), pf_q.data() + (size_t)t * ne, ne, eps);
+            });
             const float* hn = pf_q.data();
             if (!L.moe) {
                 const int ff = (int)L.gate.ne1;
@@ -6970,8 +7164,9 @@ struct Engine::Impl {
             } else {
                 moe_batch_cpu(L, hn, T, pf_moe_h.data());
             }
-            for (int t = 0; t < T; ++t)
-                for (int c = 0; c < ne; ++c) pf_h[(size_t)t * ne + c] += pf_moe_h[(size_t)t * ne + c];
+            pool.run(T, [&](int a, int b) {
+                for (size_t i = (size_t)a * ne; i < (size_t)b * ne; ++i) pf_h[i] += pf_moe_h[i];
+            });
             if (time_on) {
                 const double f = ms(t_ffn);
                 std::fprintf(stderr,
