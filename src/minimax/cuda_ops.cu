@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <cstdlib>
 
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1278,8 +1279,17 @@ void gemm_f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, in
     if (cublasSetStream(h, (cudaStream_t)stream) != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("cuda: cublasSetStream failed");
     const float alpha = 1.f;
-    const cublasStatus_t st = cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, (int)K, X,
-                                          (int)K, &beta, Y, (int)(ldy > 0 ? ldy : N));
+    // STRATA_MM_TF32=1: the same fp32 operands on the tensor cores (10-bit mantissa products, fp32 accumulate).
+    static const bool tf32 = [] {
+        const char* e = std::getenv("STRATA_MM_TF32");
+        return e && *e && *e != '0';
+    }();
+    const cublasStatus_t st =
+        tf32 ? cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, CUDA_R_32F, (int)K, X,
+                            CUDA_R_32F, (int)K, &beta, Y, CUDA_R_32F, (int)(ldy > 0 ? ldy : N),
+                            CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+             : cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, (int)K, X, (int)K, &beta,
+                           Y, (int)(ldy > 0 ? ldy : N));
     if (st != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("cuda: cublasSgemm failed: " + std::to_string((int)st) + " (N=" + std::to_string((long long)N) + " T=" + std::to_string((long long)T) + " K=" + std::to_string((long long)K) + " ldy=" + std::to_string((long long)ldy) + ")");
     check(cudaGetLastError(), "gemm_f32");

@@ -4977,15 +4977,13 @@ struct Engine::Impl {
     void init_prefill() {
         prefetch_slots = opt.expert_prefetch;
         if (opt.prefill_batch <= 1) return;
-        prefill_dense_f32 = opt.prefill_dense != "f16";
-        prefill_expert_gemm = opt.prefill_expert_gemm.empty() ? "mmvq" : opt.prefill_expert_gemm;
+        // fp16 operands with fp32 accumulation: the same 10-bit mantissa TF32 would give, on the faster tensor-core
+        // rate (4 K prompt 78 -> 90 tok/s on rig-2).  `--minimax-prefill-dense f32` keeps the fp32 SGEMM.
+        prefill_dense_f32 = opt.prefill_dense == "f32";
+        prefill_expert_gemm = opt.prefill_expert_gemm.empty() ? "auto" : opt.prefill_expert_gemm;
         if (prefill_expert_gemm != "mmvq" && prefill_expert_gemm != "tc" && prefill_expert_gemm != "auto")
             fail("--minimax-prefill-expert-gemm: '" + prefill_expert_gemm + "' is not mmvq, tc or auto");
         prefill_direct = stream_direct;
-        if (!prefill_dense_f32)
-            std::fprintf(stderr,
-                         "INFO minimax-prefill-dense=f16 (the down GEMM's activation is fp16; measured KL 1.7e-3 "
-                         "against f32 on the real slice, +9%% prefill)\n");
         if (dump_on) {
             std::fprintf(stderr, "strata-minimax: --minimax-prefill-batch is off because the parity dump needs the "
                                  "per-token path\n");
@@ -6532,6 +6530,94 @@ struct Engine::Impl {
                 cu::moe_combine_rows(p.gd, (const int32_t*)p.d_ent_row.p, (const float*)p.d_ent_w.p, nt, embd, p.sh,
                                      T, zero, nullptr);
                 zero = false;
+                // STRATA_MM_TC_CHECK=<layer>: for the first 4 expert groups of that layer, run the group through
+                // both the tensor-core path and the int8 mmvq path and compare each to an fp64 CPU reference made
+                // from the same (dequantized) weights.  Diagnostic only; it overwrites the group scratch after the
+                // combine above has been enqueued.
+                static const long tc_check = [] {
+                    const char* e = std::getenv("STRATA_MM_TC_CHECK");
+                    return e ? std::atol(e) : -1L;
+                }();
+                static int tc_checked = 0;
+                if (tc_check >= 0 && (long)(&L - layers.data()) == tc_check && a == at && tc_checked < 4 &&
+                    tc_gu_ok && tc_d_ok && gu_iq && d_iq) {
+                    ++tc_checked;
+                    const int r = std::min(nt, 4);
+                    std::vector<uint8_t> wb(2 * L.expert_gu + (size_t)L.edown.row_bytes * embd);
+                    cu::sync();
+                    cu::copy_d2h(wb.data(), sg, L.expert_gu);
+                    cu::copy_d2h(wb.data() + L.expert_gu, su, L.expert_gu);
+                    cu::copy_d2h(wb.data() + 2 * L.expert_gu, sd, (size_t)L.edown.row_bytes * embd);
+                    auto deq = [&](int type, const uint8_t* src, size_t rb, int n, int k) {
+                        std::vector<float> w((size_t)n * k);
+                        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type)type);
+                        for (int i = 0; i < n; ++i) tt->to_float(src + (size_t)i * rb, w.data() + (size_t)i * k, k);
+                        return w;
+                    };
+                    const auto Wg = deq(gt, wb.data(), L.egate.row_bytes, ff, embd);
+                    const auto Wu = deq(L.eup.type, wb.data() + L.expert_gu, L.eup.row_bytes, ff, embd);
+                    const auto Wd = deq(dt, wb.data() + 2 * L.expert_gu, L.edown.row_bytes, embd, ff);
+                    std::vector<double> ref((size_t)r * embd);
+                    std::vector<double> hh((size_t)ff);
+                    for (int i = 0; i < r; ++i) {
+                        const float* x = hhost + (size_t)row_t[(size_t)i] * embd;
+                        for (int j = 0; j < ff; ++j) {
+                            double g = 0, u = 0;
+                            for (int k = 0; k < embd; ++k) {
+                                g += (double)Wg[(size_t)j * embd + k] * x[k];
+                                u += (double)Wu[(size_t)j * embd + k] * x[k];
+                            }
+                            hh[(size_t)j] = swigluoai((float)(g * fg), (float)(u * fu), alpha, limit);
+                        }
+                        for (int c = 0; c < embd; ++c) {
+                            double y = 0;
+                            for (int j = 0; j < ff; ++j) y += (double)Wd[(size_t)c * ff + j] * hh[(size_t)j];
+                            ref[(size_t)i * embd + c] = y * fd;
+                        }
+                    }
+                    for (int mode = 0; mode < 2; ++mode) {
+                        if (mode == 1) {
+                            cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                            gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
+                            gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
+                        } else {
+                            cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                            strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
+                            strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
+                            strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
+                        }
+                        if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
+                        if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
+                        cu::swiglu_rows_f32(p.gy, p.gu, p.gh32, nt, ff, alpha, limit, nullptr);
+                        if (mode == 1) {
+                            cu::f32_to_f16(p.gh32, p.gh, (int64_t)nt * ff, nullptr);
+                            gemm_expert_f16(dt, sd, L.edown.row_bytes, p.gh, p.gd, nt, embd, ff, embd);
+                        } else {
+                            strata::kernels::quantize_q8_1_rows(p.gh32, nt, ff, p.hq, nullptr);
+                            strata::kernels::iq_mmvq(dt, sd, p.hq, p.gd, ff, embd, nt, nullptr);
+                        }
+                        if (fd != 1.f) cu::scale_rows(p.gd, (int64_t)nt * embd, fd, nullptr);
+                        std::vector<float> got((size_t)r * embd);
+                        cu::sync();
+                        cu::copy_d2h(got.data(), p.gd, got.size() * sizeof(float));
+                        double num = 0, den = 0, dot = 0, nr = 0, ng = 0, mx = 0;
+                        for (size_t q = 0; q < got.size(); ++q) {
+                            const double d = got[q] - ref[q];
+                            num += d * d;
+                            den += ref[q] * ref[q];
+                            dot += got[q] * ref[q];
+                            ng += (double)got[q] * got[q];
+                            mx = std::max(mx, std::fabs(d));
+                        }
+                        nr = den;
+                        std::fprintf(stderr,
+                                     "INFO tc-check layer=%ld expert=%d rows=%d types=%d/%d/%d path=%s rel_l2=%.3e "
+                                     "cos=%.8f max_abs=%.3e ref_rms=%.3e\n",
+                                     tc_check, e, nt, gt, L.eup.type, dt, mode ? "tc" : "mmvq",
+                                     std::sqrt(num / std::max(den, 1e-30)), dot / std::sqrt(std::max(nr * ng, 1e-60)),
+                                     mx, std::sqrt(den / (double)got.size()));
+                    }
+                }
             }
             // The slot is free for a new copy once everything the main stream enqueued for it has run.
             if (ring_slot >= 0 && p.ev_comp.size() > (size_t)ring_slot)

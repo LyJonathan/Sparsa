@@ -223,9 +223,9 @@ def build_config(args) -> dict:
         # every routed expert for every token).  `auto` asks for 4096 and the engine shrinks the chunk to what each
         # card's free VRAM can hold after the weights and the KV; it prints the size it chose
         # (`INFO minimax-prefill batch=...`).  --prefill-batch 0 keeps the token path, N is a fixed chunk.
-        # The expert projection stays on the int8 dots (the engine's `mmvq`): the full-model G3 gate for the
-        # tensor-core path failed (KL64 1.235 -> 1.300, top-1 60.8 % -> 58.2 % over the six short prompts), so
-        # `--prefill-expert-gemm tc` is a choice, not the default.
+        # The expert projection is `auto`: tensor cores for a group of 16+ tokens, the int8 dots below.  Against an
+        # fp64 reference on real IQ2_XXS/IQ2_XS experts the tensor-core output is ~25x closer (rel. L2 4e-4 vs
+        # 1.1e-2 for the int8 dots).  The old full-model gate that failed it was MSA block-selection noise.
         cfg_args += ["--minimax-prefill-batch", str(prefill_batch),
                      "--minimax-prefill-expert-gemm", args.prefill_expert_gemm]
     if args.threads:
@@ -397,11 +397,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--prefill-batch", default="auto",
                        help="prompt chunk: auto (default: 4096, shrunk by the engine to the free VRAM), 0 = the "
                             "token path, or a token count")
-        p.add_argument("--prefill-expert-gemm", choices=("auto", "mmvq", "tc"), default="mmvq",
-                       help="how a batched chunk's routed experts are projected: mmvq (default: the int8 dots), "
-                            "auto (tensor cores from 16 rows per expert, the int8 dots below), or tc. The full "
-                            "IQ2_XS-D3 G3 gate failed for tc (KL64 1.235 -> 1.300, top-1 60.8%% -> 58.2%%), so it "
-                            "stays opt-in")
+        p.add_argument("--prefill-expert-gemm", choices=("auto", "mmvq", "tc"), default="auto",
+                       help="how a batched chunk's routed experts are projected: auto (default: tensor cores from "
+                            "16 rows per expert, the int8 dots below), mmvq (the int8 dots only), or tc")
         p.add_argument("--allow-nonstandard", action="store_true",
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
