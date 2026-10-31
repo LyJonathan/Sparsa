@@ -4956,12 +4956,25 @@ struct Engine::Impl {
             // P12: in the swap mode the prompt pass may take the expert slots back for its workspace, so what the
             // batch may use is the free VRAM plus every slot on this card.
             const size_t reclaim = prefill_ws_swap ? slotted_bytes_on((int)d) : 0;
-            const size_t budget = mi.free_bytes + reclaim;
+            size_t free_now = mi.free_bytes;
+            const size_t want = reserve + per_tok * (size_t)batch_cap;
+            if (!prefill_ws_swap && free_now < want && slotted_bytes_on((int)d) > 0) {
+                // P14: the slot plan sets the workspace aside, but allocations made after it (lm_head, the shared
+                // expert's buffers, cuBLAS) can still leave the card short, and the prompt then silently ran token by
+                // token (7-10 tok/s on rig-2's 2 GPUs).  A few decode slots cost far less than that.
+                const int shed = shed_slots((int)d, want, false);
+                free_now = cu::mem_on(devs[d]).free_bytes;
+                std::fprintf(stderr,
+                             "INFO minimax-prefill-workspace dev=%d gave up %d expert slots for the %d-token batch "
+                             "(%zu MiB free now)\n",
+                             devs[d], shed, batch_cap, free_now >> 20);
+            }
+            const size_t budget = free_now + reclaim;
             if (budget <= reserve) {
                 std::fprintf(stderr,
                              "strata-minimax: batched prefill needs workspace on device %d but only %zu MiB is free. "
                              "Lower --minimax-prefill-batch or --minimax-dense-layers-gpu.\n",
-                             devs[d], mi.free_bytes >> 20);
+                             devs[d], free_now >> 20);
                 batch_cap = 0;
                 return;
             }
@@ -4969,7 +4982,7 @@ struct Engine::Impl {
             std::fprintf(stderr,
                          "INFO minimax-prefill-workspace dev=%d free=%zu MiB%s reserve=%zu MiB per_token=%.1f KiB "
                          "fit=%zu tokens\n",
-                         devs[d], mi.free_bytes >> 20, reclaim ? (" +slots=" + std::to_string(reclaim >> 20) + " MiB").c_str() : "",
+                         devs[d], free_now >> 20, reclaim ? (" +slots=" + std::to_string(reclaim >> 20) + " MiB").c_str() : "",
                          reserve >> 20, (double)per_tok / 1024.0, fit);
             if ((size_t)batch_cap > fit) batch_cap = (int)fit;
         }
@@ -5242,14 +5255,23 @@ struct Engine::Impl {
         }
         use_device_index(0);
         pf_free();
-        int restored = 0;
+        int restored = 0, lost = 0;
         for (size_t li = 0; li < layers.size(); ++li) {
             Layer& L = layers[li];
             if (ws_taken[li] <= 0) continue;
             use_device_index(L.dev);
             for (int s = 0; s < ws_taken[li]; ++s) {
+                // P14: the prompt pass can leave the card with less than it borrowed (cuBLAS and the allocator keep
+                // some of it), and a throw here killed the server after its first prompt.  Keep what fits.
+                void* p = nullptr;
+                try {
+                    p = cu::alloc(L.expert_bytes);
+                } catch (const std::exception&) {
+                    lost += ws_taken[li] - s;
+                    break;
+                }
                 Layer::VramSlot slot;
-                slot.mem = DevPtr(cu::alloc(L.expert_bytes));
+                slot.mem = DevPtr(p);
                 L.vram.push_back(std::move(slot));
                 ++restored;
             }
@@ -5257,6 +5279,9 @@ struct Engine::Impl {
         }
         use_device_index(0);
         cu::sync();
+        if (lost > 0)
+            std::fprintf(stderr, "WARN minimax-prefill-vram %d expert slots did not fit back after the prompt; "
+                                 "decode keeps the rest\n", lost);
         if (restored > 0) {
             int lo = std::numeric_limits<int>::max(), hi = 0;
             for (const Layer& L : layers)
@@ -5270,6 +5295,41 @@ struct Engine::Impl {
                          restored, lo, hi,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ws_t0).count());
         }
+    }
+
+    /// Free decode expert slots on device `d`, round-robin over its MoE layers, until it has `need` bytes free or
+    /// no slot is left.  `borrow` records them in ws_taken so pf_release re-allocates them after the prompt (swap);
+    /// otherwise they are gone for the run (init_prefill making room for the workspace).  Returns the count freed.
+    int shed_slots(int d, size_t need, bool borrow) {
+        std::vector<size_t> moe_on_d;
+        for (size_t li = 0; li < layers.size(); ++li)
+            if (layers[li].moe && layers[li].dev == d) moe_on_d.push_back(li);
+        int freed = 0;
+        size_t turn = 0;
+        bool any = true;
+        while (any && cu::mem_on(devs[(size_t)d]).free_bytes < need) {
+            any = false;
+            for (size_t k = 0; k < moe_on_d.size(); ++k) {
+                const size_t li = moe_on_d[(turn + k) % moe_on_d.size()];
+                Layer& L = layers[li];
+                if (L.vram.empty()) continue;
+                use_device_index(L.dev);
+                Layer::VramSlot& sl = L.vram.back();
+                if (sl.expert >= 0) L.vram_of[(size_t)sl.expert] = kNotResident;
+                // `VramSlot::mem` is an RAII DevPtr: free it here and null it, or pop_back's destructor frees the
+                // same pointer again (a double free that surfaces later as a bogus launch error).
+                cu::dealloc(sl.mem.p);
+                sl.mem.p = nullptr;
+                L.vram.pop_back();
+                if (borrow) ++ws_taken[li];
+                ++freed;
+                any = true;
+                break;   // re-check the free bytes before taking another
+            }
+            ++turn;
+        }
+        use_device_index(0);
+        return freed;
     }
 
     /// Make room for the workspace by taking slots away (swap mode only), then allocate it.  Returns false when the
@@ -5295,32 +5355,7 @@ struct Engine::Impl {
         if (prefill_ws_swap) {
             for (size_t d = 0; d < devs.size(); ++d) {
                 // Round-robin over this device's MoE layers so no single layer loses its whole pool.
-                std::vector<size_t> moe_on_d;
-                for (size_t li = 0; li < layers.size(); ++li)
-                    if (layers[li].moe && layers[li].dev == (int)d) moe_on_d.push_back(li);
-                size_t turn = 0;
-                bool any = true;
-                while (any && cu::mem_on(devs[d]).free_bytes < need) {
-                    any = false;
-                    for (size_t k = 0; k < moe_on_d.size(); ++k) {
-                        const size_t li = moe_on_d[(turn + k) % moe_on_d.size()];
-                        Layer& L = layers[li];
-                        if (L.vram.empty()) continue;
-                        use_device_index(L.dev);
-                        Layer::VramSlot& s = L.vram.back();
-                        if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
-                        // `VramSlot::mem` is an RAII DevPtr: free it here and null it, or pop_back's destructor
-                        // frees the same pointer again (a double free that surfaces later as a bogus launch error).
-                        cu::dealloc(s.mem.p);
-                        s.mem.p = nullptr;
-                        L.vram.pop_back();
-                        ++ws_taken[li];
-                        ++freed;
-                        any = true;
-                        break;   // re-check the free bytes before taking another
-                    }
-                    ++turn;
-                }
+                freed += shed_slots((int)d, need, true);
                 if (cu::mem_on(devs[d]).free_bytes < need) {
                     use_device_index(0);
                     std::fprintf(stderr,
