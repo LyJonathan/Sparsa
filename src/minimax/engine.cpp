@@ -163,12 +163,14 @@ struct Pool {
     std::mutex mu;
     std::condition_variable cv_work;
     std::condition_variable cv_done;
-    std::function<void(int, int)> fn;
+    const std::function<void(int, int)>* fn = nullptr;   // the caller's job; valid until run() returns
     int rows = 0;
     int parts = 1;
-    int epoch = 0;
+    int chunk = 0;                  // > 0: rows are handed out `chunk` at a time from `next` (run_dyn)
+    std::atomic<int> next{0};
+    std::atomic<int> epoch{0};
     int pending = 0;
-    bool stop = false;
+    std::atomic<bool> stop{false};
     int spin_us = 0;      // P7b: how long an idle worker spins before it sleeps on the condition variable
 
     Pool() = default;
@@ -186,48 +188,75 @@ struct Pool {
         {
             std::lock_guard<std::mutex> lk(mu);
             stop = true;
-            ++epoch;
+            epoch.fetch_add(1);
         }
         cv_work.notify_all();
         for (auto& t : workers)
             if (t.joinable()) t.join();
     }
 
+    static inline void cpu_relax() {
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+        _mm_pause();
+#endif
+    }
+
+    // Static bands (`run`) or chunks taken from `next` (`run_dyn`).  Each row is computed by exactly one call
+    // either way, so what a row computes does not depend on the mode.
+    void work(int p, const std::function<void(int, int)>& job) {
+        if (chunk > 0) {
+            for (;;) {
+                const int a = next.fetch_add(chunk, std::memory_order_relaxed);
+                if (a >= rows) break;
+                job(a, std::min(rows, a + chunk));
+            }
+            return;
+        }
+        const int a = (int)((int64_t)rows * p / parts);
+        const int b = (int)((int64_t)rows * (p + 1) / parts);
+        if (a < b) job(a, b);
+    }
+
     void worker(int p) {
         tls_part = p;
         int seen = 0;
         for (;;) {
-            std::function<void(int, int)> job;
-            int a = 0, b = 0;
+            if (spin_us > 0) {
+                // P7b: spin before sleeping.  A token's layers hand the pool several small jobs in a row, and a
+                // condvar wake per job is a context switch each (Project Maya's pool spins 20 ms through a token's
+                // layers for that reason, ds4_model.cu:5560).  The spin reads the epoch without the mutex.
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+                int k = 0;
+                while (!stop.load(std::memory_order_relaxed) && epoch.load(std::memory_order_acquire) == seen) {
+                    cpu_relax();
+                    if ((++k & 255) == 0 && std::chrono::steady_clock::now() >= until) break;
+                }
+            }
+            const std::function<void(int, int)>* job = nullptr;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                if (spin_us > 0) {
-                    // P7b: spin before sleeping.  A token's layers hand the pool several small jobs in a row, and
-                    // a condvar wake per job is a context switch each; Project Maya's pool spins 20 ms through a
-                    // token's layers for exactly that reason (ds4_model.cu:5560).  The window is measured, not
-                    // assumed: --minimax-pool-spin-us, default 0 = the old behaviour.
-                    const auto until = std::chrono::steady_clock::now() +
-                                       std::chrono::microseconds(spin_us);
-                    while (!stop && epoch == seen && std::chrono::steady_clock::now() < until) {
-                        std::this_thread::yield();
-                        lk.unlock();
-                        lk.lock();
-                    }
-                }
-                cv_work.wait(lk, [&] { return stop || epoch != seen; });
+                cv_work.wait(lk, [&] { return stop.load() || epoch.load() != seen; });
                 if (stop) return;
-                seen = epoch;
+                seen = epoch.load();
                 job = fn;
-                a = (int)((int64_t)rows * p / parts);
-                b = (int)((int64_t)rows * (p + 1) / parts);
             }
-            if (a < b && job) job(a, b);
+            if (job) work(p, *job);
             std::lock_guard<std::mutex> lk(mu);
             if (--pending == 0) cv_done.notify_one();
         }
     }
 
-    void run(int nrows, const std::function<void(int, int)>& job, bool force = false) {
+    void run(int nrows, const std::function<void(int, int)>& job, bool force = false) { dispatch(nrows, job, force, 0); }
+
+    // P14: the same job with rows handed out `chunk` at a time, so a band whose thread is late (the engine's own
+    // CUDA and SSD threads share the cores) is picked up by the others instead of holding the barrier.  Only for
+    // jobs whose rows are independent and that keep no per-band state (tls_part scratch is fine, a per-band sum
+    // is not).
+    void run_dyn(int nrows, int chunk_rows, const std::function<void(int, int)>& job) {
+        dispatch(nrows, job, false, std::max(1, chunk_rows));
+    }
+
+    void dispatch(int nrows, const std::function<void(int, int)>& job, bool force, int chunk_rows) {
         if (nrows <= 0) return;
         if (nthreads <= 1 || (!force && nrows < nthreads * 4)) {
             tls_part = 0;
@@ -237,15 +266,16 @@ struct Pool {
         tls_part = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
-            fn = job;
+            fn = &job;
             rows = nrows;
             parts = nthreads;
+            chunk = chunk_rows;
+            next.store(0, std::memory_order_relaxed);
             pending = nthreads - 1;
-            ++epoch;
+            epoch.fetch_add(1, std::memory_order_release);
         }
         cv_work.notify_all();
-        const int b0 = (int)((int64_t)nrows / nthreads);
-        if (b0 > 0) job(0, b0);
+        work(0, job);
         std::unique_lock<std::mutex> lk(mu);
         cv_done.wait(lk, [&] { return pending == 0; });
         fn = nullptr;
@@ -4247,6 +4277,8 @@ struct Engine::Impl {
     // STRATA_LANE_PF=N: software-prefetch N rows ahead in the lane's row loops (0 = off, a measured probe, not a
     // default: every thread walks its rows sequentially and the hardware prefetcher already sees that stride).
     int lane_pf = 0;
+    // P14: rows per chunk in the CPU lane's two regions (~100 KB of IQ2 rows, ~25 chunks per thread a layer).
+    static constexpr int kLaneChunkRows = 64;
     static inline void prefetch_row(const void* p) {
 #if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
         _mm_prefetch((const char*)p, _MM_HINT_T0);
@@ -4284,7 +4316,8 @@ struct Engine::Impl {
         if ((int)L.egate.ne1 != ff || (int)L.eup.ne1 != ff)
             fail("gate/up rows do not match the expert feed-forward width");
         if (ku.act_bytes != kg.act_bytes) fail("gate and up need different activation widths");
-        pool.run(n * 2 * ff, [&](int a, int b) {
+        // P14: rows go out in chunks (run_dyn), so a late thread no longer holds the barrier; rows are independent.
+        pool.run_dyn(n * 2 * ff, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
                 const int j = i / (2 * ff);
                 const int k = i - j * 2 * ff;
@@ -4314,7 +4347,7 @@ struct Engine::Impl {
         for (int j = 0; j < n; ++j)
             kd.act->from_float(&cpu_hbuf[(size_t)j * (size_t)ff], cpu_hq.data() + (size_t)j * kd.act_bytes, ff);
         const size_t d_row = L.edown.row_bytes;
-        pool.run(n * embd, [&](int a, int b) {
+        pool.run_dyn(n * embd, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
                 const int j = i / embd;
                 const int r = i - j * embd;
