@@ -7090,20 +7090,18 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
     // n_past is the cache. The last sampled token sits in `held` but is not forwarded until the next
     // request needs its logits, so held.size() is one past the cache after a normal stop. Reuse only the
     // forwarded prefix. Logits always come from the last prompt token: an exact cache hit re-forwards it.
-    int64_t cached = impl_->n_past;
-    bool extend = cached > 0 && (int64_t)prompt.size() >= cached && (int64_t)impl_->held.size() >= cached;
-    if (extend) {
-        for (int64_t i = 0; i < cached; ++i) {
-            if (impl_->held[(size_t)i] != prompt[(size_t)i]) {
-                extend = false;
-                break;
-            }
-        }
-    }
-    if (!extend) {
-        impl_->reset();
-        cached = 0;
-    }
+    // P24: keep the longest common prefix rather than all-or-nothing.  KV, indexer keys and the MSA blocks of
+    // a position depend only on the tokens up to it, and every position past the prefix is rewritten before it
+    // is read, so cutting n_past back is enough.  A chat client that does not echo the reasoning back diverges at
+    // the last assistant turn; the whole conversation used to be prefilled again on every turn.
+    int64_t cached = std::min<int64_t>(impl_->n_past, (int64_t)impl_->held.size());
+    if (cached > (int64_t)prompt.size()) cached = (int64_t)prompt.size();
+    int64_t lcp = 0;
+    while (lcp < cached && impl_->held[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
+    cached = lcp;
+    const bool extend = cached > 0;
+    if (!extend) impl_->reset();
+    else impl_->n_past = cached;
     gr.reused = (int)cached;
     gr.prompt = (int)prompt.size();
     const bool reforward = extend && (int64_t)prompt.size() == cached;
@@ -7146,6 +7144,7 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
             if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
                 gr.finish = "nonfinite";
                 gr.prompt_ms = ms_since(t0);
+                impl_->reset();   // the KV just written is not a prefix to reuse
                 return gr;
             }
         }
