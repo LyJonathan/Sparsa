@@ -853,6 +853,7 @@ struct Engine::Impl {
     // for the expert stream, so its layers hand the routed experts to the widest link; router and shared expert
     // stay on the layer's card.  Resolved by a bandwidth probe on the first prompt.
     std::vector<int> pf_xdev;
+    std::vector<double> pf_link_gbs;   // P16: measured pinned host -> device rate per device index (GB/s)
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
@@ -6173,6 +6174,7 @@ struct Engine::Impl {
                 if (gbs[(size_t)d] > gbs[(size_t)best]) best = d;
             for (int d = 0; d < n; ++d)
                 if (gbs[(size_t)best] >= 1.5 * gbs[(size_t)d]) pf_xdev[(size_t)d] = best;
+            pf_link_gbs = gbs;
             std::string line;
             for (int d = 0; d < n; ++d) {
                 char b[96];
@@ -6219,6 +6221,109 @@ struct Engine::Impl {
             }
         std::stable_sort(pf_entries.begin(), pf_entries.end(),
                          [](const PfEntry& a, const PfEntry& b) { return a.expert < b.expert; });
+
+        // P25: a short prompt gives most experts a handful of tokens, and copying one over PCIe (~1 ms on a
+        // 14 GB/s link) costs more than the CPU computing a token's worth of it from the pinned RAM tier.  The
+        // lightest RAM-tier experts go to a CPU thread while the card streams the rest, as many as keep the CPU's
+        // estimated time under the card's.  Only with unbuffered reads: the CPU thread owns the pool meanwhile, and
+        // the mapped-read staging (read_expert) would use it too.  Only for chunks up to 1024 tokens: rig-2 at
+        // 100 / 500 / 2000 tokens measured 5.8 -> 4.8 s, 10.2 -> 8.5 s and 25.5 -> 26.1 s (at 2000 the CPU's RAM
+        // reads slow the DMA more than the experts it takes save).
+        static const double cpu_gbs = [] {
+            const char* e = std::getenv("STRATA_PF_CPU_GBS");
+            return e ? std::atof(e) : 16.0;   // 0 turns the split off
+        }();
+        std::vector<char> on_cpu((size_t)nexp, 0);
+        std::vector<std::vector<std::pair<int, float>>> cpu_rows;   // per CPU expert: (token, weight)
+        std::vector<int> cpu_exp;
+        if (cpu_gbs > 0.0 && T <= 1024 && prefill_direct && !ram_inplace && L.ram_n > 0) {
+            std::vector<int> cnt((size_t)nexp, 0);
+            for (const PfEntry& en : pf_entries) ++cnt[(size_t)en.expert];
+            const double link = (size_t)xd < pf_link_gbs.size() && pf_link_gbs[(size_t)xd] > 0.0
+                                    ? pf_link_gbs[(size_t)xd] : 10.0;
+            const double eb = (double)L.expert_bytes;
+            const double g_one = eb / (link * 1e9);
+            double G = 0.0, C = 0.0;
+            std::vector<int> cand;
+            for (int e = 0; e < nexp; ++e) {
+                if (cnt[(size_t)e] == 0 || slot_of(e) >= 0) continue;
+                G += g_one;
+                if (L.ram_of[(size_t)e] >= 0) cand.push_back(e);
+            }
+            std::stable_sort(cand.begin(), cand.end(),
+                             [&](int a, int b) { return cnt[(size_t)a] < cnt[(size_t)b]; });
+            for (int e : cand) {
+                const double c = (double)cnt[(size_t)e] * eb / (cpu_gbs * 1e9);
+                if (C + c > G - g_one) break;
+                C += c;
+                G -= g_one;
+                on_cpu[(size_t)e] = 1;
+                cpu_exp.push_back(e);
+            }
+        }
+        if (!cpu_exp.empty()) {
+            std::vector<int> slot_in((size_t)nexp, -1);
+            for (size_t i = 0; i < cpu_exp.size(); ++i) slot_in[(size_t)cpu_exp[i]] = (int)i;
+            cpu_rows.resize(cpu_exp.size());
+            std::vector<PfEntry> keep;
+            keep.reserve(pf_entries.size());
+            for (const PfEntry& en : pf_entries) {
+                if (on_cpu[(size_t)en.expert]) cpu_rows[(size_t)slot_in[(size_t)en.expert]].push_back({en.tid, en.w});
+                else keep.push_back(en);
+            }
+            pf_entries.swap(keep);
+        }
+        std::vector<float> ycpu;
+        std::exception_ptr cpu_err;
+        std::thread cpu_thr;
+        double cpu_ms = 0.0;
+        if (!cpu_exp.empty()) {
+            ycpu.assign((size_t)T * (size_t)embd, 0.f);
+            cpu_thr = std::thread([&] {
+                try {
+                    const auto c0 = std::chrono::steady_clock::now();
+                    const int cap = (int)rows_cap;
+                    std::vector<float> xin((size_t)cap * embd), g((size_t)cap * ff), u((size_t)cap * ff),
+                        hid((size_t)cap * ff), yd((size_t)cap * embd);
+                    for (size_t i = 0; i < cpu_exp.size(); ++i) {
+                        const int e = cpu_exp[i];
+                        const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
+                        const uint8_t* ub = gb + L.expert_gu;
+                        const uint8_t* db = gb + 2 * L.expert_gu;
+                        const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
+                        const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
+                        const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
+                        const auto& rws = cpu_rows[i];
+                        for (size_t a = 0; a < rws.size(); a += (size_t)cap) {
+                            const int nt = (int)std::min<size_t>(rws.size() - a, (size_t)cap);
+                            for (int r = 0; r < nt; ++r)
+                                std::memcpy(xin.data() + (size_t)r * embd, hhost + (size_t)rws[a + r].first * embd,
+                                            (size_t)embd * sizeof(float));
+                            gemm_cpu_base(L.egate, gb, xin.data(), nt, embd, g.data(), ff);
+                            gemm_cpu_base(L.eup, ub, xin.data(), nt, embd, u.data(), ff);
+                            for (size_t q = 0; q < (size_t)nt * ff; ++q)
+                                hid[q] = swigluoai(g[q] * fg, u[q] * fu, alpha, limit);
+                            gemm_cpu_base(L.edown, db, hid.data(), nt, ff, yd.data(), embd);
+                            for (int r = 0; r < nt; ++r) {
+                                const float wgt = rws[a + r].second * fd;
+                                float* dst = ycpu.data() + (size_t)rws[a + r].first * embd;
+                                const float* src = yd.data() + (size_t)r * embd;
+                                for (int c = 0; c < embd; ++c) dst[c] += wgt * src[c];
+                            }
+                        }
+                    }
+                    cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+                } catch (...) {
+                    cpu_err = std::current_exception();
+                }
+            });
+        }
+        struct Joiner {   // a throw in the device loop must not destroy a joinable thread
+            std::thread& t;
+            ~Joiner() {
+                if (t.joinable()) t.join();
+            }
+        } cpu_join{cpu_thr};
 
         // Per projection, not per expert: the IQ2_XS pack has IQ2_XS gate/up and a Q2_0/IQ4_NL/F32 down, and MM-NVFP4
         // has its own type.  `gu_iq` / `d_iq` pick the int8 kernel or the dequantize-to-fp16 + cuBLAS fallback.
@@ -6441,8 +6546,18 @@ struct Engine::Impl {
                          t_disk > 0.0 ? (double)disk_bytes / (t_disk * 1.0e6) : 0.0, streamed.size(), n_vram, n_ram,
                          n_disk, n_tc);
         cu::sync();
-        cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
+        if (zero) std::fill(yout_host, yout_host + (size_t)T * embd, 0.f);   // every route went to the CPU
+        else cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         if (remote) use_device_index(own);
+        if (cpu_thr.joinable()) {
+            const auto tj = std::chrono::steady_clock::now();
+            cpu_thr.join();
+            if (cpu_err) std::rethrow_exception(cpu_err);
+            for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] += ycpu[i];
+            if (std::getenv("STRATA_MM_TIME"))
+                std::fprintf(stderr, "INFO batch-cpu experts=%zu cpu_ms=%.1f join_wait_ms=%.1f\n", cpu_exp.size(),
+                             cpu_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tj).count());
+        }
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;
         if (L.have_shared) {
             // The shared expert is a plain 1-head dense MLP: run it through the batched projection path.
