@@ -775,6 +775,7 @@ struct Engine::Impl {
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
+        void* swap_ev = nullptr;          // P22: recorded after a rebalance's async slot copies
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
         void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
         // P10: the shared expert's own buffers and stream.  It is independent of routing, so it is launched on `shs`
@@ -827,6 +828,7 @@ struct Engine::Impl {
     bool have_logits = false;
     std::mt19937_64 rng{0};
     Pool pool;
+    std::vector<std::vector<uint8_t>> requant_store;   // P19: host copies of requantized dense weights
 
     // ---- P5a: batched prompt processing.  `batch_cap` tokens per layer at a time; every buffer below lives on the
     // device that owns the layer being computed (one set per device).  Off unless --minimax-prefill-batch > 1.
@@ -979,6 +981,7 @@ struct Engine::Impl {
     std::vector<double> route_counts;   // undecayed counts for --minimax-profile-save
     uint64_t rebalance_tick = 0;
     uint64_t lru_tick = 0;
+    bool swap_inflight = false;      // P22: a rebalance copy may still be reading the RAM arena
     uint64_t swaps = 0;
 
     struct TokenStats {
@@ -2079,6 +2082,51 @@ struct Engine::Impl {
         use_device_index(0);
     }
 
+    // P19: STRATA_MM_DENSE_REQUANT=q6_K|q5_K|q4_K re-quantizes the Q8_0 attention projections and shared expert at
+    // load: per token the decode path streams attn_q + attn_output (107 MB a layer at Q8_0) and is bandwidth-bound
+    // on them, and the smaller copy also leaves VRAM for expert slots.  Rows are dequantized and requantized with
+    // ggml (no imatrix), split over the pool.
+    int dense_requant_type() const {
+        static const int t = [] {
+            const char* e = std::getenv("STRATA_MM_DENSE_REQUANT");
+            if (!e || !*e) return -1;
+            const std::string v = e;
+            if (v == "q6_K" || v == "Q6_K") return (int)GGML_TYPE_Q6_K;
+            if (v == "q5_K" || v == "Q5_K") return (int)GGML_TYPE_Q5_K;
+            if (v == "q4_K" || v == "Q4_K") return (int)GGML_TYPE_Q4_K;
+            return -1;
+        }();
+        return t;
+    }
+
+    void requant_dense(Tensor& t) {
+        const int to = dense_requant_type();
+        if (to < 0 || t.host == nullptr || t.type != (int)GGML_TYPE_Q8_0 || t.ne2 != 1 || t.ne0 % 256 != 0) return;
+        const int64_t cols = t.ne0, rows = t.ne1;
+        const size_t out_row = ggml_row_size((ggml_type)to, cols);
+        requant_store.emplace_back((size_t)rows * out_row);
+        uint8_t* dst = requant_store.back().data();
+        const ggml_type_traits* from = ggml_get_type_traits((ggml_type)t.type);
+        const int64_t chunk = 64;
+        const int nchunks = (int)((rows + chunk - 1) / chunk);
+        pool.run(nchunks, [&](int a, int b) {
+            std::vector<float> f((size_t)chunk * (size_t)cols);
+            for (int c = a; c < b; ++c) {
+                const int64_t r0 = (int64_t)c * chunk;
+                const int64_t nr = std::min<int64_t>(chunk, rows - r0);
+                for (int64_t r = 0; r < nr; ++r)
+                    from->to_float(t.host + (size_t)(r0 + r) * t.row_bytes, f.data() + (size_t)r * (size_t)cols, cols);
+                ggml_quantize_chunk((ggml_type)to, f.data(), dst + (size_t)r0 * out_row, 0, nr, cols, nullptr);
+            }
+        }, true);
+        t.type = to;
+        t.host = dst;
+        t.row_bytes = out_row;
+        t.bytes = (size_t)rows * out_row;
+        t.base = ggml_get_type_traits((ggml_type)to);
+        t.cpu = ggml_get_type_traits_cpu((ggml_type)to);
+    }
+
     void upload(Tensor& t) {
         const size_t n = (size_t)t.ne0 * (size_t)t.ne1 * (size_t)t.ne2;
         if (t.type == kF32) {
@@ -2166,6 +2214,13 @@ struct Engine::Impl {
             auto up = [&](Tensor& t) {
                 if (t.host && gpu_bytes(t) != std::numeric_limits<size_t>::max()) upload(t);
             };
+            if (L.moe) {
+                requant_dense(L.wq);
+                requant_dense(L.wo);
+                requant_dense(L.gate);
+                requant_dense(L.up);
+                requant_dense(L.down);
+            }
             up(L.wq);
             up(L.wk);
             up(L.wv);
@@ -2699,10 +2754,23 @@ struct Engine::Impl {
         use_device_index(L.dev);
         Layer::VramSlot& s = L.vram[(size_t)slot];
         uint8_t* p = (uint8_t*)s.mem.p;
-        cu::copy_h2d_async(p, L.egate.host + (size_t)expert * L.expert_gu, L.expert_gu, W().side);
-        cu::copy_h2d_async(p + L.expert_gu, L.eup.host + (size_t)expert * L.expert_gu, L.expert_gu, W().side);
-        cu::copy_h2d_async(p + 2 * L.expert_gu, L.edown.host + (size_t)expert * L.expert_down, L.expert_down,
-                           W().side);
+        // P22: copy from the pinned RAM tier when it holds the expert (a real async DMA); the mapping is pageable,
+        // so a copy from it blocks the host and can fault the expert in from the drive.
+        const uint8_t* g = L.egate.host + (size_t)expert * L.expert_gu;
+        const uint8_t* u = L.eup.host + (size_t)expert * L.expert_gu;
+        const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
+        if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
+            const int rs = L.ram_of[(size_t)expert];
+            if (rs >= 0 && rs < L.ram_n) {
+                const uint8_t* base = ram_slot_ptr(L, rs);
+                g = base;
+                u = base + L.expert_gu;
+                d = base + 2 * L.expert_gu;
+            }
+        }
+        cu::copy_h2d_async(p, g, L.expert_gu, W().side);
+        cu::copy_h2d_async(p + L.expert_gu, u, L.expert_gu, W().side);
+        cu::copy_h2d_async(p + 2 * L.expert_gu, d, L.expert_down, W().side);
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
@@ -2958,6 +3026,7 @@ struct Engine::Impl {
     // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
     // in `src`; a later SSD miss for this expert then costs a RAM read instead.
     void ram_admit(Layer& L, int expert, const uint8_t* src) {
+        wait_swaps();
         if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
@@ -2974,6 +3043,7 @@ struct Engine::Impl {
     // P6: the same admission from the three role buffers of a staging slot (the P6 read path keeps a role's bytes
     // in place instead of assembling one contiguous blob).
     void ram_admit3(Layer& L, int expert, const uint8_t* g, const uint8_t* u, const uint8_t* d) {
+        wait_swaps();
         if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
@@ -3035,6 +3105,7 @@ struct Engine::Impl {
             placed.push_back({a.e, victim});
         }
         if (pieces.empty()) return;
+        wait_swaps();
         pool.run((int)pieces.size(), [&](int x, int y) {
             for (int i = x; i < y; ++i)
                 std::memcpy(pieces[(size_t)i].dst, pieces[(size_t)i].src, pieces[(size_t)i].len);
@@ -3643,6 +3714,10 @@ struct Engine::Impl {
             }
             const int rs = L.ram_of[(size_t)e];
             if (rs >= 0) {
+                // P21: a hit refreshes the slot's tick, so eviction is LRU.  Without it the tick was the fill /
+                // admission order, and the static fill stamps the hottest expert first: every miss evicted the
+                // layer's hottest resident expert.
+                if ((size_t)rs < L.ram_tick.size()) const_cast<Layer&>(L).ram_tick[(size_t)rs] = ++lru_tick;
                 if (ram_inplace) {
                     // The page cache is the tier: read the expert where it is in the mapping.
                     cpu.push_back({e, j, false, L.egate.host + (size_t)e * L.expert_gu,
@@ -3991,13 +4066,25 @@ struct Engine::Impl {
                 any = true;
             }
         }
+        // P22: no sync.  The expert kernels that read a swapped slot run on the same side stream, after the copy;
+        // the only other reader of the source bytes is a RAM admission overwriting that arena slot, which waits
+        // on swap_ev first (ram_admit_many).
         if (any) {
             for (size_t d = 0; d < work.size(); ++d) {
                 if (!work[d].side) continue;
                 use_device_index((int)d);
-                cu::stream_sync(work[d].side);
+                if (!work[d].swap_ev) work[d].swap_ev = cu::event_create();
+                cu::event_record(work[d].swap_ev, work[d].side);
             }
+            swap_inflight = true;
         }
+    }
+
+    void wait_swaps() {
+        if (!swap_inflight) return;
+        for (size_t d = 0; d < work.size(); ++d)
+            if (work[d].swap_ev) cu::event_sync(work[d].swap_ev);
+        swap_inflight = false;
     }
 
     void decay_usage() {
@@ -6789,32 +6876,40 @@ struct Engine::Impl {
             if (sum > 0.f)
                 for (int i = 0; i < n; ++i) row[(size_t)i] /= sum;
         }
-        std::vector<int> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
-            return a < b;
-        });
         if (sp.top_p > 0.f && sp.top_p < 1.f) {
-            float c = 0.f;
+            // P20: the kept set is the shortest prefix of (prob desc, id asc) whose mass reaches top_p.  Rank only a
+            // candidate head of the vocabulary (nth_element, same total order, so the same ids in the same order as
+            // a full sort), widen it if its mass falls short, and mark the kept ids in a flag array.  It used to
+            // sort all 200 K ids and test every id against the kept list: O(vocab x kept) a sampled token.
+            auto before = [&](int a, int b) {
+                if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
+                return a < b;
+            };
+            std::vector<int> order(n);
+            std::iota(order.begin(), order.end(), 0);
             int keep = 0;
-            for (; keep < n; ++keep) {
-                c += row[(size_t)order[(size_t)keep]];
-                if (c >= sp.top_p) {
-                    ++keep;
-                    break;
-                }
-            }
-            if (keep < 1) keep = 1;
-            float sum = 0.f;
-            for (int i = 0; i < n; ++i) {
-                bool kept = false;
-                for (int j = 0; j < keep; ++j)
-                    if (order[(size_t)j] == i) {
-                        kept = true;
+            for (int head = std::min(n, 1024);; head = std::min(n, head * 8)) {
+                if (head < n) std::nth_element(order.begin(), order.begin() + head, order.end(), before);
+                std::sort(order.begin(), order.begin() + head, before);
+                float c = 0.f;
+                keep = 0;
+                bool reached = false;
+                for (; keep < head; ++keep) {
+                    c += row[(size_t)order[(size_t)keep]];
+                    if (c >= sp.top_p) {
+                        ++keep;
+                        reached = true;
                         break;
                     }
-                if (!kept) row[(size_t)i] = 0.f;
+                }
+                if (reached || head == n) break;
+            }
+            if (keep < 1) keep = 1;
+            std::vector<char> kept((size_t)n, 0);
+            for (int j = 0; j < keep; ++j) kept[(size_t)order[(size_t)j]] = 1;
+            float sum = 0.f;
+            for (int i = 0; i < n; ++i) {
+                if (!kept[(size_t)i]) row[(size_t)i] = 0.f;
                 sum += row[(size_t)i];
             }
             if (sum > 0.f)
