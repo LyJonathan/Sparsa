@@ -167,6 +167,20 @@ def find_mmproj(model: Path, explicit: str | None) -> Path | None:
     return found[0] if found else None
 
 
+def find_profile(model: Path, explicit: str | None, off: bool) -> Path | None:
+    """The routing profile: --profile, else routing-profile.bin beside the model.  It only decides which experts
+    start in VRAM / RAM / on the SSD; the math is the same with or without it."""
+    if off:
+        return None
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"sparsa: --profile {p} is not a file")
+        return p
+    p = model.parent / "routing-profile.bin"
+    return p if p.is_file() else None
+
+
 def build_config(args) -> dict:
     if not args.model:
         raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
@@ -197,6 +211,9 @@ def build_config(args) -> dict:
         # them off.
         cfg_args += ["--minimax-tiers", "--minimax-vram-slots-per-layer", str(args.vram_slots),
                      "--vram-reserve-mib", str(args.vram_reserve_mib)]
+        profile = find_profile(first, args.profile, args.no_profile)
+        if profile:
+            cfg_args += ["--minimax-profile", str(profile)]
         if args.ram_gib:
             cfg_args += ["--memory-limit-mib", str(int(args.ram_gib * 1024))]
     prefill_batch = prefill_batch_value(args.prefill_batch)
@@ -370,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--gpu", help="cards to use, as nvidia-smi numbers them (default: all)")
         p.add_argument("--cpu", action="store_true", help="run every matrix on the processor (tests only)")
         p.add_argument("--no-tiers", action="store_true", help="no RAM expert tier: every expert is read from the SSD")
+        p.add_argument("--profile", help="routing profile (default: routing-profile.bin beside the model, if any)")
+        p.add_argument("--no-profile", action="store_true", help="ignore routing-profile.bin")
         p.add_argument("--vram-slots", type=int, default=-1,
                        help="VRAM expert slots per layer (default -1: auto, sized after the prompt workspace; 0: off)")
         p.add_argument("--threads", type=int, help="CPU expert workers (default: the engine's own count)")
