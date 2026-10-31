@@ -191,9 +191,10 @@ def build_config(args) -> dict:
         # path).  "ram" is a different mode (device attention over a RAM KV) and is not the same thing.
         cfg_args += ["--minimax-kv", "host"]
     if not args.cpu and not args.no_tiers:
-        # The VRAM expert slots are OFF by default (0): the auto count is measured to leave too little VRAM for
-        # the batched-prefill workspace, and with 128 experts top-4 most routes are not resident anyway; the RAM
-        # tier is what makes the token fast.  --vram-slots N turns them on.
+        # The VRAM expert slots are auto (-1): the engine reserves the batched-prefill workspace first and sizes
+        # the slots from what is left.  rig-2 at 32 K context: 10 slots a layer, prompt speed unchanged, decode
+        # 6.6 / 6.9 -> 7.6 / 8.4 tok/s after the first request (which fills the slots).  --vram-slots 0 turns
+        # them off.
         cfg_args += ["--minimax-tiers", "--minimax-vram-slots-per-layer", str(args.vram_slots),
                      "--vram-reserve-mib", str(args.vram_reserve_mib)]
         if args.ram_gib:
@@ -369,8 +370,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--gpu", help="cards to use, as nvidia-smi numbers them (default: all)")
         p.add_argument("--cpu", action="store_true", help="run every matrix on the processor (tests only)")
         p.add_argument("--no-tiers", action="store_true", help="no RAM expert tier: every expert is read from the SSD")
-        p.add_argument("--vram-slots", type=int, default=0,
-                       help="VRAM expert slots per layer (default 0: off; the auto count starves prefill)")
+        p.add_argument("--vram-slots", type=int, default=-1,
+                       help="VRAM expert slots per layer (default -1: auto, sized after the prompt workspace; 0: off)")
         p.add_argument("--threads", type=int, help="CPU expert workers (default: the engine's own count)")
         p.add_argument("--vram-reserve-mib", type=int, default=700, help="VRAM kept free (default 700)")
         p.add_argument("--ram-gib", type=float, help="cap the RAM expert tier at this many GiB")
