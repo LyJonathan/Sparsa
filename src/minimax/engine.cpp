@@ -846,6 +846,11 @@ struct Engine::Impl {
     // expert's weights to fp16 once per chunk and runs the tokens routed to it through the FP16 tensor-core GEMM.
     std::string prefill_expert_gemm = "mmvq";
     int tc_expert_min_rows = 16;   // "auto": a group this small is not worth a weight dequantization
+    // P16: per device index, the device index whose card runs that card's layers' routed prompt experts.  A card
+    // on a narrow host link (rig-2 / the 2x5070 PC: GPU0 on Gen3 x4, ~3.5 GB/s) spends most of a layer waiting
+    // for the expert stream, so its layers hand the routed experts to the widest link; router and shared expert
+    // stay on the layer's card.  Resolved by a bandwidth probe on the first prompt.
+    std::vector<int> pf_xdev;
     bool prefill_direct = false;   // unbuffered expert reads (--minimax-prefill-read direct)
     bool prefill_kv_stage = false; // P8: stage one layer's K/V on the card for the batched prompt pass
     bool dense_mmvq = true;        // packed dense projections via native_mmvq (--minimax-dense-mmvq off)
@@ -6044,12 +6049,71 @@ struct Engine::Impl {
         }
     }
 
-    void moe_batch_gpu(const Layer& L, const float* hdev, const uint16_t* h16, int T, float* yout_host) {
-        PfBuf& p = P();
+    // P16: time a pinned host -> device copy on each card (the ring slots of the live prompt workspace) and send
+    // the routed prompt experts of a card whose link is 1.5x slower than the best to the best card.
+    void resolve_pf_xdev() {
+        const int n = (int)devs.size();
+        pf_xdev.assign((size_t)n, 0);
+        for (int d = 0; d < n; ++d) pf_xdev[(size_t)d] = d;
+        const std::string& want = opt.prefill_expert_device;
+        if (n < 2 || want == "own") return;
+        const int back = cur;
+        if (!want.empty() && want != "auto") {
+            const int d = std::atoi(want.c_str());
+            if (d < 0 || d >= n) fail("--minimax-prefill-expert-device: no device index " + want);
+            for (int i = 0; i < n; ++i) pf_xdev[(size_t)i] = d;
+        } else {
+            std::vector<double> gbs((size_t)n, 0.0);
+            for (int d = 0; d < n; ++d) {
+                use_device_index(d);
+                PfBuf& p = P();
+                if (p.ring_v.empty() || p.pin_v.empty()) continue;
+                const size_t bytes = std::min(p.ring_slot, p.pin_slot_bytes);
+                cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);   // warm-up
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int r = 0; r < 4; ++r) cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                gbs[(size_t)d] = s > 0.0 ? 4.0 * (double)bytes / s / 1e9 : 0.0;
+            }
+            int best = 0;
+            for (int d = 1; d < n; ++d)
+                if (gbs[(size_t)d] > gbs[(size_t)best]) best = d;
+            for (int d = 0; d < n; ++d)
+                if (gbs[(size_t)best] >= 1.5 * gbs[(size_t)d]) pf_xdev[(size_t)d] = best;
+            std::string line;
+            for (int d = 0; d < n; ++d) {
+                char b[96];
+                std::snprintf(b, sizeof b, "%sdev=%d %.1f GB/s -> %d", d ? ", " : "", devs[(size_t)d], gbs[(size_t)d],
+                              devs[(size_t)pf_xdev[(size_t)d]]);
+                line += b;
+            }
+            std::fprintf(stderr, "INFO minimax-prefill-expert-device %s\n", line.c_str());
+        }
+        use_device_index(back);
+    }
+
+    void moe_batch_gpu(const Layer& L, const float* hdev, const uint16_t* h16, const float* hhost, int T,
+                       float* yout_host) {
         const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
         const int embd = (int)cfg.n_embd, ff = (int)cfg.n_ff_exp;
-        gemm_gpu(L.router, h16, hdev, p.y32, T, nexp);
-        cu::copy_d2h(pf_router.data(), p.y32, (size_t)T * nexp * sizeof(float));
+        gemm_gpu(L.router, h16, hdev, P().y32, T, nexp);
+        cu::copy_d2h(pf_router.data(), P().y32, (size_t)T * nexp * sizeof(float));
+        // P16: the routed experts may run on another card (see pf_xdev); the router above and the shared expert
+        // below stay on the layer's own.
+        const int own = cur;
+        if (pf_xdev.empty()) resolve_pf_xdev();
+        const int xd = pf_xdev[(size_t)own];
+        const bool remote = xd != own;
+        const float* xin = hdev;   // the routed experts' input, on the card that runs them
+        if (remote) {
+            use_device_index(xd);
+            PfBuf& r = P();
+            cu::copy_h2d(r.p32, hhost, (size_t)T * embd * sizeof(float));
+            xin = r.p32;
+        }
+        PfBuf& p = P();
+        // A slot on the layer's own card is not reachable from the expert card: stream that expert too.
+        auto slot_of = [&](int e) { return remote || L.vram_of.empty() ? -1 : L.vram_of[(size_t)e]; };
         std::vector<int> ids;
         std::vector<float> wts;
         pf_routes(L, pf_router.data(), T, ids, wts);
@@ -6125,8 +6189,7 @@ struct Engine::Impl {
         // Stage streamed expert `si` (its index among the streamed groups) into slot si % ring_n.
         std::vector<int> streamed;   // group index of each streamed expert, in order
         for (size_t i = 0; i < grps.size(); ++i) {
-            const int v = L.vram_of.empty() ? -1 : L.vram_of[(size_t)grps[i].e];
-            if (v < 0) streamed.push_back((int)i);
+            if (slot_of(grps[i].e) < 0) streamed.push_back((int)i);
         }
         // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
         double t_disk = 0;                 // STRATA_MM_TIME: the direct-read side alone (the drive's rate)
@@ -6188,7 +6251,7 @@ struct Engine::Impl {
             const uint8_t* sg;
             const uint8_t* su;
             const uint8_t* sd;
-            const int slot = (L.vram_of.empty() ? -1 : L.vram_of[(size_t)e]);
+            const int slot = slot_of(e);
             if (slot >= 0) ++n_vram;
             else if (!ram_inplace && L.ram_n > 0 && L.ram_of[(size_t)e] >= 0) ++n_ram;
             else ++n_disk;
@@ -6235,20 +6298,20 @@ struct Engine::Impl {
                 const bool tc_d = tc_d_ok && (prefill_expert_gemm == "tc" || nt >= tc_expert_min_rows);
                 if (tc_gu && a == at) ++n_tc;
                 if (tc_gu) {
-                    cu::gather_rows_f16(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                    cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
                     gemm_expert_f16(gt, sg, L.egate.row_bytes, p.gx, p.gy, nt, ff, embd, ff);
                     gemm_expert_f16(L.eup.type, su, L.eup.row_bytes, p.gx, p.gu, nt, ff, embd, ff);
                 } else if (gu_iq) {
-                    cu::gather_rows_f32(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                    cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
                     strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
                     strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
                     strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
                 } else if (prefill_dense_f32) {
-                    cu::gather_rows_f32(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
+                    cu::gather_rows_f32(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx32, nullptr);
                     gemm_expert_gpu(gt, sg, L.egate.row_bytes, nullptr, p.gx32, p.gy, nt, ff, embd);
                     gemm_expert_gpu(gt, su, L.egate.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
                 } else {
-                    cu::gather_rows_f16(hdev, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
+                    cu::gather_rows_f16(xin, (const int32_t*)p.d_rows.p, nt, embd, p.gx, nullptr);
                     gemm_expert_gpu(gt, sg, L.egate.row_bytes, p.gx, nullptr, p.gy, nt, ff, embd);
                     gemm_expert_gpu(gt, su, L.egate.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
                 }
@@ -6286,6 +6349,7 @@ struct Engine::Impl {
                          n_disk, n_tc);
         cu::sync();
         cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
+        if (remote) use_device_index(own);
         for (size_t i = 0; i < (size_t)T * embd; ++i) yout_host[i] *= scale_routed;
         if (L.have_shared) {
             // The shared expert is a plain 1-head dense MLP: run it through the batched projection path.
@@ -6608,7 +6672,7 @@ struct Engine::Impl {
                 cu::copy_h2d(p.p32, hn, (size_t)T * ne * sizeof(float));
                 cu::f32_to_f16(p.p32, p.h16, (size_t)T * ne, nullptr);
                 cu::sync();
-                moe_batch_gpu(L, p.p32, p.h16, T, pf_moe_h.data());
+                moe_batch_gpu(L, p.p32, p.h16, hn, T, pf_moe_h.data());
             } else {
                 moe_batch_cpu(L, hn, T, pf_moe_h.data());
             }
