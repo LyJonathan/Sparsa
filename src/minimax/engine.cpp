@@ -1250,10 +1250,13 @@ struct Engine::Impl {
         // P9: `direct` is explicit; with a pinned-tier byte budget it is implied, because the budget cannot bound
         // the page cache the mmap path grows.  `mmap` stays available (and is the default without a budget): it is
         // faster when the whole expert set is meant to be cached.
+        // P45: also implied by the pinned tier itself (the default with --minimax-tiers): the arena holds the experts
+        // it can, the rest are SSD misses that P27's read-ahead reads unbuffered.  rig-2 uncapped: 4 K-context
+        // decode test prompts 57 tok/s with mmap, 86 with direct.
         stream_direct = opt.prefill_read == "direct" ||
-                        (opt.prefill_read.empty() && opt.memory_limit_mib > 0);
+                        (opt.prefill_read.empty() && (opt.memory_limit_mib > 0 || (opt.tiers && !ram_inplace)));
         if (stream_direct && opt.prefill_read != "direct")
-            std::fprintf(stderr, "INFO minimax-prefill-read=direct (implied by --memory-limit-mib; "
+            std::fprintf(stderr, "INFO minimax-prefill-read=direct (implied by --memory-limit-mib or the pinned tier; "
                                  "--minimax-prefill-read mmap keeps the page cache)\n");
         rb_in = opt.route_bias_in;
         rb_out = opt.route_bias_out;
@@ -2544,13 +2547,31 @@ struct Engine::Impl {
         size_t headroom = opt.ram_headroom_mib > 0 ? ((size_t)opt.ram_headroom_mib << 20)
                                                    : ram_headroom_auto(phys ? phys : avail);
         size_t ram_budget = 0;
-        const size_t overhead = dense_host_bytes + host_kv_bytes + host_work_bytes;
+        // P45: the batched prompt's page-locked host side as well: its activation buffers (P38: hidden state, normed
+        // input, FFN / shared / other-card outputs, the fp16 upload, the attention queries), the expert ring's and the
+        // SSD read-ahead's staging slots per card (P27, P39), and ~512 MiB of CUDA's own host memory per card.
+        // Without them an uncapped run (sparsa.py's default) pinned past the box: rig-2, 121 GB, OOM-killed at load
+        // with 106 GB resident.
+        size_t prompt_host_bytes = 0;
+        if (opt.prefill_batch > 1) {
+            const size_t tcap = (size_t)std::min<int64_t>(opt.prefill_batch, ctx);
+            const size_t qlen = (size_t)(cfg.n_head * cfg.head_dim), klen = (size_t)(cfg.n_head_kv * cfg.head_dim);
+            prompt_host_bytes += tcap * ((size_t)cfg.n_embd * (5 * 4 + 2) + qlen * 4 * 2 + klen * 4 * 2 +
+                                         (size_t)cfg.n_expert * 4);
+            prompt_host_bytes += (size_t)devs.size() * (8 + 24) * (max_expert_bytes + ((size_t)64 << 10));
+        }
+        prompt_host_bytes += (size_t)devs.size() * ((size_t)512 << 20);
+        const size_t overhead = dense_host_bytes + host_kv_bytes + host_work_bytes + prompt_host_bytes;
         if (opt.memory_limit_mib > 0) {
             ram_budget = (size_t)opt.memory_limit_mib << 20;
         } else {
             const size_t hold = phys ? phys : avail;
             const size_t room = hold > headroom + overhead ? hold - headroom - overhead : 0;
-            const size_t free_now = avail > headroom / 2 ? avail - headroom / 2 : 0;
+            // Pinned pages cannot be reclaimed, so against what is available *now* (which counts page cache the OS
+            // will not fully give up) keep twice the headroom: with one, rig-2 (121 GB, 113 available) pinned ~104 GB
+            // and was OOM-killed at load.
+            const size_t keep = 2 * headroom + prompt_host_bytes;
+            const size_t free_now = avail > keep ? avail - keep : 0;
             ram_budget = std::min(room, free_now);
         }
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
