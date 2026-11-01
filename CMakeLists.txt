@@ -320,6 +320,10 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME host_limits_test COMMAND host_limits_test)
 
   # MiniMax's automatic VRAM expert-slot sizing, including the batched-prefill reserve: header-only, no GPU
+  add_executable(ram_plan_test tests/minimax/ram_plan_test.cpp)
+  target_include_directories(ram_plan_test PRIVATE include)
+  add_test(NAME ram_plan_test COMMAND ram_plan_test)
+
   add_executable(vram_plan_test tests/minimax/vram_plan_test.cpp)
   target_include_directories(vram_plan_test PRIVATE include)
   add_test(NAME vram_plan_test COMMAND vram_plan_test)

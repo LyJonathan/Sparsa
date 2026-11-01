@@ -65,6 +65,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
+#include "strata/minimax/ram_plan.hpp"
 #include "strata/minimax/vram_plan.hpp"
 
 namespace strata::minimax {
@@ -552,12 +553,8 @@ size_t host_total_bytes() {
 // paged out) and too large on a 32 GB one, where it is 6% of the machine.  1/16 of physical, clamped to 3-10 GiB,
 // is the shape Project Maya exposes as STRATA_GLM_RAM_HEADROOM_GB (6 GiB default) and the one Strata-DS's laptop
 // notes use; the number below is sized from the machine rather than fixed, so 32 GB, 64 GB and 128 GB all work.
-size_t ram_headroom_auto(size_t phys) {
-    size_t v = phys / 16;
-    if (v < ((size_t)3 << 30)) v = (size_t)3 << 30;
-    if (v > ((size_t)10 << 30)) v = (size_t)10 << 30;
-    return v;
-}
+// ram_headroom_auto / ram_tier_budget live in strata/minimax/ram_plan.hpp: the automatic plan has to keep the 10 GB
+// floor and the working set the run grows above the tier (6.6 GiB measured), which the old local rule did not.
 
 // ---- STRP, byte for byte the format tools/make_profile.py and src/core/expert_cache.cpp read.  MiniMax has one
 // profile row per MoE layer (57 x 128 for M3.1), not per model layer: dense layers have no routed experts.
@@ -2426,10 +2423,7 @@ struct Engine::Impl {
         if (opt.memory_limit_mib > 0) {
             ram_budget = (size_t)opt.memory_limit_mib << 20;
         } else {
-            const size_t hold = phys ? phys : avail;
-            const size_t room = hold > headroom + overhead ? hold - headroom - overhead : 0;
-            const size_t free_now = avail > headroom / 2 ? avail - headroom / 2 : 0;
-            ram_budget = std::min(room, free_now);
+            ram_budget = ram_tier_budget(phys ? phys : avail, avail, headroom, overhead);
         }
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
         // more slots than a cold one.  With a uniform count the layer budgets ignore the routing profile entirely;
