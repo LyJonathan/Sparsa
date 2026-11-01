@@ -1617,6 +1617,13 @@ struct Engine::Impl {
                 if (L.gu_split && !(strata::kernels::iq_supported(L.type_g) && strata::kernels::iq_supported(L.type_u)))
                     fail(b + "gate and up experts have different types, and one is not an i-quant or Q8_0 (" +
                          std::to_string(L.type_g) + " and " + std::to_string(L.type_u) + ")");
+                // Load-time invariants the expert paths rely on: each expert's gate (up) matrix is ne1 whole rows, and
+                // a split layer's down type needs a GPU kernel that takes the split gate/up outputs.
+                if (L.egate.row_bytes * (size_t)L.egate.ne1 != L.stride_g || L.eup.row_bytes * (size_t)L.eup.ne1 != L.stride_u)
+                    fail(b + "expert gate/up bytes per expert are not ne1 rows of row_bytes");
+                if (L.gu_split && !iq_expert_type(L.edown.type))
+                    fail(b + "gate and up experts have different types, and the down type (" + std::to_string(L.edown.type) +
+                         ") is not an i-quant or Q8_0");
                 if (cfg.n_shared_experts > 0) {
                     L.have_shared = true;
                     L.gate = must(b + "ffn_gate_shexp.weight");
@@ -3651,18 +3658,21 @@ struct Engine::Impl {
 
     // The synchronizing form (raw expert types, or a call site that does not split GPU and CPU work).
     void gpu_experts(const Layer& L, const std::vector<int>& exps, const float* in, std::vector<float>& out) {
-        // A split gate/up layer has only the async pair (gpu_experts_begin / gpu_experts_finish) for i-quants.
-        if (L.gu_split && gpu_experts_begin(L, exps, in)) {
-            gpu_experts_finish((int)exps.size(), out);
-            return;
-        }
         const int k = (int)exps.size();
         if (k == 0) return;
+        // A split gate/up layer runs only the async pair (gpu_experts_begin / gpu_experts_finish).  It must never reach
+        // the single-type path below, which reads one type and one stride for gate and up.
+        if (L.gu_split) {
+            if (!gpu_experts_begin(L, exps, in)) fail("internal: a split gate/up layer has no GPU expert path");
+            gpu_experts_finish(k, out);
+            return;
+        }
         use_device_index(L.dev);
         if (gpu_experts_begin(L, exps, in)) {
             gpu_experts_finish(k, out);
             return;
         }
+        if (L.gu_split) fail("internal: the single-type GPU expert path was reached for a split gate/up layer");
         Work& w = W();
         std::vector<const void*> gp((size_t)k), up((size_t)k), dp((size_t)k);
         for (int i = 0; i < k; ++i) {
@@ -6464,6 +6474,9 @@ struct Engine::Impl {
                 else keep.push_back(en);
             }
             pf_entries.swap(keep);
+            // The grouped and per-expert CPU passes below take each expert's gate, up and down from its RAM-tier slot.
+            for (int e : cpu_exp)
+                if (L.ram_of[(size_t)e] < 0) fail("internal: a CPU-lane expert is not in the RAM tier");
         }
         std::vector<float> ycpu;
         std::exception_ptr cpu_err;
