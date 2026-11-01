@@ -594,6 +594,7 @@ __global__ void __launch_bounds__(128) msa_attn_wmma_kernel(const __half* __rest
     float* run_l = run_m + kWmmaH;                                 // [16]
     int* bstart = (int*)(run_l + kWmmaH);                          // [max_blk + 1]: entries before each used block
     int* bpos = bstart + max_blk + 1;                              // [max_blk]: first position of each used block
+    int* cpos = bpos + max_blk;                                    // [64]: this chunk's positions (P43)
     const long long t = (long long)blockIdx.x;
     const int kv = (int)blockIdx.y;
     const int hkv = (int)gridDim.y;
@@ -649,13 +650,17 @@ __global__ void __launch_bounds__(128) msa_attn_wmma_kernel(const __half* __rest
         for (int i = tid; i < kWmmaC * (kWmmaD / 8); i += 128) {
             const int r = i / (kWmmaD / 8), c = i % (kWmmaD / 8);
             uint4 val = make_uint4(0u, 0u, 0u, 0u);
-            if (r < cn) val = *(const uint4*)(src + ((long long)entry_pos(base + r) * hkv + kv) * kWmmaD + c * 8);
+            if (r < cn) val = *(const uint4*)(src + ((long long)cpos[r] * hkv + kv) * kWmmaD + c * 8);
             *(uint4*)(kvs + r * kWmmaLdK + c * 8) = val;
         }
     };
 
     for (int base = 0; base < n; base += kWmmaC) {
         const int cn = (n - base) < kWmmaC ? (n - base) : kWmmaC;
+        // P43: the chunk's 64 positions once, instead of a binary search per 16-byte load (8 per thread for K and
+        // again for V): 1.6-1.75x on rig-2's 5060 Ti, bit-identical.
+        if (tid < kWmmaC) cpos[tid] = tid < cn ? entry_pos(base + tid) : 0;
+        __syncthreads();
         load_rows(k, base, cn);
         __syncthreads();
         {   // S[:, warp*16 .. +16] = Q K^T
@@ -1484,7 +1489,8 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
         dim == kWmmaD) {
         const size_t shm = (size_t)kWmmaH * kWmmaLdQ * 2 + (size_t)kWmmaC * kWmmaLdK * 2 +
                            (size_t)kWmmaH * kWmmaLdS * 4 + 2 * (size_t)kWmmaH * kWmmaLdP * 2 +
-                           (size_t)kWmmaH * kWmmaLdO * 4 + 2 * kWmmaH * 4 + (2 * (size_t)max_blk + 1) * 4;
+                           (size_t)kWmmaH * kWmmaLdO * 4 + 2 * kWmmaH * 4 + (2 * (size_t)max_blk + 1) * 4 +
+                           (size_t)kWmmaC * 4;
         static bool shm_set[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
