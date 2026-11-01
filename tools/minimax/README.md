@@ -755,17 +755,27 @@ ends: on a 32 GB box it is 6% of the machine, on a 128 GB box it is less than th
 to the engine, and it ignored the dense weights that must stay resident. The budget is now
 
 ```
-budget = min(physical, available now) - headroom - dense_host - host_kv - host_workspace
-headroom = physical / 16, clamped to 3-10 GiB     (--minimax-ram-headroom-mib overrides it)
+budget = min(physical - headroom - dense_host - host_kv - host_workspace - prompt, available now - keep)
+keep   = max(2 x headroom, 8 GiB, physical / 10) + prompt + mapped_dense   (the last one: Windows only)
+headroom = physical / 16, clamped to 3-10 GiB     (--minimax-ram-headroom-mib overrides it: then keep = 2 x headroom)
 ```
 
 * `dense_host` is every dense tensor the engine did not upload (attention projections, dense MLP, the shared
   expert, the router, the embedding, and `lm_head` when it stays on the host). They are read on every token, so
   a tier that takes their pages away buys SSD misses with page faults, which is worse.
+* `mapped_dense` is `dense_host` less the embedding (which is gathered a row at a time). On Windows those pages
+  are in the working set of the file mapping after the snapshot, and `AvailPhys` does not count them until the
+  lazy working-set trimmer gives them back, so the budget keeps them out. Linux counts clean file pages as
+  available, so there the term is zero and the margin is what it was. A budget that ignored them ran a tier of
+  74 GiB with 12.8 GiB of host dense down to 9.8 GiB available on the 128 GB PC.
+* `prompt` is the batched-prompt pools (pinned staging, the expert ring and the SSD read-ahead slots, the host
+  activations) at the configured prompt chunk, plus ~512 MiB of CUDA's own host memory per card.
 * `host_kv` is the fp16 K/V and indexer K for the whole context (zero with `--minimax-kv vram`); the workspace is
   the token vectors, MLP scratch and the full-vocabulary logits.
-* The plan is printed once at startup (`INFO minimax-ram-tier plan budget=... headroom=... dense_host=...`) so the
-  arithmetic is visible on a machine that behaves differently from this one.
+* The plan is printed once at startup (`INFO minimax-ram-tier plan budget=... headroom=... dense_host=... keep=...
+  mapped=... avail=...`) so the arithmetic is visible on a machine that behaves differently from this one.
+* An explicit `--memory-limit-mib` is the pinned tier's byte budget and is used as given: it does not cap the
+  dense, KV or prompt pools. When it is more than the box keeps free the plan prints a `WARN minimax-ram-tier`.
 * If the operating system refuses to pin that much (`PinnedArena` fails), an automatic budget steps down 15% at a
   time and says so, instead of failing the run. An explicit `--memory-limit-mib` or
   `--minimax-ram-experts-per-layer` still fails loudly: the operator asked for that number.

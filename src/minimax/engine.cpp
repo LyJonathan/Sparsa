@@ -5,6 +5,7 @@
 // type's vec_dot_type) plus swigluoai. KV is fp16 on the host only; nothing is mirrored to the device until a GPU
 // attention kernel exists. See include/strata/minimax/forward.hpp.
 #include "strata/minimax/forward.hpp"
+#include "strata/minimax/ram_budget.hpp"
 
 #include "strata/kernels/cpu/iqk_quants.hpp"
 #include "strata/kernels/iqk_types.hpp"
@@ -2590,16 +2591,35 @@ struct Engine::Impl {
         }
         prompt_host_bytes += (size_t)devs.size() * ((size_t)512 << 20);
         const size_t overhead = dense_host_bytes + host_kv_bytes + host_work_bytes + prompt_host_bytes;
+        // What the budget must leave free (ram_budget.hpp): the margin, the batched-prompt pools that are allocated after
+        // this point, and on Windows the CPU-resident dense weights.  The dense term was the one the old
+        // keep (2 x headroom + prompt) missed.  `dense_host_bytes` only reached `room`, which is measured against the
+        // physical total and never binds, so a box whose layers did not all fit on the cards pinned the tier into RAM
+        // that its own dense pages then took back: a 74.2 GiB tier with 12.8 GiB of host dense ran down to 9.8 GiB
+        // available (watchdog).  The embedding is gathered a row at a time, so only the rest of the host dense set stays
+        // resident.  Linux counts clean file pages as available, so there the term is zero.
+#if defined(_WIN32)
+        const size_t mapped_resident = dense_host_bytes > embd.bytes ? dense_host_bytes - embd.bytes : 0;
+#else
+        const size_t mapped_resident = 0;
+#endif
+        const size_t keep = strata::minimax::ram_keep_bytes(phys, headroom, opt.ram_headroom_mib <= 0,
+                                                            prompt_host_bytes, mapped_resident);
+        const size_t free_now = avail > keep ? avail - keep : 0;
         if (opt.memory_limit_mib > 0) {
+            // The explicit cap is the pinned tier's byte budget and is used as given; this only says when it is more than
+            // the box keeps free.
             ram_budget = (size_t)opt.memory_limit_mib << 20;
+            if (ram_budget > free_now)
+                std::fprintf(stderr,
+                             "WARN minimax-ram-tier --memory-limit-mib %d is %.1f GiB more than the %.1f GiB this box "
+                             "keeps free after the other host pools (available %.1f GiB, keep %.1f GiB)\n",
+                             opt.memory_limit_mib, (double)(ram_budget - free_now) / 1073741824.0,
+                             (double)free_now / 1073741824.0, (double)avail / 1073741824.0,
+                             (double)keep / 1073741824.0);
         } else {
             const size_t hold = phys ? phys : avail;
             const size_t room = hold > headroom + overhead ? hold - headroom - overhead : 0;
-            // Pinned pages cannot be reclaimed, so against what is available *now* (which counts page cache the OS
-            // will not fully give up) keep twice the headroom: with one, rig-2 (121 GB, 113 available) pinned ~104 GB
-            // and was OOM-killed at load.
-            const size_t keep = 2 * headroom + prompt_host_bytes;
-            const size_t free_now = avail > keep ? avail - keep : 0;
             ram_budget = std::min(room, free_now);
         }
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
@@ -2734,7 +2754,7 @@ struct Engine::Impl {
                 std::fprintf(stderr,
                              "INFO minimax-ram-tier plan budget=%.1f GiB headroom=%.1f GiB dense_host=%.1f GiB "
                              "kv=%.1f GiB reserved=%.1f GiB slots=%zu experts/layer=%d..%d mean=%.1f "
-                             "source=%s mode=%s\n",
+                             "source=%s mode=%s keep=%.1f GiB mapped=%.1f GiB avail=%.1f GiB\n",
                              (double)ram_budget / 1073741824.0, (double)headroom / 1073741824.0,
                              (double)dense_host_bytes / 1073741824.0, (double)host_kv_bytes / 1073741824.0,
                              (double)ram_bytes / 1073741824.0, slots, rmin, rmax,
@@ -2742,7 +2762,8 @@ struct Engine::Impl {
                              opt.memory_limit_mib > 0
                                  ? "--memory-limit-mib"
                                  : (opt.ram_experts_per_layer >= 0 ? "--minimax-ram-experts-per-layer" : "auto"),
-                             ram_inplace ? "inplace" : "pinned");
+                             ram_inplace ? "inplace" : "pinned", (double)keep / 1073741824.0,
+                             (double)mapped_resident / 1073741824.0, (double)avail / 1073741824.0);
                 mem_probe("tier-plan");
             }
             (void)bytes;
