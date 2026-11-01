@@ -6285,14 +6285,16 @@ struct Engine::Impl {
         const int own = cur;
         if (pf_xdev.empty()) resolve_pf_xdev();
         // P29: when a layer's experts go to the other card for its faster link (P16), the layer's own card still
-        // holds that layer's VRAM-slot experts.  With STRATA_PF_DUAL_MIN tokens or more in the chunk (default 512;
+        // holds that layer's VRAM-slot experts.  With STRATA_PF_DUAL_MIN tokens or more in the chunk (default 1025;
         // 0 = off) the own card computes those itself, and the shared expert, while the other card streams and
         // computes the rest; otherwise the slot experts would be streamed (or read from the SSD, since the RAM tier
         // leaves them out).  Giving the slow card a share of the streamed experts as well measured slower on rig-2
         // (4 K prompt 153 vs 161 tok/s): its 2.9 GB/s link and the second host thread cost more than they saved.
+        // The default starts above P25's CPU split (<= 1024 tokens): with both on, rig-2's 800-token prompt took
+        // 9.8 s against 7.1 s without this split; at 2048 tokens it is 11.9 s against 12.9 s.
         static const int dual_min = [] {
             const char* e = std::getenv("STRATA_PF_DUAL_MIN");
-            return e ? std::atoi(e) : 512;
+            return e ? std::atoi(e) : 1025;
         }();
         const int other = devs.size() == 2 ? 1 - own : -1;
         const bool dual = dual_min > 0 && other >= 0 && T >= dual_min && prefill_direct && !ram_inplace &&
