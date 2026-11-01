@@ -111,6 +111,41 @@ struct Tensor {
     const ggml_type_traits* base = nullptr;
 };
 
+// P38: page-locked host memory for the batched prompt's per-layer activation buffers.  A pageable cudaMemcpy runs
+// through the driver's bounce buffer (slower, and synchronous), and a fresh std::vector of [T][embd] floats per layer
+// zero-fills 100 MB at 4 K.  Falls back to malloc when no CUDA device answers (the CPU-only build path).
+template <class T>
+struct PinnedAlloc {
+    using value_type = T;
+    PinnedAlloc() = default;
+    template <class U>
+    PinnedAlloc(const PinnedAlloc<U>&) {}
+    T* allocate(size_t n) {
+        const size_t bytes = n * sizeof(T) + 64;
+        uint8_t* p = nullptr;
+        uint8_t tag = 1;
+        try {
+            p = (uint8_t*)cu::host_alloc(bytes);
+        } catch (...) {
+            p = (uint8_t*)std::malloc(bytes);
+            tag = 2;
+            if (!p) throw std::bad_alloc();
+        }
+        p[0] = tag;
+        return (T*)(p + 64);
+    }
+    void deallocate(T* q, size_t) {
+        uint8_t* p = (uint8_t*)q - 64;
+        if (p[0] == 1) cu::host_free(p);
+        else std::free(p);
+    }
+    template <class U>
+    bool operator==(const PinnedAlloc<U>&) const { return true; }
+    template <class U>
+    bool operator!=(const PinnedAlloc<U>&) const { return false; }
+};
+using PinnedVec = std::vector<float, PinnedAlloc<float>>;
+
 struct Layer {
     bool moe = false;
     bool indexer = false;
@@ -929,15 +964,17 @@ struct Engine::Impl {
     std::vector<float> pf_tok_w;     // [T*top] combine weights
     std::vector<int32_t> pf_ent_row; // [T*top] row into the layer's routed output
     std::vector<float> pf_router;    // [T*nexp] router logits (host)
-    std::vector<float> pf_h;         // [T*embd] host hidden state
-    std::vector<float> pf_q, pf_kv;  // [T*qlen] / [T*klen] host
+    PinnedVec pf_h;                  // [T*embd] host hidden state
+    PinnedVec pf_q;                  // [T*qlen] host
+    std::vector<float> pf_kv;        // [T*klen] host
     std::vector<int32_t> pf_blk;     // [T*idx_heads*top_k]
     std::vector<int32_t> pf_nblk;    // [T*idx_heads]
     std::vector<uint16_t> pf_k16, pf_v16;
     std::vector<float> pf_att_h;   // P7: device attention output when the layer's projection is on the CPU
     std::vector<int32_t> pf_pos;      // [T] chunk positions for the fused norm+rope kernel
     std::vector<float> pf_gate_h, pf_up_h, pf_hid_h;
-    std::vector<float> pf_moe_h;     // [T][embd] the layer's FFN output on the host
+    PinnedVec pf_moe_h;              // [T][embd] the layer's FFN output on the host
+    PinnedVec pf_sh_out, pf_yb_part; // P38: the shared expert's output and the other card's routed part (P29)
     std::vector<float> pf_dense_h;   // [T][max_dense_n] host intermediate for the CPU dense MLP
     std::vector<float> pf_out_tile;  // [T][lm_head tile] host staging for the output projection
 
@@ -6230,6 +6267,8 @@ struct Engine::Impl {
                        float* yout_host) {
         const int nexp = (int)cfg.n_expert, top = (int)cfg.n_expert_used;
         const int embd = (int)cfg.n_embd, ff = (int)cfg.n_ff_exp;
+        using mclock = std::chrono::steady_clock;
+        const auto mt0 = mclock::now();
         gemm_gpu(L.router, h16, hdev, P().y32, T, nexp);
         cu::copy_d2h(pf_router.data(), P().y32, (size_t)T * nexp * sizeof(float));
         // P16: the routed experts may run on another card (see pf_xdev); the router above and the shared expert
@@ -6398,6 +6437,7 @@ struct Engine::Impl {
         const bool tc_gu_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(gt) && tc_expert_type(L.eup.type) &&
                               (cfg.n_embd % 256) == 0;
         const bool tc_d_ok = prefill_expert_gemm != "mmvq" && tc_expert_type(dt) && (cfg.n_ff_exp % 256) == 0;
+        const auto mt1 = mclock::now();
         auto& own_slot_of = slot_of;
         // One card's share of the routed experts, run on the calling thread's current device; `yout_host` gets that
         // card's (unscaled) sum over `ents`.
@@ -6409,6 +6449,7 @@ struct Engine::Impl {
             static const bool gpu_time = std::getenv("STRATA_MM_GPU_TIME") != nullptr;
             struct GEv { void* a; void* b; void* c; int nt; };
             std::vector<GEv> gpu_evs;
+            std::vector<std::pair<void*, void*>> copy_evs;   // STRATA_MM_GPU_TIME: each streamed expert's copy
             std::vector<int32_t> row_t((size_t)rows_cap);
             std::vector<float> row_w((size_t)rows_cap);
 
@@ -6548,7 +6589,17 @@ struct Engine::Impl {
                 uint8_t* dst = (uint8_t*)p.ring_v[(size_t)slot];
                 const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
                 const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+                void* cev0 = nullptr;
+                if (gpu_time) {
+                    cev0 = cu::event_create_timed();
+                    cu::event_record(cev0, p.copy_stream);
+                }
                 for (int r = 0; r < 3; ++r) cu::copy_h2d_async(dst + off[r], src[r], len[r], p.copy_stream);
+                if (gpu_time) {
+                    void* cev1 = cu::event_create_timed();
+                    cu::event_record(cev1, p.copy_stream);
+                    copy_evs.push_back({cev0, cev1});
+                }
                 cu::event_record(p.ev_copy[(size_t)slot], p.copy_stream);
             };
             int primed = 0;
@@ -6778,16 +6829,29 @@ struct Engine::Impl {
                     cu::event_destroy(g.b);
                     cu::event_destroy(g.c);
                 }
-                std::fprintf(stderr, "INFO batch-gpu groups=%zu rows=%ld gu_ms=%.1f down_ms=%.1f embd=%d ff=%d nexp=%d top=%d\n",
-                             gpu_evs.size(), rows, gu_ms, d_ms, embd, ff, nexp, top);
+                double c_ms = 0;
+                for (auto& ce : copy_evs) {
+                    c_ms += cu::event_elapsed_ms(ce.first, ce.second);
+                    cu::event_destroy(ce.first);
+                    cu::event_destroy(ce.second);
+                }
+                std::fprintf(stderr, "INFO batch-gpu groups=%zu rows=%ld gu_ms=%.1f down_ms=%.1f copies=%zu copy_ms=%.1f copy_gbs=%.2f\n",
+                             gpu_evs.size(), rows, gu_ms, d_ms, copy_evs.size(), c_ms,
+                             c_ms > 0 ? (double)copy_evs.size() * L.expert_bytes / (c_ms * 1e6) : 0.0);
             }
             if (zero) std::fill(yout_host, yout_host + (size_t)T * embd, 0.f);   // every route went to the CPU
             else cu::copy_d2h(yout_host, p.sh, (size_t)T * embd * sizeof(float));
         };
-        std::vector<float> yb_part, sh_out;   // the other card's routed part (P29) and the shared expert
+        PinnedVec& yb_part = pf_yb_part;   // the other card's routed part (P29)
+        PinnedVec& sh_out = pf_sh_out;     // the shared expert
+        bool yb_used = false;              // both keep their size across layers: a resize to the same size is free
+        bool sh_used = false;
         bool shared_done = false;
         auto run_shared = [&] {
-            if (L.have_shared) shared_batch_gpu(L, hdev, h16, T, sh_out);
+            if (L.have_shared) {
+                shared_batch_gpu(L, hdev, h16, T, sh_out);
+                sh_used = true;
+            }
             shared_done = true;
         };
         if (!dual) {
@@ -6798,7 +6862,10 @@ struct Engine::Impl {
                 if (tier_of(e) == 0) side[(size_t)e] = 0;
             std::vector<PfEntry> ea, eb2;
             for (const PfEntry& en : pf_entries) (side[(size_t)en.expert] == 0 ? ea : eb2).push_back(en);
-            if (!eb2.empty()) yb_part.assign((size_t)T * embd, 0.f);
+            if (!eb2.empty()) {
+                yb_part.resize((size_t)T * embd);   // run_side writes every element
+                yb_used = true;
+            }
             std::exception_ptr berr;
             double b_ms = 0;
             using dclock = std::chrono::steady_clock;
@@ -6828,8 +6895,10 @@ struct Engine::Impl {
                 std::fprintf(stderr, "INFO batch-dual own=%zu other=%zu wall own=%.0f other=%.0f\n",
                              ea.size(), eb2.size(), a_ms, b_ms);
         }
+        const auto mt2 = mclock::now();
         if (remote) use_device_index(own);
         if (!shared_done) run_shared();
+        const auto mt3 = mclock::now();
         if (cpu_thr.joinable()) {
             const auto tj = std::chrono::steady_clock::now();
             cpu_thr.join();
@@ -6838,10 +6907,15 @@ struct Engine::Impl {
                 std::fprintf(stderr, "INFO batch-cpu experts=%zu cpu_ms=%.1f join_wait_ms=%.1f\n", cpu_exp.size(),
                              cpu_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tj).count());
         }
+        if (std::getenv("STRATA_MM_TIME"))
+            std::fprintf(stderr, "INFO batch-moe route=%.1f routed=%.1f shared=%.1f%c",
+                         std::chrono::duration<double, std::milli>(mt1 - mt0).count(),
+                         std::chrono::duration<double, std::milli>(mt2 - mt1).count(),
+                         std::chrono::duration<double, std::milli>(mt3 - mt2).count(), 10);
         // y = (routed [+ the other card's part] [+ the CPU's part]) * scale + shared, one parallel pass.
-        const float* add_b = yb_part.empty() ? nullptr : yb_part.data();
+        const float* add_b = yb_used ? yb_part.data() : nullptr;
         const float* add_c = ycpu.empty() ? nullptr : ycpu.data();
-        const float* add_s = sh_out.empty() ? nullptr : sh_out.data();
+        const float* add_s = sh_used ? sh_out.data() : nullptr;
         pool.run(T, [&](int a, int b) {
             for (size_t i = (size_t)a * embd; i < (size_t)b * embd; ++i) {
                 float y = yout_host[i];
@@ -6855,13 +6929,27 @@ struct Engine::Impl {
     }
 
     // The shared expert of `moe_batch_gpu`, on the layer's own card, into `sh` (unscaled, [T][embd]).
-    void shared_batch_gpu(const Layer& L, const float* hdev, const uint16_t* h16, int T, std::vector<float>& sh) {
+    void shared_batch_gpu(const Layer& L, const float* hdev, const uint16_t* h16, int T, PinnedVec& sh) {
         const int embd = (int)cfg.n_embd;
         {
             // The shared expert is a plain 1-head dense MLP: run it through the batched projection path.
             PfBuf& q = P();
             const int sff = (int)L.gate.ne1;
             sh.resize((size_t)T * embd);
+            // P37: the whole chunk in one pass when the chunk-wide buffers hold it (fp16 path): gate into y32, up
+            // into sh, swiglu to a16, down into y32, one copy back.  The rows_cap loop below re-dequantized all three
+            // matrices and synced per 1024 rows (rig-2: 50 ms a layer at 4 K, ~10 ms of GEMM).  y32, sh and a16 are
+            // free here: the attention block is done and the routed sum has already been copied out of sh.
+            const int64_t qlen = cfg.n_head * cfg.head_dim, klen = cfg.n_head_kv * cfg.head_dim;
+            if (!prefill_dense_f32 && (int64_t)T * sff <= q.y32_elems && (int64_t)T * sff <= q.sh_elems &&
+                (int64_t)T * embd <= q.y32_elems && sff <= std::max(qlen, klen) && T <= batch_cap) {
+                gemm_gpu(L.gate, h16, hdev, q.y32, T, sff);
+                gemm_gpu(L.up, h16, hdev, q.sh, T, sff);
+                cu::swiglu_rows_f16(q.y32, q.sh, q.a16, T, sff, alpha, limit, nullptr);
+                gemm_gpu(L.down, q.a16, nullptr, q.y32, T, embd);
+                cu::copy_d2h(sh.data(), q.y32, (size_t)T * embd * sizeof(float));
+                return;
+            }
             // gate into y32, up into p32, swiglu to gh, down to gd, in row chunks of rows_cap
             for (int c = 0; c < T; c += (int)q.rows_cap) {
                 const int nt = std::min<int>((int)q.rows_cap, T - c);
@@ -7095,12 +7183,16 @@ struct Engine::Impl {
                     const auto ti1 = pfclock::now();
                     host_bs.resize((size_t)T * HI * (size_t)nb);
                     cu::copy_d2h(host_bs.data(), p.d_bs.p, host_bs.size() * sizeof(float));
-                    for (int t = 0; t < T; ++t) {
-                        int nblk = 0;
-                        pf_select_blocks(li, pos0 + t, host_bs.data() + (size_t)t * HI * (size_t)nb, nb,
-                                         pf_blk.data() + (size_t)t * HI * pf_max_blk, nblk);
-                        for (int h = 0; h < HI; ++h) pf_nblk[(size_t)t * HI + h] = nblk;
-                    }
+                    // P35: one partial sort per (token, indexer head); the tokens are independent, so the pool takes
+                    // them (16 K chunk on rig-2: 4.9 s of single-threaded top-k over the 60 layers).
+                    pool.run(T, [&](int a, int b) {
+                        for (int t = a; t < b; ++t) {
+                            int nblk = 0;
+                            pf_select_blocks(li, pos0 + t, host_bs.data() + (size_t)t * HI * (size_t)nb, nb,
+                                             pf_blk.data() + (size_t)t * HI * pf_max_blk, nblk);
+                            for (int h = 0; h < HI; ++h) pf_nblk[(size_t)t * HI + h] = nblk;
+                        }
+                    });
                     const auto ti2 = pfclock::now();
                     t_idx += dur(ti0, ti1);
                     t_topk += dur(ti1, ti2);
