@@ -96,6 +96,15 @@ void moe_expert_f16(int type, const void* const* gate, const void* const* up, co
                     int n_entries, int n_embd, int n_ff, size_t gu_row, size_t d_row, const float* x, float* h,
                     float* out, float alpha, float limit);
 
+/// The routed experts' gate/up pass when the two matrices have different i-quant types (a Maya-layout layer: gate
+/// IQ2_XS, up IQ2_XXS).  Each matrix runs `iq_mmvq` with its own type over the selected experts, then swigluoai, as
+/// minimax_moe_gu does.  gate_e[e]/up_e[e] are HOST arrays of device addresses; gbuf/ubuf are device scratch of
+/// n_entries * n_ff floats; h receives the activation.  s_gate/s_up (optional, device f32 [n_entries]) are the NVFP4
+/// divisors, applied before swigluoai.  Nothing synchronizes.
+void minimax_moe_gu_split(int type_g, int type_u, const void* const* gate_e, const void* const* up_e, int n_entries,
+                          int n_embd, int n_ff, const void* x_q8_1, float* gbuf, float* ubuf, float* h, float alpha,
+                          float limit, void* stream, const float* s_gate = nullptr, const float* s_up = nullptr);
+
 // ============================================================================================= P5a: batched prefill
 //
 // The prompt path.  Every kernel here is asynchronous on the stream it is given (nullptr = the default stream);

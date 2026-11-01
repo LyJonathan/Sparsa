@@ -1548,4 +1548,37 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
     check(cudaGetLastError(), "msa_attn_batch launch");
 }
 
+namespace {
+// swigluoai as minimax_moe_gu's epilogue computes it (iq_kernels.cu, minimax_swigluoai): the NVFP4 divisors first,
+// then the clamp, then (up + 1) * gate * sigmoid(alpha * gate).
+__global__ void swiglu_split_kernel(const float* g, const float* u, const float* s_gate, const float* s_up, int n_ff,
+                                    int total, float alpha, float limit, float* h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int e = i / n_ff;
+    float gate = g[i];
+    float up = u[i];
+    if (s_gate) gate *= s_gate[e];
+    if (s_up) up *= s_up[e];
+    if (gate > limit) gate = limit;
+    if (up > limit) up = limit;
+    if (up < -limit) up = -limit;
+    h[i] = (up + 1.f) * gate * (1.f / (1.f + __expf(-alpha * gate)));
+}
+}  // namespace
+
+void minimax_moe_gu_split(int type_g, int type_u, const void* const* gate_e, const void* const* up_e, int n_entries,
+                          int n_embd, int n_ff, const void* x_q8_1, float* gbuf, float* ubuf, float* h, float alpha,
+                          float limit, void* stream, const float* s_gate, const float* s_up) {
+    if (n_entries <= 0) return;
+    for (int e = 0; e < n_entries; ++e) {
+        strata::kernels::iq_mmvq(type_g, gate_e[e], x_q8_1, gbuf + (size_t)e * (size_t)n_ff, n_embd, n_ff, 1, stream);
+        strata::kernels::iq_mmvq(type_u, up_e[e], x_q8_1, ubuf + (size_t)e * (size_t)n_ff, n_embd, n_ff, 1, stream);
+    }
+    const int total = n_entries * n_ff;
+    swiglu_split_kernel<<<(total + 255) / 256, 256, 0, (cudaStream_t)stream>>>(gbuf, ubuf, s_gate, s_up, n_ff, total,
+                                                                               alpha, limit, h);
+    check(cudaGetLastError(), "minimax_moe_gu_split: swiglu launch");
+}
+
 }  // namespace strata::minimax::cu

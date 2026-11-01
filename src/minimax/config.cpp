@@ -213,7 +213,14 @@ std::vector<std::string> check_m3_1(const Config& c) {
     expect("attention.indexer.top_k", c.idx_top_k, 16);
     expect("attention.indexer.block_size", c.idx_block, 128);
     expect("attention.indexer.local_blocks", c.idx_local, 1);
-    expect("attention.indexer.first_layer", c.idx_first_layer, 0);
+    // M3.1 writes first_layer = 0: MSA on all 60 layers.  A file without the key keeps llama.cpp's M3 coupling:
+    // MSA from the first MoE layer (first_layer = leading_dense_block_count) and dense attention on the leading dense
+    // layers, which carry no indexer tensors.  llama.cpp src/models/minimax-m3.cpp: indexer_first_layer defaults to
+    // n_layer_dense_lead (:17-22), indexer tensors exist only for il >= indexer_first_layer (:95), and attention is
+    // sparse only there (:355).  Either value is this model; any other first layer is refused.
+    if (c.idx_first_layer != 0 && c.idx_first_layer != c.leading_dense)
+        out.push_back("minimax-m3.attention.indexer.first_layer = " + std::to_string(c.idx_first_layer) +
+                      ", expected 0 or " + std::to_string(c.leading_dense) + " for MiniMax-M3.1-Flash");
     if (!c.expert_weights_norm)
         out.push_back("minimax-m3.expert_weights_norm = false, expected true for MiniMax-M3.1-Flash");
     return out;
