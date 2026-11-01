@@ -323,6 +323,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(vram_plan_test tests/minimax/vram_plan_test.cpp)
   target_include_directories(vram_plan_test PRIVATE include)
   add_test(NAME vram_plan_test COMMAND vram_plan_test)
+
+  # MiniMax's automatic pinned-RAM budget: what it keeps free (margin, prompt pools, Windows dense mapping): header-only
+  add_executable(ram_budget_test tests/minimax/ram_budget_test.cpp)
+  target_include_directories(ram_budget_test PRIVATE include)
+  add_test(NAME ram_budget_test COMMAND ram_budget_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
