@@ -158,10 +158,16 @@ struct Layer {
     Tensor egate, eup, edown;
     Tensor iq, ik;
 
-    // P3: bytes of one expert's three role slices, in [gate, up, down] order, and the per-layer tiers.
-    size_t expert_gu = 0;           // one gate matrix (up is the same)
+    // P3: bytes of one expert's three role slices, in [gate, up, down] order, and the per-layer tiers.  Gate and up
+    // have their own GGML types and strides: a Maya-layout file gives gate IQ2_XS and up IQ2_XXS on some layers, so one
+    // expert's slot is [gate: stride_g | up: stride_u | down: expert_down].  When the types match, the two strides are
+    // equal and every offset is the one a single gate-sized stride gave before.
+    int type_g = 0, type_u = 0;     // egate.type, eup.type
+    size_t stride_g = 0;            // bytes of one expert's gate matrix
+    size_t stride_u = 0;            // bytes of one expert's up matrix
+    bool gu_split = false;          // type_g != type_u: the split gate/up kernels
     size_t expert_down = 0;
-    size_t expert_bytes = 0;
+    size_t expert_bytes = 0;        // stride_g + stride_u + expert_down
     // MM-NVFP4: per-expert global scales (a DIVISOR) from blk.N.ffn_*_exps.scale. Empty when the
     // layer's expert tensors carry no side scale. Applied exactly once per projection.
     std::vector<float> egate_scale, eup_scale, edown_scale;
@@ -801,6 +807,7 @@ struct Engine::Impl {
         DevPtr x, y, scratch, ex_ptr, ex_xq, ex_hq, ex_h, ex_out;
         DevPtr xq;                      // q8_1 image of a dense projection's activation (dense MMVQ)
         DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
+        DevPtr ex_g, ex_u;              // split gate/up pass (mixed gate/up types): one matrix each, n_expert_used x n_ff
         DevPtr qd, bs, slots, counts, kstage, vstage, att;
         // P5c: the fused norm+rope step's device operands.  `qn`/`kn`/`vn` are the projection outputs of the
         // token path (normed/rotated in place), `iqn`/`ikn` the indexer's; `pos1` is the one-token position array.
@@ -1582,8 +1589,6 @@ struct Engine::Impl {
                     fail(L.eup.name + ": unexpected shape");
                 if (L.edown.ne0 != cfg.n_ff_exp || L.edown.ne1 != cfg.n_embd || L.edown.ne2 != cfg.n_expert)
                     fail(L.edown.name + ": unexpected shape");
-                if (L.egate.type != L.eup.type)
-                    fail(b + "gate and up experts have different ggml types");
                 // MM-NVFP4: per-expert global scale side tensors. Present only for the exact NVFP4 layout.
                 const bool sg = load_scale_vec(b + "ffn_gate_exps.scale", L.egate_scale, cfg.n_expert);
                 const bool su = load_scale_vec(b + "ffn_up_exps.scale", L.eup_scale, cfg.n_expert);
@@ -1600,11 +1605,18 @@ struct Engine::Impl {
                 if (sd && L.edown.type != 40)
                     fail(b + " has ffn_down_exps.scale but the expert type is " + std::to_string(L.edown.type) +
                                 ", not NVFP4 (40)");
-                if (L.egate.ne2 > 0) L.expert_gu = L.egate.bytes / (size_t)L.egate.ne2;
-                if (L.eup.ne2 > 0 && L.eup.bytes / (size_t)L.eup.ne2 != L.expert_gu)
-                    fail(b + "gate and up experts have different byte sizes");
+                if (L.egate.ne2 > 0) L.stride_g = L.egate.bytes / (size_t)L.egate.ne2;
+                if (L.eup.ne2 > 0) L.stride_u = L.eup.bytes / (size_t)L.eup.ne2;
                 if (L.edown.ne2 > 0) L.expert_down = L.edown.bytes / (size_t)L.edown.ne2;
-                L.expert_bytes = L.expert_gu * 2 + L.expert_down;
+                L.expert_bytes = L.stride_g + L.stride_u + L.expert_down;
+                L.type_g = L.egate.type;
+                L.type_u = L.eup.type;
+                L.gu_split = L.type_g != L.type_u;
+                // Split gate/up runs the i-quant kernels (iq_mmvq), one matrix at a time.  Q8_0 and the raw types have
+                // no split kernel; no real file mixes them.
+                if (L.gu_split && !(strata::kernels::iq_supported(L.type_g) && strata::kernels::iq_supported(L.type_u)))
+                    fail(b + "gate and up experts have different types, and one is not an i-quant or Q8_0 (" +
+                         std::to_string(L.type_g) + " and " + std::to_string(L.type_u) + ")");
                 if (cfg.n_shared_experts > 0) {
                     L.have_shared = true;
                     L.gate = must(b + "ffn_gate_shexp.weight");
@@ -2784,7 +2796,8 @@ struct Engine::Impl {
             size_t max_gu = 0, max_dn = 0;
             for (const Layer& L : layers)
                 if (L.moe) {
-                    if (L.expert_gu > max_gu) max_gu = L.expert_gu;
+                    if (L.stride_g > max_gu) max_gu = L.stride_g;
+                    if (L.stride_u > max_gu) max_gu = L.stride_u;
                     if (L.expert_down > max_dn) max_dn = L.expert_down;
                 }
             const size_t A = strata::platform::DirectFile::alignment();
@@ -2832,21 +2845,21 @@ struct Engine::Impl {
         // P12: if the expert is already in the pinned RAM tier, copy it from there.  It used to be read out of the
         // file mapping even when the arena held the same bytes, so every compulsory admission re-faulted 15 MB of
         // the model through the page cache (or the drive) instead of a 20 GB/s memcpy from RAM.  Same bytes.
-        const uint8_t* g = L.egate.host + (size_t)expert * L.expert_gu;
-        const uint8_t* u = L.eup.host + (size_t)expert * L.expert_gu;
+        const uint8_t* g = L.egate.host + (size_t)expert * L.stride_g;
+        const uint8_t* u = L.eup.host + (size_t)expert * L.stride_u;
         const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
         if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
             const int rs = L.ram_of[(size_t)expert];
             if (rs >= 0 && rs < L.ram_n) {
                 const uint8_t* base = ram_arena->data() + L.ram_off + (uint64_t)rs * L.expert_bytes;
                 g = base;
-                u = base + L.expert_gu;
-                d = base + 2 * L.expert_gu;
+                u = base + L.stride_g;
+                d = base + L.stride_g + L.stride_u;
             }
         }
-        cu::copy_h2d(p, g, L.expert_gu);
-        cu::copy_h2d(p + L.expert_gu, u, L.expert_gu);
-        cu::copy_h2d(p + 2 * L.expert_gu, d, L.expert_down);
+        cu::copy_h2d(p, g, L.stride_g);
+        cu::copy_h2d(p + L.stride_g, u, L.stride_u);
+        cu::copy_h2d(p + L.stride_g + L.stride_u, d, L.expert_down);
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
     }
@@ -2857,21 +2870,21 @@ struct Engine::Impl {
         uint8_t* p = (uint8_t*)s.mem.p;
         // P22: copy from the pinned RAM tier when it holds the expert (a real async DMA); the mapping is pageable,
         // so a copy from it blocks the host and can fault the expert in from the drive.
-        const uint8_t* g = L.egate.host + (size_t)expert * L.expert_gu;
-        const uint8_t* u = L.eup.host + (size_t)expert * L.expert_gu;
+        const uint8_t* g = L.egate.host + (size_t)expert * L.stride_g;
+        const uint8_t* u = L.eup.host + (size_t)expert * L.stride_u;
         const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
         if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
             const int rs = L.ram_of[(size_t)expert];
             if (rs >= 0 && rs < L.ram_n) {
                 const uint8_t* base = ram_slot_ptr(L, rs);
                 g = base;
-                u = base + L.expert_gu;
-                d = base + 2 * L.expert_gu;
+                u = base + L.stride_g;
+                d = base + L.stride_g + L.stride_u;
             }
         }
-        cu::copy_h2d_async(p, g, L.expert_gu, W().side);
-        cu::copy_h2d_async(p + L.expert_gu, u, L.expert_gu, W().side);
-        cu::copy_h2d_async(p + 2 * L.expert_gu, d, L.expert_down, W().side);
+        cu::copy_h2d_async(p, g, L.stride_g, W().side);
+        cu::copy_h2d_async(p + L.stride_g, u, L.stride_u, W().side);
+        cu::copy_h2d_async(p + L.stride_g + L.stride_u, d, L.expert_down, W().side);
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
@@ -2914,11 +2927,11 @@ struct Engine::Impl {
             if ((++mem_probe_n % 512) == 0) mem_probe("fill");
             return;
         }
-        const size_t gu = L.expert_gu, dn = L.expert_down;
-        const uint8_t* src[3] = {L.egate.host + (size_t)expert * gu, L.eup.host + (size_t)expert * gu,
+        const size_t gs = L.stride_g, us = L.stride_u, dn = L.expert_down;
+        const uint8_t* src[3] = {L.egate.host + (size_t)expert * gs, L.eup.host + (size_t)expert * us,
                                  L.edown.host + (size_t)expert * dn};
-        const size_t off[3] = {0, gu, 2 * gu};
-        const size_t len[3] = {gu, gu, dn};
+        const size_t off[3] = {0, gs, gs + us};
+        const size_t len[3] = {gs, us, dn};
         const int pieces = 8 * (threads > 0 ? threads : 4);
         pool.run(pieces * 3, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
@@ -3022,10 +3035,10 @@ struct Engine::Impl {
 #endif
             for (const Job& j : jobs) {
                 const Layer& L = *j.L;
-                const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,
-                                         L.eup.host + (size_t)j.expert * L.expert_gu,
+                const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.stride_g,
+                                         L.eup.host + (size_t)j.expert * L.stride_u,
                                          L.edown.host + (size_t)j.expert * L.expert_down};
-                const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+                const size_t len[3] = {L.stride_g, L.stride_u, L.expert_down};
                 for (int r = 0; r < 3; ++r) {
                     bytes += len[r];
 #if defined(_WIN32)
@@ -3090,10 +3103,10 @@ struct Engine::Impl {
         for (const Job& j : jobs) {
             const Layer& L = *j.L;
             uint8_t* dst = ram_slot_ptr(*j.L, j.slot);
-            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
-            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
-            const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.expert_gu,
-                                     L.eup.host + (size_t)j.expert * L.expert_gu,
+            const size_t len[3] = {L.stride_g, L.stride_u, L.expert_down};
+            const size_t off[3] = {0, L.stride_g, L.stride_g + L.stride_u};
+            const uint8_t* src[3] = {L.egate.host + (size_t)j.expert * L.stride_g,
+                                     L.eup.host + (size_t)j.expert * L.stride_u,
                                      L.edown.host + (size_t)j.expert * L.expert_down};
             for (int r = 0; r < 3; ++r)
                 for (size_t at = 0; at < len[r]; at += kPiece)
@@ -3150,9 +3163,9 @@ struct Engine::Impl {
         for (int s = 1; s < L.ram_n; ++s)
             if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
         uint8_t* p = ram_slot_ptr(L, victim);
-        std::memcpy(p, g, L.expert_gu);
-        std::memcpy(p + L.expert_gu, u, L.expert_gu);
-        std::memcpy(p + 2 * L.expert_gu, d, L.expert_down);
+        std::memcpy(p, g, L.stride_g);
+        std::memcpy(p + L.stride_g, u, L.stride_u);
+        std::memcpy(p + L.stride_g + L.stride_u, d, L.expert_down);
         for (int32_t& v : L.ram_of)
             if (v == victim) v = kNotResident;
         L.ram_of[(size_t)expert] = victim;
@@ -3197,9 +3210,9 @@ struct Engine::Impl {
             if (victim < 0) break;
             used.push_back(victim);
             uint8_t* p = ram_slot_ptr(L, victim);
-            const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+            const size_t len[3] = {L.stride_g, L.stride_u, L.expert_down};
             const uint8_t* src[3] = {a.g, a.u, a.d};
-            const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
+            const size_t off[3] = {0, L.stride_g, L.stride_g + L.stride_u};
             for (int r = 0; r < 3; ++r)
                 for (size_t at = 0; at < len[r]; at += kPiece)
                     pieces.push_back({src[r] + at, p + off[r] + at, std::min(kPiece, len[r] - at)});
@@ -3250,8 +3263,8 @@ struct Engine::Impl {
 
     void ssd_read_expert(const Layer& L, int64_t expert, uint8_t* stage) {
         ssd_read_role(L.egate, expert, stage);
-        ssd_read_role(L.eup, expert, stage + L.expert_gu);
-        ssd_read_role(L.edown, expert, stage + 2 * L.expert_gu);
+        ssd_read_role(L.eup, expert, stage + L.stride_g);
+        ssd_read_role(L.edown, expert, stage + L.stride_g + L.stride_u);
         ++tok_stats.ssd;
         tok_stats.ssd_bytes += (int64_t)L.expert_bytes;
     }
@@ -3260,8 +3273,8 @@ struct Engine::Impl {
     // [gate|up|down] exactly as the mapping would present them, so a caller can hand it to the same kernels.
     void read_expert_roles(const Layer& L, int64_t expert, uint8_t* dst) {
         ssd_read_role(L.egate, expert, dst);
-        ssd_read_role(L.eup, expert, dst + L.expert_gu);
-        ssd_read_role(L.edown, expert, dst + 2 * L.expert_gu);
+        ssd_read_role(L.eup, expert, dst + L.stride_g);
+        ssd_read_role(L.edown, expert, dst + L.stride_g + L.stride_u);
     }
 
     // P10: one expert's three roles read unbuffered straight into the pinned ring slot, the three requests in flight
@@ -3558,8 +3571,8 @@ struct Engine::Impl {
             if (slot < 0) fail("internal: a GPU expert has no VRAM slot");
             const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
             gp[(size_t)i] = base;
-            up[(size_t)i] = base + L.expert_gu;
-            dp[(size_t)i] = base + 2 * L.expert_gu;
+            up[(size_t)i] = base + L.stride_g;
+            dp[(size_t)i] = base + L.stride_g + L.stride_u;
         }
         const int top = (int)cfg.n_expert_used;
         void** ptr = (void**)w.ex_ptr.p;
@@ -3567,8 +3580,8 @@ struct Engine::Impl {
         cu::copy_h2d(ptr + top, up.data(), (size_t)k * sizeof(void*));
         cu::copy_h2d(ptr + 2 * top, dp.data(), (size_t)k * sizeof(void*));
         const int n_embd = (int)cfg.n_embd, n_ff = (int)cfg.n_ff_exp;
-        const int gt = L.egate.type, dt = L.edown.type;
-        if (!(iq_expert_type(gt) && iq_expert_type(dt))) {
+        const int gt = L.type_g, ut = L.type_u, dt = L.edown.type;
+        if (!(iq_expert_type(gt) && iq_expert_type(ut) && iq_expert_type(dt))) {
             // F32/F16/BF16 experts: the existing kernel synchronizes itself, so no overlap is offered.
             return false;
         }
@@ -3608,9 +3621,18 @@ struct Engine::Impl {
         }
         h2d(w, w.x.p, in, (size_t)n_embd * sizeof(float));
         strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, n_embd, w.ex_xq.p, st);
-        strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k, n_embd,
-                                        n_ff, L.egate.row_bytes, w.ex_xq.p, (float*)w.ex_h.p, alpha, limit, st, sg,
-                                        su);
+        if (!L.gu_split) {
+            strata::kernels::minimax_moe_gu(gt, (const void* const*)ptr, (const void* const*)(ptr + top), k, n_embd,
+                                            n_ff, L.egate.row_bytes, w.ex_xq.p, (float*)w.ex_h.p, alpha, limit, st, sg,
+                                            su);
+        } else {
+            // Gate and up of different types: one pass per matrix with its own type, then the same swigluoai.
+            const size_t sc = (size_t)cfg.n_expert_used * (size_t)n_ff * sizeof(float);
+            if (!w.ex_g.p) w.ex_g = DevPtr(cu::alloc(sc));
+            if (!w.ex_u.p) w.ex_u = DevPtr(cu::alloc(sc));
+            cu::minimax_moe_gu_split(gt, ut, gp.data(), up.data(), k, n_embd, n_ff, w.ex_xq.p, (float*)w.ex_g.p,
+                                     (float*)w.ex_u.p, (float*)w.ex_h.p, alpha, limit, st, sg, su);
+        }
         strata::kernels::quantize_q8_1_rows((const float*)w.ex_h.p, k, n_ff, w.ex_hq.p, st);
         strata::kernels::minimax_moe_down(dt, (const void* const*)(ptr + 2 * top), k, n_embd, n_ff,
                                           L.edown.row_bytes, w.ex_hq.p, (float*)w.ex_out.p, st, sd);
@@ -3629,6 +3651,11 @@ struct Engine::Impl {
 
     // The synchronizing form (raw expert types, or a call site that does not split GPU and CPU work).
     void gpu_experts(const Layer& L, const std::vector<int>& exps, const float* in, std::vector<float>& out) {
+        // A split gate/up layer has only the async pair (gpu_experts_begin / gpu_experts_finish) for i-quants.
+        if (L.gu_split && gpu_experts_begin(L, exps, in)) {
+            gpu_experts_finish((int)exps.size(), out);
+            return;
+        }
         const int k = (int)exps.size();
         if (k == 0) return;
         use_device_index(L.dev);
@@ -3643,8 +3670,8 @@ struct Engine::Impl {
             const int slot = L.vram_of[(size_t)e];
             const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
             gp[(size_t)i] = base;
-            up[(size_t)i] = base + L.expert_gu;
-            dp[(size_t)i] = base + 2 * L.expert_gu;
+            up[(size_t)i] = base + L.stride_g;
+            dp[(size_t)i] = base + L.stride_g + L.stride_u;
         }
         const int top = (int)cfg.n_expert_used;
         void** ptr = (void**)w.ex_ptr.p;
@@ -3821,12 +3848,12 @@ struct Engine::Impl {
                 if ((size_t)rs < L.ram_tick.size()) const_cast<Layer&>(L).ram_tick[(size_t)rs] = ++lru_tick;
                 if (ram_inplace) {
                     // The page cache is the tier: read the expert where it is in the mapping.
-                    cpu.push_back({e, j, false, L.egate.host + (size_t)e * L.expert_gu,
-                                   L.eup.host + (size_t)e * L.expert_gu,
+                    cpu.push_back({e, j, false, L.egate.host + (size_t)e * L.stride_g,
+                                   L.eup.host + (size_t)e * L.stride_u,
                                    L.edown.host + (size_t)e * L.expert_down});
                 } else {
                     const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
-                    cpu.push_back({e, j, false, p, p + L.expert_gu, p + 2 * L.expert_gu});
+                    cpu.push_back({e, j, false, p, p + L.stride_g, p + L.stride_g + L.stride_u});
                 }
                 ++tok_stats.ram;
                 continue;
@@ -3847,10 +3874,10 @@ struct Engine::Impl {
             // the static RAM fill touched them before they were evicted).  Then the bytes are a memory read: keep
             // them where they are and queue nothing.  Measured hit rate is reported as ssd_mapped.
             if (ssd_zero_copy) {
-                const uint8_t* mg = L.egate.host + (size_t)e * L.expert_gu;
-                const uint8_t* mu = L.eup.host + (size_t)e * L.expert_gu;
+                const uint8_t* mg = L.egate.host + (size_t)e * L.stride_g;
+                const uint8_t* mu = L.eup.host + (size_t)e * L.stride_u;
                 const uint8_t* md = L.edown.host + (size_t)e * L.expert_down;
-                if (pages_resident(mg, L.expert_gu) && pages_resident(mu, L.expert_gu) &&
+                if (pages_resident(mg, L.stride_g) && pages_resident(mu, L.stride_u) &&
                     pages_resident(md, L.expert_down)) {
                     cpu.push_back({e, j, false, mg, mu, md});
                     ++tok_stats.ssd_mapped;
@@ -4068,9 +4095,9 @@ struct Engine::Impl {
             if (free_slot < 0) break;
             Layer::VramSlot& slot = L.vram[(size_t)free_slot];
             uint8_t* dst = (uint8_t*)slot.mem.p;
-            cu::copy_h2d_async(dst, L.egate.host + (size_t)e * L.expert_gu, L.expert_gu, wv->side);
-            cu::copy_h2d_async(dst + L.expert_gu, L.eup.host + (size_t)e * L.expert_gu, L.expert_gu, wv->side);
-            cu::copy_h2d_async(dst + 2 * L.expert_gu, L.edown.host + (size_t)e * L.expert_down, L.expert_down,
+            cu::copy_h2d_async(dst, L.egate.host + (size_t)e * L.stride_g, L.stride_g, wv->side);
+            cu::copy_h2d_async(dst + L.stride_g, L.eup.host + (size_t)e * L.stride_u, L.stride_u, wv->side);
+            cu::copy_h2d_async(dst + L.stride_g + L.stride_u, L.edown.host + (size_t)e * L.expert_down, L.expert_down,
                                wv->side);
             slot.expert = e;
             L.vram_of[(size_t)e] = free_slot;
@@ -4465,7 +4492,7 @@ struct Engine::Impl {
     // Everything the CPU lane needs to run a layer's experts, reused across layers and tokens so a layer allocates
     // nothing: gate/up/hidden tiles for every routed expert on the CPU, and one activation image per matrix.
     std::vector<float> cpu_gbuf, cpu_ubuf, cpu_hbuf;
-    std::vector<uint8_t> cpu_aq, cpu_hq;
+    std::vector<uint8_t> cpu_aq, cpu_hq, cpu_aq_u;   // cpu_aq_u: the up matrix's input when its format differs
     // STRATA_LANE_PF=N: software-prefetch N rows ahead in the lane's row loops (0 = off, a measured probe, not a
     // default: every thread walks its rows sequentially and the hardware prefetcher already sees that stride).
     int lane_pf = 0;
@@ -4503,11 +4530,18 @@ struct Engine::Impl {
         cpu_hbuf.resize((size_t)n * (size_t)ff);
         cpu_aq.resize(kg.act_bytes);
         kg.act->from_float(in, cpu_aq.data(), embd);
+        // Gate and up share one quantized input when they share its format (every uniform layer); a split layer
+        // quantizes the input again in the up matrix's format.
+        const bool shared_act = ku.act == kg.act;
+        if (!shared_act) {
+            cpu_aq_u.resize(ku.act_bytes);
+            ku.act->from_float(in, cpu_aq_u.data(), embd);
+        }
+        const uint8_t* aq_up = shared_act ? cpu_aq.data() : cpu_aq_u.data();
         const size_t g_row = L.egate.row_bytes, u_row = L.eup.row_bytes;
         // Region 1: every gate row and every up row of the pass, one contiguous run of rows per thread.
         if ((int)L.egate.ne1 != ff || (int)L.eup.ne1 != ff)
             fail("gate/up rows do not match the expert feed-forward width");
-        if (ku.act_bytes != kg.act_bytes) fail("gate and up need different activation widths");
         // P14: rows go out in chunks (run_dyn), so a late thread no longer holds the barrier; rows are independent.
         pool.run_dyn(n * 2 * ff, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
@@ -4520,7 +4554,7 @@ struct Engine::Impl {
                 const uint8_t* row = (is_up ? c->up : c->gate) + (size_t)r * stride;
                 if (lane_pf > 0) prefetch_row(row + stride * (size_t)lane_pf);
                 const RowKernel& kk = is_up ? ku : kg;
-                const float s = row_dot(kk, row, cpu_aq.data());
+                const float s = row_dot(kk, row, is_up ? aq_up : cpu_aq.data());
                 (is_up ? cpu_ubuf : cpu_gbuf)[(size_t)j * (size_t)ff + (size_t)r] = s;
             }
         });
@@ -5206,7 +5240,8 @@ struct Engine::Impl {
             size_t gu = 0, dn = 0;
             for (const Layer& L : layers)
                 if (L.moe) {
-                    if (L.expert_gu > gu) gu = L.expert_gu;
+                    if (L.stride_g > gu) gu = L.stride_g;
+                    if (L.stride_u > gu) gu = L.stride_u;
                     if (L.expert_down > dn) dn = L.expert_down;
                 }
             const size_t A = strata::platform::DirectFile::alignment();
@@ -6228,16 +6263,16 @@ struct Engine::Impl {
             if (rs >= 0) {
                 const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
                 gb = base;
-                ub = base + L.expert_gu;
-                db = base + 2 * L.expert_gu;
+                ub = base + L.stride_g;
+                db = base + L.stride_g + L.stride_u;
             } else if (stream_direct) {
                 read_expert_roles(L, e, pf_expert_h.data());
                 gb = pf_expert_h.data();
-                ub = gb + L.expert_gu;
-                db = gb + 2 * L.expert_gu;
+                ub = gb + L.stride_g;
+                db = gb + L.stride_g + L.stride_u;
             } else {
-                gb = L.egate.host + (size_t)e * L.expert_gu;
-                ub = L.eup.host + (size_t)e * L.expert_gu;
+                gb = L.egate.host + (size_t)e * L.stride_g;
+                ub = L.eup.host + (size_t)e * L.stride_u;
                 db = L.edown.host + (size_t)e * L.expert_down;
             }
             for (size_t a = 0; a < toks.size(); a += (size_t)rows_cap) {
@@ -6476,7 +6511,7 @@ struct Engine::Impl {
                                 const int q0 = (u_ % nb_ff) * band, q1 = std::min(ff, q0 + band);
                                 const int e = cpu_exp[i];
                                 const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
-                                const uint8_t* ub = gb + L.expert_gu;
+                                const uint8_t* ub = gb + L.stride_g;
                                 const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
                                 const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
                                 for (int q = q0; q < q1; ++q) {
@@ -6501,7 +6536,7 @@ struct Engine::Impl {
                                 const int q0 = (u_ % nb_em) * band, q1 = std::min(embd, q0 + band);
                                 const int e = cpu_exp[i];
                                 const uint8_t* db = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]) +
-                                                    2 * L.expert_gu;
+                                                    L.stride_g + L.stride_u;
                                 for (int q = q0; q < q1; ++q) {
                                     const uint8_t* drow = db + (size_t)q * L.edown.row_bytes;
                                     for (size_t j = r0[i]; j < r0[i + 1]; ++j) {
@@ -6530,8 +6565,8 @@ struct Engine::Impl {
                         for (size_t i = 0; i < cpu_exp.size(); ++i) {
                             const int e = cpu_exp[i];
                             const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
-                            const uint8_t* ub = gb + L.expert_gu;
-                            const uint8_t* db = gb + 2 * L.expert_gu;
+                            const uint8_t* ub = gb + L.stride_g;
+                            const uint8_t* db = gb + L.stride_g + L.stride_u;
                             const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
                             const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
                             const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
@@ -6580,7 +6615,7 @@ struct Engine::Impl {
 
         // Per projection, not per expert: the IQ2_XS pack has IQ2_XS gate/up and a Q2_0/IQ4_NL/F32 down, and MM-NVFP4
         // has its own type.  `gu_iq` / `d_iq` pick the int8 kernel or the dequantize-to-fp16 + cuBLAS fallback.
-        const bool gu_iq = iq_expert_type(L.egate.type) && cfg.n_embd % 32 == 0;
+        const bool gu_iq = iq_expert_type(L.egate.type) && iq_expert_type(L.eup.type) && cfg.n_embd % 32 == 0;
         const bool d_iq = iq_expert_type(L.edown.type) && cfg.n_ff_exp % 32 == 0;
         const int gt = L.egate.type, dt = L.edown.type;
         // P10: the tensor-core path needs a whole 256-value block per row (the flat dequantizer's contract) on both
@@ -6627,16 +6662,16 @@ struct Engine::Impl {
             // destination, so this is a flat list of copies: 8 pieces of >=1 MiB each keep every core on the mmap
             // (whose page faults are what the single-threaded memcpy was waiting for) without a per-piece allocation.
             auto read_expert = [&](int e, uint8_t* dst) {
-                const size_t gu = L.expert_gu, dn = L.expert_down;
+                const size_t gs = L.stride_g, us = L.stride_u, dn = L.expert_down;
                 // P5c: a RAM-tier expert is read from the pinned arena, not through the mmap.  The batch path used
                 // to ignore the tier and re-fault every page of every expert once per chunk.
                 const int rs = L.ram_n > 0 ? L.ram_of[(size_t)e] : -1;
                 const uint8_t* base = rs >= 0 && !ram_inplace ? ram_slot_ptr(const_cast<Layer&>(L), rs) : nullptr;
-                const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gu,
-                                         base ? base + gu : L.eup.host + (size_t)e * gu,
-                                         base ? base + 2 * gu : L.edown.host + (size_t)e * dn};
+                const uint8_t* src[3] = {base ? base : L.egate.host + (size_t)e * gs,
+                                         base ? base + gs : L.eup.host + (size_t)e * us,
+                                         base ? base + gs + us : L.edown.host + (size_t)e * dn};
                 const size_t off[3] = {p.role_off[0], p.role_off[1], p.role_off[2]};
-                const size_t len[3] = {gu, gu, dn};
+                const size_t len[3] = {gs, us, dn};
                 // `pool.run` runs inline when the job has fewer than 4 pieces per thread, so ask for enough pieces:
                 // 4 per thread per matrix lands on ~60 KiB each at MiniMax's expert size.
                 const int pieces = 4 * (threads > 0 ? threads : 4);
@@ -6725,8 +6760,8 @@ struct Engine::Impl {
                     // staging copy.
                     const uint8_t* base = ram_slot_ptr(const_cast<Layer&>(L), rs);
                     src[0] = base;
-                    src[1] = base + L.expert_gu;
-                    src[2] = base + 2 * L.expert_gu;
+                    src[1] = base + L.stride_g;
+                    src[2] = base + L.stride_g + L.stride_u;
                 } else if (prefill_direct && !ssd_files.empty()) {
                     cu::event_sync(p.ev_copy[(size_t)slot]);
                     const auto td0 = std::chrono::steady_clock::now();
@@ -6743,8 +6778,8 @@ struct Engine::Impl {
                     src[2] = pin + p.role_off[2];
                 }
                 uint8_t* dst = (uint8_t*)p.ring_v[(size_t)slot];
-                const size_t off[3] = {0, L.expert_gu, 2 * L.expert_gu};
-                const size_t len[3] = {L.expert_gu, L.expert_gu, L.expert_down};
+                const size_t off[3] = {0, L.stride_g, L.stride_g + L.stride_u};
+                const size_t len[3] = {L.stride_g, L.stride_u, L.expert_down};
                 void* cev0 = nullptr;
                 if (gpu_time) {
                     cev0 = cu::event_create_timed();
@@ -6801,8 +6836,8 @@ struct Engine::Impl {
                 if (slot >= 0) {
                     const uint8_t* base = (const uint8_t*)L.vram[(size_t)slot].mem.p;
                     sg = base;
-                    su = base + L.expert_gu;
-                    sd = base + 2 * L.expert_gu;
+                    su = base + L.stride_g;
+                    sd = base + L.stride_g + L.stride_u;
                 } else {
                     if (!p.ring) fail("batched prefill: no expert streaming buffer");
                     // This group's index among the streamed ones is its position in `streamed`; the pipeline keeps
@@ -6820,8 +6855,8 @@ struct Engine::Impl {
                     }
                     uint8_t* dst = (uint8_t*)p.ring_v[(size_t)ring_slot];
                     sg = dst;
-                    su = dst + L.expert_gu;
-                    sd = dst + 2 * L.expert_gu;
+                    su = dst + L.stride_g;
+                    sd = dst + L.stride_g + L.stride_u;
                     pump((int)si + 1 + lookahead);
                 }
                 for (size_t a = at; a < end; a += (size_t)rows_cap) {
@@ -6851,15 +6886,15 @@ struct Engine::Impl {
                         cu::gather_rows_f32(xin, g_rows, nt, embd, p.gx32, nullptr);
                         strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
                         strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
-                        strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
+                        strata::kernels::iq_mmvq(L.eup.type, su, p.xq, p.gu, embd, ff, nt, nullptr);
                     } else if (prefill_dense_f32) {
                         cu::gather_rows_f32(xin, g_rows, nt, embd, p.gx32, nullptr);
                         gemm_expert_gpu(gt, sg, L.egate.row_bytes, nullptr, p.gx32, p.gy, nt, ff, embd);
-                        gemm_expert_gpu(gt, su, L.egate.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
+                        gemm_expert_gpu(L.eup.type, su, L.eup.row_bytes, nullptr, p.gx32, p.gu, nt, ff, embd);
                     } else {
                         cu::gather_rows_f16(xin, g_rows, nt, embd, p.gx, nullptr);
                         gemm_expert_gpu(gt, sg, L.egate.row_bytes, p.gx, nullptr, p.gy, nt, ff, embd);
-                        gemm_expert_gpu(gt, su, L.egate.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
+                        gemm_expert_gpu(L.eup.type, su, L.eup.row_bytes, p.gx, nullptr, p.gu, nt, ff, embd);
                     }
                     if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
                     if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
@@ -6898,11 +6933,11 @@ struct Engine::Impl {
                         tc_gu_ok && tc_d_ok && gu_iq && d_iq) {
                         ++tc_checked;
                         const int r = std::min(nt, 4);
-                        std::vector<uint8_t> wb(2 * L.expert_gu + (size_t)L.edown.row_bytes * embd);
+                        std::vector<uint8_t> wb(L.stride_g + L.stride_u + (size_t)L.edown.row_bytes * embd);
                         cu::sync();
-                        cu::copy_d2h(wb.data(), sg, L.expert_gu);
-                        cu::copy_d2h(wb.data() + L.expert_gu, su, L.expert_gu);
-                        cu::copy_d2h(wb.data() + 2 * L.expert_gu, sd, (size_t)L.edown.row_bytes * embd);
+                        cu::copy_d2h(wb.data(), sg, L.stride_g);
+                        cu::copy_d2h(wb.data() + L.stride_g, su, L.stride_u);
+                        cu::copy_d2h(wb.data() + L.stride_g + L.stride_u, sd, (size_t)L.edown.row_bytes * embd);
                         auto deq = [&](int type, const uint8_t* src, size_t rb, int n, int k) {
                             std::vector<float> w((size_t)n * k);
                             const ggml_type_traits* tt = ggml_get_type_traits((ggml_type)type);
@@ -6910,8 +6945,8 @@ struct Engine::Impl {
                             return w;
                         };
                         const auto Wg = deq(gt, wb.data(), L.egate.row_bytes, ff, embd);
-                        const auto Wu = deq(L.eup.type, wb.data() + L.expert_gu, L.eup.row_bytes, ff, embd);
-                        const auto Wd = deq(dt, wb.data() + 2 * L.expert_gu, L.edown.row_bytes, embd, ff);
+                        const auto Wu = deq(L.eup.type, wb.data() + L.stride_g, L.eup.row_bytes, ff, embd);
+                        const auto Wd = deq(dt, wb.data() + L.stride_g + L.stride_u, L.edown.row_bytes, embd, ff);
                         std::vector<double> ref((size_t)r * embd);
                         std::vector<double> hh((size_t)ff);
                         for (int i = 0; i < r; ++i) {
@@ -6939,7 +6974,7 @@ struct Engine::Impl {
                                 cu::gather_rows_f32(xin, g_rows, nt, embd, p.gx32, nullptr);
                                 strata::kernels::quantize_q8_1_rows(p.gx32, nt, embd, p.xq, nullptr);
                                 strata::kernels::iq_mmvq(gt, sg, p.xq, p.gy, embd, ff, nt, nullptr);
-                                strata::kernels::iq_mmvq(gt, su, p.xq, p.gu, embd, ff, nt, nullptr);
+                                strata::kernels::iq_mmvq(L.eup.type, su, p.xq, p.gu, embd, ff, nt, nullptr);
                             }
                             if (fg != 1.f) cu::scale_rows(p.gy, (int64_t)nt * ff, fg, nullptr);
                             if (fu != 1.f) cu::scale_rows(p.gu, (int64_t)nt * ff, fu, nullptr);
