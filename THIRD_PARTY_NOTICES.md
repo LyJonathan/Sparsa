@@ -79,6 +79,11 @@ MIT License
 Copyright (c) 2026 Peasant Smith and the Project Maya contributors
 ```
 
+Also adapted from Project Maya (same license and copyright), at commit `cd48762`:
+`tools/minimax/quant/prep_calib_mm.py` (from `tools/maya_quant/prep_calib.py`: the calibration mix and packing) and
+`tools/minimax/quant/seq_gptq.py` (the `gptq()` core and the per-expert Hessian with a layer-wide prior, from
+`tools/maya_quant/gptq.py`, run sequentially on the quantized prefix).
+
 ## agentionai llama.cpp (trellis types, TQ2_T / TQK6 / TQK7)
 
 `third_party/ggml-tq/` holds the trellis headers of the agentionai ("Gyro") llama.cpp fork: `tq.cuh`
