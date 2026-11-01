@@ -60,8 +60,21 @@ void usage() {
         "  --exp-layer N               experiment: quantize every expert of MoE layer N\n"
         "  --exp-type TYPE             experiment expert type (default: recipe experts)\n"
         "  --exp-out FILE              experiment JSON report\n"
+        "  --exp-method old|diag|gptq  experiment rounding: imatrix, per-expert diagonal, GPTQ feedback\n"
+        "  --exp-pack FILE             experiment: also write the layer's expert tensors as a GGUF\n"
+        "                              (a donor for the engine's --expert-source 30-30=FILE)\n"
+        "  --exp-pack-frag DIR         experiment: write one raw file per (kind, expert) instead,\n"
+        "                              so a pass can be split across turns\n"
+        "  --exp-start N               experiment: first expert of the pass (default 0)\n"
+        "  --pack-merge DIR            assemble the layer pack from --exp-pack-frag's directory\n"
+        "  --gptq-prior N              tokens' worth of the layer-wide Hessian mixed into each expert (16384)\n"
+        "  --gptq-damp X               GPTQ diagonal damping as a fraction of mean(diag) (0.1)\n"
+        "  --exp-holdout X             share of each expert's rows held out of the Hessian (0.2)\n"
+        "  --gptq-selftest N           check the Cholesky/inverse against a naive reference and exit\n"
         "  --exp-x FILE.npy            experiment: routed-expert input [tokens, n_embd]\n"
         "  --exp-dumps DIR             experiment: dump dir with expert_XXX_hidden/token_idx.npy\n"
+        "  --exp-eval-x FILE.npy       experiment: rows of a DIFFERENT document, scored only (never in H)\n"
+        "  --exp-eval-dumps DIR        experiment: its dump dir (expert_XXX_token_idx / _hidden)\n"
         "  --exp-experts N             experiment: limit to the first N experts (default all)\n"
         "  --nvfp4-check               report whether expert scales fold into GGML_TYPE_NVFP4\n"
         "  --mmproj OUT.gguf           F16 vision projector via llama.cpp (skips if shards are absent)\n"
@@ -145,8 +158,30 @@ int main(int argc, char ** argv) {
                 opt.exp_x = val;
             } else if (take(i, argc, argv, "--exp-dumps", val)) {
                 opt.exp_dumps = val;
+            } else if (take(i, argc, argv, "--exp-eval-x", val)) {
+                opt.exp_eval_x = val;
+            } else if (take(i, argc, argv, "--exp-eval-dumps", val)) {
+                opt.exp_eval_dumps = val;
             } else if (take(i, argc, argv, "--exp-experts", val)) {
                 opt.exp_experts = std::stoi(val);
+            } else if (take(i, argc, argv, "--exp-method", val)) {
+                opt.exp_method = val;
+            } else if (take(i, argc, argv, "--exp-pack", val)) {
+                opt.exp_pack = val;
+            } else if (take(i, argc, argv, "--exp-pack-frag", val)) {
+                opt.exp_pack_frag = val;
+            } else if (take(i, argc, argv, "--pack-merge", val)) {
+                opt.pack_merge = val;
+            } else if (take(i, argc, argv, "--exp-start", val)) {
+                opt.exp_start = std::stoi(val);
+            } else if (take(i, argc, argv, "--gptq-prior", val)) {
+                opt.gptq_prior = std::stod(val);
+            } else if (take(i, argc, argv, "--gptq-damp", val)) {
+                opt.gptq_damp = std::stod(val);
+            } else if (take(i, argc, argv, "--exp-holdout", val)) {
+                opt.exp_holdout = std::stod(val);
+            } else if (take(i, argc, argv, "--gptq-selftest", val)) {
+                opt.gptq_selftest = std::stoi(val);
             } else if (take(i, argc, argv, "--write-test-imatrix", val)) {
                 opt.write_imatrix = val;
             } else if (take(i, argc, argv, "--max-layers", val)) {
