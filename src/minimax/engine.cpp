@@ -6332,7 +6332,7 @@ struct Engine::Impl {
         // reads slow the DMA more than the experts it takes save).
         static const double cpu_gbs = [] {
             const char* e = std::getenv("STRATA_PF_CPU_GBS");
-            return e ? std::atof(e) : 16.0;   // 0 turns the split off
+            return e ? std::atof(e) : 24.0;   // 0 turns the split off (P41: 16 -> 24 after the batched CPU passes)
         }();
         std::vector<char> on_cpu((size_t)nexp, 0);
         std::vector<std::vector<std::pair<int, float>>> cpu_rows;   // per CPU expert: (token, weight)
@@ -6383,33 +6383,119 @@ struct Engine::Impl {
             cpu_thr = std::thread([&] {
                 try {
                     const auto c0 = std::chrono::steady_clock::now();
-                    const int cap = (int)rows_cap;
-                    std::vector<float> xin((size_t)cap * embd), g((size_t)cap * ff), u((size_t)cap * ff),
-                        hid((size_t)cap * ff), yd((size_t)cap * embd);
-                    for (size_t i = 0; i < cpu_exp.size(); ++i) {
-                        const int e = cpu_exp[i];
-                        const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
-                        const uint8_t* ub = gb + L.expert_gu;
-                        const uint8_t* db = gb + 2 * L.expert_gu;
-                        const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
-                        const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
-                        const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
-                        const auto& rws = cpu_rows[i];
-                        for (size_t a = 0; a < rws.size(); a += (size_t)cap) {
-                            const int nt = (int)std::min<size_t>(rws.size() - a, (size_t)cap);
-                            for (int r = 0; r < nt; ++r)
-                                std::memcpy(xin.data() + (size_t)r * embd, hhost + (size_t)rws[a + r].first * embd,
-                                            (size_t)embd * sizeof(float));
-                            gemm_cpu_base(L.egate, gb, xin.data(), nt, embd, g.data(), ff);
-                            gemm_cpu_base(L.eup, ub, xin.data(), nt, embd, u.data(), ff);
-                            for (size_t q = 0; q < (size_t)nt * ff; ++q)
-                                hid[q] = swigluoai(g[q] * fg, u[q] * fu, alpha, limit);
-                            gemm_cpu_base(L.edown, db, hid.data(), nt, ff, yd.data(), embd);
-                            for (int r = 0; r < nt; ++r) {
-                                const float wgt = rws[a + r].second * fd;
-                                float* dst = ycpu.data() + (size_t)rws[a + r].first * embd;
-                                const float* src = yd.data() + (size_t)r * embd;
-                                for (int c = 0; c < embd; ++c) dst[c] += wgt * src[c];
+                    // P41: all of the chunk's CPU experts in four pool passes (quantize inputs, gate+up+SwiGLU over
+                    // (expert, row band), quantize hidden, down over (expert, row band)) instead of three pool.run
+                    // barriers per expert: at 100 tokens rig-2 spent ~1.7 ms an expert (8.5 GB/s) on the old loop.
+                    auto ggml_ok = [](const Tensor& t) {
+                        return t.cpu && t.cpu->vec_dot && !strata::kernels::ikq::is_iqk_type(t.type) &&
+                               ggml_get_type_traits_cpu(t.cpu->vec_dot_type) &&
+                               ggml_get_type_traits_cpu(t.cpu->vec_dot_type)->from_float;
+                    };
+                    if (ggml_ok(L.egate) && ggml_ok(L.eup) && ggml_ok(L.edown) &&
+                        L.egate.cpu->vec_dot_type == L.eup.cpu->vec_dot_type) {
+                        const size_t ne_ = cpu_exp.size();
+                        std::vector<size_t> r0(ne_ + 1, 0);   // first row of each expert in the flattened row list
+                        for (size_t i = 0; i < ne_; ++i) r0[i + 1] = r0[i] + cpu_rows[i].size();
+                        const size_t nrow = r0[ne_];
+                        std::vector<int> row_e(nrow);
+                        for (size_t i = 0; i < ne_; ++i)
+                            for (size_t j = r0[i]; j < r0[i + 1]; ++j) row_e[j] = (int)i;
+                        const ggml_type at_gu = L.egate.cpu->vec_dot_type, at_d = L.edown.cpu->vec_dot_type;
+                        const size_t ab_gu = ggml_row_size(at_gu, embd), ab_d = ggml_row_size(at_d, ff);
+                        std::vector<uint8_t> xq(nrow * ab_gu), hq(nrow * ab_d);
+                        std::vector<float> hid(nrow * (size_t)ff), yd(nrow * (size_t)embd);
+                        const auto* fx = ggml_get_type_traits_cpu(at_gu);
+                        const auto* fh = ggml_get_type_traits_cpu(at_d);
+                        auto flat = [&](size_t j) { return cpu_rows[(size_t)row_e[j]][j - r0[(size_t)row_e[j]]]; };
+                        pool.run((int)nrow, [&](int a, int b) {
+                            for (int j = a; j < b; ++j)
+                                fx->from_float(hhost + (size_t)flat((size_t)j).first * embd, xq.data() + (size_t)j * ab_gu,
+                                               embd);
+                        });
+                        const int band = 128;
+                        const int nb_ff = (ff + band - 1) / band, nb_em = (embd + band - 1) / band;
+                        pool.run((int)(ne_ * nb_ff), [&](int a, int b) {
+                            for (int u_ = a; u_ < b; ++u_) {
+                                const size_t i = (size_t)u_ / nb_ff;
+                                const int q0 = (u_ % nb_ff) * band, q1 = std::min(ff, q0 + band);
+                                const int e = cpu_exp[i];
+                                const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
+                                const uint8_t* ub = gb + L.expert_gu;
+                                const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
+                                const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
+                                for (int q = q0; q < q1; ++q) {
+                                    const uint8_t* grow = gb + (size_t)q * L.egate.row_bytes;
+                                    const uint8_t* urow = ub + (size_t)q * L.eup.row_bytes;
+                                    for (size_t j = r0[i]; j < r0[i + 1]; ++j) {
+                                        float gv = 0.f, uv = 0.f;
+                                        L.egate.cpu->vec_dot(embd, &gv, 0, grow, 0, xq.data() + j * ab_gu, 0, 1);
+                                        L.eup.cpu->vec_dot(embd, &uv, 0, urow, 0, xq.data() + j * ab_gu, 0, 1);
+                                        hid[j * (size_t)ff + q] = swigluoai(gv * fg, uv * fu, alpha, limit);
+                                    }
+                                }
+                            }
+                        });
+                        pool.run((int)nrow, [&](int a, int b) {
+                            for (int j = a; j < b; ++j)
+                                fh->from_float(hid.data() + (size_t)j * ff, hq.data() + (size_t)j * ab_d, ff);
+                        });
+                        pool.run((int)(ne_ * nb_em), [&](int a, int b) {
+                            for (int u_ = a; u_ < b; ++u_) {
+                                const size_t i = (size_t)u_ / nb_em;
+                                const int q0 = (u_ % nb_em) * band, q1 = std::min(embd, q0 + band);
+                                const int e = cpu_exp[i];
+                                const uint8_t* db = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]) +
+                                                    2 * L.expert_gu;
+                                for (int q = q0; q < q1; ++q) {
+                                    const uint8_t* drow = db + (size_t)q * L.edown.row_bytes;
+                                    for (size_t j = r0[i]; j < r0[i + 1]; ++j) {
+                                        float dv = 0.f;
+                                        L.edown.cpu->vec_dot(ff, &dv, 0, drow, 0, hq.data() + j * ab_d, 0, 1);
+                                        yd[j * (size_t)embd + q] = dv;
+                                    }
+                                }
+                            }
+                        });
+                        // Sum into ycpu per column band: each band owns its columns across every row.
+                        pool.run(nb_em, [&](int a, int b) {
+                            for (size_t j = 0; j < nrow; ++j) {
+                                const auto rw = flat(j);
+                                const int e = cpu_exp[(size_t)row_e[j]];
+                                const float wgt = rw.second * (L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e]);
+                                float* dst = ycpu.data() + (size_t)rw.first * embd;
+                                const float* src = yd.data() + j * (size_t)embd;
+                                for (int c = a * band; c < std::min(embd, b * band); ++c) dst[c] += wgt * src[c];
+                            }
+                        });
+                    } else {
+                        const int cap = (int)rows_cap;
+                        std::vector<float> xin((size_t)cap * embd), g((size_t)cap * ff), u((size_t)cap * ff),
+                            hid((size_t)cap * ff), yd((size_t)cap * embd);
+                        for (size_t i = 0; i < cpu_exp.size(); ++i) {
+                            const int e = cpu_exp[i];
+                            const uint8_t* gb = ram_slot_ptr(const_cast<Layer&>(L), L.ram_of[(size_t)e]);
+                            const uint8_t* ub = gb + L.expert_gu;
+                            const uint8_t* db = gb + 2 * L.expert_gu;
+                            const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)e];
+                            const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)e];
+                            const float fd = L.edown_scale.empty() ? 1.f : L.edown_scale[(size_t)e];
+                            const auto& rws = cpu_rows[i];
+                            for (size_t a = 0; a < rws.size(); a += (size_t)cap) {
+                                const int nt = (int)std::min<size_t>(rws.size() - a, (size_t)cap);
+                                for (int r = 0; r < nt; ++r)
+                                    std::memcpy(xin.data() + (size_t)r * embd, hhost + (size_t)rws[a + r].first * embd,
+                                                (size_t)embd * sizeof(float));
+                                gemm_cpu_base(L.egate, gb, xin.data(), nt, embd, g.data(), ff);
+                                gemm_cpu_base(L.eup, ub, xin.data(), nt, embd, u.data(), ff);
+                                for (size_t q = 0; q < (size_t)nt * ff; ++q)
+                                    hid[q] = swigluoai(g[q] * fg, u[q] * fu, alpha, limit);
+                                gemm_cpu_base(L.edown, db, hid.data(), nt, ff, yd.data(), embd);
+                                for (int r = 0; r < nt; ++r) {
+                                    const float wgt = rws[a + r].second * fd;
+                                    float* dst = ycpu.data() + (size_t)rws[a + r].first * embd;
+                                    const float* src = yd.data() + (size_t)r * embd;
+                                    for (int c = 0; c < embd; ++c) dst[c] += wgt * src[c];
+                                }
                             }
                         }
                     }
