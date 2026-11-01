@@ -89,9 +89,12 @@ void usage() {
                  "                                    batched prompt pass (default auto, the long-context path)\n"
                  "  --minimax-prefill-batch N         process prompt tokens N at a time in batched passes (0 = per token)\n"
                  "  --minimax-prefill-experts auto|cpu|gpu  where a batched chunk's routed experts are computed\n"
-                 "  --minimax-prefill-expert-gemm mmvq|tc|auto\n"
-                 "                                    routed experts: int8 iq_mmvq dots (default), dequantize-once +\n"
-                 "                                    FP16 tensor-core GEMM per expert, or auto (tc from 16 rows)\n"
+                 "  --minimax-prefill-expert-device auto|own|N  card that runs a layer's prompt experts (auto: the\n"
+                 "                       fastest host link when the layer's own card is 1.5x slower)\n"
+                 "  --minimax-prefill-expert-gemm auto|mmvq|tc\n"
+                 "                                    routed experts: auto (default: tc from 16 rows), int8 iq_mmvq\n"
+                 "                                    dots, or dequantize-once + FP16 tensor-core GEMM per expert\n"
+                 "  --minimax-prefill-dense f16|f32   dense prompt GEMMs: fp16 tensor cores (default) or fp32 SGEMM\n"
                  "  --minimax-prefill-read mmap|direct    cached expert reads (default) or unbuffered 16 MiB reads\n"
                  "  --minimax-prefill-vram reserve|swap  reserve (default): the prompt workspace is subtracted from the\n"
                  "                                    VRAM expert slots at startup and lives for the run (P10); swap:\n"
@@ -602,7 +605,7 @@ int run(int argc, char** argv) {
     std::string kv_quant, host_attn, prefill_kv;
     int prefill_batch = 0, expert_prefetch = 0;
     std::string prefill_vram;
-    std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq;
+    std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq, prefill_expert_device;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
     int ssd_chunks = 1, expert_skip_ssd = 0;
@@ -648,6 +651,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-experts") prefill_experts = next();
         else if (a == "--minimax-prefill-dense") prefill_dense = next();
         else if (a == "--minimax-prefill-expert-gemm") prefill_expert_gemm = next();
+        else if (a == "--minimax-prefill-expert-device") prefill_expert_device = next();
         else if (a == "--minimax-prefill-read") prefill_read = next();
         else if (a == "--minimax-prefill-vram") prefill_vram = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
@@ -888,6 +892,7 @@ int run(int argc, char** argv) {
     opt.prefill_experts = prefill_experts;
     opt.prefill_dense = prefill_dense;
     opt.prefill_expert_gemm = prefill_expert_gemm;
+    opt.prefill_expert_device = prefill_expert_device;
     opt.prefill_read = prefill_read;
     opt.prefill_vram = prefill_vram;
     opt.expert_prefetch = expert_prefetch;

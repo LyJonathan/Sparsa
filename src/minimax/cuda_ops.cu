@@ -11,6 +11,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
+#include <cstdlib>
 
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -219,6 +221,11 @@ __global__ void msa_attn_kernel(const __half* __restrict__ k, const __half* __re
 
 namespace {
 
+__global__ void f16_to_f32_kernel(const __half* __restrict__ x, float* __restrict__ y, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(x[i]);
+}
+
 __global__ void f32_to_f16_kernel(const float* __restrict__ x, __half* __restrict__ y, long long n) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
@@ -365,6 +372,78 @@ __global__ void idx_scores_batch_kernel(const __half* __restrict__ ik, const __h
     if (threadIdx.x == 0) bs[(t * gridDim.y + h) * nb + b] = m;
 }
 
+// P31: the same block scores on the tensor cores.  The queries of one chunk are rows r = token * heads + head of
+// q[r][dim] (all indexer heads share the one key head), so S = Q K^T is a plain GEMM tile: one warp per 16 query
+// rows, one CTA per (key block, 64 query rows), fp16 x fp16 -> fp32 MMAs over 16-key tiles, then the causal max of
+// each row over the block.  Partial tiles (the last 16 query rows, the keys past the chunk) are staged in shared
+// memory with zero fill so no load runs past the buffers.  Requires dim % 16 == 0 and dim <= 128.
+constexpr int kIdxLd = 136;
+__global__ void idx_scores_wmma_kernel(const __half* __restrict__ ik, const __half* __restrict__ q, int dim, int blk,
+                                       long long pos0, long long n_tok, int heads, long long nb,
+                                       float* __restrict__ bs) {
+    using namespace nvcuda;
+    __shared__ __align__(32) float sc[4][16 * 16];
+    __shared__ __align__(32) __half qt[4][16 * kIdxLd];
+    __shared__ __align__(32) __half kt[4][16 * kIdxLd];
+    const int warp = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
+    const long long R = n_tok * heads;
+    const long long r0 = ((long long)blockIdx.y * 4 + warp) * 16;
+    if (r0 >= R) return;
+    const long long b = (long long)blockIdx.x;
+    const long long key_lo = b * blk;
+    const long long kv_end = pos0 + n_tok;   // keys at or past this are not in the cache yet
+    const long long rlast = (r0 + 15 < R ? r0 + 15 : R - 1);
+    const long long pmax = pos0 + rlast / heads;   // the latest query position in this warp's rows
+    float rowmax = -INFINITY;
+    if (pmax >= key_lo) {
+        const __half* qbase = q + r0 * dim;
+        int ldq = dim;
+        if (r0 + 16 > R) {
+            for (int i = lane; i < 16 * dim; i += 32) {
+                const int row = i / dim, col = i % dim;
+                qt[warp][row * kIdxLd + col] = r0 + row < R ? q[(r0 + row) * dim + col] : __float2half(0.f);
+            }
+            __syncwarp();
+            qbase = qt[warp];
+            ldq = kIdxLd;
+        }
+        for (int n0 = 0; n0 < blk; n0 += 16) {
+            const long long key0 = key_lo + n0;
+            if (key0 > pmax) break;   // causal: no row of this warp sees these keys
+            const __half* kbase = ik + key0 * dim;
+            int ldk = dim;
+            if (key0 + 16 > kv_end) {
+                __syncwarp();
+                for (int i = lane; i < 16 * dim; i += 32) {
+                    const int row = i / dim, col = i % dim;
+                    kt[warp][row * kIdxLd + col] = key0 + row < kv_end ? ik[(key0 + row) * dim + col] : __float2half(0.f);
+                }
+                __syncwarp();
+                kbase = kt[warp];
+                ldk = kIdxLd;
+            }
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.f);
+            for (int k0 = 0; k0 < dim; k0 += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fa, qbase + k0, ldq);
+                wmma::load_matrix_sync(fb, kbase + k0, ldk);
+                wmma::mma_sync(acc, fa, fb, acc);
+            }
+            wmma::store_matrix_sync(sc[warp], acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            if (lane < 16 && r0 + lane < R) {
+                const long long pos = pos0 + (r0 + lane) / heads;
+                for (int c = 0; c < 16; ++c)
+                    if (key0 + c <= pos) rowmax = fmaxf(rowmax, sc[warp][lane * 16 + c]);
+            }
+            __syncwarp();
+        }
+    }
+    if (lane < 16 && r0 + lane < R) bs[(r0 + lane) * nb + b] = rowmax;
+}
+
 // One block per (query token, head).  Indexed layers store the selected scores/positions in shared memory (at most
 // top_k blocks x block_size); the dense fallback (no indexer) walks the cache three times so no 32 K-float buffer is
 // needed.
@@ -488,6 +567,172 @@ cublasHandle_t blas_handle() {
 
 }  // namespace
 
+
+// P15: tensor-core variant of msa_attn_flash_kernel for 16 query heads per KV head and 128-dim heads (M3.1).  The
+// 16 heads of one KV head share the selected positions, so a block's queries are exactly one 16-row WMMA tile:
+// S = Q K^T and O += P V run as fp16 x fp16 -> fp32 MMAs over chunks of 64 positions, with the online softmax in
+// fp32 between them.  P goes into the second MMA as two fp16 halves (hi + lo), which keeps it at ~fp32 precision;
+// MSA's block selection amplifies small attention differences layer over layer, so a plain fp16 P is not close
+// enough.  STRATA_MSA_WMMA=0 keeps the scalar kernel.
+constexpr int kWmmaH = 16, kWmmaD = 128, kWmmaC = 64;
+constexpr int kWmmaLdQ = kWmmaD + 8, kWmmaLdK = kWmmaD + 8, kWmmaLdS = kWmmaC + 4, kWmmaLdP = kWmmaC + 8,
+              kWmmaLdO = kWmmaD + 4;
+
+__global__ void __launch_bounds__(128) msa_attn_wmma_kernel(const __half* __restrict__ k, const __half* __restrict__ v,
+                                                           const __half* __restrict__ q, const int* __restrict__ blk,
+                                                           const int* __restrict__ nblk, int blk_size, int heads,
+                                                           long long pos0, long long max_blk, float* __restrict__ out) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem[];
+    __half* qs = (__half*)smem;                                    // [16][kWmmaLdQ]
+    __half* kvs = qs + kWmmaH * kWmmaLdQ;                          // [64][kWmmaLdK], K then V of a chunk
+    float* ss = (float*)(kvs + kWmmaC * kWmmaLdK);                 // [16][kWmmaLdS]
+    __half* ps = (__half*)(ss + kWmmaH * kWmmaLdS);                // [16][kWmmaLdP] hi half of P
+    __half* pl = ps + kWmmaH * kWmmaLdP;                           // [16][kWmmaLdP] lo half of P
+    float* os = (float*)(pl + kWmmaH * kWmmaLdP);                  // [16][kWmmaLdO]
+    float* run_m = os + kWmmaH * kWmmaLdO;                         // [16]
+    float* run_l = run_m + kWmmaH;                                 // [16]
+    int* bstart = (int*)(run_l + kWmmaH);                          // [max_blk + 1]: entries before each used block
+    int* bpos = bstart + max_blk + 1;                              // [max_blk]: first position of each used block
+    int* cpos = bpos + max_blk;                                    // [64]: this chunk's positions (P43)
+    const long long t = (long long)blockIdx.x;
+    const int kv = (int)blockIdx.y;
+    const int hkv = (int)gridDim.y;
+    const long long pos = pos0 + t;
+    const int tid = (int)threadIdx.x, warp = tid >> 5;
+    const float att_scale = 1.f / sqrtf((float)kWmmaD);
+
+    if (tid == 0) {
+        const int nb = nblk[t * (long long)hkv + kv];
+        int n = 0, used = 0;
+        for (int j = 0; j < nb && j < (int)max_blk; ++j) {
+            const int b = blk[(t * (long long)hkv + kv) * max_blk + j];
+            if (b < 0) continue;
+            const long long p0 = (long long)b * blk_size;
+            long long p1 = p0 + blk_size;
+            if (p1 > pos + 1) p1 = pos + 1;
+            if (p1 <= p0) continue;
+            bstart[used] = n;
+            bpos[used] = (int)p0;
+            n += (int)(p1 - p0);
+            ++used;
+        }
+        bstart[used] = n;
+        run_l[0] = (float)used;   // handed to the other threads below, reset before use
+    }
+    for (int i = tid; i < kWmmaH * (kWmmaD / 8); i += 128) {
+        const int h = i / (kWmmaD / 8), c = i % (kWmmaD / 8);
+        *(uint4*)(qs + h * kWmmaLdQ + c * 8) =
+            *(const uint4*)(q + ((t * (long long)heads) + kv * kWmmaH + h) * kWmmaD + c * 8);
+    }
+    for (int i = tid; i < kWmmaH * kWmmaLdO; i += 128) os[i] = 0.f;
+    __syncthreads();
+    const int nused = (int)run_l[0];
+    const int n = bstart[nused];
+    __syncthreads();
+    if (tid < kWmmaH) {
+        run_m[tid] = -INFINITY;
+        run_l[tid] = 0.f;
+    }
+    __syncthreads();
+
+    // Position of selected entry i: the used blocks are contiguous runs of positions.
+    auto entry_pos = [&](int i) {
+        int lo = 0, hi = nused - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (bstart[mid] <= i) lo = mid;
+            else hi = mid - 1;
+        }
+        return bpos[lo] + (i - bstart[lo]);
+    };
+    auto load_rows = [&](const __half* src, int base, int cn) {
+        for (int i = tid; i < kWmmaC * (kWmmaD / 8); i += 128) {
+            const int r = i / (kWmmaD / 8), c = i % (kWmmaD / 8);
+            uint4 val = make_uint4(0u, 0u, 0u, 0u);
+            if (r < cn) val = *(const uint4*)(src + ((long long)cpos[r] * hkv + kv) * kWmmaD + c * 8);
+            *(uint4*)(kvs + r * kWmmaLdK + c * 8) = val;
+        }
+    };
+
+    for (int base = 0; base < n; base += kWmmaC) {
+        const int cn = (n - base) < kWmmaC ? (n - base) : kWmmaC;
+        // P43: the chunk's 64 positions once, instead of a binary search per 16-byte load (8 per thread for K and
+        // again for V): 1.6-1.75x on rig-2's 5060 Ti, bit-identical.
+        if (tid < kWmmaC) cpos[tid] = tid < cn ? entry_pos(base + tid) : 0;
+        __syncthreads();
+        load_rows(k, base, cn);
+        __syncthreads();
+        {   // S[:, warp*16 .. +16] = Q K^T
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
+            wmma::fill_fragment(sf, 0.f);
+            for (int kk = 0; kk < kWmmaD / 16; ++kk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> bf;
+                wmma::load_matrix_sync(af, qs + kk * 16, kWmmaLdQ);
+                wmma::load_matrix_sync(bf, kvs + warp * 16 * kWmmaLdK + kk * 16, kWmmaLdK);
+                wmma::mma_sync(sf, af, bf, sf);
+            }
+            wmma::store_matrix_sync(ss + warp * 16, sf, kWmmaLdS, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // V of this chunk replaces K while 8 threads a row run the online softmax and rescale O.
+        load_rows(v, base, cn);
+        {
+            const int r = tid >> 3, l = tid & 7;
+            float sv[8];
+            float mx = -INFINITY;
+            for (int j = 0; j < 8; ++j) {
+                const int c = l * 8 + j;
+                sv[j] = c < cn ? ss[r * kWmmaLdS + c] * att_scale : -INFINITY;
+                mx = fmaxf(mx, sv[j]);
+            }
+            for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 8));
+            const float m_old = run_m[r];
+            const float mn = fmaxf(m_old, mx);
+            const float alpha = m_old == -INFINITY ? 0.f : __expf(m_old - mn);
+            float sum = 0.f;
+            for (int j = 0; j < 8; ++j) {
+                const float e = sv[j] == -INFINITY ? 0.f : __expf(sv[j] - mn);
+                const __half eh = __float2half(e);
+                ps[r * kWmmaLdP + l * 8 + j] = eh;
+                pl[r * kWmmaLdP + l * 8 + j] = __float2half(e - __half2float(eh));
+                sum += e;
+            }
+            for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, 8);
+            for (int c = l; c < kWmmaD; c += 8) os[r * kWmmaLdO + c] *= alpha;
+            __syncwarp();
+            if (l == 0) {
+                run_m[r] = mn;
+                run_l[r] = run_l[r] * alpha + sum;
+            }
+        }
+        __syncthreads();
+        {   // O[:, warp*32 .. +32] += P V
+            for (int nt = 0; nt < 2; ++nt) {
+                const int c0 = warp * 32 + nt * 16;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> of;
+                wmma::load_matrix_sync(of, os + c0, kWmmaLdO, wmma::mem_row_major);
+                for (int kk = 0; kk < kWmmaC / 16; ++kk) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> bf;
+                    wmma::load_matrix_sync(bf, kvs + kk * 16 * kWmmaLdK + c0, kWmmaLdK);
+                    wmma::load_matrix_sync(af, ps + kk * 16, kWmmaLdP);
+                    wmma::mma_sync(of, af, bf, of);
+                    wmma::load_matrix_sync(af, pl + kk * 16, kWmmaLdP);
+                    wmma::mma_sync(of, af, bf, of);
+                }
+                wmma::store_matrix_sync(os + c0, of, kWmmaLdO, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < kWmmaH * kWmmaD; i += 128) {
+        const int h = i / kWmmaD, d = i % kWmmaD;
+        const float l = run_l[h] > 0.f ? run_l[h] : 1.f;
+        out[((t * (long long)heads) + kv * kWmmaH + h) * kWmmaD + d] = os[h * kWmmaLdO + d] / l;
+    }
+}
 
 // Four query heads of one KV head per block: the K rows are dotted against all four queries and the V rows are read
 // Four query heads of one KV head per block: the K rows are dotted against all four queries and the V rows are read
@@ -794,7 +1039,17 @@ MemInfo mem() {
 void* alloc(size_t bytes) {
     if (bytes == 0) bytes = 4;
     void* p = nullptr;
-    check(cudaMalloc(&p, bytes), "cudaMalloc");
+    const cudaError_t e = cudaMalloc(&p, bytes);
+    if (e != cudaSuccess) {
+        int dev = -1;
+        cudaGetDevice(&dev);
+        size_t fr = 0, tot = 0;
+        cudaGetLastError();
+        cudaMemGetInfo(&fr, &tot);
+        throw std::runtime_error("cuda: cudaMalloc of " + std::to_string(bytes >> 20) + " MiB on device " +
+                                 std::to_string(dev) + " (" + std::to_string(fr >> 20) + " MiB free): " +
+                                 cudaGetErrorString(e));
+    }
     return p;
 }
 
@@ -860,6 +1115,11 @@ void* stream_create_blocking() {
 }
 
 void* stream_legacy() { return (void*)cudaStreamLegacy; }
+
+// P39: make `stream` (nullptr = the legacy default stream) wait on the device for `event`; the host does not block.
+void stream_wait_event(void* stream, void* event) {
+    check(cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0), "cudaStreamWaitEvent");
+}
 
 // P5c: CUDA graphs.  Capture is ThreadLocal so a launch from another thread (the pool) cannot be folded in by
 // accident, and the stream must be the dedicated blocking one: the legacy default stream cannot be captured.
@@ -1065,6 +1325,13 @@ void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     check(cudaGetLastError(), "f32_to_f16 launch");
 }
 
+void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const long long blocks = (n + 255) / 256;
+    f16_to_f32_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>((const __half*)x, y, n);
+    check(cudaGetLastError(), "f16_to_f32 launch");
+}
+
 void head_norm_rope(const float* x, const float* gamma, float* o32, uint16_t* o16, int64_t rows, int heads_per_tok,
                     int dim, int n_rot, const float* cos_tab, const float* sin_tab, const int32_t* pos, float eps,
                     void* stream) {
@@ -1116,8 +1383,17 @@ void gemm_f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, in
     if (cublasSetStream(h, (cudaStream_t)stream) != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("cuda: cublasSetStream failed");
     const float alpha = 1.f;
-    const cublasStatus_t st = cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, (int)K, X,
-                                          (int)K, &beta, Y, (int)(ldy > 0 ? ldy : N));
+    // STRATA_MM_TF32=1: the same fp32 operands on the tensor cores (10-bit mantissa products, fp32 accumulate).
+    static const bool tf32 = [] {
+        const char* e = std::getenv("STRATA_MM_TF32");
+        return e && *e && *e != '0';
+    }();
+    const cublasStatus_t st =
+        tf32 ? cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, CUDA_R_32F, (int)K, X,
+                            CUDA_R_32F, (int)K, &beta, Y, CUDA_R_32F, (int)(ldy > 0 ? ldy : N),
+                            CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+             : cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)T, (int)K, &alpha, W, (int)K, X, (int)K, &beta,
+                           Y, (int)(ldy > 0 ? ldy : N));
     if (st != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("cuda: cublasSgemm failed: " + std::to_string((int)st) + " (N=" + std::to_string((long long)N) + " T=" + std::to_string((long long)T) + " K=" + std::to_string((long long)K) + " ldy=" + std::to_string((long long)ldy) + ")");
     check(cudaGetLastError(), "gemm_f32");
@@ -1186,6 +1462,18 @@ void moe_combine_rows(const float* Y, const int32_t* ent_tok, const float* ent_w
 void idx_block_scores_batch(const void* ik, const uint16_t* q, int heads, int dim, int blk, int64_t nb, int64_t n_tok,
                             int64_t pos0, float* bs, void* stream) {
     if (nb <= 0 || heads <= 0 || n_tok <= 0) return;
+    static const bool idx_wmma = [] {
+        const char* e = std::getenv("STRATA_IDX_WMMA");
+        return !(e && e[0] == '0');
+    }();
+    if (idx_wmma && dim % 16 == 0 && dim <= 128 && blk % 16 == 0) {
+        const long long rows = n_tok * heads;
+        const dim3 g((unsigned)nb, (unsigned)((rows + 63) / 64));
+        idx_scores_wmma_kernel<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)ik, (const __half*)q, dim, blk, pos0,
+                                                                   n_tok, heads, nb, bs);
+        check(cudaGetLastError(), "idx_scores_wmma launch");
+        return;
+    }
     const dim3 grid((unsigned)nb, (unsigned)heads, (unsigned)n_tok);
     idx_scores_batch_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>((const __half*)ik, (const __half*)q, dim, blk, pos0,
                                                                   bs);
@@ -1203,6 +1491,31 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
     const int hkv_d = q_per_kv > 0 ? heads / q_per_kv : 0;
     const int idx_per_head = q_per_idx > 0 ? heads / q_per_idx : 0;
     static const bool msa_old = std::getenv("STRATA_MSA_OLD") != nullptr;
+    static const bool msa_wmma = [] {
+        const char* e = std::getenv("STRATA_MSA_WMMA");
+        return !(e && e[0] == '0');
+    }();
+    if (msa_wmma && !msa_old && !dense_all && hkv_d > 0 && hkv_d == idx_per_head && q_per_kv == kWmmaH &&
+        dim == kWmmaD) {
+        const size_t shm = (size_t)kWmmaH * kWmmaLdQ * 2 + (size_t)kWmmaC * kWmmaLdK * 2 +
+                           (size_t)kWmmaH * kWmmaLdS * 4 + 2 * (size_t)kWmmaH * kWmmaLdP * 2 +
+                           (size_t)kWmmaH * kWmmaLdO * 4 + 2 * kWmmaH * 4 + (2 * (size_t)max_blk + 1) * 4 +
+                           (size_t)kWmmaC * 4;
+        static bool shm_set[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (shm > 48u * 1024u && dev >= 0 && dev < 64 && !shm_set[dev]) {
+            check(cudaFuncSetAttribute(msa_attn_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm),
+                  "msa_attn_wmma smem");
+            shm_set[dev] = true;
+        }
+        const dim3 grid((unsigned)n_tok, (unsigned)hkv_d);
+        msa_attn_wmma_kernel<<<grid, 128, shm, (cudaStream_t)stream>>>((const __half*)k, (const __half*)v,
+                                                                      (const __half*)q, blk, nblk, blk_size, heads,
+                                                                      pos0, max_blk, out);
+        check(cudaGetLastError(), "msa_attn_wmma launch");
+        return;
+    }
     if (!msa_old && !dense_all && hkv_d > 0 && hkv_d == idx_per_head && q_per_kv >= 1 && q_per_kv <= 16 && dim >= 2 &&
         dim <= 128 && dim % 2 == 0) {
         const size_t shm = (size_t)q_per_kv * (size_t)dim * 2 + (size_t)max_blk * (size_t)blk_size * sizeof(int) +

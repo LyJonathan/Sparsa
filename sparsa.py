@@ -167,6 +167,20 @@ def find_mmproj(model: Path, explicit: str | None) -> Path | None:
     return found[0] if found else None
 
 
+def find_profile(model: Path, explicit: str | None, off: bool) -> Path | None:
+    """The routing profile: --profile, else routing-profile.bin beside the model.  It only decides which experts
+    start in VRAM / RAM / on the SSD; the math is the same with or without it."""
+    if off:
+        return None
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"sparsa: --profile {p} is not a file")
+        return p
+    p = model.parent / "routing-profile.bin"
+    return p if p.is_file() else None
+
+
 def build_config(args) -> dict:
     if not args.model:
         raise SystemExit("sparsa: --model is needed (the folder of GGUF parts, or the first part)")
@@ -191,11 +205,15 @@ def build_config(args) -> dict:
         # path).  "ram" is a different mode (device attention over a RAM KV) and is not the same thing.
         cfg_args += ["--minimax-kv", "host"]
     if not args.cpu and not args.no_tiers:
-        # The VRAM expert slots are OFF by default (0): the auto count is measured to leave too little VRAM for
-        # the batched-prefill workspace, and with 128 experts top-4 most routes are not resident anyway; the RAM
-        # tier is what makes the token fast.  --vram-slots N turns them on.
+        # The VRAM expert slots are auto (-1): the engine reserves the batched-prefill workspace first and sizes
+        # the slots from what is left.  rig-2 at 32 K context: 10 slots a layer, prompt speed unchanged, decode
+        # 6.6 / 6.9 -> 7.6 / 8.4 tok/s after the first request (which fills the slots).  --vram-slots 0 turns
+        # them off.
         cfg_args += ["--minimax-tiers", "--minimax-vram-slots-per-layer", str(args.vram_slots),
                      "--vram-reserve-mib", str(args.vram_reserve_mib)]
+        profile = find_profile(first, args.profile, args.no_profile)
+        if profile:
+            cfg_args += ["--minimax-profile", str(profile)]
         if args.ram_gib:
             cfg_args += ["--memory-limit-mib", str(int(args.ram_gib * 1024))]
     prefill_batch = prefill_batch_value(args.prefill_batch)
@@ -205,9 +223,9 @@ def build_config(args) -> dict:
         # every routed expert for every token).  `auto` asks for 4096 and the engine shrinks the chunk to what each
         # card's free VRAM can hold after the weights and the KV; it prints the size it chose
         # (`INFO minimax-prefill batch=...`).  --prefill-batch 0 keeps the token path, N is a fixed chunk.
-        # The expert projection stays on the int8 dots (the engine's `mmvq`): the full-model G3 gate for the
-        # tensor-core path failed (KL64 1.235 -> 1.300, top-1 60.8 % -> 58.2 % over the six short prompts), so
-        # `--prefill-expert-gemm tc` is a choice, not the default.
+        # The expert projection is `auto`: tensor cores for a group of 16+ tokens, the int8 dots below.  Against an
+        # fp64 reference on real IQ2_XXS/IQ2_XS experts the tensor-core output is ~25x closer (rel. L2 4e-4 vs
+        # 1.1e-2 for the int8 dots).  The old full-model gate that failed it was MSA block-selection noise.
         cfg_args += ["--minimax-prefill-batch", str(prefill_batch),
                      "--minimax-prefill-expert-gemm", args.prefill_expert_gemm]
     if args.threads:
@@ -369,19 +387,19 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--gpu", help="cards to use, as nvidia-smi numbers them (default: all)")
         p.add_argument("--cpu", action="store_true", help="run every matrix on the processor (tests only)")
         p.add_argument("--no-tiers", action="store_true", help="no RAM expert tier: every expert is read from the SSD")
-        p.add_argument("--vram-slots", type=int, default=0,
-                       help="VRAM expert slots per layer (default 0: off; the auto count starves prefill)")
+        p.add_argument("--profile", help="routing profile (default: routing-profile.bin beside the model, if any)")
+        p.add_argument("--no-profile", action="store_true", help="ignore routing-profile.bin")
+        p.add_argument("--vram-slots", type=int, default=-1,
+                       help="VRAM expert slots per layer (default -1: auto, sized after the prompt workspace; 0: off)")
         p.add_argument("--threads", type=int, help="CPU expert workers (default: the engine's own count)")
         p.add_argument("--vram-reserve-mib", type=int, default=700, help="VRAM kept free (default 700)")
         p.add_argument("--ram-gib", type=float, help="cap the RAM expert tier at this many GiB")
         p.add_argument("--prefill-batch", default="auto",
                        help="prompt chunk: auto (default: 4096, shrunk by the engine to the free VRAM), 0 = the "
                             "token path, or a token count")
-        p.add_argument("--prefill-expert-gemm", choices=("auto", "mmvq", "tc"), default="mmvq",
-                       help="how a batched chunk's routed experts are projected: mmvq (default: the int8 dots), "
-                            "auto (tensor cores from 16 rows per expert, the int8 dots below), or tc. The full "
-                            "IQ2_XS-D3 G3 gate failed for tc (KL64 1.235 -> 1.300, top-1 60.8%% -> 58.2%%), so it "
-                            "stays opt-in")
+        p.add_argument("--prefill-expert-gemm", choices=("auto", "mmvq", "tc"), default="auto",
+                       help="how a batched chunk's routed experts are projected: auto (default: tensor cores from "
+                            "16 rows per expert, the int8 dots below), mmvq (the int8 dots only), or tc")
         p.add_argument("--allow-nonstandard", action="store_true",
                        help="serve a test slice (fewer layers than a full model)")
         p.add_argument("--engine-arg", action="append", help="one more engine option, repeatable")
