@@ -1039,7 +1039,17 @@ MemInfo mem() {
 void* alloc(size_t bytes) {
     if (bytes == 0) bytes = 4;
     void* p = nullptr;
-    check(cudaMalloc(&p, bytes), "cudaMalloc");
+    const cudaError_t e = cudaMalloc(&p, bytes);
+    if (e != cudaSuccess) {
+        int dev = -1;
+        cudaGetDevice(&dev);
+        size_t fr = 0, tot = 0;
+        cudaGetLastError();
+        cudaMemGetInfo(&fr, &tot);
+        throw std::runtime_error("cuda: cudaMalloc of " + std::to_string(bytes >> 20) + " MiB on device " +
+                                 std::to_string(dev) + " (" + std::to_string(fr >> 20) + " MiB free): " +
+                                 cudaGetErrorString(e));
+    }
     return p;
 }
 

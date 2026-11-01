@@ -2355,6 +2355,16 @@ struct Engine::Impl {
         return b;
     }
 
+    // What one VRAM slot really takes: cudaMalloc hands out 2 MiB pages, so a 14.5 MiB expert costs 16 MiB.  Planning
+    // with the raw size over-filled a card by ~10% once each card got its own slot count (P28), and the swap mode,
+    // which plans no workspace, died in the slot allocation at load.  The reserve mode keeps the raw size: its
+    // workspace estimate (1543 MiB/device on rig-2 at 4 K) is well above what the workspace takes, and rounding
+    // there cost a slot a layer (decode 7.9 -> 7.4 tok/s).
+    static size_t slot_cost(size_t bytes) {
+        const size_t page = (size_t)2 << 20;
+        return (bytes + page - 1) / page * page;
+    }
+
     void init_tiers() {
         for (const Layer& L : layers)
             if (L.moe) {
@@ -2431,7 +2441,8 @@ struct Engine::Impl {
                 // duration of the prompt instead.  The explicit-count path (`requested >= 0`) is unchanged:
                 // init_prefill shrinks the batch to whatever room that count left, as before.
                 const VramSlotPlan pl = plan_vram_slots(dev_budget[d], 0, prefill_swap ? 0 : prefill_need,
-                                                        max_expert_bytes, (int)dev_moe[d], (int)cfg.n_expert, -1);
+                                                        prefill_swap ? slot_cost(max_expert_bytes) : max_expert_bytes,
+                                                        (int)dev_moe[d], (int)cfg.n_expert, -1);
                 q_dev[d] = std::max(0, std::min(pl.slots, (int)cfg.n_expert));
                 q = std::max(q, q_dev[d]);
             }
@@ -2447,7 +2458,8 @@ struct Engine::Impl {
                 size_t need = 0;
                 for (int64_t i = 0; i < cfg.n_layers; ++i) {
                     const Layer& L = layers[(size_t)i];
-                    if (L.moe && layer_dev[(size_t)i] == (int)d) need += (size_t)q_dev[d] * L.expert_bytes;
+                    if (L.moe && layer_dev[(size_t)i] == (int)d)
+                        need += (size_t)q_dev[d] * (prefill_swap ? slot_cost(L.expert_bytes) : L.expert_bytes);
                 }
                 if (need > dev_budget[d]) {
                     fail("the VRAM expert tier asked for " + std::to_string(q_dev[d]) + " slots per layer (" +
