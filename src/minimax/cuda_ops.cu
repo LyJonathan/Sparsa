@@ -367,6 +367,78 @@ __global__ void idx_scores_batch_kernel(const __half* __restrict__ ik, const __h
     if (threadIdx.x == 0) bs[(t * gridDim.y + h) * nb + b] = m;
 }
 
+// P31: the same block scores on the tensor cores.  The queries of one chunk are rows r = token * heads + head of
+// q[r][dim] (all indexer heads share the one key head), so S = Q K^T is a plain GEMM tile: one warp per 16 query
+// rows, one CTA per (key block, 64 query rows), fp16 x fp16 -> fp32 MMAs over 16-key tiles, then the causal max of
+// each row over the block.  Partial tiles (the last 16 query rows, the keys past the chunk) are staged in shared
+// memory with zero fill so no load runs past the buffers.  Requires dim % 16 == 0 and dim <= 128.
+constexpr int kIdxLd = 136;
+__global__ void idx_scores_wmma_kernel(const __half* __restrict__ ik, const __half* __restrict__ q, int dim, int blk,
+                                       long long pos0, long long n_tok, int heads, long long nb,
+                                       float* __restrict__ bs) {
+    using namespace nvcuda;
+    __shared__ __align__(32) float sc[4][16 * 16];
+    __shared__ __align__(32) __half qt[4][16 * kIdxLd];
+    __shared__ __align__(32) __half kt[4][16 * kIdxLd];
+    const int warp = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
+    const long long R = n_tok * heads;
+    const long long r0 = ((long long)blockIdx.y * 4 + warp) * 16;
+    if (r0 >= R) return;
+    const long long b = (long long)blockIdx.x;
+    const long long key_lo = b * blk;
+    const long long kv_end = pos0 + n_tok;   // keys at or past this are not in the cache yet
+    const long long rlast = (r0 + 15 < R ? r0 + 15 : R - 1);
+    const long long pmax = pos0 + rlast / heads;   // the latest query position in this warp's rows
+    float rowmax = -INFINITY;
+    if (pmax >= key_lo) {
+        const __half* qbase = q + r0 * dim;
+        int ldq = dim;
+        if (r0 + 16 > R) {
+            for (int i = lane; i < 16 * dim; i += 32) {
+                const int row = i / dim, col = i % dim;
+                qt[warp][row * kIdxLd + col] = r0 + row < R ? q[(r0 + row) * dim + col] : __float2half(0.f);
+            }
+            __syncwarp();
+            qbase = qt[warp];
+            ldq = kIdxLd;
+        }
+        for (int n0 = 0; n0 < blk; n0 += 16) {
+            const long long key0 = key_lo + n0;
+            if (key0 > pmax) break;   // causal: no row of this warp sees these keys
+            const __half* kbase = ik + key0 * dim;
+            int ldk = dim;
+            if (key0 + 16 > kv_end) {
+                __syncwarp();
+                for (int i = lane; i < 16 * dim; i += 32) {
+                    const int row = i / dim, col = i % dim;
+                    kt[warp][row * kIdxLd + col] = key0 + row < kv_end ? ik[(key0 + row) * dim + col] : __float2half(0.f);
+                }
+                __syncwarp();
+                kbase = kt[warp];
+                ldk = kIdxLd;
+            }
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.f);
+            for (int k0 = 0; k0 < dim; k0 += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fa, qbase + k0, ldq);
+                wmma::load_matrix_sync(fb, kbase + k0, ldk);
+                wmma::mma_sync(acc, fa, fb, acc);
+            }
+            wmma::store_matrix_sync(sc[warp], acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            if (lane < 16 && r0 + lane < R) {
+                const long long pos = pos0 + (r0 + lane) / heads;
+                for (int c = 0; c < 16; ++c)
+                    if (key0 + c <= pos) rowmax = fmaxf(rowmax, sc[warp][lane * 16 + c]);
+            }
+            __syncwarp();
+        }
+    }
+    if (lane < 16 && r0 + lane < R) bs[(r0 + lane) * nb + b] = rowmax;
+}
+
 // One block per (query token, head).  Indexed layers store the selected scores/positions in shared memory (at most
 // top_k blocks x block_size); the dense fallback (no indexer) walks the cache three times so no 32 K-float buffer is
 // needed.
@@ -1358,6 +1430,18 @@ void moe_combine_rows(const float* Y, const int32_t* ent_tok, const float* ent_w
 void idx_block_scores_batch(const void* ik, const uint16_t* q, int heads, int dim, int blk, int64_t nb, int64_t n_tok,
                             int64_t pos0, float* bs, void* stream) {
     if (nb <= 0 || heads <= 0 || n_tok <= 0) return;
+    static const bool idx_wmma = [] {
+        const char* e = std::getenv("STRATA_IDX_WMMA");
+        return !(e && e[0] == '0');
+    }();
+    if (idx_wmma && dim % 16 == 0 && dim <= 128 && blk % 16 == 0) {
+        const long long rows = n_tok * heads;
+        const dim3 g((unsigned)nb, (unsigned)((rows + 63) / 64));
+        idx_scores_wmma_kernel<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)ik, (const __half*)q, dim, blk, pos0,
+                                                                   n_tok, heads, nb, bs);
+        check(cudaGetLastError(), "idx_scores_wmma launch");
+        return;
+    }
     const dim3 grid((unsigned)nb, (unsigned)heads, (unsigned)n_tok);
     idx_scores_batch_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>((const __half*)ik, (const __half*)q, dim, blk, pos0,
                                                                   bs);

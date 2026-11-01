@@ -1296,6 +1296,11 @@ struct Engine::Impl {
             route_counts.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert, 0.0);
         }
         init_prefill();
+        // P33: allocate the workspace once at load so its pinned host slots exist before the first prompt (the
+        // first request paid 0.5-2 s of cudaHostAlloc).  Each prompt still frees the device side after it (decode
+        // measured slower with it kept: 7.2 vs 7.9 tok/s on rig-2); the pinned slots stay.
+        if (batch_on && !prefill_ws_swap && !cpu_only && !pf_acquire())
+            std::fprintf(stderr, "WARN minimax-prefill the prompt workspace did not fit at load\n");
         // P9: drop the mapping pages the weight upload just faulted in.  With a pinned tier the budget is a hard
         // promise; leaving 10 GiB of dense weights in the standby list next to it is what a desktop feels.
         mem_probe("prefill-init");
@@ -5225,11 +5230,11 @@ struct Engine::Impl {
             cu::dealloc(p.kv_k.p);       p.kv_k.p = nullptr;
             cu::dealloc(p.kv_v.p);       p.kv_v.p = nullptr;
             for (void* r : p.ring_v) cu::dealloc(r);
-            for (void* h : p.pin_v) cu::host_free(h);
+            // P33: the pinned staging slots stay for the run: cudaHostAlloc is the slow part of the allocation
+            // (0.5-2 s a prompt on rig-2), and the host side costs no VRAM.  pf_alloc reuses them.
             for (void* e : p.ev_copy) cu::event_destroy(e);
             for (void* e : p.ev_comp) cu::event_destroy(e);
             p.ring_v.clear();
-            p.pin_v.clear();
             p.ev_copy.clear();
             p.ev_comp.clear();
             p.ring = nullptr;
@@ -5332,7 +5337,7 @@ struct Engine::Impl {
                 p.ring_n = want;
                 for (int s = 0; s < p.ring_n; ++s) {
                     p.ring_v.push_back(cu::alloc(slot));
-                    p.pin_v.push_back(cu::host_alloc(p.pin_slot_bytes));
+                    if ((size_t)s >= p.pin_v.size()) p.pin_v.push_back(cu::host_alloc(p.pin_slot_bytes));
                     p.ev_copy.push_back(cu::event_create());
                     p.ev_comp.push_back(cu::event_create());
                 }
@@ -5343,6 +5348,27 @@ struct Engine::Impl {
         }
         use_device_index(0);
         ws_live = true;
+        // P27: the SSD read-ahead slots, allocated here once for each card that streams experts.  Pinning ~350 MB
+        // inside the first prompt's first MoE layer cost that layer 1.7 s on rig-2.
+        if (prefill_direct && !ssd_files.empty() && pf_disk_ahead() > 0) {
+            if (pf_xdev.empty()) resolve_pf_xdev();
+            for (size_t d = 0; d < pf.size(); ++d) {
+                const int x = pf_xdev.size() > d ? pf_xdev[d] : (int)d;
+                if (!pf[(size_t)x].ring) continue;
+                std::vector<void*>& v = pf_disk_pin[x];
+                while ((int)v.size() < pf_disk_ahead()) v.push_back(cu::host_alloc(pf[(size_t)x].pin_slot_bytes));
+            }
+        }
+    }
+
+    // P27: how many of a chunk's SSD-miss experts per layer get a pinned read-ahead slot (STRATA_PF_DISK_AHEAD,
+    // default 24: a 4 K prompt on rig-2 misses 15-24 per layer; any beyond are read on the compute thread).
+    int pf_disk_ahead() const {
+        static const int n = [] {
+            const char* e = std::getenv("STRATA_PF_DISK_AHEAD");
+            return e ? std::max(0, std::atoi(e)) : 24;
+        }();
+        return n;
     }
 
     // `--minimax-prefill-vram swap`'s two halves.  `pf_acquire` frees expert slots until every card has room for
@@ -6439,12 +6465,8 @@ struct Engine::Impl {
             // Read + queue expert number `si` into slot si % ring_n.  Called ahead of the compute loop.
             double t_disk = 0;                 // STRATA_MM_TIME: the direct-read side alone (the drive's rate)
             int64_t disk_bytes = 0;
-            // P27: the SSD read-ahead (see the tier order above).  Up to STRATA_PF_DISK_AHEAD experts (default 48) get
-            // a pinned slot of their own; any beyond that are read on this thread as before.
-            static const int disk_ahead = [] {
-                const char* e = std::getenv("STRATA_PF_DISK_AHEAD");
-                return e ? std::max(0, std::atoi(e)) : 48;
-            }();
+            // P27: the SSD read-ahead (see the tier order above), into the pinned slots pf_alloc made.
+            const int disk_ahead = pf_disk_ahead();
             std::vector<int> disk_k(streamed.size(), -1);
             std::vector<int> disk_si;
             if (prefill_direct && !ssd_files.empty() && disk_ahead > 0) {
@@ -6861,6 +6883,7 @@ struct Engine::Impl {
         if (!batch_on) fail("internal: the batched path is off");
         if (T < 1) fail("empty batch");
         if (n_past + T > ctx) fail("context is full (" + std::to_string(ctx) + ")");
+        const auto fb_t0 = std::chrono::steady_clock::now();
         const int64_t pos0 = n_past;
         const int ne = (int)cfg.n_embd;
         const int H = (int)cfg.n_head, HKV = (int)cfg.n_head_kv, D = (int)cfg.head_dim;
@@ -6870,15 +6893,21 @@ struct Engine::Impl {
         tok_stats = TokenStats{};
         const Tensor& embd_t = embd;
 
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < T; ++t)
             if (toks[t] < 0 || (int64_t)toks[t] >= cfg.n_vocab) fail("token id out of range");
+        // P32: the embedding rows come through the mapping, cold after the P9 page trims; one row at a time that was
+        // ~0.75 s of page faults for a 4 K chunk on rig-2.  The pool takes them in parallel.
+        if (seed_h.empty())
+            pool.run(T, [&](int a, int b) {
+                for (int t = a; t < b; ++t)
+                    decode_f32(embd_t, embd_t.host + (size_t)toks[t] * embd_t.row_bytes, pf_h.data() + (size_t)t * ne,
+                               ne);
+            });
+        for (int t = 0; t < T; ++t) {
             if (!seed_h.empty()) {
                 if (pos0 + t >= seed_rows) fail("--minimax-seed-hidden has too few rows");
                 std::memcpy(pf_h.data() + (size_t)t * ne, seed_h.data() + (size_t)(pos0 + t) * ne,
                             (size_t)ne * sizeof(float));
-            } else {
-                decode_f32(embd_t, embd_t.host + (size_t)toks[t] * embd_t.row_bytes, pf_h.data() + (size_t)t * ne,
-                           ne);
             }
             if ((size_t)(pos0 + t) < img_row.size()) {
                 const int row = img_row[(size_t)(pos0 + t)];
@@ -6887,6 +6916,9 @@ struct Engine::Impl {
                                 img_data.data() + (size_t)row * (size_t)ne, (size_t)ne * sizeof(float));
             }
         }
+        if (std::getenv("STRATA_MM_TIME"))
+            std::fprintf(stderr, "INFO batch-embed ms=%.1f%c",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fb_t0).count(), 10);
         std::vector<float> att((size_t)qlen);          // one row's attention output (host path)
         std::vector<float> qf((size_t)T * qlen);       // attention queries, fp32 (host path and the q8 upload)
         std::vector<float> vf((size_t)T * klen);       // attention values
@@ -7179,8 +7211,8 @@ struct Engine::Impl {
             if (stream_direct && (li % 8) == 7) trim_mapped_pages();
         }
         if (time_on) {
-            std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f\n", t_idx, t_topk,
-                         t_msa, t_prep, t_kvw);
+            std::fprintf(stderr, "INFO batch-marks idx=%.1f topk=%.1f msa=%.1f prep=%.1f kvw=%.1f layers_end_ms=%.1f\n", t_idx, t_topk,
+                         t_msa, t_prep, t_kvw, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fb_t0).count());
         }
 
         // ---- final norm and output projection
@@ -7515,6 +7547,7 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
     // decode loop, and the guard releases on every early return.
     {
         Impl::PrefillWs ws(impl_);
+        if (std::getenv("STRATA_MM_TIME")) std::fprintf(stderr, "INFO prompt-ws ms=%.1f%c", ms_since(t0), 10);
         const int batch = impl_->batch_on ? impl_->batch_cap : 1;
         for (int i = (int)begin; i < (int)prompt.size();) {
             if (stop.load(std::memory_order_relaxed)) {
