@@ -1045,11 +1045,16 @@ struct Engine::Impl {
         double embed = 0, attn = 0, attn_idx_sync = 0, attn_sync = 0, router = 0, pick = 0, gpu_begin = 0,
                cpu_ram = 0, ssd_wait = 0, cpu_ssd = 0, gpu_finish = 0, combine = 0, shared = 0, admit = 0,
                prefetch = 0, lm_head = 0, total = 0;
+        // P46: the layer loop's own untimed work, so `other` can be attributed.  `pre` is the layer's device switch,
+        // `dense` the leading dense layers' FFN (no MoE), `join` the prefetch wait before the MoE, `resid` the residual
+        // add after the FFN.  `host` is the generate loop's sampling and bookkeeping before this token (not in `total`).
+        double pre = 0, dense = 0, join = 0, resid = 0, host = 0;
         double cpu_bytes = 0, ssd_bytes = 0, gpu_stream = 0;
         int64_t cpu_experts = 0, gpu_experts = 0, ram_experts = 0, ssd_experts = 0;
     };
     Prof prof, prof_sum;
     int64_t prof_tokens = 0;
+    double host_pending_ms = 0.0;   // P46: generate()'s host time before the token that forward_token runs next
     static double pms(std::chrono::steady_clock::time_point a) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
     }
@@ -1061,24 +1066,27 @@ struct Engine::Impl {
         a.total += b.total; a.cpu_bytes += b.cpu_bytes; a.ssd_bytes += b.ssd_bytes; a.gpu_stream += b.gpu_stream;
         a.cpu_experts += b.cpu_experts; a.gpu_experts += b.gpu_experts; a.ram_experts += b.ram_experts;
         a.ssd_experts += b.ssd_experts;
+        a.pre += b.pre; a.dense += b.dense; a.join += b.join; a.resid += b.resid; a.host += b.host;
     }
     // The phases that are timed, added up.  `other` is whatever the clock did not see (a float comparison, a loop
     // the phases do not name): if it is large, a timer is missing, not work.
     static std::string prof_line(const Prof& p, int64_t idx) {
         const double named = p.embed + p.attn + p.router + p.pick + p.gpu_begin + p.cpu_ram + p.ssd_wait + p.cpu_ssd +
-                             p.gpu_finish + p.combine + p.shared + p.admit + p.prefetch + p.lm_head;
+                             p.gpu_finish + p.combine + p.shared + p.admit + p.prefetch + p.lm_head + p.pre + p.dense +
+                             p.join + p.resid;
         // bytes/ms -> GB/s, both from this token's own counters.
         const double gbs = p.cpu_ram + p.cpu_ssd > 0 ? p.cpu_bytes / (p.cpu_ram + p.cpu_ssd) / 1.0e6 : 0.0;
         char buf[1024];
         std::snprintf(buf, sizeof(buf),
                       "INFO minimax-profile token=%lld total=%.1f embed=%.2f attn=%.1f idx_sync=%.1f msa_sync=%.1f "
                       "router=%.1f pick=%.1f gpu_begin=%.2f cpu_ram=%.1f ssd_wait=%.1f cpu_ssd=%.1f gpu_finish=%.1f "
-                      "gpu_stream=%.1f combine=%.1f shared=%.1f admit=%.1f prefetch=%.1f lm_head=%.1f other=%.1f "
-                      "cpu_exp=%lld cpu_gbs=%.1f ssd_exp=%lld",
+                      "gpu_stream=%.1f combine=%.1f shared=%.1f admit=%.1f prefetch=%.1f lm_head=%.1f pre=%.2f "
+                      "dense=%.2f join=%.2f resid=%.2f host=%.2f "
+                      "other=%.1f cpu_exp=%lld cpu_gbs=%.1f ssd_exp=%lld",
                       (long long)idx, p.total, p.embed, p.attn, p.attn_idx_sync, p.attn_sync, p.router, p.pick,
                       p.gpu_begin, p.cpu_ram, p.ssd_wait, p.cpu_ssd, p.gpu_finish, p.gpu_stream, p.combine,
-                      p.shared, p.admit, p.prefetch, p.lm_head, p.total - named, (long long)p.cpu_experts, gbs,
-                      (long long)p.ssd_experts);
+                      p.shared, p.admit, p.prefetch, p.lm_head, p.pre, p.dense, p.join, p.resid, p.host,
+                      p.total - named, (long long)p.cpu_experts, gbs, (long long)p.ssd_experts);
         return std::string(buf);
     }
     static Prof prof_mean(const Prof& s, int64_t n) {
@@ -1091,6 +1099,7 @@ struct Engine::Impl {
         m.gpu_finish = s.gpu_finish / d; m.combine = s.combine / d; m.shared = s.shared / d; m.admit = s.admit / d;
         m.prefetch = s.prefetch / d; m.lm_head = s.lm_head / d; m.total = s.total / d;
         m.gpu_stream = s.gpu_stream / d;
+        m.pre = s.pre / d; m.dense = s.dense / d; m.join = s.join / d; m.resid = s.resid / d; m.host = s.host / d;
         m.cpu_bytes = s.cpu_bytes / d; m.ssd_bytes = s.ssd_bytes / d;
         m.cpu_experts = (int64_t)std::llround((double)s.cpu_experts / d);
         m.gpu_experts = (int64_t)std::llround((double)s.gpu_experts / d);
@@ -5839,7 +5848,11 @@ struct Engine::Impl {
         decay_usage();
         const bool pt = opt.profile_time;
         const auto t_tok = std::chrono::steady_clock::now();
-        if (pt) prof = Prof{};
+        if (pt) {
+            prof = Prof{};
+            prof.host = host_pending_ms;   // P46
+            host_pending_ms = 0.0;
+        }
         if (!seed_h.empty()) {
             if (pos >= seed_rows) fail("--minimax-seed-hidden has only " + std::to_string(seed_rows) + " rows");
             std::memcpy(x.data(), seed_h.data() + (size_t)pos * (size_t)cfg.n_embd, (size_t)cfg.n_embd * sizeof(float));
@@ -5861,7 +5874,9 @@ struct Engine::Impl {
         };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
+            const auto t_pre = pt ? tokclock::now() : tokclock::time_point();   // P46
             if (kv_mode != 0 || L.want_gpu) use_layer_device(li);
+            if (pt) prof.pre += pms(t_pre);
             const auto t_layer = tokclock::now();
             const bool dbg = dumping(li);
             const std::string pfx = "L" + std::to_string(src_layer[(size_t)li]);
@@ -6080,7 +6095,9 @@ struct Engine::Impl {
             rms(x.data(), L.ffn_norm.data(), h.data(), (int)cfg.n_embd, eps);
             const auto t_ffn = tokclock::now();
             if (!L.moe) {
+                const auto t_dn = pt ? tokclock::now() : tokclock::time_point();   // P46
                 mlp(L.gate, L.up, L.down, 0, h.data(), proj.data(), (int)cfg.n_ff_dense);
+                if (pt) prof.dense += pms(t_dn);
                 if (dbg) {
                     std::vector<float> gu((size_t)cfg.n_ff_dense * 2);
                     std::memcpy(gu.data(), ff_g.data(), (size_t)cfg.n_ff_dense * sizeof(float));
@@ -6090,10 +6107,14 @@ struct Engine::Impl {
                     dbuf_put(pfx + "/dense_out", proj.data(), (int)cfg.n_embd);
                 }
             } else {
+                const auto t_jn = pt ? tokclock::now() : tokclock::time_point();   // P46
                 prefetch_join(li);
+                if (pt) prof.join += pms(t_jn);
                 moe(L, h.data(), proj.data());
             }
+            const auto t_rs = pt ? tokclock::now() : tokclock::time_point();   // P46
             for (int64_t i = 0; i < cfg.n_embd; ++i) x[(size_t)i] += proj[(size_t)i];
+            if (pt) prof.resid += pms(t_rs);
             if (prefetch_slots > 0 && li + 1 < cfg.n_layers) {
                 // The SSD lookahead is issued from inside moe() (it needs this layer's FFN input); only the VRAM
                 // fill is left here, and it keeps its one-layer distance and its exact router input.
@@ -7516,6 +7537,30 @@ struct Engine::Impl {
         have_logits = false;
     }
 
+    // P46: softmax_inplace with its exp pass and its scale pass split over the pool.  Each element is independent, so
+    // the values are the serial ones; the normalising sum stays a serial left-to-right sum, so the rounding is too.
+    void softmax_pool(float* s, int n) {
+        float m = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n; ++i)
+            if (s[i] > m) m = s[i];
+        if (!(m > -std::numeric_limits<float>::infinity())) {
+            for (int i = 0; i < n; ++i) s[i] = 0.f;
+            return;
+        }
+        pool.run(n, [&](int a, int b) {
+            for (int i = a; i < b; ++i) {
+                if (s[i] == -std::numeric_limits<float>::infinity()) s[i] = 0.f;
+                else s[i] = std::exp(s[i] - m);
+            }
+        });
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i) sum += s[i];
+        const float inv = sum > 0.f ? 1.f / sum : 0.f;
+        pool.run(n, [&](int a, int b) {
+            for (int i = a; i < b; ++i) s[i] *= inv;
+        });
+    }
+
     int sample(std::vector<float>& row, const SampleParams& sp, const std::vector<int32_t>& hist) {
         const int n = (int)cfg.n_vocab;
         if (sp.penalty_repeat != 1.f || sp.penalty_freq != 0.f || sp.penalty_present != 0.f) {
@@ -7553,7 +7598,7 @@ struct Engine::Impl {
             for (int i = 0; i < n; ++i)
                 if (row[(size_t)i] < cut) row[(size_t)i] = -std::numeric_limits<float>::infinity();
         }
-        softmax_inplace(row.data(), n);
+        softmax_pool(row.data(), n);
         if (sp.min_p > 0.f) {
             float peak = 0.f;
             for (int i = 0; i < n; ++i)
@@ -7569,19 +7614,30 @@ struct Engine::Impl {
         }
         if (sp.top_p > 0.f && sp.top_p < 1.f) {
             // P20: the kept set is the shortest prefix of (prob desc, id asc) whose mass reaches top_p.  Rank only a
-            // candidate head of the vocabulary (nth_element, same total order, so the same ids in the same order as
-            // a full sort), widen it if its mass falls short, and mark the kept ids in a flag array.  It used to
+            // candidate head of the vocabulary (the same total order, so the same ids in the same order as a full
+            // sort), widen it if its mass falls short, and mark the kept ids in a flag array.  It used to
             // sort all 200 K ids and test every id against the kept list: O(vocab x kept) a sampled token.
             auto before = [&](int a, int b) {
                 if (row[(size_t)a] != row[(size_t)b]) return row[(size_t)a] > row[(size_t)b];
                 return a < b;
             };
-            std::vector<int> order(n);
-            std::iota(order.begin(), order.end(), 0);
+            // P46: the head is picked by one bounded-heap pass over the vocabulary (the `head` best ids under `before`,
+            // then sorted), not nth_element over all 200 K ids: the same ids in the same order, a few ms a sampled token.
+            std::vector<int> order;
             int keep = 0;
             for (int head = std::min(n, 1024);; head = std::min(n, head * 8)) {
-                if (head < n) std::nth_element(order.begin(), order.begin() + head, order.end(), before);
-                std::sort(order.begin(), order.begin() + head, before);
+                order.clear();
+                for (int i = 0; i < n; ++i) {
+                    if ((int)order.size() < head) {
+                        order.push_back(i);
+                        std::push_heap(order.begin(), order.end(), before);
+                    } else if (before(i, order.front())) {
+                        std::pop_heap(order.begin(), order.end(), before);
+                        order.back() = i;
+                        std::push_heap(order.begin(), order.end(), before);
+                    }
+                }
+                std::sort(order.begin(), order.end(), before);
                 float c = 0.f;
                 keep = 0;
                 bool reached = false;
@@ -7841,6 +7897,7 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
 
     const auto t1 = clock::now();
     std::vector<int32_t> hist = impl_->held;
+    auto t_host = clock::now();   // P46: profile only: the host time (sampling, callbacks) before each token
     for (int n = 0; n < max_new; ++n) {
         if (stop.load(std::memory_order_relaxed)) {
             gr.finish = "cancel";
@@ -7871,7 +7928,9 @@ GenerateResult Engine::generate(const std::vector<int32_t>& prompt, int max_new,
             gr.decode_ms = ms_since(t1);
             return gr;
         }
+        if (impl_->opt.profile_time) impl_->host_pending_ms = ms_since(t_host);
         impl_->forward_token(id, impl_->last_logits.data());
+        if (impl_->opt.profile_time) t_host = clock::now();
         if (!finite_row(impl_->last_logits.data(), (int)impl_->cfg.n_vocab)) {
             gr.finish = "nonfinite";
             gr.generated = n + 1;
