@@ -80,6 +80,8 @@ void* event_create();
 void event_destroy(void* event);
 void event_record(void* event, void* stream);
 void event_sync(void* event);
+/// P39: `stream` (nullptr = legacy default) waits on the device for `event`.
+void stream_wait_event(void* stream, void* event);
 bool event_ready(void* event);
 /// P8: a timing event pair.  `event_create_timed` makes an event `cudaEventElapsedTime` accepts;
 /// `event_elapsed_ms` is the device-busy time between two records (0 when either is null).
@@ -102,6 +104,7 @@ void moe_expert_f16(int type, const void* const* gate, const void* const* up, co
 
 /// y[i] = (half) x[i], n values.  Device pointers.
 void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
 /// P5c: per-head RMSNorm + NEOX partial RoPE + (optional) fp32/fp16 store, one block per row.
 /// `x` is [rows][dim]; `heads_per_tok` rows belong to one token and take `pos[token]`.  `o32` and/or `o16`
 /// may be null and may equal `x` (the rotation is in-place safe: a pair writes only its two inputs).

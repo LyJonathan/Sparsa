@@ -221,6 +221,11 @@ __global__ void msa_attn_kernel(const __half* __restrict__ k, const __half* __re
 
 namespace {
 
+__global__ void f16_to_f32_kernel(const __half* __restrict__ x, float* __restrict__ y, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(x[i]);
+}
+
 __global__ void f32_to_f16_kernel(const float* __restrict__ x, __half* __restrict__ y, long long n) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
@@ -1096,6 +1101,11 @@ void* stream_create_blocking() {
 
 void* stream_legacy() { return (void*)cudaStreamLegacy; }
 
+// P39: make `stream` (nullptr = the legacy default stream) wait on the device for `event`; the host does not block.
+void stream_wait_event(void* stream, void* event) {
+    check(cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0), "cudaStreamWaitEvent");
+}
+
 // P5c: CUDA graphs.  Capture is ThreadLocal so a launch from another thread (the pool) cannot be folded in by
 // accident, and the stream must be the dedicated blocking one: the legacy default stream cannot be captured.
 void* graph_capture_begin(void* stream) {
@@ -1298,6 +1308,13 @@ void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     const long long blocks = (n + 255) / 256;
     f32_to_f16_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>(x, (__half*)y, n);
     check(cudaGetLastError(), "f32_to_f16 launch");
+}
+
+void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const long long blocks = (n + 255) / 256;
+    f16_to_f32_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>((const __half*)x, y, n);
+    check(cudaGetLastError(), "f16_to_f32 launch");
 }
 
 void head_norm_rope(const float* x, const float* gamma, float* o32, uint16_t* o16, int64_t rows, int heads_per_tok,
