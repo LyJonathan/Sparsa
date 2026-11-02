@@ -98,8 +98,8 @@ calls.
 Useful flags: `--access lan` (shares it, with an API key), `--context 8192`, `--gpu 0,1`, `--threads N`, `--ram-gib N`
 (cap the RAM tier), `--plan`. `python sparsa.py pick` prints the tier this machine would choose.
 
-The attention and indexer projections are requantized from Q8_0 to Q6_K when the model loads by default, which saves
-1.5 GiB. The engine's `--minimax-attn-type q8_0` keeps the file's Q8_0 weights.
+On `main`, the attention and indexer projections are requantized from Q8_0 to Q6_K when the model loads, which saves
+1.5 GiB. v0.2.1 keeps the Q8_0 weights; on `main`, `--minimax-attn-type q8_0` does the same.
 
 ## Build from source
 
