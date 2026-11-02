@@ -82,6 +82,42 @@ int main() {
                "explicit headroom 2 GiB: margin is 2 x headroom, no floor");
     }
 
+    // 6. The no-tier path (no pinned expert tier, so the batched prompt's pools are the only host pools it sizes).
+    //    128 GiB, automatic headroom 8 GiB (margin 16 GiB), 2.8 GiB of fixed pools, 100 KiB a token.
+    {
+        const size_t phys = 128 * GiB, hd = 8 * GiB, fixed = 2800 * MiB, per_tok = 100 * 1024;
+        expect(ram_prompt_tokens_fit(phys, hd, true, 30 * GiB, fixed, per_tok, 0, 4096) == 4096,
+               "no-tier: a 4096-token chunk is kept whole when 30 GiB are available");
+        const size_t tight = ram_prompt_tokens_fit(phys, hd, true, 19 * GiB, fixed, per_tok, 0, 4096);
+        expect(tight >= 2 && tight < 4096, "no-tier: 19 GiB available shrinks the chunk below 4096");
+        expect(ram_prompt_tokens_fit(phys, hd, true, 17 * GiB, fixed, per_tok, 0, 4096) == 0,
+               "no-tier: 17 GiB available (below margin + pools) keeps the token path (0)");
+        expect(ram_prompt_tokens_fit(phys, hd, true, 30 * GiB, fixed, per_tok, 0, 1) == 1,
+               "no-tier: a requested chunk below 2 is returned unchanged");
+        // Whatever chunk is returned, the keep rule still holds: margin + pools + mapped <= available.
+        for (size_t avail_gib : {17, 18, 19, 20, 21, 22, 24}) {
+            for (size_t mapped : {(size_t)0, 1900 * MiB}) {
+                const size_t avail = avail_gib * GiB;
+                const size_t T = ram_prompt_tokens_fit(phys, hd, true, avail, fixed, per_tok, mapped, 4096);
+                const size_t keep = ram_keep_bytes(phys, hd, true, fixed + T * per_tok, mapped);
+                expect(T == 0 || keep <= avail, "no-tier: the returned chunk leaves the budget's keep free");
+                expect(T < 2 || ram_keep_bytes(phys, hd, true, fixed + (T + 1) * per_tok, mapped) > avail || T == 4096,
+                       "no-tier: the returned chunk is the largest that fits");
+            }
+        }
+        // The Windows dense term is charged too: 1.9 GiB of resident dense takes the room that 19 GiB left.
+        expect(ram_prompt_tokens_fit(phys, hd, true, 19 * GiB, fixed, per_tok, 1900 * MiB, 4096) == 0,
+               "no-tier: the mapped dense term counts against the chunk (Windows)");
+    }
+    // 7. An explicit headroom, and a zero per-token cost: the fit is the requested chunk, or the floor's keep only.
+    {
+        const size_t phys = 128 * GiB;
+        expect(ram_prompt_tokens_fit(phys, 2 * GiB, false, 6 * GiB, 1 * GiB, 1 * MiB, 0, 4096) == 1024,
+               "no-tier, explicit 2 GiB headroom: 6 GiB - 4 GiB margin - 1 GiB pools = 1024 MiB of 1 MiB tokens");
+        expect(ram_prompt_tokens_fit(phys, 2 * GiB, false, 6 * GiB, 1 * GiB, 0, 0, 4096) == 4096,
+               "no-tier: zero per-token cost keeps the requested chunk");
+    }
+
     if (failures) {
         std::fprintf(stderr, "ram_budget_test: %d failure(s)\n", failures);
         return 1;

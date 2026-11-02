@@ -10,6 +10,8 @@
 //     stay in the working set, and AvailPhys does not count a working-set page as available: the working-set trimmer
 //     gives those pages back only under pressure, so the snapshot does not show them.  Linux counts clean file pages
 //     as MemAvailable (they are reclaimable), so the caller passes 0 there.
+// Without a pinned tier (sparsa.py --no-tiers) nothing sizes the expert RAM, so the same keep bounds the batched
+// prompt's pools through the chunk size (ram_prompt_tokens_fit).
 // Header-only, so the arithmetic can be unit-tested without a GPU (tests/minimax/ram_budget_test.cpp).
 #ifndef STRATA_MINIMAX_RAM_BUDGET_HPP
 #define STRATA_MINIMAX_RAM_BUDGET_HPP
@@ -34,6 +36,24 @@ inline size_t ram_keep_bytes(size_t phys_bytes, size_t headroom_bytes, bool auto
         margin = std::max(margin, floor_free);
     }
     return margin + post_plan_bytes + mapped_bytes;
+}
+
+/// The batched prompt's chunk size on the no-tier path.  With no pinned expert tier, nothing sizes the host RAM before the
+/// prompt pools are allocated, so the chunk is the knob: the largest chunk (at most `requested`) whose pinned pools
+/// still leave ram_keep_bytes() free.  The pools are `fixed_bytes + tokens * per_token_bytes`; `mapped_bytes` is the
+/// CPU-resident dense term (Windows only, as in ram_keep_bytes).  Returns `requested` unchanged when it is below 2 (no
+/// batch to shrink), 0 when not even a 2-token chunk fits (the caller then keeps the token path, which pins no pools).
+/// \param avail_bytes  available physical RAM at planning time (ullAvailPhys / MemAvailable)
+inline size_t ram_prompt_tokens_fit(size_t phys_bytes, size_t headroom_bytes, bool auto_headroom, size_t avail_bytes,
+                                    size_t fixed_bytes, size_t per_token_bytes, size_t mapped_bytes, size_t requested) {
+    if (requested < 2) return requested;
+    const size_t margin = ram_keep_bytes(phys_bytes, headroom_bytes, auto_headroom, 0, 0);
+    const size_t taken = fixed_bytes + mapped_bytes;
+    if (avail_bytes <= margin + taken) return 0;
+    if (per_token_bytes == 0) return requested;
+    const size_t fit = (avail_bytes - margin - taken) / per_token_bytes;
+    if (fit < 2) return 0;
+    return std::min(requested, fit);
 }
 
 } // namespace strata::minimax
