@@ -104,6 +104,16 @@ def stage(files: list[Path], staging: Path) -> None:
         shutil.copy2(f, bindir / f.name)
 
 
+def cmake_sparsa_version() -> str:
+    """The Sparsa release number CMakeLists.txt compiles into the engine (set(SPARSA_VERSION "..."))."""
+    import re
+    text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'^set\(SPARSA_VERSION\s+"([^"]+)"\)', text, re.M)
+    if not m:
+        raise SystemExit("package: CMakeLists.txt has no set(SPARSA_VERSION \"...\") line")
+    return m.group(1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True, help="release version, e.g. 0.1.2")
@@ -124,6 +134,12 @@ def main() -> int:
         print("\n".join(lines))
         return 0
 
+    # The archive's version must be the number the engine was compiled with (CMake SPARSA_VERSION), so the release name and
+    # the banner the engine prints ("version=") cannot disagree.
+    built = cmake_sparsa_version()
+    if a.version != built:
+        raise SystemExit(f"package: --version {a.version} is not SPARSA_VERSION in CMakeLists.txt ({built}); "
+                         "change the number there, rebuild, then package that version")
     engine = Path(a.engine)
     if not engine.is_file():
         raise SystemExit(f"package: no engine at {engine}")

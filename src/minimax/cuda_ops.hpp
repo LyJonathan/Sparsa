@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace strata::minimax::cu {
 
@@ -26,6 +27,8 @@ int device_count();
 void set_device(int dev);
 int current_device();
 MemInfo mem_on(int dev);
+/// The card's name and PCI address ("name@domain:bus:device"): the key its cached link rate is stored under.  Empty on error.
+std::string device_key(int dev);
 void* alloc_on(int dev, size_t bytes);
 
 /// Page-locked host memory for the KV cache and the cross-GPU hop.  Throws when the driver refuses it.

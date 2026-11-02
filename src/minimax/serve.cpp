@@ -48,6 +48,9 @@
 #ifndef STRATA_VERSION
 #define STRATA_VERSION "dev"
 #endif
+#ifndef SPARSA_VERSION
+#define SPARSA_VERSION "dev"
+#endif
 
 namespace strata::minimax {
 namespace {
@@ -947,7 +950,8 @@ int run(int argc, char** argv) {
         }
     }
 
-    std::printf("INFO engine=minimax-m3 version=%s forward=token%s\n", STRATA_VERSION,
+    // version is the Sparsa release (CMake SPARSA_VERSION); strata is the shared engine number (CMake project VERSION).
+    std::printf("INFO engine=minimax-m3 version=%s strata=%s forward=token%s\n", SPARSA_VERSION, STRATA_VERSION,
                 allow_nonstandard ? " geometry=nonstandard" : "");
     std::printf("INFO ctx=%lld layers=%lld embd=%lld experts=%lld\n", (long long)engine->context(),
                 (long long)engine->config().n_layers, (long long)engine->config().n_embd,

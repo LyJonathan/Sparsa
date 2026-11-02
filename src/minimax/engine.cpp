@@ -729,6 +729,90 @@ bool write_strp(const std::string& path, int64_t n_moe, int64_t n_expert,
 
 }  // namespace
 
+// ---- The cached link rates behind the prompt's card choice and CPU split.  resolve_pf_xdev times a pinned host -> device
+// copy on each card, and those rates decide which card runs the routed prompt experts (P16) and how many experts the CPU
+// takes (moe_batch_gpu).  Timed, they move by a few percent between two starts of the same binary, the split then moves a
+// few experts between the CPU and the card, and a different placement gives different logits (PC: KL 0.074 between two
+// runs of one binary).  So each card's rate is stored under its name and PCI address, and later starts read it back: the
+// split is then the same on every start.  STRATA_PF_LINK_CACHE sets the file; "off" measures every start (the old way).
+static std::string pf_link_cache_path() {
+    const char* env = std::getenv("STRATA_PF_LINK_CACHE");
+    if (env && *env) return std::string(env) == "off" ? std::string() : std::string(env);
+#if defined(_WIN32)
+    const char* base = std::getenv("LOCALAPPDATA");
+    if (!base || !*base) return std::string();
+    return std::string(base) + "\\Sparsa\\pf-link.txt";
+#else
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    std::string dir = xdg && *xdg ? std::string(xdg) : (home && *home ? std::string(home) + "/.cache" : std::string());
+    if (dir.empty()) return std::string();
+    return dir + "/sparsa/pf-link.txt";
+#endif
+}
+
+// The cached rate of every card, in `keys` order; false unless every card has one.  Lines are "key<TAB>GB/s".
+static bool pf_link_cache_read(const std::string& path, const std::vector<std::string>& keys, std::vector<double>& gbs) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::vector<std::pair<std::string, double>> have;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t tab = line.rfind('\t');
+        if (tab == std::string::npos) continue;
+        const char* num = line.c_str() + tab + 1;
+        char* end = nullptr;
+        const double v = std::strtod(num, &end);
+        if (end == num || !(v > 0.0)) continue;
+        have.emplace_back(line.substr(0, tab), v);
+    }
+    gbs.assign(keys.size(), 0.0);
+    for (size_t d = 0; d < keys.size(); ++d) {
+        bool found = false;
+        for (const auto& h : have)
+            if (h.first == keys[d]) {
+                gbs[d] = h.second;
+                found = true;
+            }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// Writes the file with these cards' rates merged over the lines of other cards (temp file, then rename).  A failure is not
+// fatal: the next start measures again.
+static void pf_link_cache_write(const std::string& path, const std::vector<std::string>& keys, const std::vector<double>& gbs) {
+    std::vector<std::pair<std::string, std::string>> rows;   // key, whole line
+    {
+        std::ifstream f(path);
+        std::string line;
+        while (f && std::getline(f, line)) {
+            const size_t tab = line.rfind('\t');
+            if (tab == std::string::npos) continue;
+            const std::string key = line.substr(0, tab);
+            bool ours = false;
+            for (const auto& k : keys) ours = ours || k == key;
+            if (!ours) rows.emplace_back(key, line);
+        }
+    }
+    for (size_t d = 0; d < keys.size(); ++d) {
+        char num[40];
+        std::snprintf(num, sizeof num, "%.17g", gbs[d]);
+        rows.emplace_back(keys[d], keys[d] + "\t" + num);
+    }
+    std::error_code ec;
+    const std::filesystem::path p(path);
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream o(tmp, std::ios::trunc);
+        if (!o) return;
+        for (const auto& r : rows) o << r.second << '\n';
+    }
+    std::filesystem::rename(tmp, p, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+}
+
 struct Engine::Impl {
     EngineOptions opt;
     GgufModel model;
@@ -1353,6 +1437,9 @@ struct Engine::Impl {
                 if (L.moe) ++moe_layers;
             route_counts.assign((size_t)cfg.n_layers * (size_t)cfg.n_expert, 0.0);
         }
+        // No pinned expert tier (sparsa.py --no-tiers): init_tiers did not run, so nothing has sized the host RAM for the
+        // batched prompt's pinned pools.  The same budget as the tier path applies here (ram_budget.hpp).
+        if (!tiers_on) clamp_prompt_chunk_to_ram();
         init_prefill();
         // P33: allocate the workspace once at load so its pinned host slots exist before the first prompt (the
         // first request paid 0.5-2 s of cudaHostAlloc).  Each prompt still frees the device side after it (decode
@@ -5139,6 +5226,50 @@ struct Engine::Impl {
 
     // ===================================================================== P5a: batched prompt processing
 
+    // The no-tier path: the batched prompt's pinned host pools are the one host allocation that grows with the chunk, and
+    // only init_tiers sizes it (against the same keep as ram_budget.hpp).  Without a tier the chunk is the knob: it is
+    // clamped to the largest size whose pools still leave ram_keep_bytes() free.  0 keeps the token path, which pins
+    // no pools.  The arithmetic mirrors init_tiers' prompt_host_bytes, per token and per card.
+    void clamp_prompt_chunk_to_ram() {
+        if (opt.prefill_batch <= 1) return;
+        const size_t phys = host_total_bytes();
+        const size_t avail = host_available_bytes();
+        const size_t headroom = opt.ram_headroom_mib > 0 ? ((size_t)opt.ram_headroom_mib << 20)
+                                                         : ram_headroom_auto(phys ? phys : avail);
+        size_t dense_host = 0, max_exp = 0;
+        for (const Layer& L : layers) {
+            if (L.moe) {
+                dense_host += L.have_shared ? L.gate.bytes + L.up.bytes + L.down.bytes : 0;
+                if (L.expert_bytes > max_exp) max_exp = L.expert_bytes;
+            } else if (!L.gate.gpu) {
+                dense_host += L.gate.bytes + L.up.bytes + L.down.bytes;
+            }
+            for (const Tensor* t : {&L.wq, &L.wk, &L.wv, &L.wo, &L.router, &L.iq, &L.ik})
+                if (!t->gpu) dense_host += t->bytes;
+        }
+        if (!output_gpu) dense_host += output.bytes;
+        dense_host += embd.bytes;
+        // Windows keeps the CPU-resident dense pages in the working set (ram_budget.hpp); the embedding is only gathered.
+#if defined(_WIN32)
+        const size_t mapped = dense_host > embd.bytes ? dense_host - embd.bytes : 0;
+#else
+        const size_t mapped = 0;
+#endif
+        const size_t qlen = (size_t)(cfg.n_head * cfg.head_dim), klen = (size_t)(cfg.n_head_kv * cfg.head_dim);
+        const size_t per_tok = (size_t)cfg.n_embd * (5 * 4 + 2) + qlen * 4 * 2 + klen * 4 * 2 + (size_t)cfg.n_expert * 4;
+        const size_t fixed = devs.size() * (((size_t)512 << 20) + (size_t)(8 + 24) * (max_exp + ((size_t)64 << 10)));
+        const size_t fit = strata::minimax::ram_prompt_tokens_fit(phys, headroom, opt.ram_headroom_mib <= 0, avail, fixed,
+                                                                  per_tok, mapped, (size_t)opt.prefill_batch);
+        if (fit != (size_t)opt.prefill_batch) {
+            std::fprintf(stderr,
+                         "INFO minimax-prefill: no pinned RAM tier, so the batched prompt is budgeted: chunk %d -> %zu "
+                         "tokens (available %.1f GiB, fixed pools %.1f GiB, per token %.1f KiB, mapped dense %.1f GiB)\n",
+                         opt.prefill_batch, fit, (double)avail / 1073741824.0, (double)fixed / 1073741824.0,
+                         (double)per_tok / 1024.0, (double)mapped / 1073741824.0);
+            opt.prefill_batch = (int)fit;
+        }
+    }
+
     void init_prefill() {
         prefetch_slots = opt.expert_prefetch;
         if (opt.prefill_batch <= 1) return;
@@ -6363,16 +6494,29 @@ struct Engine::Impl {
             for (int i = 0; i < n; ++i) pf_xdev[(size_t)i] = d;
         } else {
             std::vector<double> gbs((size_t)n, 0.0);
+            // The rates come from the cache when every card has an entry (see pf_link_cache_path); otherwise they are timed
+            // below and stored for the next start.
+            std::vector<std::string> keys((size_t)n);
+            bool keyed = true;
             for (int d = 0; d < n; ++d) {
-                use_device_index(d);
-                PfBuf& p = P();
-                if (p.ring_v.empty() || p.pin_v.empty()) continue;
-                const size_t bytes = std::min(p.ring_slot, p.pin_slot_bytes);
-                cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);   // warm-up
-                const auto t0 = std::chrono::steady_clock::now();
-                for (int r = 0; r < 4; ++r) cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);
-                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                gbs[(size_t)d] = s > 0.0 ? 4.0 * (double)bytes / s / 1e9 : 0.0;
+                keys[(size_t)d] = cu::device_key(devs[(size_t)d]);
+                keyed = keyed && !keys[(size_t)d].empty();
+            }
+            const std::string cache = keyed ? pf_link_cache_path() : std::string();
+            const bool cached = !cache.empty() && pf_link_cache_read(cache, keys, gbs);
+            if (!cached) {
+                for (int d = 0; d < n; ++d) {
+                    use_device_index(d);
+                    PfBuf& p = P();
+                    if (p.ring_v.empty() || p.pin_v.empty()) continue;
+                    const size_t bytes = std::min(p.ring_slot, p.pin_slot_bytes);
+                    cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);   // warm-up
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int r = 0; r < 4; ++r) cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);
+                    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    gbs[(size_t)d] = s > 0.0 ? 4.0 * (double)bytes / s / 1e9 : 0.0;
+                }
+                if (!cache.empty()) pf_link_cache_write(cache, keys, gbs);
             }
             int best = 0;
             for (int d = 1; d < n; ++d)
@@ -6387,7 +6531,8 @@ struct Engine::Impl {
                               devs[(size_t)pf_xdev[(size_t)d]]);
                 line += b;
             }
-            std::fprintf(stderr, "INFO minimax-prefill-expert-device %s\n", line.c_str());
+            std::fprintf(stderr, "INFO minimax-prefill-expert-device %s%s\n", line.c_str(),
+                         cached ? " (link rates from the cache)" : "");
         }
         use_device_index(back);
     }

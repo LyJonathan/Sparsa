@@ -1013,6 +1013,15 @@ MemInfo mem_on(int dev) {
     return m;
 }
 
+std::string device_key(int dev) {
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return std::string();
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "%s@%04x:%02x:%02x", p.name, (unsigned)p.pciDomainID, (unsigned)p.pciBusID,
+                  (unsigned)p.pciDeviceID);
+    return std::string(buf);
+}
+
 void* alloc_on(int dev, size_t bytes) {
     // Leaves `dev` current: the caller is always about to use the buffer it just asked for.
     if (current_device() != dev) set_device(dev);
