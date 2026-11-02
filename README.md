@@ -5,7 +5,7 @@ RAM you already have, and an SSD.
 
 **EXPERIMENTAL.** Development has slowed down but the project is still active.
 
-| Measured on two 16 GB cards (RTX 4060 Ti + RTX 5060 Ti), Ryzen 9 5900X, 121 GB DDR4, one NVMe | |
+| Measured on rig-2 (Linux): two 16 GB cards (RTX 4060 Ti + RTX 5060 Ti), Ryzen 9 5900X, 121 GB DDR4, one NVMe | |
 | --- | ---: |
 | Prompt, 4,000 tokens | **245 tokens/s** (16 s) |
 | Prompt, 16,000 tokens | **245 tokens/s** |
@@ -16,6 +16,10 @@ RAM you already have, and an SSD.
 At the start of this round of work, the same box read a 4,000-token prompt at 50 tokens/s. What changed is listed in
 [PR #50](https://github.com/LyJonathan/Sparsa/pull/50). Every number there was measured, and every new kernel was
 checked against the one it replaces.
+
+On `main` after v0.2.1, rig-2 reaches **9.63 tokens/s** on the dec5 bench (3 requests × 128 tokens, context 32768).
+v0.2.1 gave 7.89 over nine requests (three sessions) on the same bench. The changes are listed in
+[tools/minimax/README.md](tools/minimax/README.md#defaults-and-the-2-november-changes).
 
 ## Why it is fast
 
@@ -31,8 +35,9 @@ cheapest to run:
   normed inputs sent as fp16.
 - **Short prompts lean on the CPU:** experts with a few tokens run from RAM on the CPU (faster than a PCIe copy)
   while the cards stream the rest.
-- **Decode follows the conversation:** per-card VRAM expert slots, a routing profile shipped with every tier, and a
-  prompt cache that keeps the longest shared prefix.
+- **Decode follows the conversation:** per-card VRAM expert slots that rebalance without stalling a token, a routing
+  profile shipped with every tier, and a prompt cache that keeps the longest shared prefix. A demoted expert stays in
+  RAM, so decode almost never reads the drive.
 
 ## The model files
 
@@ -42,8 +47,11 @@ Point Sparsa at the folder. Most tiers do not load in stock llama.cpp, LM Studio
 
 | Tier | Size | Quality | Use |
 | --- | ---: | --- | --- |
-| `IQ2_XXS-GPTQ` | 124.5 GB | assistant-turn KL 0.284, top-1 84.4 % | **Best 2-bit:** sequential GPTQ, 27 % lower KL than plain `IQ2_XXS` |
+| `IQ2_XXS-GPTQ-v2` | 122.4 GB | assistant-turn KL 0.211, top-1 87.5 % | Maya-S per-layer types with sequential GPTQ on gate, up and down (Maya-S: KL 0.199); needs v0.2.1 or later |
+| `IQ2_XXS-GPTQ` | 124.5 GB | assistant-turn KL 0.284, top-1 84.4 % | Sequential GPTQ: 27 % lower KL than the same layout without it (0.388) |
+| `IQ1_M-GPTQ-v2` | 106.6 GB | assistant-turn KL 0.312, top-1 82.4 % | Best under ~110 GB: IQ1_M gate and up, IQ2_XXS down, sequential GPTQ |
 | `IQ1_M` | 106.6 GB | top-1 47.1 % | Smallest usable tier; 1-bit quality is degraded |
+| `IQ1_S-GPTQ` | 94.8 GB | assistant-turn KL 0.461, top-1 79.1 % | 1-bit with sequential GPTQ; does not loop like plain `IQ1_S` |
 | `IQ1_S` | 94.8 GB | top-1 44.3 % | Do not use: its output is incoherent |
 | `IQ2_KT` | 123.8 GB | top-1 56.3 % | Best 2-bit per byte of the plain tiers; Sparsa only |
 | `IQ2_XXS` | 124.5 GB | top-1 52.0 % | Also loads in patched llama.cpp |
@@ -59,8 +67,10 @@ Two measures are used:
   `tools/minimax/score_assistant.py`. Lower is better.
 - **Top-1:** agreement with an FP32 reference on 6 short prompts.
 
-The two are not comparable with each other. Pick the largest tier that fits in RAM + VRAM with ~10 GB to spare;
-Sparsa streams the rest from the SSD.
+The two are not comparable with each other. On assistant turns, plain `IQ2_XXS` scores KL 0.413 and top-1 81.85 %
+through Sparsa. Patched llama.cpp, scored with the same script on the same eval, gives KL 0.413 and top-1 81.72 %.
+
+Pick the largest tier that fits in RAM + VRAM with ~10 GB to spare; Sparsa streams the rest from the SSD.
 
 ## Run it
 
@@ -88,6 +98,9 @@ calls.
 Useful flags: `--access lan` (shares it, with an API key), `--context 8192`, `--gpu 0,1`, `--threads N`, `--ram-gib N`
 (cap the RAM tier), `--plan`. `python sparsa.py pick` prints the tier this machine would choose.
 
+On `main`, the attention and indexer projections are requantized from Q8_0 to Q6_K when the model loads, which saves
+1.5 GiB. v0.2.1 keeps the Q8_0 weights; on `main`, `--minimax-attn-type q8_0` does the same.
+
 ## Build from source
 
 Linux (CUDA 12.8+, CMake, Ninja, a C++17 compiler):
@@ -112,15 +125,16 @@ powershell -File tools/minimax/build_windows.ps1 -Targets strata-minimax -CudaAr
 ## Known limitations
 
 - **Decode is bound by memory bandwidth.** The experts that do not fit in VRAM are read from RAM every token, so
-  ~8 tokens/s is close to what a dual-channel DDR4 box can feed. More VRAM, faster RAM or a smaller tier raises it.
+  8 to 10 tokens/s is close to what a dual-channel DDR4 box can feed. More VRAM, faster RAM or a smaller tier raises it.
 - **Rare stall.** About 5 % of runs stall in the CPU-expert prompt path of
   [PR #34](https://github.com/LyJonathan/Sparsa/pull/34), so that PR is not merged.
 - **Context.** Measured up to 32K. Longer contexts are untested.
 - **Vision.** Images only, no video. The encoder runs on the CPU in fp32 and takes 64-80 s per 640x480 image.
 - **Tool calls** use MiniMax's XML form and are parsed whole, so their arguments are not streamed.
-- **Tested** on Linux with two NVIDIA cards. Windows builds; Windows and single-GPU boxes were not re-measured for
-  these numbers.
-- **CI** is a Linux build only (no GPU, no model).
+- **Tested** on Linux: the headline numbers are from rig-2 (RTX 4060 Ti + RTX 5060 Ti, Ryzen 9 5900X). Windows builds
+  and runs on the PC (2x RTX 5070). Single-GPU boxes have not been measured.
+- **CI** is turned off on this fork (see `.github/workflows-disabled/`). Builds are checked by hand, on Windows
+  (CUDA 13.3) and on Linux.
 
 ## Contributing
 

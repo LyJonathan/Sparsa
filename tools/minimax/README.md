@@ -1,5 +1,7 @@
 # MiniMax engine tools
 
+**EXPERIMENTAL.** Development has slowed down but the project is still active.
+
 The engine lives in `src/minimax/` and `include/strata/minimax/`. P2b runs a full MiniMax-M3.1-Flash forward
 on one GPU plus the CPU and speaks the serve protocol. Routed experts stay on the CPU. Prefill walks the
 same per-token path as decode (a batched prefill is later work; the two are the same math).
@@ -20,6 +22,43 @@ MiniMax-patched `_baseline/llama.cpp` is not a Strata build dependency (its MMQ 
 
 `strata-minimax` needs `STRATA_NATIVE_EXPERTS` (the default). That links ggml-cpu for the expert dots. The Qwen
 expert pool is not used: its activation is SiLU, and MiniMax's is swigluoai.
+
+## Defaults and the 2 November changes
+
+What `main` runs with no flags, and the measurements behind it. The decode figures are from rig-2 (Linux; RTX 4060 Ti +
+RTX 5060 Ti, Ryzen 9 5900X) on IQ2_XXS with the `dec5` bench: 3 requests of 128 tokens at a context of 32768, as PR #56 defines it.
+
+- **Decode: 9.63 tokens/s on `main`, 7.89 on v0.2.1.** The 9.63 is the mean of three requests in one session; the 7.89
+  is nine requests over three sessions. PR #56 measured 8.98 tokens/s over nine requests on its branch. The decode
+  changes:
+  - A demoted expert keeps its bytes in RAM. A VRAM swap used to demote an expert that had no RAM copy, so its next
+    route read it from the drive. Decode now reads 0.05 experts a token from the drive (2.5 before) and waits 0.3 ms
+    for them (7.4 ms before).
+  - Rebalance copies run on their own stream, and decode inputs are host-mapped. The rebalance used to queue about
+    380 MB of VRAM slot copies every 16 tokens, and the next token's first copy waited behind them: 133 ms in one token
+    per rebalance, about 8 ms a token on average.
+  - The MSA kernel stages its K rows a tile at a time, and the attention and router outputs are host-mapped.
+    `--minimax-profile-time` prints the device time of each attention op (`INFO attn-ops`).
+- **`--minimax-attn-type q6_k` is the default.** The attention and indexer projections are requantized from Q8_0 at
+  load, from 6.58 GiB to 5.08 GiB. Rig-2 decodes at 9.50 tokens/s against 8.96 with `q8_0` (nine requests each), and
+  the teacher KL on 3,020 assistant-turn positions moves by +0.00002 ± 0.00197. `q8_0` keeps the file's weights. The
+  table in the attention projections section has the other types.
+- **Exact GPU router.** On the batched GPU prompt path the MoE input goes up as fp32 and the router is an fp32 GEMM on
+  it. On a 512-token teacher-forced pass the fp16 router picked a different top-4 in 35 of 29,184 token-layers, and the
+  fp32 router in none.
+- **Prefill CPU lane on by default.** `STRATA_PF_CPU_GBS` defaults to 24, so the lane is on. It runs only for prefill
+  chunks of 1024 tokens or fewer, so a 4,096-token prompt never uses it. `STRATA_PF_CPU_GBS=0` turns it off.
+- **Repeatable prompt split.** Each card's host-to-device rate is timed over 20 ms windows (best of three) and cached in
+  `%LOCALAPPDATA%\Sparsa\pf-link.txt`, or `$XDG_CACHE_HOME/sparsa/pf-link.txt` (default
+  `~/.cache/sparsa/pf-link.txt`). `STRATA_PF_LINK_CACHE=<file>` moves the cache, and `off` times every start, as
+  before. Two starts of one binary give bit-identical logits (checked on random token ids, default path).
+- **RAM budget without tiers.** A `--no-tiers` run also clamps the batched prompt's pinned pools to the RAM budget the
+  tier path uses (`clamp_prompt_chunk_to_ram`). The chunk shrinks to what fits, or the token path is used when even two
+  tokens do not fit.
+- **Two version numbers.** The startup line prints `version=`, the Sparsa release (CMake `SPARSA_VERSION`, now 0.2.1),
+  and `strata=`, the engine number (`project(strata VERSION 0.1.48)`). They are separate numbers.
+- **Quality on assistant turns.** Plain `IQ2_XXS` scores KL 0.413 and top-1 81.85 % through Sparsa, over 3,020
+  positions scored against the NVFP4 teacher. Patched llama.cpp, scored with the same script on the same eval, gives KL 0.413 and top-1 81.72 %.
 
 ## Inspect a GGUF
 
@@ -47,6 +86,10 @@ vec_dot type, then `vec_dot`, then swigluoai (`clamp(gate, max=7)`, `clamp(up, -
 interleaved. The router is fp32 sigmoid; the bias is added only while choosing the top experts; the unbiased
 weights are renormalized and the routed sum is scaled by `expert_weights_scale` (2 for M3.1). The shared expert is
 added unscaled.
+
+On the batched GPU prompt path the MoE input goes up as fp32 and the router is an fp32 GEMM on it, so the top-4 is
+exact. On a 512-token teacher-forced pass the fp16 router picked a different top-4 in 35 of 29,184 token-layers; the fp32
+router in none.
 
 Norm weights follow the llama.cpp GGUF convention. `minimax-m3.norm.add1` is authoritative when present
 (`true` adds 1 at load). When the key is absent, a mean near 1 is treated as already baked and a mean near 0
@@ -535,9 +578,10 @@ i-quant dequantizer, which only knows the i-quant formats. `--minimax-dense-mmvq
 ### Attention projections: `--minimax-attn-type` (default q6_k)
 
 The attention and indexer projections (attn_q, attn_k, attn_v, attn_output, indexer q and k) are Q8_0 in the file,
-and decode streams about 7 GB of them a token. `--minimax-attn-type q6_k|q5_k|q4_k` requantizes those tensors from
-Q8_0 at load with ggml's quantizer (no imatrix, nothing written to disk), before the VRAM plan, so the split and the
-expert slots are sized on the smaller copies. `--minimax-attn-type q8_0` keeps the file's weights.
+and decode streams about 7 GB of them a token (6.58 GiB; `q6_k`, the default, brings it to 5.08 GiB).
+`--minimax-attn-type q6_k|q5_k|q4_k` requantizes those tensors from Q8_0 at load with ggml's quantizer (no imatrix,
+nothing written to disk), before the VRAM plan, so the split and the expert slots are sized on the smaller copies.
+`--minimax-attn-type q8_0` keeps the file's weights.
 
 Measured on rig-2 (dec5, 9 requests a setting) and on the PC (teacher KL on 3,020 assistant-turn positions, NVFP4
 teacher, batched prefill 1024):
