@@ -66,13 +66,14 @@ Sparsa streams the rest from the SSD.
 
 You need an NVIDIA card (12 GB is enough; CUDA 12.8 or newer for an RTX 50 series), RAM for most of the tier, and
 Python 3.10+. Download the engine from
-[v0.2.0](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.0-experimental) (Windows and Linux, CUDA,
-the build measured above), or build from source (below).
+[v0.2.1](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.1-experimental) (Windows and Linux, CUDA), or
+build from source (below). The speeds above were measured on the
+[v0.2.0](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.0-experimental) build.
 
 ```sh
 git clone https://github.com/LyJonathan/Sparsa.git
 cd Sparsa
-# unzip sparsa-v0.2.0-windows-x64-cuda.zip (or the Linux tarball) here, so that bin/strata-minimax sits in bin/
+# unzip sparsa-v0.2.1-windows-x64-cuda.zip (or the Linux tarball) here, so that bin/strata-minimax sits in bin/
 python -m pip install -r requirements.txt
 python sparsa.py download iq2-xs-d3 --dir D:/models
 python sparsa.py download tokenizer --dir D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3/tokenizer
