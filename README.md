@@ -5,7 +5,7 @@ RAM you already have, and an SSD.
 
 **EXPERIMENTAL.** Development has slowed down but the project is still active.
 
-| Measured on two 16 GB cards (RTX 4060 Ti + RTX 5060 Ti), Ryzen 9 5900X, 121 GB DDR4, one NVMe | |
+| Measured on rig-2 (Linux): two 16 GB cards (RTX 4060 Ti + RTX 5060 Ti), Ryzen 9 5900X, 121 GB DDR4, one NVMe | |
 | --- | ---: |
 | Prompt, 4,000 tokens | **245 tokens/s** (16 s) |
 | Prompt, 16,000 tokens | **245 tokens/s** |
@@ -17,8 +17,8 @@ At the start of this round of work, the same box read a 4,000-token prompt at 50
 [PR #50](https://github.com/LyJonathan/Sparsa/pull/50). Every number there was measured, and every new kernel was
 checked against the one it replaces.
 
-On `main` after v0.2.1, decode on a second machine (rig-2: RTX 4060 Ti + RTX 5060 Ti) reaches **9.63 tokens/s** at a
-32K context, over three requests in one session. v0.2.1 gave 7.89 over nine requests. The changes are listed in
+On `main` after v0.2.1, rig-2 reaches **9.63 tokens/s** on the dec5 bench (3 requests × 128 tokens, context 32768).
+v0.2.1 gave 7.89 over nine requests (three sessions) on the same bench. The changes are listed in
 [tools/minimax/README.md](tools/minimax/README.md#defaults-and-the-2-november-changes).
 
 ## Why it is fast
@@ -68,7 +68,7 @@ Two measures are used:
 - **Top-1:** agreement with an FP32 reference on 6 short prompts.
 
 The two are not comparable with each other. On assistant turns, plain `IQ2_XXS` scores KL 0.413 and top-1 81.85 %
-through Sparsa, and patched llama.cpp scores KL 0.413 and top-1 81.72 % on the same file.
+through Sparsa. Patched llama.cpp, scored with the same script on the same eval, gives KL 0.413 and top-1 81.72 %.
 
 Pick the largest tier that fits in RAM + VRAM with ~10 GB to spare; Sparsa streams the rest from the SSD.
 
@@ -131,8 +131,8 @@ powershell -File tools/minimax/build_windows.ps1 -Targets strata-minimax -CudaAr
 - **Context.** Measured up to 32K. Longer contexts are untested.
 - **Vision.** Images only, no video. The encoder runs on the CPU in fp32 and takes 64-80 s per 640x480 image.
 - **Tool calls** use MiniMax's XML form and are parsed whole, so their arguments are not streamed.
-- **Tested** on Linux with two NVIDIA cards. Windows builds; Windows and single-GPU boxes were not re-measured for
-  these numbers.
+- **Tested** on Linux: the headline numbers are from rig-2 (RTX 4060 Ti + RTX 5060 Ti, Ryzen 9 5900X). Windows builds
+  and runs on the PC (2x RTX 5070). Single-GPU boxes have not been measured.
 - **CI** is turned off on this fork (see `.github/workflows-disabled/`). Builds are checked by hand, on Windows
   (CUDA 13.3) and on Linux.
 

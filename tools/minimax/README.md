@@ -25,8 +25,8 @@ expert pool is not used: its activation is SiLU, and MiniMax's is swigluoai.
 
 ## Defaults and the 2 November changes
 
-What `main` runs with no flags, and the measurements behind it. The decode figures are from rig-2 (RTX 4060 Ti +
-RTX 5060 Ti) on IQ2_XXS with the `dec5` bench: 128 tokens a request at a 32K context.
+What `main` runs with no flags, and the measurements behind it. The decode figures are from rig-2 (Linux; RTX 4060 Ti +
+RTX 5060 Ti, Ryzen 9 5900X) on IQ2_XXS with the `dec5` bench: 3 requests of 128 tokens at a context of 32768, as PR #56 defines it.
 
 - **Decode: 9.63 tokens/s on `main`, 7.89 on v0.2.1.** The 9.63 is the mean of three requests in one session; the 7.89
   is nine requests over three sessions. PR #56 measured 8.98 tokens/s over nine requests on its branch. The decode
@@ -58,7 +58,7 @@ RTX 5060 Ti) on IQ2_XXS with the `dec5` bench: 128 tokens a request at a 32K con
 - **Two version numbers.** The startup line prints `version=`, the Sparsa release (CMake `SPARSA_VERSION`, now 0.2.1),
   and `strata=`, the engine number (`project(strata VERSION 0.1.48)`). They are separate numbers.
 - **Quality on assistant turns.** Plain `IQ2_XXS` scores KL 0.413 and top-1 81.85 % through Sparsa, over 3,020
-  positions scored against the NVFP4 teacher. Patched llama.cpp scores KL 0.413 and top-1 81.72 % on the same file.
+  positions scored against the NVFP4 teacher. Patched llama.cpp, scored with the same script on the same eval, gives KL 0.413 and top-1 81.72 %.
 
 ## Inspect a GGUF
 
