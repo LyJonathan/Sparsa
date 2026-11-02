@@ -532,6 +532,28 @@ went from 4.4 to 1.0 ms/layer and decode from 241 to 76 ms/token. It is also *cl
 path it replaced (KL 7.8e-3 vs 9.1e-2 on the real slice), because that path was handing Q8_0/Q6_K weights to the
 i-quant dequantizer, which only knows the i-quant formats. `--minimax-dense-mmvq off` keeps the old path.
 
+### Attention projections: `--minimax-attn-type` (default q6_k)
+
+The attention and indexer projections (attn_q, attn_k, attn_v, attn_output, indexer q and k) are Q8_0 in the file,
+and decode streams about 7 GB of them a token. `--minimax-attn-type q6_k|q5_k|q4_k` requantizes those tensors from
+Q8_0 at load with ggml's quantizer (no imatrix, nothing written to disk), before the VRAM plan, so the split and the
+expert slots are sized on the smaller copies. `--minimax-attn-type q8_0` keeps the file's weights.
+
+Measured on rig-2 (dec5, 9 requests a setting) and on the PC (teacher KL on 3,020 assistant-turn positions, NVFP4
+teacher, batched prefill 1024):
+
+| type | tok/s | attention ms a token, host | teacher KL | paired KL change vs q8_0 (1 SE) |
+|---|---|---|---|---|
+| q8_0 | 8.96 | 34.4 | 0.4129 | - |
+| q6_k (default) | 9.50 | 29.9 | 0.4129 | +0.00002 (0.00197) |
+| q5_k | 9.61 | 27.6 | 0.4166 | +0.0037 (0.0024) |
+| q4_k | 10.04 | 26.0 | 0.4274 | +0.0145 (0.0038) |
+
+q6_k is the default with the user's approval. The placement gate (KL at most 0.005 on 200 per-token positions) fails
+for every type and does not discriminate: the batched and per-token paths already differ by KL 0.72 with q8_0
+weights. The six-prompt G3 check against an fp32 reference could not run here (the reference logits are not on the
+PC). No imatrix was used. q5_k and q4_k stay available for speed; q4_k fails the teacher rule.
+
 ### Expert ring: four staging slots, overlapped
 
 The batched MoE stream ran read → copy → compute per expert through one slot, and the "parallel" read was one

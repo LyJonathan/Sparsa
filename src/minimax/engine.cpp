@@ -175,6 +175,7 @@ struct Layer {
     struct VramSlot {
         DevPtr mem;
         int32_t expert = -1;
+        void* ready_ev = nullptr;   // recorded on the swap stream after the copies that last filled this slot
     };
     std::vector<VramSlot> vram;
     std::vector<int32_t> vram_of;   // n_expert -> slot or -1
@@ -889,7 +890,12 @@ struct Engine::Impl {
     int64_t ik_row_bytes = 0;
     int32_t max_slot = 0;            // selected positions one KV head can have
     struct Work {
-        DevPtr x, y, scratch, ex_ptr, ex_xq, ex_hq, ex_h, ex_out;
+        DevPtr x, xo, y, scratch, ex_ptr, ex_xq, ex_hq, ex_h, ex_out;   // x: host-visible activation; xo: its dev_out twin
+        DevPtr xd;                      // device copy of x for the fallback GEMV (every block reads it)
+        DevPtr demote;                  // one expert's bytes on their way from a VRAM slot to the RAM tier
+        DevPtr ymap, rmap;              // host-visible outputs: a kernel writes them, the host reads them (no copy)
+        float* ymap_h = nullptr;        // their host addresses
+        float* rmap_h = nullptr;
         DevPtr xq;                      // q8_1 image of a dense projection's activation (dense MMVQ)
         DevPtr ex_sg, ex_su, ex_sd;     // MM-NVFP4: per-selected-expert divisors, one per device
         DevPtr ex_g, ex_u;              // split gate/up pass (mixed gate/up types): one matrix each, n_expert_used x n_ff
@@ -905,7 +911,7 @@ struct Engine::Impl {
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
-        void* swap_ev = nullptr;          // P22: recorded after a rebalance's async slot copies
+        void* swap_s = nullptr;           // P22: the rebalance copies' own stream (not `side`, see rebalance_layer())
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
         void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
         // P10: the shared expert's own buffers and stream.  It is independent of routing, so it is launched on `shs`
@@ -1116,7 +1122,54 @@ struct Engine::Impl {
     std::vector<double> route_counts;   // undecayed counts for --minimax-profile-save
     uint64_t rebalance_tick = 0;
     uint64_t lru_tick = 0;
-    bool swap_inflight = false;      // P22: a rebalance copy may still be reading the RAM arena
+    // P22: rebalance copies that may still be in flight, with the RAM-arena bytes each one reads.  An admission that
+    // would overwrite those bytes waits for that copy alone (wait_src_range).
+    struct PendingSrc {
+        const uint8_t* lo;
+        const uint8_t* hi;
+        void* ev;
+        bool write;     // a demoted expert's bytes land here (a read of these bytes must wait for the copy)
+        bool own_ev;    // the event belongs to this entry alone (destroyed when it completes)
+    };
+    std::vector<PendingSrc> pending_src;
+    bool rebalance_now = false;      // this token ends a rebalance window: each MoE layer decides at the end of its MoE
+    std::vector<void*> zc_hosts;     // host pointers of the host-mapped device blocks (released in ~Impl)
+    // Per-op device timing of the decode attention (--minimax-profile-time): each op is bracketed by a timed
+    // event pair on the stream it runs on; the elapsed times are read when the token ends.
+    static constexpr int kAttnOps = 6;   // 0 graph prefix, 1 indexer (scores+select), 2 top-k select, 3 gather,
+                                         // 4 MSA, 5 output projection
+    std::vector<void*> attn_ev;          // ((layer * kAttnOps + op) * 2 + {0 begin, 1 end})
+    std::vector<int> attn_ev_on;         // (layer * kAttnOps + op) recorded this token
+    double attn_tok_ms[kAttnOps] = {0, 0, 0, 0, 0, 0};
+    double attn_sum_ms[kAttnOps] = {0, 0, 0, 0, 0, 0};
+    int64_t attn_li = 0;                 // the layer whose attention is running
+    void attn_begin(int op, void* st) {
+        if (!opt.profile_time) return;
+        if (attn_ev.empty()) attn_ev.assign((size_t)cfg.n_layers * kAttnOps * 2, nullptr);
+        const size_t k = (size_t)((attn_li * kAttnOps + op) * 2);
+        if (!attn_ev[k]) {
+            attn_ev[k] = cu::event_create_timed();
+            attn_ev[k + 1] = cu::event_create_timed();
+        }
+        cu::event_record(attn_ev[k], st);
+    }
+    void attn_end(int op, void* st) {
+        if (!opt.profile_time) return;
+        const size_t k = (size_t)((attn_li * kAttnOps + op) * 2);
+        cu::event_record(attn_ev[k + 1], st);
+        attn_ev_on.push_back((int)(attn_li * kAttnOps + op));
+    }
+    // The token's per-op device times (read after the token's syncs), added to the run's sums.
+    void attn_collect() {
+        for (int i = 0; i < kAttnOps; ++i) attn_tok_ms[i] = 0.0;
+        for (int id : attn_ev_on) {
+            const size_t k = (size_t)id * 2;
+            const double ms = cu::event_elapsed_ms(attn_ev[k], attn_ev[k + 1]);
+            attn_tok_ms[id % kAttnOps] += ms;
+            attn_sum_ms[id % kAttnOps] += ms;
+        }
+        attn_ev_on.clear();
+    }
     uint64_t swaps = 0;
 
     struct TokenStats {
@@ -1126,6 +1179,9 @@ struct Engine::Impl {
     TokenStats total_stats;
     int64_t tokens_seen = 0;
     int64_t profile_saves = 0;
+    // Diagnostic (STRATA_MM_ROUTE_TRACE=path): one line per token and MoE layer, "pos layer e0 .. e(top-1)" in route
+    // order.  Used to measure how much the experts of consecutive tokens overlap (see tools/minimax/route_overlap.py).
+    std::FILE* route_trace = nullptr;
 
     // ---- P8: --minimax-profile-time.  One decode token's wall time, split by the phase that spent it, on stderr
     // after every token; `stats()` prints the mean of the run.  Every timer is a steady_clock pair around work that
@@ -1401,6 +1457,9 @@ struct Engine::Impl {
                      opt.cpu_threads > 0 ? "--cpu-threads" : "physical cores",
                      (int)std::thread::hardware_concurrency());
         pool.start(threads);
+        // --minimax-attn-type requantizes the attention projections before the VRAM plan: choose_split_and_kv and
+        // place_weights size the layers from the tensors' bytes.
+        requant_attention();
 
         // N=0 is the all-CPU dense path: no device, no CUDA runtime calls. Automatic placement (-1), any
         // positive layer count, and the P3 expert tiers still need a device to size VRAM.
@@ -1483,14 +1542,28 @@ struct Engine::Impl {
     }
 
     ~Impl() {
+        if (route_trace) std::fclose(route_trace);
+        route_trace = nullptr;
         write_own_profile();
         flush_dumps();
         for (void* g : tok_graph)
             if (g) cu::graph_destroy(g);
         tok_graph.clear();
+        // The host-mapped inputs are released here, not by their DevPtr (cudaFree on a mapped pointer is an error).
+        for (Work& w : work) {
+            w.x.p = nullptr;
+            w.xo.p = nullptr;
+            w.pos1.p = nullptr;
+            w.ex_ptr.p = nullptr;
+            w.sh_x.p = nullptr;
+        }
+        for (void* h : zc_hosts) cu::host_free_mapped(h);
+        zc_hosts.clear();
         for (Work& w : work) {
             if (w.side) cu::stream_destroy(w.side);
             w.side = nullptr;
+            if (w.swap_s) cu::stream_destroy(w.swap_s);
+            w.swap_s = nullptr;
             if (w.ds) cu::stream_destroy(w.ds);
             w.ds = nullptr;
             if (w.dsb) cu::stream_destroy(w.dsb);
@@ -1930,7 +2003,13 @@ struct Engine::Impl {
         for (size_t d = 0; d < devs.size(); ++d) {
             use_device_index((int)d);
             Work& w = work[d];
-            w.x = DevPtr(cu::alloc((size_t)max_cols * sizeof(float)));
+            w.x = zc_alloc((size_t)max_cols * sizeof(float));      // host-visible: the activation's H2D is a host write
+            w.xo = zc_alloc((size_t)max_cols * sizeof(float));     // the same for a GEMV whose result stays on the card
+            w.xd = DevPtr(cu::alloc((size_t)max_cols * sizeof(float)));
+            w.ymap = zc_alloc((size_t)max_rows * sizeof(float));
+            w.ymap_h = (float*)cu::mapped_host_of(w.ymap.p, (size_t)max_rows * sizeof(float));
+            w.rmap = zc_alloc((size_t)max_rows * sizeof(float));
+            w.rmap_h = (float*)cu::mapped_host_of(w.rmap.p, (size_t)max_rows * sizeof(float));
             w.y = DevPtr(cu::alloc((size_t)max_rows * sizeof(float)));
             w.scratch = DevPtr(cu::alloc((size_t)kTile * (size_t)max_cols * sizeof(float)));
             // q8_1 image of a dense projection's activation (P5b dense MMVQ): 36 bytes per 32 values.
@@ -1945,7 +2024,7 @@ struct Engine::Impl {
                 w.vn = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * sizeof(float)));
                 w.iqn = DevPtr(cu::alloc((size_t)cfg.idx_heads * cfg.idx_dim * sizeof(float)));
                 w.ikn = DevPtr(cu::alloc((size_t)cfg.idx_dim * sizeof(float)));
-                w.pos1 = DevPtr(cu::alloc(sizeof(int32_t)));
+                w.pos1 = zc_alloc(sizeof(int32_t));
                 w.kn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
                 w.vn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
                 w.ik16 = DevPtr(cu::alloc((size_t)cfg.idx_dim * 2 + 64));
@@ -1990,7 +2069,7 @@ struct Engine::Impl {
             const int64_t shff = cfg.n_ff_exp * (cfg.n_shared_experts > 0 ? cfg.n_shared_experts : 0);
             if (shff > 0 && cfg.n_embd > 0) {
                 const size_t embd4 = (size_t)cfg.n_embd * sizeof(float);
-                w.sh_x = DevPtr(cu::alloc(embd4));
+                w.sh_x = zc_alloc(embd4);
                 w.sh_xq = DevPtr(cu::alloc(q8_1_bytes(cfg.n_embd) + 64));
                 w.sh_g = DevPtr(cu::alloc((size_t)shff * sizeof(float)));
                 w.sh_u = DevPtr(cu::alloc((size_t)shff * sizeof(float)));
@@ -2012,6 +2091,27 @@ struct Engine::Impl {
     // Every activation that crosses to a device goes through page-locked memory when more than one GPU is in
     // play: there is no P2P between these cards, so the hidden state hops through the host, and a pinned source
     // keeps the copy engine at full rate instead of bouncing through a pageable staging buffer.
+    // Host-visible device memory for an input of the decode path (cu::host_alloc_mapped).  A host copy into it does
+    // not wait behind the rebalance's DMA queue.  ~Impl releases the block and clears the DevPtr first.
+    // A host write into a host-mapped input must not overtake the device reads of its previous value.  The copies it
+    // replaced were cudaMemcpy calls on the legacy stream, which waited for the graph and expert kernels in flight
+    // before the host went on; a memcpy does not.  Drain the streams that read these inputs (idle in the steady state,
+    // so this costs microseconds).  A stream sync never waits for a copy-engine transfer, so the rebalance DMA stays
+    // out of it.
+    void drain_inputs(Work& w) {
+        if (w.dsb) cu::stream_sync(w.dsb);
+        if (w.side) cu::stream_sync(w.side);
+        if (w.shs) cu::stream_sync(w.shs);
+        if (w.ds) cu::stream_sync(w.ds);
+        cu::stream_sync(nullptr);   // the legacy default stream: the norm+rope kernels and the K/V copies
+    }
+
+    DevPtr zc_alloc(size_t bytes) {
+        void* dev = nullptr;
+        zc_hosts.push_back(cu::host_alloc_mapped(bytes, &dev));
+        return DevPtr(dev);
+    }
+
     void h2d(Work& w, void* dst, const void* src, size_t bytes) {
         if (w.hop_h && bytes <= w.hop_bytes) {
             std::memcpy(w.hop_h, src, bytes);
@@ -2266,8 +2366,7 @@ struct Engine::Impl {
         return t;
     }
 
-    void requant_dense(Tensor& t) {
-        const int to = dense_requant_type();
+    void requant_to(Tensor& t, int to) {
         if (to < 0 || t.host == nullptr || t.type != (int)GGML_TYPE_Q8_0 || t.ne2 != 1 || t.ne0 % 256 != 0) return;
         const int64_t cols = t.ne0, rows = t.ne1;
         const size_t out_row = ggml_row_size((ggml_type)to, cols);
@@ -2292,6 +2391,56 @@ struct Engine::Impl {
         t.bytes = (size_t)rows * out_row;
         t.base = ggml_get_type_traits((ggml_type)to);
         t.cpu = ggml_get_type_traits_cpu((ggml_type)to);
+    }
+
+    void requant_dense(Tensor& t) { requant_to(t, dense_requant_type()); }
+
+    // --minimax-attn-type q6_k|q5_k|q4_k: the same requantization for every layer's attn_q, attn_k, attn_v,
+    // attn_output and the indexer's q and k projections.  It runs once at load, before the VRAM plan, so
+    // choose_split_and_kv and place_weights size the layers from the smaller copies.  The default is q6_k;
+    // "q8_0" (or "") keeps the file's Q8_0.
+    int attn_requant_type() const {
+        if (opt.attn_type.empty() || opt.attn_type == "q8_0") return -1;
+        if (opt.attn_type == "q6_k") return (int)GGML_TYPE_Q6_K;
+        if (opt.attn_type == "q5_k") return (int)GGML_TYPE_Q5_K;
+        if (opt.attn_type == "q4_k") return (int)GGML_TYPE_Q4_K;
+        fail("--minimax-attn-type: unknown value '" + opt.attn_type + "' (use q8_0, q6_k, q5_k or q4_k)");
+    }
+
+    void requant_attention() {
+        const int to = attn_requant_type();
+        if (to < 0) return;
+        size_t bytes_before = 0, bytes_after = 0;
+        int count = 0;
+        for (Layer& L : layers) {
+            for (Tensor* t : {&L.wq, &L.wk, &L.wv, &L.wo, &L.iq, &L.ik}) {
+                if (t->host == nullptr || t->type != (int)GGML_TYPE_Q8_0) continue;
+                const size_t before = t->bytes;
+                requant_to(*t, to);
+                if (t->type != to)
+                    fail(t->name + ": --minimax-attn-type needs rows of whole 256-value blocks (ne0 " +
+                         std::to_string(t->ne0) + ")");
+                bytes_before += before;
+                bytes_after += t->bytes;
+                ++count;
+            }
+        }
+        std::fprintf(stderr, "INFO minimax-attn-type=%s requantized %d attention projections at load (%.2f -> %.2f GiB)\n",
+                     opt.attn_type.c_str(), count, (double)bytes_before / 1073741824.0,
+                     (double)bytes_after / 1073741824.0);
+    }
+
+    // The host copy of a requantized tensor is owned by requant_store.  Once its bytes are on the device nothing
+    // reads them (the GPU paths work from the device pointer), so the copy is freed and the RAM tier keeps the memory.
+    void release_requant_host(Tensor& t) {
+        if (!t.gpu || t.host == nullptr) return;
+        for (auto& s : requant_store) {
+            if (!s.empty() && s.data() == t.host) {
+                std::vector<uint8_t>().swap(s);
+                t.host = nullptr;
+                return;
+            }
+        }
     }
 
     void upload(Tensor& t) {
@@ -2379,7 +2528,10 @@ struct Engine::Impl {
             L.want_gpu = true;
             use_device_index(L.dev);
             auto up = [&](Tensor& t) {
-                if (t.host && gpu_bytes(t) != std::numeric_limits<size_t>::max()) upload(t);
+                if (t.host && gpu_bytes(t) != std::numeric_limits<size_t>::max()) {
+                    upload(t);
+                    release_requant_host(t);
+                }
             };
             if (L.moe) {
                 requant_dense(L.wq);
@@ -2485,6 +2637,7 @@ struct Engine::Impl {
     }
 
     void init_tiers() {
+        if (const char* rt = std::getenv("STRATA_MM_ROUTE_TRACE")) route_trace = std::fopen(rt, "w");
         for (const Layer& L : layers)
             if (L.moe) {
                 ++moe_layers;
@@ -2605,7 +2758,7 @@ struct Engine::Impl {
             for (size_t d = 0; d < devs.size(); ++d) {
                 use_device_index((int)d);
                 Work& w = work[d];
-                w.ex_ptr = DevPtr(cu::alloc((size_t)top * 3 * sizeof(void*)));
+                w.ex_ptr = zc_alloc((size_t)top * 3 * sizeof(void*));
                 w.ex_xq = DevPtr(cu::alloc(q8_1_bytes(cfg.n_embd)));
                 w.ex_hq = DevPtr(cu::alloc((size_t)top * q8_1_bytes(cfg.n_ff_exp)));
                 w.ex_h = DevPtr(cu::alloc((size_t)top * (size_t)cfg.n_ff_exp * sizeof(float)));
@@ -2955,6 +3108,7 @@ struct Engine::Impl {
         if (slot < 0 || slot >= (int)L.vram.size()) fail("VRAM slot out of range");
         use_device_index(L.dev);
         Layer::VramSlot& s = L.vram[(size_t)slot];
+        if (s.ready_ev && !cu::event_ready(s.ready_ev)) cu::event_sync(s.ready_ev);   // a copy still filling it
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         uint8_t* p = (uint8_t*)s.mem.p;
         // P12: if the expert is already in the pinned RAM tier, copy it from there.  It used to be read out of the
@@ -2981,25 +3135,89 @@ struct Engine::Impl {
 
     void vram_swap(Layer& L, int slot, int expert) {
         use_device_index(L.dev);
+        Work& w = W();
+        if (!w.swap_s) w.swap_s = cu::stream_create();
         Layer::VramSlot& s = L.vram[(size_t)slot];
         uint8_t* p = (uint8_t*)s.mem.p;
+        const int worst = s.expert;   // the expert this slot gives up (-1: the slot was empty)
+        void* st = w.swap_s;
+        // The demoted expert keeps its bytes in the RAM tier.  The RAM and VRAM sets are disjoint, so a swap without this
+        // moved one expert out of RAM and another in, and every demoted expert was read from the drive once it was routed
+        // again (2 a token).  Its destination is the promoted expert's own RAM slot when it has one (that expert leaves RAM
+        // as it enters VRAM), or else the least-used RAM resident when the demoted expert is hotter than that one.  The
+        // bytes are the same bytes either way: the RAM copy and the staged drive copy feed the same arithmetic.
+        const bool arena_on = !ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0;
+        int dst = -1;
+        bool dst_is_promoted = false;
+        if (worst >= 0 && arena_on && L.ram_of[(size_t)worst] < 0) {
+            const int rb = L.ram_of[(size_t)expert];
+            if (rb >= 0) {
+                dst = rb;
+                dst_is_promoted = true;
+            } else {
+                const size_t ub = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
+                int v = -1;
+                float vu = 0.f;
+                for (int r = 0; r < L.ram_n; ++r) {
+                    const int32_t ve = L.ram_expert_of[(size_t)r];
+                    const float u = ve < 0 ? -1.f : usage[ub + (size_t)ve];
+                    if (v < 0 || u < vu || (u == vu && L.ram_tick[(size_t)r] < L.ram_tick[(size_t)v])) {
+                        v = r;
+                        vu = u;
+                    }
+                }
+                if (v >= 0 && (L.ram_expert_of[(size_t)v] < 0 || usage[ub + (size_t)worst] > vu)) dst = v;
+            }
+        }
+        const size_t nb = (size_t)L.expert_bytes;
+        if (dst >= 0) {
+            if (!w.demote.p) w.demote = DevPtr(cu::alloc((size_t)max_expert_bytes));
+            // The demoted bytes leave the slot before the promoted ones overwrite it (same stream, in order).
+            cu::copy_d2d_async(w.demote.p, p, nb, st);
+        }
         // P22: copy from the pinned RAM tier when it holds the expert (a real async DMA); the mapping is pageable,
         // so a copy from it blocks the host and can fault the expert in from the drive.
         const uint8_t* g = L.egate.host + (size_t)expert * L.stride_g;
         const uint8_t* u = L.eup.host + (size_t)expert * L.stride_u;
         const uint8_t* d = L.edown.host + (size_t)expert * L.expert_down;
-        if (!ram_inplace && ram_arena && ram_arena->valid() && L.ram_n > 0) {
+        const uint8_t* arena_src = nullptr;   // the RAM-arena bytes this copy reads (null: the mapping)
+        if (arena_on) {
             const int rs = L.ram_of[(size_t)expert];
             if (rs >= 0 && rs < L.ram_n) {
                 const uint8_t* base = ram_slot_ptr(L, rs);
+                arena_src = base;
                 g = base;
                 u = base + L.stride_g;
                 d = base + L.stride_g + L.stride_u;
             }
         }
-        cu::copy_h2d_async(p, g, L.stride_g, W().side);
-        cu::copy_h2d_async(p + L.stride_g, u, L.stride_u, W().side);
-        cu::copy_h2d_async(p + L.stride_g + L.stride_u, d, L.expert_down, W().side);
+        cu::copy_h2d_async(p, g, L.stride_g, st);
+        cu::copy_h2d_async(p + L.stride_g, u, L.stride_u, st);
+        cu::copy_h2d_async(p + L.stride_g + L.stride_u, d, L.expert_down, st);
+        // The slot is ready when these copies are: the expert kernels wait on this event (wait_slots_ready).
+        if (!s.ready_ev) s.ready_ev = cu::event_create();
+        cu::event_record(s.ready_ev, st);
+        if (arena_src) {
+            prune_pending();
+            pending_src.push_back({arena_src, arena_src + nb, s.ready_ev, false, false});
+        }
+        if (dst >= 0) {
+            // Written after the promoted expert's RAM bytes were read (the H2D above), so the RAM slot is reused in order.
+            uint8_t* hd = ram_slot_ptr(L, dst);
+            cu::copy_d2h_async(hd, w.demote.p, nb, st);
+            void* ev = cu::event_create_timed();
+            cu::event_record(ev, st);
+            prune_pending();
+            pending_src.push_back({hd, hd + nb, ev, true, true});
+            if (dst_is_promoted) {
+                L.ram_of[(size_t)expert] = kNotResident;
+            } else if (L.ram_expert_of[(size_t)dst] >= 0) {
+                L.ram_of[(size_t)L.ram_expert_of[(size_t)dst]] = kNotResident;
+            }
+            L.ram_expert_of[(size_t)dst] = worst;
+            L.ram_of[(size_t)worst] = dst;
+            L.ram_tick[(size_t)dst] = ++lru_tick;
+        }
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
@@ -3255,12 +3473,12 @@ struct Engine::Impl {
     // Copy an expert that was just read from the SSD into the least-recently-used RAM slot.  The bytes are already
     // in `src`; a later SSD miss for this expert then costs a RAM read instead.
     void ram_admit(Layer& L, int expert, const uint8_t* src) {
-        wait_swaps();
         if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
             if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
         uint8_t* p = ram_slot_ptr(L, victim);
+        wait_src_range(p, L.expert_bytes);
         std::memcpy(p, src, L.expert_bytes);
         for (int32_t& v : L.ram_of)
             if (v == victim) v = kNotResident;
@@ -3272,12 +3490,12 @@ struct Engine::Impl {
     // P6: the same admission from the three role buffers of a staging slot (the P6 read path keeps a role's bytes
     // in place instead of assembling one contiguous blob).
     void ram_admit3(Layer& L, int expert, const uint8_t* g, const uint8_t* u, const uint8_t* d) {
-        wait_swaps();
         if (!opt.adaptive || ram_inplace || !ram_arena || L.ram_n <= 0) return;
         int victim = 0;
         for (int s = 1; s < L.ram_n; ++s)
             if (L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
         uint8_t* p = ram_slot_ptr(L, victim);
+        wait_src_range(p, L.expert_bytes);
         std::memcpy(p, g, L.stride_g);
         std::memcpy(p + L.stride_g, u, L.stride_u);
         std::memcpy(p + L.stride_g + L.stride_u, d, L.expert_down);
@@ -3317,12 +3535,25 @@ struct Engine::Impl {
         const size_t kPiece = (size_t)1 << 20;
         for (const SsdAdmit& a : list) {
             if (L.ram_of[(size_t)a.e] >= 0) continue;   // one route of this layer already admitted it
+            // The victim is the least-used resident (decayed routing count, then age), and an admission that would evict
+            // an expert at least as used as the arriving one is refused: that route is computed from its staged bytes,
+            // which are the bytes the arena would have held.  Plain LRU evicted hot experts of the static fill and then
+            // read them back from the drive (2.2 SSD experts a token, against 0.04 with the admissions off).
+            const size_t ub = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
             int victim = -1;
+            float victim_u = 0.f;
             for (int s = 0; s < L.ram_n; ++s) {
                 if (std::find(used.begin(), used.end(), s) != used.end()) continue;
-                if (victim < 0 || L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim]) victim = s;
+                const int32_t ve = L.ram_expert_of[(size_t)s];
+                const float u = ve < 0 ? -1.f : usage[ub + (size_t)ve];
+                if (victim < 0 || u < victim_u ||
+                    (u == victim_u && L.ram_tick[(size_t)s] < L.ram_tick[(size_t)victim])) {
+                    victim = s;
+                    victim_u = u;
+                }
             }
             if (victim < 0) break;
+            if (L.ram_expert_of[(size_t)victim] >= 0 && usage[ub + (size_t)a.e] <= victim_u) continue;
             used.push_back(victim);
             uint8_t* p = ram_slot_ptr(L, victim);
             const size_t len[3] = {L.stride_g, L.stride_u, L.expert_down};
@@ -3334,7 +3565,7 @@ struct Engine::Impl {
             placed.push_back({a.e, victim});
         }
         if (pieces.empty()) return;
-        wait_swaps();
+        for (const auto& pr : placed) wait_src_range(ram_slot_ptr(L, pr.second), L.expert_bytes);
         pool.run((int)pieces.size(), [&](int x, int y) {
             for (int i = x; i < y; ++i)
                 std::memcpy(pieces[(size_t)i].dst, pieces[(size_t)i].src, pieces[(size_t)i].len);
@@ -3691,6 +3922,7 @@ struct Engine::Impl {
         }
         const int top = (int)cfg.n_expert_used;
         void** ptr = (void**)w.ex_ptr.p;
+        drain_inputs(w);
         cu::copy_h2d(ptr, gp.data(), (size_t)k * sizeof(void*));
         cu::copy_h2d(ptr + top, up.data(), (size_t)k * sizeof(void*));
         cu::copy_h2d(ptr + 2 * top, dp.data(), (size_t)k * sizeof(void*));
@@ -3729,6 +3961,7 @@ struct Engine::Impl {
         }
         if (!w.side) w.side = cu::stream_create();
         void* st = w.side;
+        wait_slots_ready(L, exps, st);
         if (opt.profile_time) {
             if (!w.prof_ev[0]) w.prof_ev[0] = cu::event_create_timed();
             if (!w.prof_ev[1]) w.prof_ev[1] = cu::event_create_timed();
@@ -3768,6 +4001,7 @@ struct Engine::Impl {
     void gpu_experts(const Layer& L, const std::vector<int>& exps, const float* in, std::vector<float>& out) {
         const int k = (int)exps.size();
         if (k == 0) return;
+        wait_slots_host(L, exps);
         // A split gate/up layer runs only the async pair (gpu_experts_begin / gpu_experts_finish).  It must never reach
         // the single-type path below, which reads one type and one stride for gate and up.
         if (L.gu_split) {
@@ -3793,6 +4027,7 @@ struct Engine::Impl {
         }
         const int top = (int)cfg.n_expert_used;
         void** ptr = (void**)w.ex_ptr.p;
+        drain_inputs(w);
         cu::copy_h2d(ptr, gp.data(), (size_t)k * sizeof(void*));
         cu::copy_h2d(ptr + top, up.data(), (size_t)k * sizeof(void*));
         cu::copy_h2d(ptr + 2 * top, dp.data(), (size_t)k * sizeof(void*));
@@ -3845,6 +4080,7 @@ struct Engine::Impl {
         if ((size_t)ff > (size_t)cfg.n_ff_exp * (size_t)(cfg.n_shared_experts > 0 ? cfg.n_shared_experts : 1))
             return false;
         std::memcpy(w.sh_pin, in, (size_t)embd * sizeof(float));
+        if (w.shs) cu::stream_sync(w.shs);   // the last reader of sh_x is the previous shared lane (its own sync is at finish)
         cu::copy_h2d_async(w.sh_x.p, w.sh_pin, (size_t)embd * sizeof(float), w.shs);
         strata::kernels::quantize_q8_1_rows((const float*)w.sh_x.p, 1, embd, w.sh_xq.p, w.shs);
         strata::kernels::native_mmvq(L.gate.type, L.gate.dev.p, w.sh_xq.p, (float*)w.sh_g.p, embd, ff, 1, w.shs);
@@ -3911,6 +4147,11 @@ struct Engine::Impl {
         if (!route_counts.empty()) {
             for (int j = 0; j < top; ++j) route_counts[base_idx + (size_t)order[(size_t)j]] += 1.0;
         }
+        if (route_trace) {
+            std::fprintf(route_trace, "%lld %lld", (long long)n_past, (long long)li);
+            for (int j = 0; j < top; ++j) std::fprintf(route_trace, " %d", order[(size_t)j]);
+            std::fprintf(route_trace, "\n");
+        }
 
         std::vector<int> gpu_e;
         struct CpuExpert {
@@ -3970,6 +4211,7 @@ struct Engine::Impl {
                                    L.eup.host + (size_t)e * L.stride_u,
                                    L.edown.host + (size_t)e * L.expert_down});
                 } else {
+                    wait_arena_slot(L, rs);
                     const uint8_t* p = ram_slot_ptr(const_cast<Layer&>(L), rs);
                     cpu.push_back({e, j, false, p, p + L.stride_g, p + L.stride_g + L.stride_u});
                 }
@@ -4150,6 +4392,7 @@ struct Engine::Impl {
             ssd_pf_waste += ssd_pf_n[(size_t)li] - pf_hits;
             ssd_pf_n[(size_t)li] = 0;
         }
+        if (rebalance_now) rebalance_layer(const_cast<Layer&>(L), li);
         if (opt.stats_per_layer) {
             std::fprintf(stderr, "INFO minimax-stats layer=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld\n",
                          (long long)li, (long long)tok_stats.vram, (long long)tok_stats.ram,
@@ -4285,52 +4528,94 @@ struct Engine::Impl {
         prefetch_wait = -1;
     }
 
-    void rebalance() {
-        if (!tiers_gpu || !opt.adaptive || usage.empty()) return;
-        bool any = false;
-        for (int64_t li = 0; li < cfg.n_layers; ++li) {
-            Layer& L = layers[(size_t)li];
-            if (!L.moe || L.vram.empty()) continue;
-            const size_t b = (size_t)li * (size_t)cfg.n_expert;
-            int best = -1, worst = -1;
-            float best_u = -1.f, worst_u = std::numeric_limits<float>::max();
-            for (int e = 0; e < (int)cfg.n_expert; ++e) {
-                if (L.vram_of[(size_t)e] < 0) {
-                    if (usage[b + (size_t)e] > best_u) {
-                        best_u = usage[b + (size_t)e];
-                        best = e;
-                    }
-                } else if (usage[b + (size_t)e] < worst_u) {
-                    worst_u = usage[b + (size_t)e];
-                    worst = e;
+    // One layer's adaptive swap, decided from that layer's own usage.  forward_token sets rebalance_now on a rebalance
+    // token, and each MoE layer calls this at its end, after its experts have finished.  The inputs of the decision are
+    // final by then (usage moves only with this layer's routing, the slots only here), so it is the decision a
+    // token-end pass would make.  Only the copies start earlier, while the rest of the token runs.
+    void rebalance_layer(Layer& L, int64_t li) {
+        if (!tiers_gpu || !opt.adaptive || usage.empty() || !L.moe || L.vram.empty()) return;
+        const size_t b = (size_t)li * (size_t)cfg.n_expert;
+        int best = -1, worst = -1;
+        float best_u = -1.f, worst_u = std::numeric_limits<float>::max();
+        for (int e = 0; e < (int)cfg.n_expert; ++e) {
+            if (L.vram_of[(size_t)e] < 0) {
+                if (usage[b + (size_t)e] > best_u) {
+                    best_u = usage[b + (size_t)e];
+                    best = e;
                 }
-            }
-            if (best < 0 || worst < 0) continue;
-            if (best_u > worst_u * 1.10f + 0.5f) {
-                vram_swap(L, L.vram_of[(size_t)worst], best);
-                ++swaps;
-                any = true;
+            } else if (usage[b + (size_t)e] < worst_u) {
+                worst_u = usage[b + (size_t)e];
+                worst = e;
             }
         }
-        // P22: no sync.  The expert kernels that read a swapped slot run on the same side stream, after the copy;
-        // the only other reader of the source bytes is a RAM admission overwriting that arena slot, which waits
-        // on swap_ev first (ram_admit_many).
-        if (any) {
-            for (size_t d = 0; d < work.size(); ++d) {
-                if (!work[d].side) continue;
-                use_device_index((int)d);
-                if (!work[d].swap_ev) work[d].swap_ev = cu::event_create();
-                cu::event_record(work[d].swap_ev, work[d].side);
-            }
-            swap_inflight = true;
+        if (best < 0 || worst < 0) return;
+        if (best_u <= worst_u * 1.10f + 0.5f) return;
+        const int saved = cur;
+        vram_swap(L, L.vram_of[(size_t)worst], best);
+        ++swaps;
+        use_device_index(saved);
+    }
+
+    // The GPU lane must not read a slot that a rebalance copy is still filling.  Its kernels wait for that copy on the
+    // card (the host does not), and only for the slots this layer's routes use.
+    void wait_slots_ready(const Layer& L, const std::vector<int>& exps, void* st) {
+        for (int e : exps) {
+            const int slot = L.vram_of[(size_t)e];
+            if (slot < 0) continue;
+            void* ev = L.vram[(size_t)slot].ready_ev;
+            if (ev && !cu::event_ready(ev)) cu::stream_wait_event(st, ev);
         }
     }
 
-    void wait_swaps() {
-        if (!swap_inflight) return;
-        for (size_t d = 0; d < work.size(); ++d)
-            if (work[d].swap_ev) cu::event_sync(work[d].swap_ev);
-        swap_inflight = false;
+    // The synchronous expert path: the host waits for the same copies.
+    void wait_slots_host(const Layer& L, const std::vector<int>& exps) {
+        for (int e : exps) {
+            const int slot = L.vram_of[(size_t)e];
+            if (slot < 0) continue;
+            void* ev = L.vram[(size_t)slot].ready_ev;
+            if (ev && !cu::event_ready(ev)) cu::event_sync(ev);
+        }
+    }
+
+    // Forget the copies that have finished.
+    void prune_pending() {
+        size_t keep = 0;
+        for (size_t i = 0; i < pending_src.size(); ++i) {
+            if (!cu::event_ready(pending_src[i].ev)) {
+                pending_src[keep++] = pending_src[i];
+            } else if (pending_src[i].own_ev) {
+                cu::event_destroy(pending_src[i].ev);
+            }
+        }
+        pending_src.resize(keep);
+    }
+
+    // A RAM slot that a demoted expert's copy is still writing is read only after that copy has landed.
+    void wait_arena_slot(const Layer& L, int slot) {
+        if (pending_src.empty()) return;
+        const uint8_t* lo = ram_slot_ptr(const_cast<Layer&>(L), slot);
+        const uint8_t* hi = lo + L.expert_bytes;
+        for (const PendingSrc& ps : pending_src)
+            if (ps.write && ps.lo < hi && lo < ps.hi && !cu::event_ready(ps.ev)) cu::event_sync(ps.ev);
+    }
+
+    // An admission is about to overwrite RAM-arena bytes [dst, dst + len).  Wait for an in-flight rebalance copy that
+    // is still reading any of them, and for no other copy.
+    void wait_src_range(const void* dst, size_t len) {
+        if (pending_src.empty()) return;
+        const uint8_t* lo = (const uint8_t*)dst;
+        const uint8_t* hi = lo + len;
+        size_t keep = 0;
+        for (size_t i = 0; i < pending_src.size(); ++i) {
+            const PendingSrc ps = pending_src[i];
+            if (cu::event_ready(ps.ev)) continue;
+            if (ps.lo < hi && lo < ps.hi) {
+                cu::event_sync(ps.ev);
+                continue;
+            }
+            pending_src[keep++] = ps;
+        }
+        pending_src.resize(keep);
     }
 
     void decay_usage() {
@@ -4387,8 +4672,10 @@ struct Engine::Impl {
                 if (!dev_out && !w.ds) w.ds = cu::stream_create();
                 if (dev_out && !w.dsb) w.dsb = cu::stream_create_blocking();
                 void* ds = dev_out ? w.dsb : w.ds;
-                h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-                strata::kernels::quantize_q8_1_rows((const float*)w.x.p, 1, cols, w.xq.p, ds);
+                void* xd = dev_out ? w.xo.p : w.x.p;
+                if (dev_out && w.dsb) cu::stream_sync(w.dsb);   // the last dev_out reader of xo is still in flight
+                h2d(w, xd, xin, (size_t)cols * sizeof(float));
+                strata::kernels::quantize_q8_1_rows((const float*)xd, 1, cols, w.xq.p, ds);
                 strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)(dev_out ? dev_out : w.y.p), cols, rows,
                                              1, ds);
                 if (dev_out) return;
@@ -4396,8 +4683,33 @@ struct Engine::Impl {
                 cu::stream_sync(w.ds);
                 return;
             }
+            if (!dev_out) {
+                // The fallback runs on the GEMV's own stream and waits for that stream alone.  A device-wide sync
+                // here would also wait for the rebalance's copies and the attention graph.  The input is host-visible,
+                // so its last reader (the graph) goes first.
+                if (!w.ds) w.ds = cu::stream_create();
+                if (w.dsb) cu::stream_sync(w.dsb);
+                h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
+                // One pass over the host-visible input, then the device copy is what every block reads (a block
+                // that read the mapped input itself would cross the link once per block).
+                void* ds = w.ds;
+                cu::copy_f32((const float*)w.x.p, (float*)w.xd.p, cols, ds);
+                float* dy = (float*)w.rmap.p;
+                if (t.dev_f32) {
+                    cu::gemv((const float*)t.dev.p, (const float*)w.xd.p, dy, rows, cols, ds);
+                } else {
+                    for (int r = 0; r < rows; r += kTile) {
+                        const int n = rows - r < kTile ? rows - r : kTile;
+                        cu::dequant_f32(t.type, t.dev.p, r, n, cols, (float*)w.scratch.p, ds);
+                        cu::gemv((const float*)w.scratch.p, (const float*)w.xd.p, dy + r, n, cols, ds);
+                    }
+                }
+                cu::stream_sync(ds);
+                std::memcpy(yout, w.rmap_h, (size_t)rows * sizeof(float));
+                return;
+            }
             h2d(w, w.x.p, xin, (size_t)cols * sizeof(float));
-            float* dy = (float*)(dev_out ? dev_out : w.y.p);
+            float* dy = (float*)dev_out;
             if (t.dev_f32) {
                 cu::gemv((const float*)t.dev.p, (const float*)w.x.p, dy, rows, cols);
             } else {
@@ -4407,8 +4719,6 @@ struct Engine::Impl {
                     cu::gemv((const float*)w.scratch.p, (const float*)w.x.p, dy + r, n, cols);
                 }
             }
-            if (dev_out) return;
-            cu::copy_d2h(yout, dy, (size_t)rows * sizeof(float));
             return;
         }
         if (t.type == kF32 || t.type == kF16 || t.type == kBF16) {
@@ -4459,9 +4769,13 @@ struct Engine::Impl {
         // default stream's handle keeps native MMVQ (which rejects nullptr) ordered with it, and the synchronous
         // copy-out is the only wait.
         void* st = cu::stream_legacy();
+        attn_begin(5, nullptr);
         strata::kernels::quantize_q8_1_rows((const float*)din, 1, cols, w.xq.p, st);
-        strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.y.p, cols, rows, 1, st);
-        cu::copy_d2h(yout, w.y.p, (size_t)rows * sizeof(float));
+        strata::kernels::native_mmvq(t.type, t.dev.p, w.xq.p, (float*)w.ymap.p, cols, rows, 1, st);
+        attn_end(5, nullptr);
+        // The copy engine is not used for this result: the stream sync is enough, and the host reads the mapped rows.
+        cu::stream_sync(st);
+        std::memcpy(yout, w.ymap_h, (size_t)rows * sizeof(float));
     }
 
     void dot_rows_base(const Tensor& t, const uint8_t* base, const float* xin, float* yout, int rows_n, int cols) {
@@ -4609,7 +4923,7 @@ struct Engine::Impl {
 
     // Everything the CPU lane needs to run a layer's experts, reused across layers and tokens so a layer allocates
     // nothing: gate/up/hidden tiles for every routed expert on the CPU, and one activation image per matrix.
-    std::vector<float> cpu_gbuf, cpu_ubuf, cpu_hbuf;
+    std::vector<float> cpu_hbuf;
     std::vector<uint8_t> cpu_aq, cpu_hq, cpu_aq_u;   // cpu_aq_u: the up matrix's input when its format differs
     // STRATA_LANE_PF=N: software-prefetch N rows ahead in the lane's row loops (0 = off, a measured probe, not a
     // default: every thread walks its rows sequentially and the hardware prefetcher already sees that stride).
@@ -4643,8 +4957,6 @@ struct Engine::Impl {
                         L.edown_scale.empty() ? nullptr : &L.edown_scale[(size_t)c->e]);
             return;
         }
-        cpu_gbuf.resize((size_t)n * (size_t)ff);
-        cpu_ubuf.resize((size_t)n * (size_t)ff);
         cpu_hbuf.resize((size_t)n * (size_t)ff);
         cpu_aq.resize(kg.act_bytes);
         kg.act->from_float(in, cpu_aq.data(), embd);
@@ -4657,34 +4969,30 @@ struct Engine::Impl {
         }
         const uint8_t* aq_up = shared_act ? cpu_aq.data() : cpu_aq_u.data();
         const size_t g_row = L.egate.row_bytes, u_row = L.eup.row_bytes;
-        // Region 1: every gate row and every up row of the pass, one contiguous run of rows per thread.
+        // Region 1: every gate row and every up row of the pass.  P14: rows go out in chunks (run_dyn), so a late thread
+        // no longer holds the barrier.  One unit is a gate row with the up row of the same index, so the swigluoai of
+        // that row runs on the thread that computed it: the same two dot products and the same swigluoai as the serial
+        // pass that used to follow the barrier, with that pass removed.
         if ((int)L.egate.ne1 != ff || (int)L.eup.ne1 != ff)
             fail("gate/up rows do not match the expert feed-forward width");
-        // P14: rows go out in chunks (run_dyn), so a late thread no longer holds the barrier; rows are independent.
-        pool.run_dyn(n * 2 * ff, kLaneChunkRows, [&](int a, int b) {
+        pool.run_dyn(n * ff, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
-                const int j = i / (2 * ff);
-                const int k = i - j * 2 * ff;
-                const bool is_up = k >= ff;
-                const int r = is_up ? k - ff : k;
+                const int j = i / ff;
+                const int r = i - j * ff;
                 const CpuExpertRef* c = jobs[(size_t)j];
-                const size_t stride = is_up ? u_row : g_row;
-                const uint8_t* row = (is_up ? c->up : c->gate) + (size_t)r * stride;
-                if (lane_pf > 0) prefetch_row(row + stride * (size_t)lane_pf);
-                const RowKernel& kk = is_up ? ku : kg;
-                const float s = row_dot(kk, row, is_up ? aq_up : cpu_aq.data());
-                (is_up ? cpu_ubuf : cpu_gbuf)[(size_t)j * (size_t)ff + (size_t)r] = s;
+                const uint8_t* grow = c->gate + (size_t)r * g_row;
+                const uint8_t* urow = c->up + (size_t)r * u_row;
+                if (lane_pf > 0) {
+                    prefetch_row(grow + g_row * (size_t)lane_pf);
+                    prefetch_row(urow + u_row * (size_t)lane_pf);
+                }
+                const float g = row_dot(kg, grow, cpu_aq.data());
+                const float u = row_dot(ku, urow, aq_up);
+                const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)c->e];
+                const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)c->e];
+                cpu_hbuf[(size_t)j * (size_t)ff + (size_t)r] = swigluoai(g * fg, u * fu, alpha, limit);
             }
         });
-        // swigluoai and the divisors: n * ff values, ~12 K multiply-adds per expert, cheaper than a barrier.
-        for (int j = 0; j < n; ++j) {
-            const float* g = &cpu_gbuf[(size_t)j * (size_t)ff];
-            const float* u = &cpu_ubuf[(size_t)j * (size_t)ff];
-            const float fg = L.egate_scale.empty() ? 1.f : L.egate_scale[(size_t)jobs[(size_t)j]->e];
-            const float fu = L.eup_scale.empty() ? 1.f : L.eup_scale[(size_t)jobs[(size_t)j]->e];
-            float* h = &cpu_hbuf[(size_t)j * (size_t)ff];
-            for (int i = 0; i < ff; ++i) h[i] = swigluoai(g[i] * fg, u[i] * fu, alpha, limit);
-        }
         // Region 2: every down row.  Each expert's hidden state needs its own activation image; the quantizer is
         // cheap (ff values) and the rows are 6 K long.
         cpu_hq.resize((size_t)n * kd.act_bytes);
@@ -5115,6 +5423,7 @@ struct Engine::Impl {
         std::vector<float> bs;
         const auto t_idx = std::chrono::steady_clock::now();
         if (L.indexer) {
+            attn_begin(1, nullptr);
             if (dev_slots) {
                 if (iqdev) {
                     cu::idx_block_scores(L.d_ik.p, Tk, iqdev, HI, (int)cfg.idx_dim, BLK, nb, (float*)w.bs.p, nullptr);
@@ -5123,8 +5432,10 @@ struct Engine::Impl {
                     cu::idx_block_scores(L.d_ik.p, Tk, (const float*)w.qd.p, HI, (int)cfg.idx_dim, BLK, nb,
                                          (float*)w.bs.p, nullptr);
                 }
+                attn_begin(2, nullptr);
                 cu::idx_select((const float*)w.bs.p, HI, nb, (int)cfg.idx_top_k, BLK, pos, (int)cfg.idx_local,
                                (int)max_slot, (int32_t*)w.slots.p, (int32_t*)w.counts.p, nullptr);
+                attn_end(2, nullptr);
             } else {
                 bs.assign((size_t)HI * nb, -std::numeric_limits<float>::infinity());
                 if (iqdev) {
@@ -5138,6 +5449,7 @@ struct Engine::Impl {
                 cu::copy_d2h(bs.data(), w.bs.p, (size_t)HI * (size_t)nb * sizeof(float));
             }
         }
+        if (L.indexer) attn_end(1, nullptr);
         if (opt.profile_time) prof.attn_idx_sync += pms(t_idx);
         std::vector<int32_t> slots;
         std::vector<int> off;
@@ -5163,8 +5475,10 @@ struct Engine::Impl {
                 cu::copy_h2d(w.slots.p, sp.data(), sp.size() * sizeof(int32_t));
                 cu::copy_h2d(w.counts.p, cnt.data(), cnt.size() * sizeof(int32_t));
             }
+            attn_begin(3, nullptr);
             cu::kv_gather(L.d_k.p, L.d_v.p, HKV, D, (const int32_t*)w.slots.p, (const int32_t*)w.counts.p,
                           (int)max_slot, w.kstage.p, w.vstage.p, nullptr);
+            attn_end(3, nullptr);
         } else {
             cu::copy_h2d(w.slots.p, sp.data(), sp.size() * sizeof(int32_t));
             cu::copy_h2d(w.counts.p, cnt.data(), cnt.size() * sizeof(int32_t));
@@ -5201,8 +5515,10 @@ struct Engine::Impl {
         const auto t_msa = std::chrono::steady_clock::now();
         float* att_dst = att_dev_out ? att_dev_out : (float*)w.att.p;
         if (qdev) {
+            attn_begin(4, nullptr);
             cu::msa_attn(w.kstage.p, w.vstage.p, qdev, att_dst, H, q_per_kv, (int)max_slot,
                          (const int32_t*)w.counts.p, D, nullptr);
+            attn_end(4, nullptr);
         } else {
             h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
             cu::msa_attn(w.kstage.p, w.vstage.p, (const float*)w.qd.p, att_dst, H, q_per_kv, (int)max_slot,
@@ -6043,6 +6359,7 @@ struct Engine::Impl {
         tok_stats = TokenStats{};
         ssd_wait_ms = 0.0;
         decay_usage();
+        rebalance_now = tiers_on && opt.adaptive && ((rebalance_tick + 1) % 16) == 0;
         const bool pt = opt.profile_time;
         const auto t_tok = std::chrono::steady_clock::now();
         if (pt) {
@@ -6071,6 +6388,7 @@ struct Engine::Impl {
         };
         for (int64_t li = 0; li < cfg.n_layers; ++li) {
             Layer& L = layers[(size_t)li];
+            attn_li = li;
             const auto t_pre = pt ? tokclock::now() : tokclock::time_point();   // P46
             if (kv_mode != 0 || L.want_gpu) use_layer_device(li);
             if (pt) prof.pre += pms(t_pre);
@@ -6139,6 +6457,7 @@ struct Engine::Impl {
                             }
                         };
                         if (!tok_graph[(size_t)li]) {
+                            drain_inputs(w);
                             h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
                             cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
                             cu::graph_capture_begin(w.dsb);
@@ -6152,9 +6471,12 @@ struct Engine::Impl {
                         if (tok_graph[(size_t)li]) {
                             // The activation and the position are host-side inputs: copied every token, outside
                             // the graph, which only bakes in their device addresses.
+                            drain_inputs(w);
                             h2d(w, w.x.p, h.data(), (size_t)cfg.n_embd * sizeof(float));
                             cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
+                            attn_begin(0, w.dsb);
                             cu::graph_launch(tok_graph[(size_t)li], w.dsb);
+                            attn_end(0, w.dsb);
                             cu::copy_d2d((uint16_t*)L.d_k.p + koff_dev, w.kn16.p, (size_t)HKV * D * 2);
                             cu::copy_d2d((uint16_t*)L.d_v.p + koff_dev, w.vn16.p, (size_t)HKV * D * 2);
                             if (L.indexer)
@@ -6168,6 +6490,7 @@ struct Engine::Impl {
                 gemv(L.wq, h.data(), nullptr, w.qn.p);
                 gemv(L.wk, h.data(), nullptr, w.kn.p);
                 gemv(L.wv, h.data(), nullptr, w.vn.p);
+                drain_inputs(w);
                 cu::copy_h2d(w.pos1.p, &ppos, sizeof(ppos));
                 cu::head_norm_rope((const float*)w.qn.p, (const float*)L.d_qn.p, (float*)w.qn.p, nullptr, H, H, D,
                                    (int)cfg.n_rot, (const float*)w.rope_cos.p, (const float*)w.rope_sin.p,
@@ -6341,6 +6664,11 @@ struct Engine::Impl {
             ++prof_tokens;
             const std::string line = prof_line(prof, prof_tokens);
             std::fprintf(stderr, "%s\n", line.c_str());
+            attn_collect();
+            std::fprintf(stderr, "INFO attn-ops token=%lld graph=%.3f idx=%.3f select=%.3f gather=%.3f msa=%.3f "
+                         "wo=%.3f\n",
+                         (long long)prof_tokens, attn_tok_ms[0], attn_tok_ms[1], attn_tok_ms[2], attn_tok_ms[3],
+                         attn_tok_ms[4], attn_tok_ms[5]);
         }
         if (tiers_on) {
             total_stats.vram += tok_stats.vram;
@@ -6350,7 +6678,7 @@ struct Engine::Impl {
             total_stats.skipped += tok_stats.skipped;
             total_stats.ssd_mapped += tok_stats.ssd_mapped;
             ++tokens_seen;
-            if (opt.adaptive && (++rebalance_tick % 16) == 0) rebalance();
+            if (opt.adaptive) ++rebalance_tick;   // the layers decided this token's swaps as they ran (rebalance_now)
             if (opt.stats)
                 std::fprintf(stderr,
                              "INFO minimax-stats token=%lld vram=%lld ram=%lld ssd=%lld ssd_bytes=%lld "

@@ -19,6 +19,7 @@ void dealloc(void* p);
 void copy_h2d(void* dst, const void* src, size_t bytes);
 void copy_d2h(void* dst, const void* src, size_t bytes);
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
+void copy_d2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void copy_d2d(void* dst, const void* src, size_t bytes);
 
 // ---- P4: more than one device.  Every call above acts on the thread's CURRENT device; `set_device` is the only
@@ -34,6 +35,15 @@ void* alloc_on(int dev, size_t bytes);
 /// Page-locked host memory for the KV cache and the cross-GPU hop.  Throws when the driver refuses it.
 void* host_alloc(size_t bytes);
 void host_free(void* p);
+
+/// Host-mapped device memory (cudaHostAllocMapped): the host writes it through the returned pointer and the kernels
+/// read it over PCIe at `*device`.  A host copy into it uses no copy engine, so it never waits behind a DMA queue (the
+/// rebalance's slot copies sit in that queue).  `copy_h2d` and `copy_h2d_async` take this path for a mapped
+/// destination; the caller must keep the bytes stable until the kernels that read them have finished.
+void* host_alloc_mapped(size_t bytes, void** device);
+void host_free_mapped(void* host);
+/// The host address behind `dev` when [dev, dev + bytes) lies inside a block from host_alloc_mapped, else nullptr.
+void* mapped_host_of(const void* dev, size_t bytes);
 
 // ---- P4: MSA attention on the device (fp16 KV, fp32 scores).
 /// bs[h*nb + b] = max over t in block b with t < ntok of dot(q_h, ik[t]).  `ik` is fp16 [ctx][dim].
@@ -54,10 +64,15 @@ void msa_attn(const void* kstage, const void* vstage, const float* q, float* out
               int maxslot, const int32_t* counts, int dim, void* stream);
 
 /// y[rows] = W[rows, cols] * x[cols], all device pointers, row-major W. Synchronizes before return.
-void gemv(const float* W, const float* x, float* y, int rows, int cols);
+/// `stream` null: the legacy stream and a device-wide sync.  Non-null: that stream only, the host waits for it alone.
+void gemv(const float* W, const float* x, float* y, int rows, int cols, void* stream = nullptr);
 
 /// Dequantize `rows` rows of a GGUF matrix starting at `row0` into device fp32. Synchronizes.
-void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out);
+void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out,
+                 void* stream = nullptr);
+
+/// dst[i] = src[i] for n floats, on `stream`: one read of `src` (a host-mapped input is read once, not per block).
+void copy_f32(const float* src, float* dst, int64_t n, void* stream);
 
 void sync();
 

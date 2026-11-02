@@ -87,6 +87,9 @@ void usage() {
                  "  --minimax-kv host|vram|ram|auto   where K/V live; vram|ram run MSA on the owning device\n"
                  "  --minimax-kv-quant f16|q8_0|auto  fp16 (default) or q8_0 blocks for the host/pinned K/V;\n"
                  "                                    auto picks q8_0 only when f16 does not fit\n"
+                 "  --minimax-attn-type q6_k|q5_k|q4_k|q8_0  attention and indexer projections (default q6_k):\n"
+                 "                                    requantized from Q8_0 at load (no new file; MMVQ reads them);\n"
+                 "                                    q8_0 keeps the file's Q8_0 weights\n"
                  "  --minimax-host-attn fast|legacy   multithreaded host attention (default fast; same arithmetic)\n"
                  "  --minimax-prefill-kv auto|off     with the KV in RAM, stage one layer's K/V on the card for the\n"
                  "                                    batched prompt pass (default auto, the long-context path)\n"
@@ -606,6 +609,7 @@ int run(int argc, char** argv) {
     std::string dump_dir, dump_layers, seed_hidden;
     std::string layer_split, gpus, kv_space;
     std::string kv_quant, host_attn, prefill_kv;
+    std::string attn_type = "q6_k";
     int prefill_batch = 0, expert_prefetch = 0;
     std::string prefill_vram;
     std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq, prefill_expert_device;
@@ -659,6 +663,7 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-prefill-vram") prefill_vram = next();
         else if (a == "--minimax-expert-prefetch") expert_prefetch = std::atoi(next().c_str());
         else if (a == "--minimax-dense-mmvq") dense_mmvq = next();
+        else if (a == "--minimax-attn-type") attn_type = next();
         else if (a == "--minimax-gpu-normrope") gpu_normrope = next();
         else if (a == "--minimax-expert-skip") expert_skip = (float)std::atof(next().c_str());
         else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
@@ -900,6 +905,7 @@ int run(int argc, char** argv) {
     opt.prefill_vram = prefill_vram;
     opt.expert_prefetch = expert_prefetch;
     opt.dense_mmvq = dense_mmvq;
+    opt.attn_type = attn_type;
     opt.gpu_normrope = gpu_normrope;
     opt.expert_resident = expert_resident;
     opt.expert_skip = expert_skip;
