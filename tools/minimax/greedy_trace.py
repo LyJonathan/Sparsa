@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--open-len", type=int, default=500)
     ap.add_argument("--max-context", default="32768")
     ap.add_argument("--extra", default="", help="extra engine flags, split on spaces")
+    ap.add_argument("--only", choices=["repetitive", "open"], help="one prompt per session (route traces)")
     args = ap.parse_args()
 
     ids = read_ids(args.ids)
@@ -43,6 +44,8 @@ def main():
         ("repetitive", block * 3),
         ("open", ids[b * 3:b * 3 + args.open_len]),
     ]
+    if args.only:
+        prompts = [pr for pr in prompts if pr[0] == args.only]
     flags = ["--gpus", "0,1", "--vram-reserve-mib", "700", "--minimax-kv", "vram", "--minimax-tiers",
              "--minimax-prefill-batch", "4096"] + args.extra.split()
     cmd = [args.exe, "--model", args.model, "--serve", "--max-context", args.max_context] + flags
