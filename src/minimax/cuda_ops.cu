@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cstdlib>
+#include <vector>
 
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -195,6 +196,60 @@ __global__ void msa_attn_kernel(const __half* __restrict__ k, const __half* __re
         s[i] = acc * scale;
     }
     __syncthreads();
+    float m = -INFINITY;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) m = fmaxf(m, s[i]);
+    m = block_max(m, red);
+    __syncthreads();
+    float sum = 0.f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const float e = __expf(s[i] - m);
+        s[i] = e;
+        sum += e;
+    }
+    sum = block_sum(sum, red);
+    __syncthreads();
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int d = (int)threadIdx.x; d < dim; d += (int)blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < n; ++i) acc += s[i] * __half2float(vb[(size_t)i * dim + d]);
+        out[(size_t)qh * dim + d] = acc * inv;
+    }
+}
+
+// The MSA kernel with its K rows staged through shared memory, a tile at a time.  The old loop had each thread
+// read its own row (uncoalesced); here the tile is copied in coalesced and each row's dot product runs in the
+// same order over the same values, so the output is byte-identical to msa_attn_kernel.
+constexpr int kMsaTileRows = 64;
+__global__ void msa_attn_tiled_kernel(const __half* __restrict__ k, const __half* __restrict__ v,
+                                const float* __restrict__ q, float* __restrict__ out, int q_per_kv, int maxslot,
+                                const int* __restrict__ counts, int dim, float scale) {
+    extern __shared__ float s[];
+    __shared__ float red[32];
+    __shared__ __half kt[kMsaTileRows][128];   // head_dim 128 (checked by the launcher)
+    const int qh = (int)blockIdx.x;
+    const int kv = qh / q_per_kv;
+    const int n = counts[kv];
+    const __half* kb = k + (size_t)kv * maxslot * dim;
+    const __half* vb = v + (size_t)kv * maxslot * dim;
+    const float* qh_p = q + (size_t)qh * dim;
+    if (threadIdx.x == 0) red[0] = 0.f;
+    __syncthreads();
+    if (n <= 0) {
+        for (int d = (int)threadIdx.x; d < dim; d += (int)blockDim.x) out[(size_t)qh * dim + d] = 0.f;
+        return;
+    }
+    for (int i0 = 0; i0 < n; i0 += kMsaTileRows) {
+        const int rows = min(kMsaTileRows, n - i0);
+        for (int e = (int)threadIdx.x; e < rows * dim; e += (int)blockDim.x)
+            kt[e / dim][e % dim] = kb[(size_t)i0 * dim + (size_t)e];
+        __syncthreads();
+        for (int r = (int)threadIdx.x; r < rows; r += (int)blockDim.x) {
+            float acc = 0.f;
+            for (int d = 0; d < dim; ++d) acc += __half2float(kt[r][d]) * qh_p[d];
+            s[i0 + r] = acc * scale;
+        }
+        __syncthreads();
+    }
     float m = -INFINITY;
     for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) m = fmaxf(m, s[i]);
     m = block_max(m, red);
@@ -1030,6 +1085,49 @@ void host_free(void* p) {
     if (p) cudaFreeHost(p);
 }
 
+// Host-mapped device blocks.  Written at setup and read by lookup on every copy; only the engine's main thread calls
+// into this module, so no lock is taken.
+namespace {
+struct MappedBlock {
+    const char* dev;   // the device address the kernels use
+    size_t bytes;
+    char* host;        // the same bytes through the host
+};
+std::vector<MappedBlock>& mapped_blocks() {
+    static std::vector<MappedBlock> v;
+    return v;
+}
+}  // namespace
+
+void* host_alloc_mapped(size_t bytes, void** device) {
+    if (bytes == 0) bytes = 4;
+    void* h = nullptr;
+    check(cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc mapped");
+    void* d = nullptr;
+    check(cudaHostGetDevicePointer(&d, h, 0), "cudaHostGetDevicePointer");
+    mapped_blocks().push_back({(const char*)d, bytes, (char*)h});
+    if (device) *device = d;
+    return h;
+}
+
+void host_free_mapped(void* host) {
+    if (!host) return;
+    auto& v = mapped_blocks();
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].host == (char*)host) {
+            v.erase(v.begin() + (std::ptrdiff_t)i);
+            break;
+        }
+    cudaFreeHost(host);
+}
+
+void* mapped_host_of(const void* dev, size_t bytes) {
+    const char* d = (const char*)dev;
+    for (const MappedBlock& m : mapped_blocks())
+        if (d >= m.dev && d + bytes <= m.dev + m.bytes) return m.host + (d - m.dev);
+    return nullptr;
+}
+
 MemInfo mem() {
     MemInfo m;
     check(cudaMemGetInfo(&m.free_bytes, &m.total_bytes), "cudaMemGetInfo");
@@ -1059,6 +1157,10 @@ void dealloc(void* p) {
 
 void copy_h2d(void* dst, const void* src, size_t bytes) {
     if (!bytes) return;
+    if (void* hp = mapped_host_of(dst, bytes)) {   // host-mapped: no copy engine, so no queue behind it
+        std::memcpy(hp, src, bytes);
+        return;
+    }
     const cudaError_t e = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
         int dev = -1;
@@ -1074,6 +1176,10 @@ void copy_d2h(void* dst, const void* src, size_t bytes) {
     if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
 }
 
+void copy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream), "copy D2D async");
+}
+
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream) {
     if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream),
                      "cudaMemcpyAsync D2H");
@@ -1083,20 +1189,36 @@ void copy_d2d(void* dst, const void* src, size_t bytes) {
     if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy D2D");
 }
 
-void gemv(const float* W, const float* x, float* y, int rows, int cols) {
+void gemv(const float* W, const float* x, float* y, int rows, int cols, void* stream) {
     if (rows <= 0 || cols <= 0) return;
-    gemv_f32<<<rows, 256>>>(W, x, y, cols);
+    gemv_f32<<<rows, 256, 0, (cudaStream_t)stream>>>(W, x, y, cols);
     check(cudaGetLastError(), "gemv launch");
-    check(cudaDeviceSynchronize(), "gemv sync");
+    if (stream) check(cudaStreamSynchronize((cudaStream_t)stream), "gemv stream sync");
+    else check(cudaDeviceSynchronize(), "gemv sync");
 }
 
-void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out) {
-    strata::kernels::dequant_f32(ggml_type, blocks, row0, rows, cols, out, nullptr);
+void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out,
+                 void* stream) {
+    strata::kernels::dequant_f32(ggml_type, blocks, row0, rows, cols, out, stream);
     check(cudaGetLastError(), "dequant_f32");
-    check(cudaDeviceSynchronize(), "dequant sync");
+    if (stream) check(cudaStreamSynchronize((cudaStream_t)stream), "dequant stream sync");
+    else check(cudaDeviceSynchronize(), "dequant sync");
 }
 
 void sync() { check(cudaDeviceSynchronize(), "sync"); }
+
+__global__ void copy_f32_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+void copy_f32(const float* src, float* dst, int64_t n, void* stream) {
+    if (n <= 0) return;
+    int blocks = (int)((n + 255) / 256);
+    if (blocks > 16) blocks = 16;
+    copy_f32_kernel<<<blocks, 256, 0, (cudaStream_t)stream>>>(src, dst, n);
+    check(cudaGetLastError(), "copy_f32 launch");
+}
 
 void* stream_create() {
     cudaStream_t s = nullptr;
@@ -1159,7 +1281,12 @@ void stream_destroy(void* stream) {
 }
 
 void copy_h2d_async(void* dst, const void* src, size_t bytes, void* stream) {
-    if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream), "copy H2D async");
+    if (!bytes) return;
+    if (void* hp = mapped_host_of(dst, bytes)) {   // host-mapped: the kernels read it straight from host memory
+        std::memcpy(hp, src, bytes);
+        return;
+    }
+    check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream), "copy H2D async");
 }
 
 void stream_sync(void* stream) { check(cudaStreamSynchronize((cudaStream_t)stream), "stream sync"); }
@@ -1295,8 +1422,13 @@ void msa_attn(const void* kstage, const void* vstage, const float* q, float* out
     if (nheads <= 0) return;
     const float scale = 1.f / std::sqrt((float)dim);
     const size_t shm = (size_t)maxslot * sizeof(float);
-    msa_attn_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q, out,
-                                                                q_per_kv, maxslot, counts, dim, scale);
+    if (dim == 128) {
+        msa_attn_tiled_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q,
+                                                                         out, q_per_kv, maxslot, counts, dim, scale);
+    } else {
+        msa_attn_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q, out,
+                                                                    q_per_kv, maxslot, counts, dim, scale);
+    }
     check(cudaGetLastError(), "msa_attn launch");
 }
 
