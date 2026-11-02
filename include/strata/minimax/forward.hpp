@@ -98,9 +98,9 @@ struct EngineOptions {
     int expert_prefetch = 0;        ///< experts per layer to prefetch ahead (0 = off)
     std::string dense_mmvq;         ///< "" / "on": packed dense GEMV through CUDA MMVQ (q8_1 activation);
                                     ///< "off": the fp32 dequantize + SGEMM path, bit-closer to the CPU dots
-    std::string attn_type;          ///< "" / "q8_0" (default): the attention and indexer projections stay Q8_0.
-                                    ///< "q6_k" | "q5_k" | "q4_k": requantized from Q8_0 at load with ggml's
-                                    ///< quantizer (no imatrix) and read by the same MMVQ kernels; no file is written
+    std::string attn_type = "q6_k"; ///< attention and indexer projections: "q6_k" (default), "q5_k" or "q4_k"
+                                    ///< requantize the Q8_0 weights at load (ggml's quantizer, no imatrix, no file
+                                    ///< written; the same MMVQ kernels read them). "q8_0" (or "") keeps the file's Q8_0
     // ---- P5c: the fused device norm+rope step and the resident expert arena.
     std::string gpu_normrope;       ///< "" / "on": per-head RMSNorm + RoPE + the fp16 cache write on the device;
                                     ///< "off": the host rms_heads/rope/ggml_fp32_to_fp16 loop (the P5b path)

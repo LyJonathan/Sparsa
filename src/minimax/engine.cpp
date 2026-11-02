@@ -2310,8 +2310,8 @@ struct Engine::Impl {
 
     // --minimax-attn-type q6_k|q5_k|q4_k: the same requantization for every layer's attn_q, attn_k, attn_v,
     // attn_output and the indexer's q and k projections.  It runs once at load, before the VRAM plan, so
-    // choose_split_and_kv and place_weights size the layers from the smaller copies.  "" and "q8_0" keep the
-    // file's Q8_0 (the default).
+    // choose_split_and_kv and place_weights size the layers from the smaller copies.  The default is q6_k;
+    // "q8_0" (or "") keeps the file's Q8_0.
     int attn_requant_type() const {
         if (opt.attn_type.empty() || opt.attn_type == "q8_0") return -1;
         if (opt.attn_type == "q6_k") return (int)GGML_TYPE_Q6_K;
