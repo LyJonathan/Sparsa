@@ -18,6 +18,7 @@ void dealloc(void* p);
 void copy_h2d(void* dst, const void* src, size_t bytes);
 void copy_d2h(void* dst, const void* src, size_t bytes);
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
+void copy_d2d_async(void* dst, const void* src, size_t bytes, void* stream);
 void copy_d2d(void* dst, const void* src, size_t bytes);
 
 // ---- P4: more than one device.  Every call above acts on the thread's CURRENT device; `set_device` is the only

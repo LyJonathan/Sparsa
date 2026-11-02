@@ -216,6 +216,60 @@ __global__ void msa_attn_kernel(const __half* __restrict__ k, const __half* __re
     }
 }
 
+// The MSA kernel with its K rows staged through shared memory, a tile at a time.  The old loop had each thread
+// read its own row (uncoalesced); here the tile is copied in coalesced and each row's dot product runs in the
+// same order over the same values, so the output is byte-identical to msa_attn_kernel.
+constexpr int kMsaTileRows = 64;
+__global__ void msa_attn_tiled_kernel(const __half* __restrict__ k, const __half* __restrict__ v,
+                                const float* __restrict__ q, float* __restrict__ out, int q_per_kv, int maxslot,
+                                const int* __restrict__ counts, int dim, float scale) {
+    extern __shared__ float s[];
+    __shared__ float red[32];
+    __shared__ __half kt[kMsaTileRows][128];   // head_dim 128 (checked by the launcher)
+    const int qh = (int)blockIdx.x;
+    const int kv = qh / q_per_kv;
+    const int n = counts[kv];
+    const __half* kb = k + (size_t)kv * maxslot * dim;
+    const __half* vb = v + (size_t)kv * maxslot * dim;
+    const float* qh_p = q + (size_t)qh * dim;
+    if (threadIdx.x == 0) red[0] = 0.f;
+    __syncthreads();
+    if (n <= 0) {
+        for (int d = (int)threadIdx.x; d < dim; d += (int)blockDim.x) out[(size_t)qh * dim + d] = 0.f;
+        return;
+    }
+    for (int i0 = 0; i0 < n; i0 += kMsaTileRows) {
+        const int rows = min(kMsaTileRows, n - i0);
+        for (int e = (int)threadIdx.x; e < rows * dim; e += (int)blockDim.x)
+            kt[e / dim][e % dim] = kb[(size_t)i0 * dim + (size_t)e];
+        __syncthreads();
+        for (int r = (int)threadIdx.x; r < rows; r += (int)blockDim.x) {
+            float acc = 0.f;
+            for (int d = 0; d < dim; ++d) acc += __half2float(kt[r][d]) * qh_p[d];
+            s[i0 + r] = acc * scale;
+        }
+        __syncthreads();
+    }
+    float m = -INFINITY;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) m = fmaxf(m, s[i]);
+    m = block_max(m, red);
+    __syncthreads();
+    float sum = 0.f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const float e = __expf(s[i] - m);
+        s[i] = e;
+        sum += e;
+    }
+    sum = block_sum(sum, red);
+    __syncthreads();
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int d = (int)threadIdx.x; d < dim; d += (int)blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < n; ++i) acc += s[i] * __half2float(vb[(size_t)i * dim + d]);
+        out[(size_t)qh * dim + d] = acc * inv;
+    }
+}
+
 }  // namespace
 
 // ============================================================================================= P5a: batched prefill
@@ -1122,6 +1176,10 @@ void copy_d2h(void* dst, const void* src, size_t bytes) {
     if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
 }
 
+void copy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream), "copy D2D async");
+}
+
 void copy_d2h_async(void* dst, const void* src, size_t bytes, void* stream) {
     if (bytes) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream),
                      "cudaMemcpyAsync D2H");
@@ -1364,8 +1422,13 @@ void msa_attn(const void* kstage, const void* vstage, const float* q, float* out
     if (nheads <= 0) return;
     const float scale = 1.f / std::sqrt((float)dim);
     const size_t shm = (size_t)maxslot * sizeof(float);
-    msa_attn_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q, out,
-                                                                q_per_kv, maxslot, counts, dim, scale);
+    if (dim == 128) {
+        msa_attn_tiled_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q,
+                                                                         out, q_per_kv, maxslot, counts, dim, scale);
+    } else {
+        msa_attn_kernel<<<nheads, 256, shm, (cudaStream_t)stream>>>((const __half*)kstage, (const __half*)vstage, q, out,
+                                                                    q_per_kv, maxslot, counts, dim, scale);
+    }
     check(cudaGetLastError(), "msa_attn launch");
 }
 
