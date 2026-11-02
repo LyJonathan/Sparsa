@@ -6511,10 +6511,22 @@ struct Engine::Impl {
                     if (p.ring_v.empty() || p.pin_v.empty()) continue;
                     const size_t bytes = std::min(p.ring_slot, p.pin_slot_bytes);
                     cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);   // warm-up
-                    const auto t0 = std::chrono::steady_clock::now();
-                    for (int r = 0; r < 4; ++r) cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);
-                    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                    gbs[(size_t)d] = s > 0.0 ? 4.0 * (double)bytes / s / 1e9 : 0.0;
+                    // Best of three windows, each at least 20 ms (and 4 copies).  The old single 4-copy window (2-3 ms)
+                    // read card 1 at 25.7 GB/s on one start and 3.6 GB/s on the next on the PC: one stall in a short window
+                    // is enough, so a window that long keeps the sample representative.
+                    double best = 0.0;
+                    for (int w = 0; w < 3; ++w) {
+                        int reps = 0;
+                        double s = 0.0;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        do {
+                            cu::copy_h2d(p.ring_v[0], p.pin_v[0], bytes);
+                            ++reps;
+                            s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        } while (reps < 4 || (s < 0.02 && reps < 256));
+                        if (s > 0.0) best = std::max(best, (double)reps * (double)bytes / s / 1e9);
+                    }
+                    gbs[(size_t)d] = best;
                 }
                 if (!cache.empty()) pf_link_cache_write(cache, keys, gbs);
             }
