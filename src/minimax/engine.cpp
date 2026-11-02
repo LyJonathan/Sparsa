@@ -7096,13 +7096,14 @@ struct Engine::Impl {
         // the mapped-read staging (read_expert) would use it too.  Only for chunks up to 1024 tokens: rig-2 at
         // 100 / 500 / 2000 tokens measured 5.8 -> 4.8 s, 10.2 -> 8.5 s and 25.5 -> 26.1 s (at 2000 the CPU's RAM
         // reads slow the DMA more than the experts it takes save).
-        // Off by default (PR #57).  The lane computes its experts with Q8_K activations, 0.9-2.3% error per MoE layer against
-        // 0.03-0.06% on the tensor cores, and the assistant-turn score is the same with it off (3020 positions: KL 0.4136 off vs
-        // 0.4149 on, paired difference -0.0013 +- 0.0010; top-1 82.1% vs 81.9%).  It only runs for chunks of 1024 tokens
-        // or fewer.  STRATA_PF_CPU_GBS=<GB/s> turns it on (P41 tuned it to 24).
+        // On by default at 24 GB/s (P41 tuned it).  The lane computes its experts with Q8_K activations, 0.9-2.3% error
+        // per MoE layer against 0.03-0.06% on the tensor cores.  With it off the assistant-turn score is not significantly
+        // different (3020 positions: KL 0.4136 off vs 0.4149 on, paired difference -0.0013 +- 0.0010), and prompt speed on
+        // rig-2 drops about 30% (decode is unchanged).  It only runs for chunks of 1024 tokens or fewer.
+        // STRATA_PF_CPU_GBS=0 turns it off; a value in GB/s sets its rate.
         static const double cpu_gbs = [] {
             const char* e = std::getenv("STRATA_PF_CPU_GBS");
-            return e ? std::atof(e) : 0.0;
+            return e ? std::atof(e) : 24.0;   // 0 turns the split off (P41: 16 -> 24 after the batched CPU passes)
         }();
         std::vector<char> on_cpu((size_t)nexp, 0);
         std::vector<std::vector<std::pair<int, float>>> cpu_rows;   // per CPU expert: (token, weight)
