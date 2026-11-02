@@ -658,6 +658,48 @@ placement (`tools/minimax/skip_quality.py`):
 checkpoint (0.012), for +3 % decode; 0.15 is at the floor with a visible top-1 cost. The default stays **off**: a
 3 % win does not justify changing answers, and the slice's 15 layers understate what a deep-layer skip costs.
 
+### Adaptive route drop: `--minimax-topk-adaptive T` (default off)
+
+A routed expert whose share of the route weight is below `T` is dropped. The two largest routes always stay, so a
+token runs at least two experts. The survivors are renormalized to sum to 1 (`--minimax-topk-adaptive-renorm on`,
+the default), or keep the router's own weights (`off`). A dropped route has weight 0, so its bytes are never read or
+computed. Off, the build is byte-identical: the teacher-forced logits match the previous build with `cmp`.
+
+Quality, MiniMax-M3.1-Flash IQ2_XXS on rig-2: 200 teacher-forced positions (`--minimax-eval`, `/tmp/gate_ids.txt`).
+Every arm runs with `--no-minimax-adaptive`, so the VRAM placement is the same in all of them. KL is per position,
+against the same build with no drop. Route counts come from `--minimax-stats` (45,600 routes in 200 tokens).
+
+| T | routes dropped | routes per token | KL mean | KL median | KL p95 | top-1 agrees |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 (off) | 0 % | 0 | 0 | 0 | 0 | 100 % |
+| 0.01 | 0.07 % | 0.15 | 0.114 | 0.021 | 0.552 | 89.5 % |
+| 0.05 | 1.7 % | 3.9 | 0.269 | 0.121 | 0.873 | 78.0 % |
+| 0.10 | 6.8 % | 15.5 | 0.418 | 0.243 | 1.388 | 71.5 % |
+| 0.10, renorm off | 6.8 % | 15.5 | 0.413 | 0.206 | 1.516 | 72.5 % |
+| 0.15 | 16.4 % | 37.3 | 0.779 | 0.525 | 2.168 | 62.5 % |
+| 0.20 | 33.8 % | 77.2 | 1.589 | 1.194 | 4.626 | 47.0 % |
+
+The logits are already sensitive to small changes on this set. Turning the VRAM swaps on or off, with no drop at all,
+moves them by KL 0.175 (median 0.071, top-1 87.0 %). So a 0.01 bar cannot be judged on this metric, and every
+threshold above is far from it.
+
+Speed, dec5 (3 requests x 128 sampled tokens, context 32768, default placement). Means over the sessions:
+
+| arm | sessions | decode tok/s | CPU lane ms/token | CPU lane experts/token |
+| ---: | ---: | ---: | ---: | ---: |
+| `final` (157861da) | 3 | 8.12 | 65.0 | 157 |
+| this build, no flag | 1 | 8.28 | 63.0 | 159 |
+| T 0.05 | 1 | 8.30 | 63.1 | 159 |
+| T 0.10 | 2 | 8.63 | 59.3 | 149 |
+| T 0.10, renorm off | 1 | 8.53 | 60.3 | 148 |
+| T 0.15 | 2 | 8.43 | 59.7 | 147 |
+| T 0.20 | 2 | 9.40 | 50.8 | 122 |
+
+The gain at T 0.15 and below is inside the spread between the `final` sessions (7.99 to 8.27 tok/s). T 0.20 is about
+16 % faster and saves about 0.5 GB of CPU-lane expert reads a token, and it costs KL 1.6 and top-1 47 %. The default
+stays **off**: no tested threshold stays near the engine without the drop, and the speed it buys is small until the
+answers have already changed.
+
 ### CUDA graphs: `--minimax-graphs off` (default on)
 
 The token path's attention prefix is nine small launches per layer per token: the q8_1 quantize of the activation,
