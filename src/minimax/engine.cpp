@@ -1373,6 +1373,9 @@ struct Engine::Impl {
                      opt.cpu_threads > 0 ? "--cpu-threads" : "physical cores",
                      (int)std::thread::hardware_concurrency());
         pool.start(threads);
+        // --minimax-attn-type requantizes the attention projections before the VRAM plan: choose_split_and_kv and
+        // place_weights size the layers from the tensors' bytes.
+        requant_attention();
 
         // N=0 is the all-CPU dense path: no device, no CUDA runtime calls. Automatic placement (-1), any
         // positive layer count, and the P3 expert tiers still need a device to size VRAM.
@@ -2276,8 +2279,7 @@ struct Engine::Impl {
         return t;
     }
 
-    void requant_dense(Tensor& t) {
-        const int to = dense_requant_type();
+    void requant_to(Tensor& t, int to) {
         if (to < 0 || t.host == nullptr || t.type != (int)GGML_TYPE_Q8_0 || t.ne2 != 1 || t.ne0 % 256 != 0) return;
         const int64_t cols = t.ne0, rows = t.ne1;
         const size_t out_row = ggml_row_size((ggml_type)to, cols);
@@ -2302,6 +2304,56 @@ struct Engine::Impl {
         t.bytes = (size_t)rows * out_row;
         t.base = ggml_get_type_traits((ggml_type)to);
         t.cpu = ggml_get_type_traits_cpu((ggml_type)to);
+    }
+
+    void requant_dense(Tensor& t) { requant_to(t, dense_requant_type()); }
+
+    // --minimax-attn-type q6_k|q5_k|q4_k: the same requantization for every layer's attn_q, attn_k, attn_v,
+    // attn_output and the indexer's q and k projections.  It runs once at load, before the VRAM plan, so
+    // choose_split_and_kv and place_weights size the layers from the smaller copies.  "" and "q8_0" keep the
+    // file's Q8_0 (the default).
+    int attn_requant_type() const {
+        if (opt.attn_type.empty() || opt.attn_type == "q8_0") return -1;
+        if (opt.attn_type == "q6_k") return (int)GGML_TYPE_Q6_K;
+        if (opt.attn_type == "q5_k") return (int)GGML_TYPE_Q5_K;
+        if (opt.attn_type == "q4_k") return (int)GGML_TYPE_Q4_K;
+        fail("--minimax-attn-type: unknown value '" + opt.attn_type + "' (use q8_0, q6_k, q5_k or q4_k)");
+    }
+
+    void requant_attention() {
+        const int to = attn_requant_type();
+        if (to < 0) return;
+        size_t bytes_before = 0, bytes_after = 0;
+        int count = 0;
+        for (Layer& L : layers) {
+            for (Tensor* t : {&L.wq, &L.wk, &L.wv, &L.wo, &L.iq, &L.ik}) {
+                if (t->host == nullptr || t->type != (int)GGML_TYPE_Q8_0) continue;
+                const size_t before = t->bytes;
+                requant_to(*t, to);
+                if (t->type != to)
+                    fail(t->name + ": --minimax-attn-type needs rows of whole 256-value blocks (ne0 " +
+                         std::to_string(t->ne0) + ")");
+                bytes_before += before;
+                bytes_after += t->bytes;
+                ++count;
+            }
+        }
+        std::fprintf(stderr, "INFO minimax-attn-type=%s requantized %d attention projections at load (%.2f -> %.2f GiB)\n",
+                     opt.attn_type.c_str(), count, (double)bytes_before / 1073741824.0,
+                     (double)bytes_after / 1073741824.0);
+    }
+
+    // The host copy of a requantized tensor is owned by requant_store.  Once its bytes are on the device nothing
+    // reads them (the GPU paths work from the device pointer), so the copy is freed and the RAM tier keeps the memory.
+    void release_requant_host(Tensor& t) {
+        if (!t.gpu || t.host == nullptr) return;
+        for (auto& s : requant_store) {
+            if (!s.empty() && s.data() == t.host) {
+                std::vector<uint8_t>().swap(s);
+                t.host = nullptr;
+                return;
+            }
+        }
     }
 
     void upload(Tensor& t) {
@@ -2389,7 +2441,10 @@ struct Engine::Impl {
             L.want_gpu = true;
             use_device_index(L.dev);
             auto up = [&](Tensor& t) {
-                if (t.host && gpu_bytes(t) != std::numeric_limits<size_t>::max()) upload(t);
+                if (t.host && gpu_bytes(t) != std::numeric_limits<size_t>::max()) {
+                    upload(t);
+                    release_requant_host(t);
+                }
             };
             if (L.moe) {
                 requant_dense(L.wq);
