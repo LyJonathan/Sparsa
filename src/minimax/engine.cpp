@@ -1043,6 +1043,9 @@ struct Engine::Impl {
     TokenStats total_stats;
     int64_t tokens_seen = 0;
     int64_t profile_saves = 0;
+    // Diagnostic (STRATA_MM_ROUTE_TRACE=path): one line per token and MoE layer, "pos layer e0 .. e(top-1)" in route
+    // order.  Used to measure how much the experts of consecutive tokens overlap (see tools/minimax/route_overlap.py).
+    std::FILE* route_trace = nullptr;
 
     // ---- P8: --minimax-profile-time.  One decode token's wall time, split by the phase that spent it, on stderr
     // after every token; `stats()` prints the mean of the run.  Every timer is a steady_clock pair around work that
@@ -1397,6 +1400,8 @@ struct Engine::Impl {
     }
 
     ~Impl() {
+        if (route_trace) std::fclose(route_trace);
+        route_trace = nullptr;
         write_own_profile();
         flush_dumps();
         for (void* g : tok_graph)
@@ -2401,6 +2406,7 @@ struct Engine::Impl {
     }
 
     void init_tiers() {
+        if (const char* rt = std::getenv("STRATA_MM_ROUTE_TRACE")) route_trace = std::fopen(rt, "w");
         for (const Layer& L : layers)
             if (L.moe) {
                 ++moe_layers;
@@ -3827,6 +3833,11 @@ struct Engine::Impl {
         }
         if (!route_counts.empty()) {
             for (int j = 0; j < top; ++j) route_counts[base_idx + (size_t)order[(size_t)j]] += 1.0;
+        }
+        if (route_trace) {
+            std::fprintf(route_trace, "%lld %lld", (long long)n_past, (long long)li);
+            for (int j = 0; j < top; ++j) std::fprintf(route_trace, " %d", order[(size_t)j]);
+            std::fprintf(route_trace, "\n");
         }
 
         std::vector<int> gpu_e;
