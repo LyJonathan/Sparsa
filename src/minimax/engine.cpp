@@ -821,6 +821,7 @@ struct Engine::Impl {
         void* hop_h = nullptr;          // pinned staging for the hidden state that crosses devices
         size_t hop_bytes = 0;
         void* side = nullptr;
+        void* swap_s = nullptr;           // P22: the rebalance copies' own stream (not `side`, see rebalance())
         void* swap_ev = nullptr;          // P22: recorded after a rebalance's async slot copies
         void* ds = nullptr;             // dense GEMV stream (native_mmvq needs an explicit stream)
         void* dsb = nullptr;            // blocking dense-GEMV stream for the dev_out (norm+rope) chain
@@ -1404,6 +1405,8 @@ struct Engine::Impl {
         for (Work& w : work) {
             if (w.side) cu::stream_destroy(w.side);
             w.side = nullptr;
+            if (w.swap_s) cu::stream_destroy(w.swap_s);
+            w.swap_s = nullptr;
             if (w.ds) cu::stream_destroy(w.ds);
             w.ds = nullptr;
             if (w.dsb) cu::stream_destroy(w.dsb);
@@ -2894,6 +2897,7 @@ struct Engine::Impl {
 
     void vram_swap(Layer& L, int slot, int expert) {
         use_device_index(L.dev);
+        if (!W().swap_s) W().swap_s = cu::stream_create();
         Layer::VramSlot& s = L.vram[(size_t)slot];
         uint8_t* p = (uint8_t*)s.mem.p;
         // P22: copy from the pinned RAM tier when it holds the expert (a real async DMA); the mapping is pageable,
@@ -2910,9 +2914,9 @@ struct Engine::Impl {
                 d = base + L.stride_g + L.stride_u;
             }
         }
-        cu::copy_h2d_async(p, g, L.stride_g, W().side);
-        cu::copy_h2d_async(p + L.stride_g, u, L.stride_u, W().side);
-        cu::copy_h2d_async(p + L.stride_g + L.stride_u, d, L.expert_down, W().side);
+        cu::copy_h2d_async(p, g, L.stride_g, W().swap_s);
+        cu::copy_h2d_async(p + L.stride_g, u, L.stride_u, W().swap_s);
+        cu::copy_h2d_async(p + L.stride_g + L.stride_u, d, L.expert_down, W().swap_s);
         if (s.expert >= 0) L.vram_of[(size_t)s.expert] = kNotResident;
         s.expert = expert;
         L.vram_of[(size_t)expert] = slot;
@@ -4230,10 +4234,14 @@ struct Engine::Impl {
         // on swap_ev first (ram_admit_many).
         if (any) {
             for (size_t d = 0; d < work.size(); ++d) {
-                if (!work[d].side) continue;
+                if (!work[d].swap_s) continue;
                 use_device_index((int)d);
                 if (!work[d].swap_ev) work[d].swap_ev = cu::event_create();
-                cu::event_record(work[d].swap_ev, work[d].side);
+                cu::event_record(work[d].swap_ev, work[d].swap_s);
+                // The expert kernels of the next token read these slots, so they wait for the copies on the device
+                // (the host does not wait here).  The copies live on their own stream, so nothing the side stream
+                // queues before the wait is held behind them.
+                if (work[d].side) cu::stream_wait_event(work[d].side, work[d].swap_ev);
             }
             swap_inflight = true;
         }
