@@ -55,7 +55,7 @@ RTX 5060 Ti, Ryzen 9 5900X) on IQ2_XXS with the `dec5` bench: 3 requests of 128 
 - **RAM budget without tiers.** A `--no-tiers` run also clamps the batched prompt's pinned pools to the RAM budget the
   tier path uses (`clamp_prompt_chunk_to_ram`). The chunk shrinks to what fits, or the token path is used when even two
   tokens do not fit.
-- **Two version numbers.** The startup line prints `version=`, the Sparsa release (CMake `SPARSA_VERSION`, now 0.2.1),
+- **Two version numbers.** The startup line prints `version=`, the Sparsa release (CMake `SPARSA_VERSION`, now 0.2.2),
   and `strata=`, the engine number (`project(strata VERSION 0.1.48)`). They are separate numbers.
 - **Quality on assistant turns.** Plain `IQ2_XXS` scores KL 0.413 and top-1 81.85 % through Sparsa, over 3,020
   positions scored against the NVFP4 teacher. Patched llama.cpp, scored with the same script on the same eval, gives KL 0.413 and top-1 81.72 %.

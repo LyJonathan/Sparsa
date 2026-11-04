@@ -47,7 +47,7 @@ Point Sparsa at the folder. Most tiers do not load in stock llama.cpp, LM Studio
 
 | Tier | Size | Quality | Use |
 | --- | ---: | --- | --- |
-| `IQ2_XXS-GPTQ-v2` | 122.4 GB | assistant-turn KL 0.211, top-1 87.5 % | Maya-S per-layer types with sequential GPTQ on gate, up and down (Maya-S: KL 0.199); needs v0.2.1 or later |
+| `IQ2_XXS-GPTQ-v2` | 122.4 GB | assistant-turn KL 0.211, top-1 87.5 % | Maya-S per-layer types with sequential GPTQ on gate, up and down (Maya-S: KL 0.199); needs v0.2.2 or later |
 | `IQ2_XXS-GPTQ` | 124.5 GB | assistant-turn KL 0.284, top-1 84.4 % | Sequential GPTQ: 27 % lower KL than the same layout without it (0.388) |
 | `IQ1_M-GPTQ-v2` | 106.6 GB | assistant-turn KL 0.312, top-1 82.4 % | Best under ~110 GB: IQ1_M gate and up, IQ2_XXS down, sequential GPTQ |
 | `IQ1_M` | 106.6 GB | top-1 47.1 % | Smallest usable tier; 1-bit quality is degraded |
@@ -76,14 +76,15 @@ Pick the largest tier that fits in RAM + VRAM with ~10 GB to spare; Sparsa strea
 
 You need an NVIDIA card (12 GB is enough; CUDA 12.8 or newer for an RTX 50 series), RAM for most of the tier, and
 Python 3.10+. Download the engine from
-[v0.2.1](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.1-experimental) (Windows and Linux, CUDA), or
+[v0.2.2](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.2-experimental) (Windows, CUDA; the Linux tarball is still on
+[v0.2.1](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.1-experimental)), or
 build from source (below). The speeds above were measured on the
 [v0.2.0](https://github.com/LyJonathan/Sparsa/releases/tag/sparsa-v0.2.0-experimental) build.
 
 ```sh
 git clone https://github.com/LyJonathan/Sparsa.git
 cd Sparsa
-# unzip sparsa-v0.2.1-windows-x64-cuda.zip (or the Linux tarball) here, so that bin/strata-minimax sits in bin/
+# unzip sparsa-v0.2.2-windows-x64-cuda.zip (or the Linux tarball) here, so that bin/strata-minimax sits in bin/
 python -m pip install -r requirements.txt
 python sparsa.py download iq2-xs-d3 --dir D:/models
 python sparsa.py download tokenizer --dir D:/models/MiniMax-M3.1-Flash-IQ2_XS-D3/tokenizer
@@ -98,8 +99,8 @@ calls.
 Useful flags: `--access lan` (shares it, with an API key), `--context 8192`, `--gpu 0,1`, `--threads N`, `--ram-gib N`
 (cap the RAM tier), `--plan`. `python sparsa.py pick` prints the tier this machine would choose.
 
-On `main`, the attention and indexer projections are requantized from Q8_0 to Q6_K when the model loads, which saves
-1.5 GiB. v0.2.1 keeps the Q8_0 weights; on `main`, `--minimax-attn-type q8_0` does the same.
+Since v0.2.2, the attention and indexer projections are requantized from Q8_0 to Q6_K when the model loads, which saves
+1.5 GiB. v0.2.1 keeps the Q8_0 weights; `--minimax-attn-type q8_0` does the same.
 
 ## Build from source
 
