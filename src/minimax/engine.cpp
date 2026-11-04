@@ -8164,7 +8164,23 @@ struct Engine::Impl {
                     attend_host((int)li, L, pos0 + t, att.data());
                     std::memcpy(pf_dense_h.data() + (size_t)t * qlen, att.data(), (size_t)qlen * sizeof(float));
                 }
-                gemm_cpu(L.wo, pf_dense_h.data(), T, qlen, pf_moe_h.data(), ne);
+                if (gpu && L.wo.gpu) {
+                    // This layer's dense weights are on the card, and the host copy of wo was released at upload, so the
+                    // projection runs on the card, as in the device branch above.  Reading it on the CPU here was a null
+                    // dereference inside ggml_vec_dot_q6_K_q8_K: every batched prompt that takes this branch (any file
+                    // whose indexer starts after layer 0, such as MiniMax-M3.1 Maya-layout GGUFs) crashed.
+                    cu::copy_h2d(p.p32, pf_dense_h.data(), (size_t)T * qlen * sizeof(float));
+                    if (!prefill_dense_f32) cu::f32_to_f16(p.p32, p.a16, (size_t)T * qlen, nullptr);
+                    cu::sync();
+                    gemm_gpu(L.wo, prefill_dense_f32 ? p.h16 : p.a16, p.p32, p.y32, T, ne);
+                    cu::copy_d2h(pf_moe_h.data(), p.y32, (size_t)T * ne * sizeof(float));
+                } else {
+                    // Fail closed: the CPU projection needs the host copy, and a layer without one must not read null.
+                    if (!L.wo.host)
+                        fail("internal: layer " + std::to_string((long long)li) +
+                             " has its attention output weights neither on the card nor on the host");
+                    gemm_cpu(L.wo, pf_dense_h.data(), T, qlen, pf_moe_h.data(), ne);
+                }
             }
             pool.run(T, [&](int a, int b) {
                 for (size_t i = (size_t)a * ne; i < (size_t)b * ne; ++i) pf_h[i] += pf_moe_h[i];
