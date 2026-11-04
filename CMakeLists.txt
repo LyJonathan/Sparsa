@@ -24,7 +24,7 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # The Sparsa (MiniMax) release number, printed by the MiniMax server's banner. It is not the `project` number above: that
 # one is the engine and Control number which the app checks against engine_min (commit 6f8800ae), and it stays 0.1.48.
 # Keep this equal to the sparsa-v<version> release; tools/minimax/package_release.py refuses a different --version.
-set(SPARSA_VERSION "0.2.1")
+set(SPARSA_VERSION "0.2.2")
 add_compile_definitions(SPARSA_VERSION="${SPARSA_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
