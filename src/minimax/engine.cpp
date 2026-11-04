@@ -1276,6 +1276,43 @@ struct Engine::Impl {
     }
     int apply_expert_skip(std::vector<float>& w) { return apply_expert_skip_range(w.data(), (int)w.size()); }
 
+    // --minimax-topk-adaptive T: a route whose share of the route weights is below T is dropped.  The two largest
+    // weights always stay, so a token never runs fewer than two routed experts.  The survivors are renormalized
+    // (--minimax-topk-adaptive-renorm on, the default: the routed sum keeps its scale) or keep the router's weights
+    // (off).  A dropped route gets weight 0, which the lanes already skip: its bytes are never read or computed.
+    // Off (T = 0) this changes nothing.
+    float topk_adaptive = 0.f;
+    bool topk_adaptive_renorm = true;
+    static constexpr int kTopkFloor = 2;
+    int apply_topk_adaptive(float* w, int n) {
+        if (topk_adaptive <= 0.f || n <= kTopkFloor || n > 64) return n;
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i) sum += w[i];
+        if (!(sum > 0.f)) return n;
+        int best = 0;
+        for (int i = 1; i < n; ++i)
+            if (w[i] > w[best]) best = i;
+        int second = best == 0 ? 1 : 0;
+        for (int i = 0; i < n; ++i)
+            if (i != best && w[i] > w[second]) second = i;
+        bool keep[64];
+        int kept = 0;
+        for (int i = 0; i < n; ++i) {
+            keep[i] = i == best || i == second || w[i] / sum >= topk_adaptive;
+            kept += keep[i] ? 1 : 0;
+        }
+        if (kept == n) return n;
+        float kept_sum = 0.f;
+        for (int i = 0; i < n; ++i)
+            if (keep[i]) kept_sum += w[i];
+        for (int i = 0; i < n; ++i) {
+            if (!keep[i]) w[i] = 0.f;
+            else if (topk_adaptive_renorm && kept_sum > 0.f) w[i] /= kept_sum;
+        }
+        tok_stats.skipped += n - kept;
+        return kept;
+    }
+
     bool ram_inplace = false;      // P7b: --minimax-ram-mode inplace: the page cache is the tier, nothing is copied
     // P6: --minimax-ssd-chunks and --minimax-expert-skip-ssd.  P7: --minimax-ssd-zerocopy.
     int ssd_chunks = 1;
@@ -1389,6 +1426,12 @@ struct Engine::Impl {
         if (expert_skip > 1.f) fail("--minimax-expert-skip is a renormalized weight in (0, 1]");
         if (expert_skip > 0.f)
             std::fprintf(stderr, "INFO minimax-expert-skip threshold=%.3f\n", expert_skip);
+        topk_adaptive = opt.topk_adaptive > 0.f ? opt.topk_adaptive : 0.f;
+        topk_adaptive_renorm = opt.topk_adaptive_renorm != "off";
+        if (topk_adaptive >= 1.f) fail("--minimax-topk-adaptive is a share of the route weights in (0, 1)");
+        if (topk_adaptive > 0.f)
+            std::fprintf(stderr, "INFO minimax-topk-adaptive threshold=%.3f floor=%d renorm=%s\n", topk_adaptive,
+                         kTopkFloor, topk_adaptive_renorm ? "on" : "off");
         ssd_chunks = opt.ssd_chunks > 0 ? opt.ssd_chunks : 1;
         if (ssd_chunks > 16) ssd_chunks = 16;
         ssd_skip_rank = opt.expert_skip_ssd;
@@ -4132,6 +4175,7 @@ struct Engine::Impl {
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
         apply_expert_skip(w);
+        apply_topk_adaptive(w.data(), (int)w.size());
         if (pt) {
             prof.router += pms(t_ph);
             t_ph = std::chrono::steady_clock::now();
@@ -5041,6 +5085,7 @@ struct Engine::Impl {
         if (renorm && sum > 0.f)
             for (float& v : w) v /= sum;
         apply_expert_skip(w);
+        apply_topk_adaptive(w.data(), (int)w.size());
         if (!route_counts.empty()) {
             const size_t b = (size_t)(&L - layers.data()) * (size_t)cfg.n_expert;
             for (int j = 0; j < top; ++j) route_counts[b + (size_t)order[(size_t)j]] += 1.0;
@@ -6715,6 +6760,7 @@ struct Engine::Impl {
             if (renorm && sum > 0.f)
                 for (int j = 0; j < top; ++j) wts[(size_t)t * top + j] /= sum;
             apply_expert_skip_range(wts.data() + (size_t)t * top, top);
+            apply_topk_adaptive(wts.data() + (size_t)t * top, top);
             if (!usage.empty())
                 for (int j = 0; j < top; ++j) usage[base_idx + (size_t)order[(size_t)j]] += 1.f;
             if (!route_counts.empty())

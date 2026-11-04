@@ -106,6 +106,11 @@ struct EngineOptions {
                                     ///< "off": the host rms_heads/rope/ggml_fp32_to_fp16 loop (the P5b path)
     float expert_skip = 0.f;        ///< --minimax-expert-skip: drop a routed expert whose renormalized weight is
                                     ///< below this; the survivors are renormalized. 0 (default) keeps every route.
+    float topk_adaptive = 0.f;      ///< --minimax-topk-adaptive: drop a routed expert whose share of the route weights
+                                    ///< is below this, but never leave fewer than two routes (the two largest weights
+                                    ///< always stay). 0 (default) keeps every route.
+    std::string topk_adaptive_renorm;  ///< --minimax-topk-adaptive-renorm: "" / "on" renormalize the kept weights to sum
+                                    ///< to 1; "off" keeps their router weights (the routed sum shrinks).
     std::string graphs;             ///< "" / "on": CUDA-graph the token path's per-layer GPU prefix; "off": launch
                                     ///< the same kernels one at a time
     std::string expert_resident;    ///< "" / "auto": pin the RAM tier at startup when it fits; "all": also pin the

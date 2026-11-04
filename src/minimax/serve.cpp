@@ -112,6 +112,10 @@ void usage() {
                  "                                    many small requests\n"
                  "  --minimax-expert-skip-ssd N       drop a route at or past rank N (0 = best) when its expert would\n"
                  "                                    be read from the SSD; 0 (default) keeps every route\n"
+                 "  --minimax-topk-adaptive T         drop a route whose share of the route weights is below T (0 < T < 1),\n"
+                 "                                    but always keep the two largest; 0 (default) keeps every route\n"
+                 "  --minimax-topk-adaptive-renorm on|off  renormalize the kept route weights (default on), or keep\n"
+                 "                                    the router's own weights (off)\n"
                  "  --minimax-ssd-zerocopy on|off     an SSD-tier expert whose pages are already resident is computed\n"
                  "                                    from the mapping with no read (default on)\n"
                  "  --minimax-page-probe N            pages sampled per expert for that check (default 32; 0 = all)\n"
@@ -615,6 +619,8 @@ int run(int argc, char** argv) {
     std::string prefill_experts, prefill_dense, prefill_expert_gemm, prefill_read, dense_mmvq, prefill_expert_device;
     std::string gpu_normrope, expert_resident;
     float expert_skip = 0.f;
+    float topk_adaptive = 0.f;
+    std::string topk_adaptive_renorm;
     int ssd_chunks = 1, expert_skip_ssd = 0;
     std::string ssd_zerocopy;
     int page_probe = 32;
@@ -666,6 +672,8 @@ int run(int argc, char** argv) {
         else if (a == "--minimax-attn-type") attn_type = next();
         else if (a == "--minimax-gpu-normrope") gpu_normrope = next();
         else if (a == "--minimax-expert-skip") expert_skip = (float)std::atof(next().c_str());
+        else if (a == "--minimax-topk-adaptive") topk_adaptive = (float)std::atof(next().c_str());
+        else if (a == "--minimax-topk-adaptive-renorm") topk_adaptive_renorm = next();
         else if (a == "--minimax-ssd-chunks") ssd_chunks = std::atoi(next().c_str());
         else if (a == "--minimax-expert-skip-ssd") expert_skip_ssd = std::atoi(next().c_str());
         else if (a == "--minimax-ssd-zerocopy") ssd_zerocopy = next();
@@ -909,6 +917,8 @@ int run(int argc, char** argv) {
     opt.gpu_normrope = gpu_normrope;
     opt.expert_resident = expert_resident;
     opt.expert_skip = expert_skip;
+    opt.topk_adaptive = topk_adaptive;
+    opt.topk_adaptive_renorm = topk_adaptive_renorm;
     opt.ssd_chunks = ssd_chunks;
     opt.expert_skip_ssd = expert_skip_ssd;
     opt.ssd_zerocopy = ssd_zerocopy;
