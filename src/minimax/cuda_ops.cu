@@ -789,6 +789,66 @@ __global__ void __launch_bounds__(128) msa_attn_wmma_kernel(const __half* __rest
     }
 }
 
+// Round 23 (on by default; STRATA_MSA_DENSE_FAST=0 turns it off): the dense (no indexer) MSA with each key's score computed once.
+// Same arithmetic and the same key order as msa_attn_batch_kernel's dense branch, so the output is bit-identical.  The
+// old third pass recomputed every key's dot product once per output dimension (dim x dim work per key); here the
+// softmax weights of 256 keys at a time sit in shared memory and each output dimension is accumulated over the keys in
+// increasing order.  Needs dim <= blockDim (128): one output dimension per thread.
+__global__ void msa_attn_dense_fast_kernel(const __half* __restrict__ k, const __half* __restrict__ v,
+                                           const __half* __restrict__ q, int q_per_kv, int dim, long long pos0,
+                                           float* __restrict__ out) {
+    __shared__ float red[32];
+    __shared__ float w[256];
+    const long long t = (long long)blockIdx.x;
+    const int qh = (int)blockIdx.y;
+    const int kv = qh / q_per_kv;
+    const long long pos = pos0 + t;
+    const __half* qrow = q + (t * gridDim.y + qh) * (long long)dim;
+    const float att_scale = 1.f / sqrtf((float)dim);
+    const __half* kb = k + (long long)kv * dim;
+    const int hkv = gridDim.y / q_per_kv;
+    const long long cnt = pos + 1;
+    // pass 1: the max score (as in msa_attn_batch_kernel)
+    float m = -INFINITY;
+    for (long long p = threadIdx.x; p < cnt; p += blockDim.x) {
+        const __half* row = k + (p * hkv + kv) * (long long)dim;
+        float acc = 0.f;
+        for (int d = 0; d < dim; ++d) acc += __half2float(row[d]) * __half2float(qrow[d]);
+        m = fmaxf(m, acc * att_scale);
+    }
+    m = block_max(m, red);
+    __syncthreads();
+    // pass 2: the softmax denominator (as in msa_attn_batch_kernel)
+    float sum = 0.f;
+    for (long long p = threadIdx.x; p < cnt; p += blockDim.x) {
+        const __half* row = k + (p * hkv + kv) * (long long)dim;
+        float acc = 0.f;
+        for (int d = 0; d < dim; ++d) acc += __half2float(row[d]) * __half2float(qrow[d]);
+        sum += __expf(acc * att_scale - m);
+    }
+    sum = block_sum(sum, red);
+    __syncthreads();
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    // pass 3: out[d] = sum over keys p (increasing) of exp(s_p - m) * v[p][d]; each key's weight is computed once per chunk
+    const int d = (int)threadIdx.x;
+    float acc_out = 0.f;
+    for (long long c0 = 0; c0 < cnt; c0 += 256) {
+        const long long c1 = (c0 + 256 < cnt) ? c0 + 256 : cnt;
+        for (long long p = c0 + threadIdx.x; p < c1; p += blockDim.x) {
+            const __half* row = k + (p * hkv + kv) * (long long)dim;
+            float sc = 0.f;
+            for (int e = 0; e < dim; ++e) sc += __half2float(row[e]) * __half2float(qrow[e]);
+            w[p - c0] = __expf(sc * att_scale - m);
+        }
+        __syncthreads();
+        if (d < dim) {
+            for (long long p = c0; p < c1; ++p) acc_out += w[p - c0] * __half2float(v[(p * hkv + kv) * (long long)dim + d]);
+        }
+        __syncthreads();
+    }
+    if (d < dim) out[(t * gridDim.y + qh) * (long long)dim + d] = acc_out * inv;
+}
+
 // Four query heads of one KV head per block: the K rows are dotted against all four queries and the V rows are read
 // Four query heads of one KV head per block: the K rows are dotted against all four queries and the V rows are read
 __global__ void msa_attn_flash_kernel(const __half* __restrict__ k, const __half* __restrict__ v,
@@ -1629,6 +1689,23 @@ void msa_attn_batch(const void* k, const void* v, const uint16_t* q, const int32
     // P5b: indexed layers whose query heads per KV head equal the query heads per indexer head (M3.1: 8) take the
     // flash-style kernel: one block per (token, KV head), all 8 heads of that KV head, online softmax over the
     // selected positions in chunks of 128.  ~15 KB of shared memory instead of 43 KB.
+    // Round 23: dense (no indexer) layers with the scores computed once per key (on by default; STRATA_MSA_DENSE_FAST=0 turns it off).
+    static const bool msa_dense_fast = [] {
+        const char* e = std::getenv("STRATA_MSA_DENSE_FAST");
+        return !(e && e[0] == '0');
+    }();
+    if (dense_all && msa_dense_fast && dim >= 1 && dim <= 128 && q_per_kv > 0 && heads % q_per_kv == 0) {
+        const dim3 gridf((unsigned)n_tok, (unsigned)heads, 1u);
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr, "INFO minimax-msa: STRATA_MSA_DENSE_FAST path on the dense (no indexer) layers\n");
+        }
+        msa_attn_dense_fast_kernel<<<gridf, 128, 0, (cudaStream_t)stream>>>((const __half*)k, (const __half*)v,
+                                                                            (const __half*)q, q_per_kv, dim, pos0, out);
+        check(cudaGetLastError(), "msa_attn_dense_fast launch");
+        return;
+    }
     const int hkv_d = q_per_kv > 0 ? heads / q_per_kv : 0;
     const int idx_per_head = q_per_idx > 0 ? heads / q_per_idx : 0;
     static const bool msa_old = std::getenv("STRATA_MSA_OLD") != nullptr;

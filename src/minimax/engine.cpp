@@ -68,6 +68,7 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/minimax/vram_plan.hpp"
+#include "lane_pool.hpp"   // R9 STRATA_LANE_POOL: the CPU lane pool (on by default; STRATA_LANE_POOL=0 turns it off)
 
 namespace strata::minimax {
 namespace {
@@ -904,6 +905,7 @@ struct Engine::Impl {
         // token path (normed/rotated in place), `iqn`/`ikn` the indexer's; `pos1` is the one-token position array.
         DevPtr qn, kn, vn, iqn, ikn, pos1;
         DevPtr kn16, vn16, ik16;    // fp16 staging the graph writes; the cache copy is one D2D outside it
+        DevPtr q16;                 // fp16 copy of the query for the dense device attention (layers without an indexer)
         DevPtr rope_cos, rope_sin;   // [rope_pos_cap][n_rot/2] fp32
         int64_t rope_pos_cap = 0;
         uint16_t* kstage_h = nullptr;   // pinned staging for the RAM tier
@@ -964,6 +966,14 @@ struct Engine::Impl {
     bool have_logits = false;
     std::mt19937_64 rng{0};
     Pool pool;
+    // R9 STRATA_LANE_POOL: the CPU lane's two expert regions (mlp_ptr_multi) run on a CCD-aware pool (lane_pool.hpp).
+    // Same rows, same kernels: only the thread that computes a row changes, so the logits are bit-identical.  Everything
+    // else stays on `pool`.  Null when STRATA_LANE_POOL=0.
+    std::unique_ptr<LanePool> lane_pool;
+    void lane_run_dyn(int nrows, int chunk_rows, const std::function<void(int, int)>& job) {
+        if (lane_pool) lane_pool->run_dyn(nrows, chunk_rows, job);
+        else pool.run_dyn(nrows, chunk_rows, job);
+    }
     std::vector<std::vector<uint8_t>> requant_store;   // P19: host copies of requantized dense weights
 
     // ---- P5a: batched prompt processing.  `batch_cap` tokens per layer at a time; every buffer below lives on the
@@ -1367,6 +1377,17 @@ struct Engine::Impl {
         cfg = from_gguf(model.meta());
         const std::string bad = check_structure(cfg);
         if (!bad.empty()) fail(bad);
+        // Debug cap for the placement gate (the repo's 15-layer check is a truncated GGUF; this runs the first N layers
+        // of this same file, with the same tensors and output head, so the forward is the same computation).  Unset
+        // (or N >= the file's layers) runs the whole model.
+        if (const char* cap = std::getenv("STRATA_MM_MAX_LAYERS")) {
+            const long long want = std::atoll(cap);
+            if (want >= 1 && want < (long long)cfg.n_layers) {
+                std::fprintf(stderr, "INFO minimax-debug: STRATA_MM_MAX_LAYERS=%lld, running layers 0..%lld of %lld\n",
+                             want, want - 1, (long long)cfg.n_layers);
+                cfg.n_layers = (int64_t)want;
+            }
+        }
         if (cfg.n_head % cfg.idx_heads != 0)
             fail("attention.head_count is not a multiple of the indexer head count");
         if (cfg.idx_first_layer < cfg.n_layers && cfg.n_rot > cfg.idx_dim)
@@ -1457,6 +1478,16 @@ struct Engine::Impl {
                      opt.cpu_threads > 0 ? "--cpu-threads" : "physical cores",
                      (int)std::thread::hardware_concurrency());
         pool.start(threads);
+        // R9 STRATA_LANE_POOL, on by default (STRATA_LANE_POOL=0 turns it off).  Pinning is on by default too
+        // (STRATA_POOL_PIN=0 turns it off); a worker whose pin the OS refuses simply runs unpinned.
+        const char* lane_pool_env = std::getenv("STRATA_LANE_POOL");
+        if (!(lane_pool_env && lane_pool_env[0] == '0')) {
+            LanePoolOptions lo = LanePoolOptions::from_env(std::max(0, opt.pool_spin_us));
+            if (!std::getenv("STRATA_POOL_PIN")) lo.pin = true;
+            lane_pool = std::make_unique<LanePool>(threads, lo);
+            std::fprintf(stderr, "INFO minimax-lane-pool threads=%d ccds=%d pin=%d ccd=%d tail=%d spin_us=%d\n",
+                         lane_pool->threads(), lane_pool->ccds(), (int)lo.pin, (int)lo.ccd, lo.tail, lo.spin_us);
+        }
         // --minimax-attn-type requantizes the attention projections before the VRAM plan: choose_split_and_kv and
         // place_weights size the layers from the tensors' bytes.
         requant_attention();
@@ -2028,6 +2059,7 @@ struct Engine::Impl {
                 w.kn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
                 w.vn16 = DevPtr(cu::alloc((size_t)cfg.n_head_kv * cfg.head_dim * 2 + 64));
                 w.ik16 = DevPtr(cu::alloc((size_t)cfg.idx_dim * 2 + 64));
+                w.q16 = DevPtr(cu::alloc((size_t)cfg.n_head * cfg.head_dim * 2 + 64));
                 // The cos/sin table the kernel indexes.  It is built once per device up to a cap: at 256 KiB of
                 // table per 1 K positions an uncapped 1 M context would cost 256 MiB on every card, so the table
                 // stops at 128 K and a longer context keeps the host rope (correct, just not this fast path).
@@ -2204,12 +2236,23 @@ struct Engine::Impl {
             fail("--minimax-kv vram|ram runs MSA on the device, which needs the indexer head count (" +
                  std::to_string(cfg.idx_heads) + ") to equal the KV head count (" + std::to_string(cfg.n_head_kv) +
                  "). This file has " + std::to_string(cfg.n_head_kv) + " KV heads. Use --minimax-kv host.");
-        if (mode != 0 && cfg.idx_first_layer > 0) {
+        // A file whose indexer starts after layer 0 has leading dense layers (no indexer) that attend over every
+        // position.  The VRAM tier can run them on the device (attend_dev's dense branch; the batched prompt pass already
+        // uses the dense kernel for them).  That path is on by default (STRATA_VRAM_DENSE_LEADING=0 turns it off);
+        // a K/V that does not fit on the cards keeps the host cache instead (see the budget check below).
+        const char* dense_env = std::getenv("STRATA_VRAM_DENSE_LEADING");
+        const bool vram_dense_leading = !(dense_env && dense_env[0] == '0');
+        if (cfg.idx_first_layer > 0 && (mode == 2 || (mode == 1 && !vram_dense_leading))) {
             std::fprintf(stderr,
                          "INFO minimax-kv: this file indexes only from layer %lld, so the device attention path "
                          "is off; keeping the KV cache on the host\n",
                          (long long)cfg.idx_first_layer);
             mode = 0;
+        } else if (mode == 1 && cfg.idx_first_layer > 0) {
+            std::fprintf(stderr,
+                         "INFO minimax-kv: the leading dense layers (0..%lld) attend on "
+                         "the device over all positions (VRAM K/V)\n",
+                         (long long)cfg.idx_first_layer - 1);
         }
 
         // Split points.  `K` = the first layer on the next device.  "auto" fills each device with dense + KV
@@ -2282,6 +2325,15 @@ struct Engine::Impl {
             mode = 2;
             assign(false);
             bad = check_budget(false);
+        }
+        if (bad.empty() && mode == 2 && cfg.idx_first_layer > 0) {
+            // Auto placement moved the K/V to pinned RAM because it did not fit on the cards.  A file with leading dense
+            // layers keeps the host cache instead (the pinned-RAM placement does not run those layers), as before.
+            std::fprintf(stderr,
+                         "INFO minimax-kv: this file indexes only from layer %lld and its K/V does not fit on the cards; "
+                         "keeping the KV cache on the host\n",
+                         (long long)cfg.idx_first_layer);
+            mode = 0;
         }
         if (bad.empty() && mode == 2 && opt.kv_quant == "auto" && !kv_q) {
             // The quant is only chosen by capacity: fp16 unless the process cannot commit it.
@@ -2860,7 +2912,13 @@ struct Engine::Impl {
         } else {
             const size_t hold = phys ? phys : avail;
             const size_t room = hold > headroom + overhead ? hold - headroom - overhead : 0;
-            ram_budget = std::min(room, free_now);
+            // The tier is real bytes; the slot counts below divide by the largest expert, so convert or the tier would
+            // reserve only the smallest-expert share of the RAM it was given.
+            size_t expert_bytes_sum = 0;
+            for (const Layer& L : layers)
+                if (L.moe) expert_bytes_sum += L.expert_bytes;
+            ram_budget = strata::minimax::ram_slot_budget_bytes(strata::minimax::ram_auto_tier_bytes(room, avail, keep),
+                                                                expert_bytes_sum, (size_t)moe_layers, max_expert_bytes);
         }
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
         // more slots than a cold one.  With a uniform count the layer budgets ignore the routing profile entirely;
@@ -2873,37 +2931,20 @@ struct Engine::Impl {
             for (int64_t i = 0; i < cfg.n_layers; ++i)
                 if (layers[(size_t)i].moe) ram_n[(size_t)i] = r;
         } else if (!profile.empty()) {
-            // Walk the global ranked list; each entry offers its layer one more slot for the next-hottest expert
-            // that is not already going to VRAM.  The cost of a slot is that layer's expert_bytes, so a file whose
-            // layers are not uniform is sized correctly.
-            std::vector<int> seen((size_t)cfg.n_layers, 0);
-            size_t spent = 0;
-            const int cap = (int)cfg.n_expert;
-            for (const auto& [pl, pe] : profile) {
-                (void)pe;
-                Layer& L = layers[(size_t)(pl + cfg.leading_dense)];
-                if (!L.moe) continue;
-                const int s = seen[(size_t)(pl + cfg.leading_dense)]++;
-                const int nn = ram_n[(size_t)(pl + cfg.leading_dense)];
-                if (s < (int)L.vram.size()) continue;   // the profile's top q per layer went to VRAM
-                if (nn >= cap) continue;
-                if (spent + L.expert_bytes > ram_budget) break;
-                ram_n[(size_t)(pl + cfg.leading_dense)] = nn + 1;
-                spent += L.expert_bytes;
+            // The frequency walk (strata::minimax::ram_slots_by_profile): hottest first, each slot paid in its own layer's
+            // expert bytes, and never more bytes than the uniform plan reserves.  The first profile entries of a layer are
+            // that layer's VRAM slots and are skipped here.
+            std::vector<char> is_moe((size_t)cfg.n_layers, 0);
+            std::vector<int> vram_n((size_t)cfg.n_layers, 0);
+            std::vector<size_t> xbytes((size_t)cfg.n_layers, 0);
+            for (int64_t i = 0; i < cfg.n_layers; ++i) {
+                const Layer& L = layers[(size_t)i];
+                is_moe[(size_t)i] = L.moe ? 1 : 0;
+                vram_n[(size_t)i] = (int)L.vram.size();
+                xbytes[(size_t)i] = L.expert_bytes;
             }
-            // Anything the profile did not cover (a truncated STRP, or a model with no profile entry for a layer)
-            // is filled round-robin from whatever budget is left, so the tier is never left half empty.
-            for (bool progress = true; progress;) {
-                progress = false;
-                for (int64_t i = 0; i < cfg.n_layers; ++i) {
-                    Layer& L = layers[(size_t)i];
-                    if (!L.moe || ram_n[(size_t)i] >= cap) continue;
-                    if (spent + L.expert_bytes > ram_budget) continue;
-                    ++ram_n[(size_t)i];
-                    spent += L.expert_bytes;
-                    progress = true;
-                }
-            }
+            ram_n = strata::minimax::ram_slots_by_profile(profile, (int)cfg.leading_dense, is_moe, vram_n, xbytes,
+                                                          (int)cfg.n_expert, ram_budget);
         } else {
             const int uniform = (int)(ram_budget / ((size_t)moe_layers * max_expert_bytes));
             const int capped = uniform > cfg.n_expert ? (int)cfg.n_expert : uniform;
@@ -3050,6 +3091,10 @@ struct Engine::Impl {
                     vram_fill(L, s, order[(size_t)at].second);
                 for (int s = 0; s < L.ram_n && at < (int)order.size(); ++s, ++at)
                     ram_fill(L, s, order[(size_t)at].second);
+                // Layer order, as the uniform plan's fill runs (fill_ram_static): this layer's reads through the file
+                // mapping (the VRAM slots and the RAM copies) are handed back before the next layer, so they do not pile
+                // up in the working set and take the available RAM under the watchdog floor.  Same slots, same bytes.
+                trim_mapped_pages();
             }
         }
 
@@ -4975,7 +5020,7 @@ struct Engine::Impl {
         // pass that used to follow the barrier, with that pass removed.
         if ((int)L.egate.ne1 != ff || (int)L.eup.ne1 != ff)
             fail("gate/up rows do not match the expert feed-forward width");
-        pool.run_dyn(n * ff, kLaneChunkRows, [&](int a, int b) {
+        lane_run_dyn(n * ff, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
                 const int j = i / ff;
                 const int r = i - j * ff;
@@ -4999,7 +5044,7 @@ struct Engine::Impl {
         for (int j = 0; j < n; ++j)
             kd.act->from_float(&cpu_hbuf[(size_t)j * (size_t)ff], cpu_hq.data() + (size_t)j * kd.act_bytes, ff);
         const size_t d_row = L.edown.row_bytes;
-        pool.run_dyn(n * embd, kLaneChunkRows, [&](int a, int b) {
+        lane_run_dyn(n * embd, kLaneChunkRows, [&](int a, int b) {
             for (int i = a; i < b; ++i) {
                 const int j = i / embd;
                 const int r = i - j * embd;
@@ -5262,6 +5307,9 @@ struct Engine::Impl {
     }
 
     void attend_host(int layer, const Layer& L, int64_t pos, float* att) {
+        // Fail closed: under the VRAM tier there is no host K/V copy for any layer, so this path must never run.
+        if (kv_mode == 1)
+            fail("minimax: host attention ran under --minimax-kv vram, which keeps no host K/V (placement bug)");
         // P7: --minimax-kv vram keeps no host K/V at all.  Calling the host path under it used to read a null
         // pointer and take an access violation tens of seconds into a batched prefill; name the combination
         // instead of dying in it.
@@ -5417,6 +5465,28 @@ struct Engine::Impl {
         const int BLK = (int)cfg.idx_block;
         const int64_t Tk = pos + 1;
         const int nb = (int)((Tk + BLK - 1) / BLK);
+        if (!L.indexer) {
+            // A leading dense layer (no indexer) attends over every causal position 0..pos.  The indexer path below
+            // would select only this token's own block here (every indexer score is -inf), so these layers take the
+            // device dense kernel, which reads the layer's VRAM K/V in place.  The batched prompt pass runs the same
+            // kernel for them.  Fail closed if this layer has no VRAM K/V or no fp16 query buffer.
+            if (kv_mode != 1 || !L.d_k.p || !L.d_v.p || !w.q16.p)
+                fail("minimax: a dense layer's device attention needs its VRAM K/V and the fp16 query buffer");
+            const float* qsrc = qdev;
+            if (!qsrc) {
+                h2d(w, w.qd.p, q.data(), (size_t)H * (size_t)D * sizeof(float));
+                qsrc = (const float*)w.qd.p;
+            }
+            cu::f32_to_f16(qsrc, (uint16_t*)w.q16.p, (int64_t)H * D, nullptr);
+            float* att_dst = att_dev_out ? att_dev_out : (float*)w.att.p;
+            cu::msa_attn_batch(L.d_k.p, L.d_v.p, (const uint16_t*)w.q16.p, nullptr, nullptr, H, H / HKV, 1, D, BLK, 1,
+                               pos, 1, 1, att_dst, nullptr);
+            if (!att_dev_out) {
+                cu::sync();
+                cu::copy_d2h(att, att_dst, (size_t)H * (size_t)D * sizeof(float));
+            }
+            return;
+        }
         // The device selection writes the slot lists the gather consumes; the dump needs the host arrays, and the
         // pinned-RAM tier needs the counts on the host to know how many rows to copy.
         const bool dev_slots = kv_mode == 1 && L.indexer && !dumping(layer) && w.slots.p && w.counts.p;
