@@ -494,6 +494,18 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         } else {
             note = std::string("cudaHostRegister FAILED (") + cudaGetErrorString(e) +
                    ") - the arena is NOT pinned, so copies will be slow; " + note;
+#ifdef _WIN32
+            // Diagnostic: the WDDM shared-memory budget and usage at the refusal, so the log says why it was refused.
+            {
+                uint64_t diag_limit = 0;
+                std::string diag_why;
+                const bool diag_ok = sliced_pin_limit(diag_limit, diag_why);
+                std::fprintf(stderr, "INFO pinned-arena refused: %.2f GiB requested; %s; limit %.2f GiB\n",
+                             (double) bytes / (double) (1ull << 30), diag_ok ? diag_why.c_str() : "budget unavailable",
+                             (double) diag_limit / (double) (1ull << 30));
+                (void) cudaGetLastError();
+            }
+#endif
             // **CONSUME THE ERROR, OR IT LIES ABOUT SOMETHING ELSE LATER.**
             //
             // `cudaGetLastError()` returns the last error and CLEARS it; until something reads it, the error

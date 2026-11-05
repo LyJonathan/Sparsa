@@ -333,6 +333,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ram_budget_test tests/minimax/ram_budget_test.cpp)
   target_include_directories(ram_budget_test PRIVATE include)
   add_test(NAME ram_budget_test COMMAND ram_budget_test)
+  # R9: the CPU lane's CCD-aware pool (src/minimax/lane_pool.hpp, header-only): topology reader and every row once
+  add_executable(lane_pool_test tools/minimax/lane_pool_test.cpp)
+  target_link_libraries(lane_pool_test PRIVATE Threads::Threads)
+  add_test(NAME lane_pool_test COMMAND lane_pool_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
