@@ -2238,11 +2238,10 @@ struct Engine::Impl {
                  "). This file has " + std::to_string(cfg.n_head_kv) + " KV heads. Use --minimax-kv host.");
         // A file whose indexer starts after layer 0 has leading dense layers (no indexer) that attend over every
         // position.  The VRAM tier can run them on the device (attend_dev's dense branch; the batched prompt pass already
-        // uses the dense kernel for them).  That path is opt-in (STRATA_VRAM_DENSE_LEADING=1).  Its 15-layer gate passes,
-        // but the full-model gate does not, so it is off by default.  A K/V that does not fit on the cards keeps the host
-        // cache instead (see the budget check below).
+        // uses the dense kernel for them).  That path is on by default (STRATA_VRAM_DENSE_LEADING=0 turns it off);
+        // a K/V that does not fit on the cards keeps the host cache instead (see the budget check below).
         const char* dense_env = std::getenv("STRATA_VRAM_DENSE_LEADING");
-        const bool vram_dense_leading = dense_env && dense_env[0] == '1';
+        const bool vram_dense_leading = !(dense_env && dense_env[0] == '0');
         if (cfg.idx_first_layer > 0 && (mode == 2 || (mode == 1 && !vram_dense_leading))) {
             std::fprintf(stderr,
                          "INFO minimax-kv: this file indexes only from layer %lld, so the device attention path "
@@ -2913,7 +2912,13 @@ struct Engine::Impl {
         } else {
             const size_t hold = phys ? phys : avail;
             const size_t room = hold > headroom + overhead ? hold - headroom - overhead : 0;
-            ram_budget = strata::minimax::ram_auto_tier_bytes(room, avail, keep);
+            // The tier is real bytes; the slot counts below divide by the largest expert, so convert or the tier would
+            // reserve only the smallest-expert share of the RAM it was given.
+            size_t expert_bytes_sum = 0;
+            for (const Layer& L : layers)
+                if (L.moe) expert_bytes_sum += L.expert_bytes;
+            ram_budget = strata::minimax::ram_slot_budget_bytes(strata::minimax::ram_auto_tier_bytes(room, avail, keep),
+                                                                expert_bytes_sum, (size_t)moe_layers, max_expert_bytes);
         }
         // The per-layer split: hottest first from the profile, so a layer whose experts are routed more often gets
         // more slots than a cold one.  With a uniform count the layer budgets ignore the routing profile entirely;

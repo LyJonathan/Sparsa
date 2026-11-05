@@ -81,6 +81,20 @@ inline size_t ram_auto_tier_bytes(size_t room_bytes, size_t avail_bytes, size_t 
     return std::min(std::min(room_bytes, free_now), kRamTierCeilingBytes);
 }
 
+/// The budget to hand the slot planners so an automatic tier reserves its real bytes.  The planners count a layer's slots as
+/// budget / (MoE layers x the largest expert).  Layers whose experts are smaller than the largest would otherwise leave
+/// part of the tier unused.  With this budget the count is tier / (the sum of one expert per MoE layer), so the reserved
+/// bytes reach the tier and never pass it.
+/// \param tier_bytes        ram_auto_tier_bytes()
+/// \param expert_bytes_sum  one expert's bytes, summed over the MoE layers
+/// \param moe_layers        MoE layers
+/// \param max_expert_bytes  the largest expert
+inline size_t ram_slot_budget_bytes(size_t tier_bytes, size_t expert_bytes_sum, size_t moe_layers, size_t max_expert_bytes) {
+    if (expert_bytes_sum == 0) return tier_bytes;
+    const size_t slots_each = tier_bytes / expert_bytes_sum;
+    return (slots_each + 1) * moe_layers * max_expert_bytes - 1;
+}
+
 /// The pinned tier's per-layer slot counts under a routing profile: the frequency walk, as the engine runs it.
 ///
 /// The walk hands out slots hottest first.  Each profile entry offers its layer one more slot for that entry's expert,

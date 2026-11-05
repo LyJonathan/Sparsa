@@ -235,6 +235,19 @@ int main() {
                "32 GiB box with less than its keep free: no tier");
     }
 
+    // 13. An automatic tier reserves its real bytes when experts differ in size: the uniform count is tier / sum, never more.
+    {
+        const size_t GiB = (size_t)1 << 30, MiB = (size_t)1 << 20;
+        const size_t layers = 57, big = 21 * MiB, each = 14 * MiB, sum = 3 * big + 54 * each;
+        for (size_t tier : {(size_t)10 * GiB, 47 * GiB, 68 * GiB, 74 * GiB, 108 * GiB}) {
+            const size_t n = ram_slot_budget_bytes(tier, sum, layers, big) / (layers * big);
+            expect(n == tier / sum, "the slot count is the tier over the summed expert bytes");
+            expect(n * sum <= tier, "the reserved bytes never pass the tier");
+            expect(tier - n * sum < sum, "the tier is used to within one slot per layer");
+        }
+        expect(ram_slot_budget_bytes(5 * GiB, 0, 0, 0) == 5 * GiB, "no MoE layers: the tier is unchanged");
+    }
+
     if (failures) {
         std::fprintf(stderr, "ram_budget_test: %d failure(s)\n", failures);
         return 1;
