@@ -7,9 +7,16 @@ top-1 agreement, NLL against the true next token, and plain-text perplexity on t
 reference's own 2,048 ids. `tools/minimax/g3_sparsa.py` produces the logits with
 `strata-minimax --minimax-eval`; nothing in the scoring path is re-derived.
 
-Measured on this PC (Ryzen 9 5900X, 2x RTX 5070 12 GB, 128 GB RAM, Windows, NVMe).
+Measured on three boxes, each named where it is used:
+
+* **this PC** - Ryzen 9 5900X, 2x RTX 5070 12 GB, 128 GB RAM, Windows, NVMe. MM-IQ2_XS-D3.
+* **rig-2** - Linux, 2 GPUs, 128 GB RAM. The `IQ1_*`, `IQ2_XXS`, `IQ2_KT`, `IQ2_KL`, `IQ3_K` and `IQ4_KS` rows.
+* **the cloud box** - RTX PRO 6000 96 GB, 160 GiB RAM (`tools/minimax/cloud/README.md`). `NVFP4`,
+  `IQ1_M` and the `IQ2_KL` cross-check.
+
 Every tier file was checked byte-for-byte against the Hub's blob sha256 before a run
-(`tools/minimax/verify_tier.ps1`).
+(`tools/minimax/verify_tier.ps1`). All tier rows use the same 6 short prompts and the same 679
+positions; `--no-ppl` throughout, so there is no ppl column (see "Not measured").
 
 ## Alignment and reference self-check (run first)
 
@@ -82,6 +89,43 @@ where the reference itself is at 11.6 nats. The residual is the IQ2_XS expert ti
 Timing: 2,089 s of engine time for the six prompts (6 model loads; 151-token prompt
 213 s, 288-token 418 s, 547-token 821 s), plus 8.5 s of scoring.
 
+## Every tier measured against the reference (6 short prompts, 679 positions)
+
+Same reference, same 679 positions, same scoring. `Size` is the folder on the Hub. `Wall` is the engine
+time for the six prompts (six model loads included). Flags: `--minimax-tiers --layer-split auto
+--minimax-kv vram --minimax-dense-layers-gpu -1 --minimax-prefill-batch 512
+--minimax-prefill-experts cpu --minimax-vram-slots-per-layer 0`; rig-2 with `--gpus 0,1 --cpu-threads 24
+--memory-limit-mib 90000`, the cloud box with `--gpus 0 --cpu-threads 20 --memory-limit-mib 140000`, the
+PC's D3 row with the host-KV flags above (this engine build could not run device attention with the dense
+layers off the GPU; see "Not measured").
+
+| tier | size | KL64 mean | p50 | p99 | full-vocab KL | top-1 | wall | box |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| IQ1_S | 94.8 GB | 1.9256 | 1.0085 | 10.5614 | 2.3104 | 44.33% | 9.0 min | rig-2 |
+| IQ1_M | 106.6 GB | 1.6732 | 0.8699 | 9.9632 | 2.0076 | 47.13% | 11.9 min | cloud |
+| IQ2_XXS | 124.5 GB | 1.8039 | 0.8795 | 11.9040 | 2.1472 | 51.99% | 9.9 min | rig-2 |
+| IQ2_KT | 123.8 GB | 1.2917 | 0.4328 | 10.1728 | 1.5084 | 56.26% | 41.7 min | rig-2 |
+| IQ2_XS-D3 | 146.1 GB | 1.2110 | 0.3844 | 9.5184 | 1.4722 | 59.35% | 34.8 min | this PC |
+| IQ2_KL | 152.7 GB | 1.1843 | 0.3219 | 11.7607 | 1.3868 | 59.79% | 17.6 min | rig-2 |
+| IQ2_KL | 152.7 GB | 1.1175 | 0.3332 | 9.9738 | 1.3439 | 60.24% | 23.2 min | cloud |
+| IQ3_K | 191.2 GB | 0.8467 | 0.1427 | 8.4363 | 0.9820 | 69.81% | 30.5 min | rig-2 |
+| IQ4_KS | 233.6 GB | 0.7597 | 0.0720 | 9.2681 | 0.9049 | 74.37% | 20.3 min | rig-2 |
+| NVFP4 | 246.1 GB | 0.6704 | 0.0239 | 8.9966 | 0.7760 | 77.32% | 16.0 min | cloud |
+
+`code_lru` carries almost all of every mean (it is the prompt where the fp32 model itself sits at NLL
+11.57 and 6.19% top-1); the other five prompts are 0.02-0.73 KL64 on the 3-4 bit tiers. `p50` is the
+fairer per-position view: NVFP4 0.024, IQ4_KS 0.072, IQ3_K 0.143, IQ2_KL 0.32, IQ2_XS-D3 0.38.
+
+Two boxes scored the same `IQ2_KL` bytes (sha256-matched): KL64 1.1843 on rig-2 against 1.1175 on the
+cloud box, top-1 59.79% against 60.24%, and the cloud box reproduced `prose_moe` 0.6420 and
+`tool_weather` 0.7291 exactly on a re-run. The gap is the tier composition each box used (86 vs 128
+experts resident per layer, one GPU vs two), which changes the batched prefill's expert grouping; it is
+6% on KL64 and 0.45 points on top-1, so read the tier-to-tier steps, not the third decimal.
+
+`IQ1_S` is the one coherence failure: on both prompts tried it decodes into a loop ("and and and",
+"- No - No -") while `IQ1_M` and `IQ2_XS-D3` are coherent on the same prompt. That is the quant, not the
+harness (`rig2/IQ1_S/smoke.log`).
+
 ## Not measured
 
 * **long_code_stdlib (5,536 tok) and long_prose_austen (4,093 tok)** - opt-in (`--long-prompts`) and
@@ -92,11 +136,12 @@ Timing: 2,089 s of engine time for the six prompts (6 model loads; 151-token pro
   (`--minimax-dense-layers-gpu 0`, both `vram` and `ram`, reproduced twice), and with
   `--minimax-dense-layers-gpu -1` it exceeds 12 GB of VRAM per card and stalls. That engine bug is
   being fixed separately; these two prompts are re-runnable as soon as it is.
-* **Plain-text perplexity (2,048 ids)** - the pass was started and cut after ~2 minutes at
-  the rig handover; it needs the same host-attention path (~30-60 min) and is not measured
-  for this tier yet. The llama.cpp harness's D3 number is ppl 87.25 against the fp32
-  reference's 39.69.
-* IQ3_K and IQ4_KS - not run yet.
+* **Plain-text perplexity (2,048 ids)** - not measured on the engine for any tier: the pass needs the
+  same host-attention path (~30-60 min per tier) that the long prompts need, and it was cut at the
+  rig handover. The only ppl numbers are llama.cpp's on this reference: MM-IQ2_XS-D3 87.25 and MM-IQ2_XS
+  68.04 against the fp32 reference's 39.69.
+* **IQ2_XS (not D3)** - not run through this harness; the HF README keeps llama.cpp's eight-prompt
+  number for it, which is not comparable with the 679-position table.
 
 ## Reproducing
 
